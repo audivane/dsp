@@ -246,6 +246,10 @@ pub struct Facts {
     /// `default.configured.audio.sink`, the user's preference, when set. It
     /// can differ from `default_sink` (e.g. a preferred device is unplugged).
     pub default_configured_sink: Option<String>,
+    /// `node.description` of the effective default sink when it is not one of
+    /// ours (the output an unrouted stream plays on in per-app mode). `None`
+    /// when the default is ours, unset, or names a sink that does not exist.
+    pub normal_output: Option<String>,
 }
 
 impl Facts {
@@ -598,6 +602,9 @@ struct Graph {
     nodes: HashMap<u32, Tracked>,
     /// link id -> (output node, input node)
     links: BTreeMap<u32, (u32, u32)>,
+    /// Other `Audio/Sink` nodes: id -> (`node.name`, `node.description`).
+    /// Only read from the registry globals; never bound.
+    other_sinks: HashMap<u32, (String, Option<String>)>,
     meta: Option<Metadata>,
     meta_listener: Option<pw::metadata::MetadataListener>,
     /// Parsed `default.audio.sink`.
@@ -699,7 +706,20 @@ impl Graph {
             sinks,
             default_sink: self.default_sink.clone(),
             default_configured_sink: self.configured_sink.clone(),
+            normal_output: self.normal_output(),
         }
+    }
+
+    /// Description of the default sink when it is someone else's.
+    fn normal_output(&self) -> Option<String> {
+        let name = self.default_sink.as_deref()?;
+        if name == self.opts.dsp_sink_name || name == self.opts.direct_sink_name {
+            return None;
+        }
+        self.other_sinks
+            .values()
+            .find(|(sink, _)| sink == name)
+            .map(|(sink, description)| description.clone().unwrap_or_else(|| sink.clone()))
     }
 
     fn sink_choice(&self, node: u32) -> Option<SinkChoice> {
@@ -1297,6 +1317,7 @@ fn run_loop(
         core: Some(core.clone()),
         nodes: HashMap::new(),
         links: BTreeMap::new(),
+        other_sinks: HashMap::new(),
         meta: None,
         meta_listener: None,
         default_sink: None,
@@ -1508,6 +1529,18 @@ fn on_node_global(
     let is_ours =
         node_name.is_some_and(|name| name == dsp_name.as_str() || name == direct_name.as_str());
     if !is_stream && !is_ours {
+        if media_class == Some("Audio/Sink")
+            && let Some(name) = node_name
+        {
+            let description = props
+                .and_then(|p| p.get("node.description"))
+                .map(str::to_string);
+            let mut graph = graph.borrow_mut();
+            graph
+                .other_sinks
+                .insert(global.id, (name.to_string(), description));
+            graph.publish();
+        }
         return;
     }
     let Ok(node) = registry.bind::<Node, _>(global) else {
@@ -1655,7 +1688,8 @@ impl Graph {
         }
         let removed_node = self.nodes.remove(&id).is_some();
         let removed_link = self.links.remove(&id).is_some();
-        if !removed_node && !removed_link {
+        let removed_sink = self.other_sinks.remove(&id).is_some();
+        if !removed_node && !removed_link && !removed_sink {
             return;
         }
         self.routed.remove(&id);
@@ -1726,6 +1760,7 @@ mod tests {
             }],
             default_sink: Some("audivane_dsp".into()),
             default_configured_sink: Some("alsa_output.pci".into()),
+            normal_output: None,
         };
         assert_eq!(facts.sink(SinkChoice::Dsp).map(|s| s.node), Some(10));
         assert_eq!(facts.sink(SinkChoice::Direct), None);

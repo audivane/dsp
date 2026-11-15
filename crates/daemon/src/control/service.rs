@@ -1002,6 +1002,12 @@ impl Service {
             ab,
             preset,
             volume,
+            device_caps: snap.device_caps.clone(),
+            effective_rates: snap.effective_rates.clone(),
+            direct_rates: snap.direct_rates.clone(),
+            effective_default_rate: snap.effective_default_rate,
+            dither_bits: snap.dither_bits,
+            normal_output: facts.normal_output.clone(),
         }
     }
 
@@ -1281,6 +1287,11 @@ mod tests {
                 frames_out: 0,
                 chain_generation: 0,
                 gaps: Default::default(),
+                device_caps: None,
+                effective_rates: Vec::new(),
+                direct_rates: Vec::new(),
+                effective_default_rate: None,
+                dither_bits: None,
             }
         }
         fn meters(&self) -> Meters {

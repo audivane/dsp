@@ -1,5 +1,6 @@
 import type { RateConflict } from "../api/types";
-import { fmtRate, fmtSampleFormat } from "../lib/format";
+import { directRateNote, rateSupportNote } from "../lib/deviceCaps";
+import { fmtRate, fmtRateShort, fmtSampleFormat } from "../lib/format";
 import { store, useApp } from "../store/store";
 import { DevicePicker } from "../components/TopBar";
 import { Seg } from "../components/Seg";
@@ -14,6 +15,10 @@ export function DeviceView() {
   const dev = devices.length ? st.currentDevice() : undefined;
   const released = status?.state === "idle";
   const hw = status?.volume ? (status.volume.hardware ? "Yes" : "No (digital)") : "—";
+  const effectiveRates = status?.effective_rates ?? [];
+  const rateNote = rateSupportNote(cfg.rate.allowed_rates, effectiveRates);
+  const directNote = directRateNote(effectiveRates, status?.direct_rates);
+  const defaultRate = status?.effective_default_rate ?? cfg.rate.default_rate;
   return (
     <section className="view" aria-labelledby="dev-title">
       <div className="view-head">
@@ -51,6 +56,23 @@ export function DeviceView() {
           </div>
         </div>
         <div className="row">
+          <span className="k" title="Sample rates the DAC may run at (before upsampling). An app at another rate is resampled by PipeWire.">
+            Sample rates
+          </span>
+          <span className="rate-list" aria-label="Allowed sample rates">
+            {cfg.rate.allowed_rates.map((r) => {
+              const unsupported = rateNote?.unsupported.includes(r) ?? false;
+              return (
+                <span key={r} className={"rate-chip" + (unsupported ? " off" : "")} title={unsupported ? "Not supported by this device" : undefined}>
+                  {fmtRateShort(r)}
+                </span>
+              );
+            })}
+          </span>
+          {rateNote && <span className="hint">{rateNote.text}</span>}
+          {directNote && <span className="hint">{directNote}</span>}
+        </div>
+        <div className="row">
           <span className="k" title="When apps play into Audivane DSP at different sample rates, the DAC can run at only one of them; PipeWire resamples the others. Apps on the Direct (bit-perfect) path always set the rate themselves.">
             Mixed rates
           </span>
@@ -62,10 +84,10 @@ export function DeviceView() {
             options={[
               ["keep_current", "Keep current", "Keep the current rate while any app still plays at it; otherwise follow the app that started first."],
               ["highest", "Use highest", "Run at the highest rate any of the apps plays at."],
-              ["default_rate", "Use default", `Run at the default rate (${fmtRate(cfg.rate.default_rate)}) while the apps disagree. A single app is still followed.`],
+              ["default_rate", "Use default", `Run at the default rate (${fmtRate(defaultRate)}) while the apps disagree. A single app is still followed.`],
             ]}
           />
-          {!cfg.rate.follow_source && <span className="hint">Rate following is off: always {fmtRate(cfg.rate.default_rate)}</span>}
+          {!cfg.rate.follow_source && <span className="hint">Rate following is off: always {fmtRate(defaultRate)}</span>}
         </div>
         <div className="row">
           {released ? (

@@ -1,10 +1,12 @@
 //! Safe direct ALSA `hw:` PCM playback wrapper with zero-alloc audio-path writes.
 
+use crate::caps::{describe_pcm, plan_open, probe_pcm, ratio_ladder, to_alsa_format};
 use crate::error::{AlsaError, Result};
-use alsa::pcm::{Access, Format, HwParams, PCM, State, SwParams, TstampType};
+use alsa::pcm::{Access, HwParams, PCM, State, SwParams, TstampType};
 use alsa::poll::Descriptors;
 use alsa::{Direction, ValueOr};
 use audivane_protocol::SampleFormat;
+use audivane_protocol::ipc::DeviceCapabilities;
 use std::time::Duration;
 
 /// Preferred format negotiation order: highest bit depth first.
@@ -66,6 +68,127 @@ pub struct NegotiatedParams {
 /// Maximum consecutive zero-progress poll waits before `write_i32_all*` aborts.
 const MAX_ZERO_PROGRESS_WAITS: usize = 10;
 
+/// An opened playback PCM that is not configured yet. Probe it with
+/// [`OpenPcm::probe`] (no second handle needed, so this works while the
+/// engine holds the device), then turn it into an [`AlsaOutput`].
+pub struct OpenPcm {
+    pcm: PCM,
+    device: String,
+}
+
+impl OpenPcm {
+    /// Open `device` for playback, retrying briefly on `EBUSY`.
+    pub fn open(device: &str, nonblock: bool) -> Result<Self> {
+        Ok(Self {
+            pcm: open_pcm_with_ebusy_retry(device, nonblock)?,
+            device: device.to_string(),
+        })
+    }
+
+    pub fn device(&self) -> &str {
+        &self.device
+    }
+
+    /// Supported (rate, format) pairs for `channels` channels, over `rates`.
+    /// Leaves the PCM unconfigured.
+    pub fn probe(&self, channels: u32, rates: &[u32]) -> Result<DeviceCapabilities> {
+        probe_pcm(&self.pcm, &self.device, channels, rates)
+    }
+
+    /// Configure at exactly `config.rate`, trying `formats` in order.
+    pub fn configure(self, config: &AlsaConfig, formats: &[SampleFormat]) -> Result<AlsaOutput> {
+        let candidate_list = if formats.is_empty() {
+            FORMAT_PREFERENCE.to_vec()
+        } else {
+            formats.to_vec()
+        };
+        let params = negotiate_params(&self.pcm, &self.device, config, &candidate_list)?;
+        AlsaOutput::from_pcm(self.pcm, &self.device, params)
+    }
+
+    /// Configure at `source_rate * ratio` for the first ratio on
+    /// [`ratio_ladder`]`(desired_ratio)` the device takes, returning the ratio
+    /// used. With `caps` the ratio and format are planned from the probe
+    /// ([`plan_open`]); without, each rate is tried. There is no "nearest
+    /// rate" fallback: the device rate is always exactly `source_rate * ratio`,
+    /// otherwise the graph would play at the wrong pitch.
+    ///
+    /// `period_frames` is scaled as `quantum * ratio` whenever `quantum >= 32`.
+    pub fn configure_with_ratio_fallback(
+        self,
+        config: &AlsaConfig,
+        source_rate: u32,
+        desired_ratio: u32,
+        quantum: u32,
+        formats: &[SampleFormat],
+        caps: Option<&DeviceCapabilities>,
+    ) -> Result<(AlsaOutput, u32)> {
+        let candidate_list = if formats.is_empty() {
+            FORMAT_PREFERENCE.to_vec()
+        } else {
+            formats.to_vec()
+        };
+        let cfg_for = |ratio: u32| {
+            let mut c = config.clone();
+            c.rate = source_rate.saturating_mul(ratio);
+            if quantum >= 32 {
+                c.period_frames = quantum.saturating_mul(ratio);
+            }
+            c
+        };
+
+        if let Some(caps) = caps.filter(|c| !c.rates.is_empty()) {
+            let (ratio, format) = plan_open(caps, source_rate, desired_ratio, &candidate_list)?;
+            let try_cfg = cfg_for(ratio);
+            // The planned format first, then the other candidates the device
+            // takes at this rate (in case the driver disagrees with the probe).
+            let mut order = vec![format];
+            order.extend(
+                candidate_list
+                    .iter()
+                    .copied()
+                    .filter(|&f| f != format && caps.supports(try_cfg.rate, f)),
+            );
+            if ratio != desired_ratio.max(1) {
+                log::info!(
+                    "ALSA '{}' has no {} Hz; using x{ratio} ({} Hz) instead of x{desired_ratio}",
+                    self.device,
+                    source_rate.saturating_mul(desired_ratio.max(1)),
+                    try_cfg.rate
+                );
+            }
+            let params = negotiate_params(&self.pcm, &self.device, &try_cfg, &order)?;
+            let out = AlsaOutput::from_pcm(self.pcm, &self.device, params)?;
+            return Ok((out, ratio));
+        }
+
+        let mut last_err = None;
+        for ratio in ratio_ladder(desired_ratio) {
+            let try_cfg = cfg_for(ratio);
+            match negotiate_params(&self.pcm, &self.device, &try_cfg, &candidate_list) {
+                Ok(params) => {
+                    let out = AlsaOutput::from_pcm(self.pcm, &self.device, params)?;
+                    return Ok((out, ratio));
+                }
+                Err(e) => {
+                    log::debug!(
+                        "ALSA '{}' rejected {} Hz: {e}; trying a smaller ratio",
+                        self.device,
+                        try_cfg.rate
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        // The ratio-1 attempt is the last one: its error is the most telling.
+        Err(last_err.unwrap_or_else(|| AlsaError::Unsupported {
+            device: self.device.clone(),
+            rejected: format!("rate {source_rate} Hz"),
+            supported: describe_pcm(&self.pcm),
+        }))
+    }
+}
+
 /// Direct ALSA PCM playback handle with pre-allocated packing scratch buffer.
 pub struct AlsaOutput {
     pcm: PCM,
@@ -90,89 +213,28 @@ impl AlsaOutput {
 
     /// Open and configure an ALSA `hw:` playback device trying `formats` in order.
     pub fn open_with_formats(config: &AlsaConfig, formats: &[SampleFormat]) -> Result<Self> {
-        let pcm = open_pcm_with_ebusy_retry(&config.device, config.nonblock)?;
-        let candidate_list = if formats.is_empty() {
-            FORMAT_PREFERENCE.to_vec()
-        } else {
-            formats.to_vec()
-        };
-        let params = negotiate_params(&pcm, config, &candidate_list)?;
-        Self::from_pcm(pcm, &config.device, params)
+        OpenPcm::open(&config.device, config.nonblock)?.configure(config, formats)
     }
 
-    /// Open the ALSA device at `source_rate * actual_ratio`, falling back from
-    /// `desired_ratio` down to smaller integer ratios (halving powers of two,
-    /// then `1`) if the hardware rejects the target rate.
-    ///
-    /// `period_frames` is scaled as `quantum * actual_ratio` whenever `quantum >= 32`.
+    /// Open the device and configure it at `source_rate * ratio`, see
+    /// [`OpenPcm::configure_with_ratio_fallback`]. Without `caps` the ratio
+    /// ladder is tried blind.
     pub fn open_with_ratio_fallback(
         config: &AlsaConfig,
         source_rate: u32,
         desired_ratio: u32,
         quantum: u32,
         formats: &[SampleFormat],
+        caps: Option<&DeviceCapabilities>,
     ) -> Result<(Self, u32)> {
-        let pcm = open_pcm_with_ebusy_retry(&config.device, config.nonblock)?;
-        let candidate_list = if formats.is_empty() {
-            FORMAT_PREFERENCE.to_vec()
-        } else {
-            formats.to_vec()
-        };
-
-        let mut ratios = Vec::new();
-        let mut r = desired_ratio.max(1);
-        while r >= 1 {
-            ratios.push(r);
-            if r == 1 {
-                break;
-            }
-            if r.is_power_of_two() {
-                r /= 2;
-            } else {
-                r -= 1;
-            }
-        }
-
-        let mut last_err = None;
-        for ratio in ratios {
-            let target_rate = source_rate.saturating_mul(ratio);
-            let mut try_cfg = config.clone();
-            try_cfg.rate = target_rate;
-            if quantum >= 32 {
-                try_cfg.period_frames = quantum.saturating_mul(ratio);
-            }
-            match negotiate_params(&pcm, &try_cfg, &candidate_list) {
-                Ok(params) if params.rate == target_rate => {
-                    let out = Self::from_pcm(pcm, &config.device, params)?;
-                    return Ok((out, ratio));
-                }
-                Ok(params) => {
-                    log::debug!(
-                        "ALSA '{}' snapped rate {} -> {}, trying smaller ratio",
-                        config.device,
-                        target_rate,
-                        params.rate
-                    );
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                }
-            }
-        }
-
-        // Fallback: accept whatever nearest rate the device supports at ratio 1.
-        let mut try_cfg = config.clone();
-        try_cfg.rate = source_rate;
-        if quantum >= 32 {
-            try_cfg.period_frames = quantum;
-        }
-        match negotiate_params(&pcm, &try_cfg, &candidate_list) {
-            Ok(params) => {
-                let out = Self::from_pcm(pcm, &config.device, params)?;
-                Ok((out, 1))
-            }
-            Err(e) => Err(last_err.unwrap_or(e)),
-        }
+        OpenPcm::open(&config.device, config.nonblock)?.configure_with_ratio_fallback(
+            config,
+            source_rate,
+            desired_ratio,
+            quantum,
+            formats,
+            caps,
+        )
     }
 
     fn from_pcm(pcm: PCM, device: &str, params: NegotiatedParams) -> Result<Self> {
@@ -522,39 +584,80 @@ fn candidate_formats_from_config(config: &AlsaConfig) -> Vec<SampleFormat> {
 
 fn negotiate_params(
     pcm: &PCM,
+    device: &str,
     config: &AlsaConfig,
     candidate_formats: &[SampleFormat],
 ) -> Result<NegotiatedParams> {
+    // Why each candidate failed, so the error names the parameter.
+    let mut access_rejected = false;
+    let mut format_rejected: Vec<SampleFormat> = Vec::new();
+    let mut channels_rejected = false;
+    let mut rate_rejected: Vec<SampleFormat> = Vec::new();
+    let mut install_err: Option<String> = None;
+
     let mut chosen_format = None;
     for &fmt in candidate_formats {
         let hwp = HwParams::any(pcm)?;
         let _ = hwp.set_rate_resample(false);
         if hwp.set_access(Access::RWInterleaved).is_err() {
-            continue;
+            access_rejected = true;
+            break;
         }
         if hwp.set_format(to_alsa_format(fmt)).is_err() {
+            format_rejected.push(fmt);
             continue;
         }
         if hwp.set_channels(config.channels).is_err() {
+            channels_rejected = true;
             continue;
         }
-        if hwp.set_rate(config.rate, ValueOr::Nearest).is_err() {
+        if hwp.set_rate(config.rate, ValueOr::Nearest).is_err()
+            || hwp.get_rate().ok() != Some(config.rate)
+        {
+            rate_rejected.push(fmt);
             continue;
         }
         let period = hwp.set_period_size_near(config.period_frames as _, ValueOr::Nearest)?;
         let desired_buf = (period as u32).saturating_mul(config.buffer_periods.max(2));
         let _buffer = hwp.set_buffer_size_near(desired_buf as _)?;
-        if pcm.hw_params(&hwp).is_ok() {
-            chosen_format = Some(fmt);
-            break;
+        match pcm.hw_params(&hwp) {
+            Ok(()) => {
+                chosen_format = Some(fmt);
+                break;
+            }
+            Err(e) => install_err = Some(e.to_string()),
         }
     }
 
-    let format = chosen_format.ok_or_else(|| AlsaError::NoSupportedFormat {
-        device: config.device.clone(),
-        rate: config.rate,
-        channels: config.channels,
-    })?;
+    let Some(format) = chosen_format else {
+        let names = |v: &[SampleFormat]| v.iter().map(|f| f.name()).collect::<Vec<_>>().join(", ");
+        let rejected = if access_rejected {
+            "interleaved read/write access".to_string()
+        } else if !rate_rejected.is_empty() {
+            format!(
+                "rate {} Hz (with {} channels, format {})",
+                config.rate,
+                config.channels,
+                names(&rate_rejected)
+            )
+        } else if channels_rejected {
+            format!("{} channels", config.channels)
+        } else if format_rejected.len() == candidate_formats.len() {
+            format!("sample format {}", names(&format_rejected))
+        } else if let Some(e) = install_err {
+            format!(
+                "{} Hz, {} channels with the requested buffer ({e})",
+                config.rate, config.channels
+            )
+        } else {
+            format!("{} Hz, {} channels", config.rate, config.channels)
+        };
+        return Err(AlsaError::Unsupported {
+            device: device.to_string(),
+            rejected,
+            supported: describe_pcm(pcm),
+        });
+    };
 
     let hwp = pcm.hw_params_current()?;
     let rate = hwp.get_rate()?;
@@ -578,15 +681,6 @@ fn negotiate_params(
         period_frames,
         buffer_frames,
     })
-}
-
-fn to_alsa_format(fmt: SampleFormat) -> Format {
-    match fmt {
-        SampleFormat::S16 => Format::S16LE,
-        SampleFormat::S24 => Format::S24LE,
-        SampleFormat::S24_3 => Format::S243LE,
-        SampleFormat::S32 => Format::S32LE,
-    }
 }
 
 /// Bytes per sample on the ALSA wire for a [`SampleFormat`].

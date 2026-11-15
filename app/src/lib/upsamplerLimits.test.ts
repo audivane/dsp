@@ -44,7 +44,8 @@ describe("upsampler limits (mirror of dsp-core)", () => {
   });
 
   it("identifies preset vs custom Kaiser beta values", () => {
-    expect(KAISER_BETA_PRESETS.map((p) => p.beta)).toEqual([10, 14, 17, 20]);
+    expect(KAISER_BETA_PRESETS.map((p) => p.beta)).toEqual([10, 14, 17, 20, 24]);
+    expect(selectedKaiserPreset(24)).toBe(24);
     expect(selectedKaiserPreset(10)).toBe(10);
     expect(selectedKaiserPreset(14)).toBe(14);
     expect(selectedKaiserPreset(17)).toBe(17);
@@ -68,11 +69,15 @@ describe("upsampler limits (mirror of dsp-core)", () => {
     // In fraction cutoff mode, taps do not restrict beta.
     expect(kaiserBetaBlockReason({ ...base, cutoff_mode: "fraction" }, 20)).toBeNull();
 
-    // Minimum phase blocks beta outside 2..20, allows all presets 10..20.
+    // Minimum phase blocks beta outside 2..20: presets 10..20 are fine, 24 is not.
     const minPhase = { target: { ratio: 4 } as const, taps: 16384, phase: "minimum" as const, cutoff_mode: "fraction" as const };
-    for (const { beta } of KAISER_BETA_PRESETS) {
+    for (const { beta } of KAISER_BETA_PRESETS.filter((p) => p.beta <= 20)) {
       expect(kaiserBetaBlockReason(minPhase, beta)).toBeNull();
     }
+    expect(kaiserBetaBlockReason(minPhase, 24)).toContain("between 2 and 20");
+    // β 24 is fine for linear phase, also with Stop at Nyquist (range 5..24).
+    expect(kaiserBetaBlockReason({ ...minPhase, phase: "linear" }, 24)).toBeNull();
+    expect(kaiserBetaBlockReason({ ...minPhase, phase: "linear", cutoff_mode: "nyquist_stop" }, 24)).toBeNull();
     expect(kaiserBetaBlockReason(minPhase, 1)).toContain("between 2 and 20");
     expect(kaiserBetaBlockReason(minPhase, 22)).toContain("between 2 and 20");
 
@@ -111,5 +116,7 @@ describe("upsampler limits (mirror of dsp-core)", () => {
       expect(tip).toContain("24-bit");
       expect(tip).toContain("136 dB");
     }
+    // β 24: 24 / 0.1102 + 8.7 ≈ 226.5 dB.
+    expect(kaiserPresetTooltip(24, "Extreme")).toContain("≈ 226 dB stopband");
   });
 });

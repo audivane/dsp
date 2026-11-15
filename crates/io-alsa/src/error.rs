@@ -16,13 +16,13 @@ pub enum AlsaError {
     #[error("invalid ALSA device name '{0}'")]
     InvalidDeviceName(String),
 
-    #[error(
-        "no supported sample format found on device '{device}' (rate {rate} Hz, channels {channels})"
-    )]
-    NoSupportedFormat {
+    /// The device rejected a hardware parameter. `rejected` names it (with
+    /// the values asked for); `supported` lists what the device accepts.
+    #[error("device '{device}' does not support {rejected} (device supports {supported})")]
+    Unsupported {
         device: String,
-        rate: u32,
-        channels: u32,
+        rejected: String,
+        supported: String,
     },
 
     #[error("device reservation denied for card {card}: current owner refused release")]

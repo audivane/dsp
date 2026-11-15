@@ -8,16 +8,18 @@ use crate::clock::{
 };
 use crate::error::{PwError, Result};
 use crate::lifecycle::{
-    DesiredDspConfig, DeviceBackend, DeviceLifecycle, OpenedDevice, ReopenGate, decide_rt_reopen,
+    DesiredDspConfig, DeviceBackend, DeviceLifecycle, NegotiatedKey, OpenedDevice, ReopenGate,
+    decide_rt_reopen, negotiated_key,
 };
 use crate::metadata::{MetadataOp, MetadataTracker};
-use crate::rate_arbiter::{RateArbiter, RateClient, RateInputs, Verdict};
+use crate::rate_arbiter::{RateArbiter, RateClient, RateInputs, Verdict, choose_allowed_rate};
+use crate::rate_caps::{direct_rate_policy, effective_rate_policy};
 use audivane_io_alsa::{
-    AlsaConfig, AlsaOutput, DEFAULT_RESERVE_PRIORITY, DeviceReservation, NegotiatedParams,
-    card_index_from_device, try_promote_current_thread_rt,
+    AlsaConfig, AlsaOutput, DEFAULT_RESERVE_PRIORITY, DeviceReservation, NegotiatedParams, OpenPcm,
+    card_index_from_device, probe_rates, try_promote_current_thread_rt,
 };
-use audivane_protocol::ipc::{EngineState, RatePolicy, SinkChoice};
-use audivane_protocol::{RateTarget, SampleFormat, resolve_ratio};
+use audivane_protocol::ipc::{DeviceCapabilities, EngineState, RatePolicy, SinkChoice};
+use audivane_protocol::{ALLOWED_RATES, MAX_OUTPUT_RATE, RateTarget, SampleFormat, resolve_ratio};
 use pipewire as pw;
 use pw::spa;
 use spa::param::audio::{AudioFormat, AudioInfoRaw};
@@ -123,12 +125,57 @@ pub struct NegotiatedChain {
 }
 
 /// Callback invoked off the RT thread right after ALSA opens/reopens at
-/// `(graph_rate, actual_ratio)` and before `Resume` is sent to the RT thread.
+/// `(graph_rate, actual_ratio, sink, negotiated format)` and before `Resume`
+/// is sent to the RT thread.
 ///
 /// Returns the swap sequence the resume gate must wait for (when the engine
 /// queued a chain swap) plus any rebuild failure that was recovered from with a
 /// fallback chain.
-pub type RatioNegotiator = Arc<dyn Fn(u32, u32, SinkChoice) -> NegotiatedChain + Send + Sync>;
+pub type RatioNegotiator =
+    Arc<dyn Fn(u32, u32, SinkChoice, SampleFormat) -> NegotiatedChain + Send + Sync>;
+
+/// DAC rates worth probing: every engine graph rate times every ratio up to
+/// `max_ratio`, capped at 768 kHz.
+fn engine_probe_rates(max_ratio: u32) -> Vec<u32> {
+    probe_rates(ALLOWED_RATES, max_ratio.max(1), MAX_OUTPUT_RATE)
+}
+
+/// The rate policy the driver runs with for `caps`: the configured one
+/// restricted to rates the device can play. Without a probe result
+/// (probe failed) the configured policy is used as is.
+fn compute_effective_policy(
+    config: &EngineDriverConfig,
+    desired: DesiredDspConfig,
+    caps: Option<&DeviceCapabilities>,
+) -> std::result::Result<RatePolicy, String> {
+    let Some(caps) = caps else {
+        return Ok(config.rate_policy.clone());
+    };
+    effective_rate_policy(
+        &config.rate_policy,
+        caps,
+        desired,
+        &config.formats,
+        ALLOWED_RATES,
+    )
+    .map(|eff| {
+        if !eff.unsupported.is_empty() || eff.widened {
+            log::debug!(
+                "Rates for '{}': offering {:?} (default {}); device cannot play {:?}{}",
+                caps.device,
+                eff.policy.allowed_rates,
+                eff.policy.default_rate,
+                eff.unsupported,
+                if eff.widened {
+                    "; none of the configured rates fit, using the device's"
+                } else {
+                    ""
+                }
+            );
+        }
+        eff.policy
+    })
+}
 
 /// Lightweight handle to wake the ALSA RT thread from background helper threads
 /// (e.g. the chain reaper flushing deferred publications) without holding a
@@ -281,6 +328,14 @@ pub struct EngineDriverSnapshot {
     pub frames_out: u64,
     pub dsp_latency_out_frames: usize,
     pub gaps: DriverGapCounters,
+    /// Probed capabilities of the open device.
+    pub device_caps: Option<DeviceCapabilities>,
+    /// Rate policy actually published to PipeWire (configured policy
+    /// restricted to the device). `None` before the first open.
+    pub effective_policy: Option<RatePolicy>,
+    /// Graph rates the Direct sink plays bit-perfect (native x1 rates among
+    /// the effective ones). Empty while no device is open.
+    pub direct_rates: Vec<u32>,
 }
 
 fn state_to_u8(s: EngineState) -> u8 {
@@ -341,17 +396,26 @@ fn sink_from_u8(v: u8) -> Option<SinkChoice> {
     }
 }
 
-/// Scale a 48 kHz base quantum to `rate`, matching PipeWire's quantum scaling
-/// rules (power-of-two friendly when `q48` is a power of two).
+/// Scale a 48 kHz base quantum to `rate` the way PipeWire does, so the ALSA
+/// period the engine opens with is the quantum the graph actually runs.
+///
+/// PipeWire turns `node.latency = q/rate` into `q * graph_rate / rate` and,
+/// with `clock.power-of-two-quantum` (the default), rounds that *down* to a
+/// power of two. So a 1024 quantum runs 512 at 44.1 kHz, 1024 at 88.2 kHz,
+/// 2048 at 176.4 kHz and 4096 at 352.8 kHz, never 1881 or 3763. Opening the
+/// DAC with a 1881-frame period while the graph ran 1024 needed almost two
+/// graph cycles per period, fired back to back, and the source clients could
+/// not keep up: PipeWire filled ~45% of the output with silence.
+///
+/// The result is also capped at PipeWire's default `clock.quantum-limit`
+/// (8192): at 768 kHz a 1024 quantum would be 16384, but the graph runs 8192.
 pub fn scaled_quantum(q48: u32, rate: u32) -> u32 {
+    const PW_QUANTUM_LIMIT: u64 = 8192;
     let q48 = q48.max(32);
     let r = rate.max(8_000) as u64;
-    let raw = ((q48 as u64 * r) / 48_000).max(32) as u32;
-    if q48.is_power_of_two() && r < 48_000 {
-        let p2 = 1u32 << (31 - raw.leading_zeros());
-        p2.max(32)
-    } else if q48.is_power_of_two() && r.is_multiple_of(48_000) {
-        q48 * (r / 48_000) as u32
+    let raw = ((q48 as u64 * r) / 48_000).clamp(32, PW_QUANTUM_LIMIT) as u32;
+    if q48.is_power_of_two() {
+        (1u32 << (31 - raw.leading_zeros())).max(32)
     } else {
         raw
     }
@@ -431,6 +495,11 @@ struct SharedEngineState {
     cycles_completed: AtomicU64,
     last_error: Mutex<Option<String>>,
     metadata_warning: Mutex<Option<String>>,
+    device_caps: Mutex<Option<DeviceCapabilities>>,
+    effective_policy: Mutex<Option<RatePolicy>>,
+    /// Rates the Direct sink may run the graph at (native x1 rates among
+    /// the effective ones). Read by the PipeWire thread's rate arbiter.
+    direct_policy: Mutex<Option<RatePolicy>>,
     /// Recovered chain-rebuild failure plus the config generation that produced
     /// it. Kept with a generation so a success from an older chain build cannot
     /// clear a warning recorded by a newer one.
@@ -523,7 +592,48 @@ impl SharedEngineState {
             cycles_completed: AtomicU64::new(0),
             last_error: Mutex::new(None),
             metadata_warning: Mutex::new(None),
+            device_caps: Mutex::new(None),
+            effective_policy: Mutex::new(None),
+            direct_policy: Mutex::new(None),
             chain_warning: Mutex::new(ChainWarningState::default()),
+        }
+    }
+
+    fn set_device_caps(&self, caps: Option<DeviceCapabilities>) {
+        if let Ok(mut g) = self.device_caps.lock() {
+            *g = caps;
+        }
+    }
+
+    fn set_effective_policy(&self, policy: Option<RatePolicy>) {
+        if let Ok(mut g) = self.effective_policy.lock() {
+            *g = policy;
+        }
+    }
+
+    fn set_direct_policy(&self, policy: Option<RatePolicy>) {
+        if let Ok(mut g) = self.direct_policy.lock() {
+            *g = policy;
+        }
+    }
+
+    fn direct_policy(&self) -> Option<RatePolicy> {
+        self.direct_policy.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// The output is closed (open failed, reopen aborted, released): drop
+    /// what was negotiated with it (format, hence dither depth, and the
+    /// effective rates) so the status never shows the previous device's
+    /// values. Capabilities stay only when they belong to `device` (the
+    /// target was probed, possibly unusable).
+    fn clear_negotiation(&self, device: &str) {
+        self.format.store(0, Ordering::Release);
+        self.set_effective_policy(None);
+        self.set_direct_policy(None);
+        if let Ok(mut g) = self.device_caps.lock()
+            && g.as_ref().is_some_and(|c| c.device != device)
+        {
+            *g = None;
         }
     }
 
@@ -704,7 +814,7 @@ enum RtControlCmd {
         actual_ratio: u32,
         target_sink: SinkChoice,
         desired_dsp: DesiredDspConfig,
-        negotiated_key: (u64, SinkChoice, u32),
+        negotiated_key: NegotiatedKey,
         required_chain_seq: Option<u64>,
         /// Chain rebuild failed without a usable fallback: stay in `Error`
         /// instead of resuming with a stale/mismatched chain.
@@ -794,11 +904,7 @@ impl EngineDriverHandle {
         on_negotiated: Option<RatioNegotiator>,
     ) -> Result<Self> {
         let channels = config.channels.max(1);
-        let init_rate = config.rate_policy.default_rate.max(8_000);
-        let init_q = scaled_quantum(config.quantum, init_rate);
         let init_desired = config.desired_dsp(0);
-        let desired_ratio = init_desired.resolve_ratio_for(SinkChoice::Dsp, init_rate);
-        let test_stall = TestStallConfig::from_env(init_rate, desired_ratio);
 
         let shared = Arc::new(SharedEngineState::new(&config));
         let cmd_efd = Arc::new(EventFd::new()?);
@@ -823,6 +929,49 @@ impl EngineDriverHandle {
             None
         };
 
+        // Open the PCM, probe what it accepts on this very handle (no second
+        // open, so a device we already reserved is never EBUSY), then pick
+        // the graph rate and ratio from that.
+        let open = match OpenPcm::open(&config.device, true) {
+            Ok(o) => o,
+            Err(e) => {
+                drop(reservation);
+                return Err(e.into());
+            }
+        };
+        let caps = match open.probe(channels, &engine_probe_rates(config.max_dsp_ratio)) {
+            Ok(c) => {
+                log::info!("Device '{}' supports {}", config.device, c.summary());
+                Some(c)
+            }
+            Err(e) => {
+                log::warn!(
+                    "Probing '{}' failed ({e}); trying rates blind",
+                    config.device
+                );
+                None
+            }
+        };
+        let effective = match compute_effective_policy(&config, init_desired, caps.as_ref()) {
+            Ok(p) => p,
+            Err(msg) => {
+                drop(open);
+                drop(reservation);
+                return Err(PwError::Init(msg));
+            }
+        };
+        let init_rate = effective.default_rate.max(8_000);
+        let init_q = scaled_quantum(config.quantum, init_rate);
+        let desired_ratio = init_desired.resolve_ratio_for(SinkChoice::Dsp, init_rate);
+        let test_stall = TestStallConfig::from_env(init_rate, desired_ratio);
+        shared.set_device_caps(caps.clone());
+        shared.set_effective_policy(Some(effective.clone()));
+        shared.set_direct_policy(Some(direct_rate_policy(
+            &effective,
+            caps.as_ref(),
+            &config.formats,
+        )));
+
         let mut base_alsa_cfg = AlsaConfig {
             device: config.device.clone(),
             rate: init_rate.saturating_mul(desired_ratio),
@@ -833,12 +982,13 @@ impl EngineDriverHandle {
             strict_format: false,
             nonblock: true,
         };
-        let (mut alsa_init, actual_ratio) = match AlsaOutput::open_with_ratio_fallback(
+        let (mut alsa_init, actual_ratio) = match open.configure_with_ratio_fallback(
             &base_alsa_cfg,
             init_rate,
             desired_ratio,
             init_q,
             &config.formats,
+            caps.as_ref(),
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -870,7 +1020,7 @@ impl EngineDriverHandle {
 
         let init_negotiated = on_negotiated
             .as_ref()
-            .map(|cb| cb(init_rate, actual_ratio, SinkChoice::Dsp))
+            .map(|cb| cb(init_rate, actual_ratio, SinkChoice::Dsp, init_params.format))
             .unwrap_or_default();
         let mut init_waiters: Vec<mpsc::SyncSender<Result<()>>> = Vec::new();
         let (init_required_seq, init_hold_error) =
@@ -887,7 +1037,9 @@ impl EngineDriverHandle {
         let (pw_tx, pw_rx) = pw::channel::channel::<PwMsg>();
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SendRawStream>>(1);
 
-        let pw_cfg = config.clone();
+        // PipeWire only ever sees the rates the device can play.
+        let mut pw_cfg = config.clone();
+        pw_cfg.rate_policy = effective.clone();
         let pw_shared = Arc::clone(&shared);
         let pw_cmd_efd = Arc::clone(&cmd_efd);
         let pw_data_efd = Arc::clone(&data_efd);
@@ -957,6 +1109,8 @@ impl EngineDriverHandle {
                     channels as usize,
                     init_rate,
                     actual_ratio,
+                    caps,
+                    effective,
                     reservation,
                     ctrl_shared,
                     ctrl_cmd_efd,
@@ -1071,6 +1225,18 @@ impl EngineDriverHandle {
                 stream_pauses_direct: self.shared.stream_pauses_direct.load(Ordering::Relaxed),
                 stream_pauses_dsp: self.shared.stream_pauses_dsp.load(Ordering::Relaxed),
             },
+            device_caps: self.shared.device_caps.lock().ok().and_then(|g| g.clone()),
+            effective_policy: self
+                .shared
+                .effective_policy
+                .lock()
+                .ok()
+                .and_then(|g| g.clone()),
+            direct_rates: self
+                .shared
+                .direct_policy()
+                .map(|p| p.allowed_rates)
+                .unwrap_or_default(),
         }
     }
 
@@ -1294,6 +1460,10 @@ struct RegistryTracker {
     rate_recheck_at: Option<Instant>,
     /// Last rate decision logged, so each distinct decision is logged once.
     last_rate_log: Option<String>,
+    /// While the Direct sink decides the rate: the native rates it may run
+    /// at. With rate following off, the graph leaves `default_rate` for one
+    /// of these when the default is not native.
+    direct_rates: Option<Vec<u32>>,
 }
 
 impl RegistryTracker {
@@ -1326,6 +1496,7 @@ impl RegistryTracker {
             arbiter: RateArbiter::new(),
             rate_recheck_at: None,
             last_rate_log: None,
+            direct_rates: None,
         }
     }
 
@@ -1386,7 +1557,14 @@ impl RegistryTracker {
 
     fn apply_policy_to_metadata(&mut self, set_force_rate: Option<u32>) {
         let target_force = if !self.policy.follow_source {
-            self.policy.default_rate
+            match (&self.direct_rates, set_force_rate) {
+                (Some(native), Some(r))
+                    if native.contains(&r) && !native.contains(&self.policy.default_rate) =>
+                {
+                    r
+                }
+                _ => self.policy.default_rate,
+            }
         } else if let Some(r) = set_force_rate {
             r
         } else {
@@ -1398,16 +1576,10 @@ impl RegistryTracker {
             self.sync_streams_rate(target_force);
             return;
         }
-        let allowed_val = if !self.policy.follow_source || self.policy.allowed_rates.is_empty() {
+        let allowed_val = if !self.policy.follow_source {
             format!("[ {target_force} ]")
         } else {
-            let parts: Vec<String> = self
-                .policy
-                .allowed_rates
-                .iter()
-                .map(u32::to_string)
-                .collect();
-            format!("[ {} ]", parts.join(" "))
+            allowed_rates_prop(&self.policy.allowed_rates, target_force)
         };
         let force_str = target_force.to_string();
         let meta_ref = self.metadata.as_ref();
@@ -1430,6 +1602,27 @@ impl RegistryTracker {
         if persisted {
             self.forced_rate = target_force;
             self.sync_streams_rate(target_force);
+        }
+    }
+
+    /// Re-publish `audio.allowed-rates` and the DSP sink's format pod after
+    /// the allowed set changed (new device with other capabilities).
+    fn publish_allowed_rates_on_streams(&self) {
+        let allowed = allowed_rates_prop(&self.policy.allowed_rates, self.forced_rate);
+        update_stream_prop(&self.dsp_stream, *pw::keys::AUDIO_ALLOWED_RATES, &allowed);
+        update_stream_prop(
+            &self.direct_stream,
+            *pw::keys::AUDIO_ALLOWED_RATES,
+            &allowed,
+        );
+        if let Ok(pod_bytes) = build_sink_format_pod(
+            self.channels,
+            &self.policy.allowed_rates,
+            self.policy.default_rate,
+        ) && let Some(pod) = Pod::from_bytes(&pod_bytes)
+        {
+            let mut params = [pod];
+            let _ = self.dsp_stream.update_params(&mut params);
         }
     }
 
@@ -1498,12 +1691,19 @@ impl RegistryTracker {
         if !self.rate_following_disabled {
             let direct: Vec<RateClient> = direct_clients.into_values().collect();
             let dsp: Vec<RateClient> = dsp_clients.into_values().collect();
+            let direct_policy = self.shared.direct_policy();
+            let direct_active = direct_client_running || direct_has_link;
+            self.direct_rates = match (&direct_policy, direct_active) {
+                (Some(p), true) if !p.allowed_rates.is_empty() => Some(p.allowed_rates.clone()),
+                _ => None,
+            };
             let inputs = RateInputs {
                 policy: &self.policy,
                 current: self.forced_rate,
-                direct_active: direct_client_running || direct_has_link,
+                direct_active,
                 direct: &direct,
                 dsp: &dsp,
+                direct_policy: direct_policy.as_ref(),
             };
             let now = Instant::now();
             let verdict = self.arbiter.decide(&inputs, now, self.driver_switching());
@@ -1575,10 +1775,31 @@ fn build_sink_format_pod(
         let rate = allowed_rates.first().copied().unwrap_or(default_rate);
         audio_info.set_rate(rate);
     }
+    let mut properties: Vec<spa::pod::Property> = audio_info.into();
+    if allowed_rates.len() > 1 {
+        // Several rates: an enum choice, default first (PipeWire's
+        // convention lists the default again among the alternatives).
+        let default = if allowed_rates.contains(&default_rate) {
+            default_rate
+        } else {
+            allowed_rates[0]
+        };
+        properties.push(spa::pod::Property {
+            key: spa::sys::SPA_FORMAT_AUDIO_rate,
+            flags: spa::pod::PropertyFlags::empty(),
+            value: spa::pod::Value::Choice(spa::pod::ChoiceValue::Int(spa::utils::Choice(
+                spa::utils::ChoiceFlags::empty(),
+                spa::utils::ChoiceEnum::Enum {
+                    default: default as i32,
+                    alternatives: allowed_rates.iter().map(|&r| r as i32).collect(),
+                },
+            ))),
+        });
+    }
     let obj = spa::pod::Object {
         type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
         id: spa::param::ParamType::EnumFormat.as_raw(),
-        properties: audio_info.into(),
+        properties,
     };
     spa::pod::serialize::PodSerializer::serialize(
         Cursor::new(Vec::new()),
@@ -1616,6 +1837,26 @@ fn connect_both_streams(
         &mut params_dir,
     )?;
     Ok(())
+}
+
+/// `audio.allowed-rates` / `clock.allowed-rates` JSON value.
+fn allowed_rates_prop(allowed: &[u32], fallback: u32) -> String {
+    if allowed.is_empty() {
+        format!("[ {fallback} ]")
+    } else {
+        let parts: Vec<String> = allowed.iter().map(u32::to_string).collect();
+        format!("[ {} ]", parts.join(" "))
+    }
+}
+
+fn update_stream_prop(stream: &pw::stream::Stream, key: &str, value: &str) {
+    let mut props = pw::properties::PropertiesBox::new();
+    props.insert(key, value.to_string());
+    // Safety: as in `update_stream_latency`.
+    unsafe {
+        let dict_ptr = &(*props.as_raw_ptr()).dict as *const pw::spa::sys::spa_dict;
+        pw::sys::pw_stream_update_properties(stream.as_raw_ptr(), dict_ptr);
+    }
 }
 
 fn update_stream_latency(stream: &pw::stream::Stream, quantum: u32, rate: u32) {
@@ -1674,17 +1915,8 @@ impl PwSession {
         let registry = core.get_registry_rc().map_err(PwError::PipeWire)?;
 
         let channels = config.channels.max(1);
-        let allowed_str = if config.rate_policy.allowed_rates.is_empty() {
-            format!("[ {init_rate} ]")
-        } else {
-            let joined: Vec<String> = config
-                .rate_policy
-                .allowed_rates
-                .iter()
-                .map(u32::to_string)
-                .collect();
-            format!("[ {} ]", joined.join(" "))
-        };
+        // `config.rate_policy` is already restricted to the device here.
+        let allowed_str = allowed_rates_prop(&config.rate_policy.allowed_rates, init_rate);
 
         // Sink 1: Audivane DSP (DAC-paced group driver).
         let mut dsp_props = pw::properties::properties! {
@@ -2409,14 +2641,29 @@ fn run_pw_loop(
             } => {
                 if let Some(ref s) = st_rc.borrow().session {
                     let mut t = s.tracker.borrow_mut();
+                    let rates_changed = t.policy.allowed_rates != policy.allowed_rates
+                        || t.policy.default_rate != policy.default_rate;
                     t.policy = policy.clone();
                     t.quantum_48k = quantum_48k;
                     t.rate_following_disabled = false;
+                    if rates_changed {
+                        t.publish_allowed_rates_on_streams();
+                    }
                     let before = t.forced_rate;
-                    t.apply_policy_to_metadata(if policy.follow_source {
-                        Some(last_rate)
+                    // Never force a rate outside the (device-restricted) set.
+                    let follow_rate = if policy.allowed_rates.is_empty()
+                        || policy.allowed_rates.contains(&last_rate)
+                    {
+                        last_rate
                     } else {
-                        Some(policy.default_rate)
+                        choose_allowed_rate(last_rate, &policy)
+                    };
+                    // With following off this is still the default rate,
+                    // unless the Direct sink had to open at a native rate.
+                    t.apply_policy_to_metadata(if policy.follow_source {
+                        Some(follow_rate)
+                    } else {
+                        Some(last_rate)
                     });
                     if t.forced_rate != before {
                         t.arbiter.note_switch(Instant::now());
@@ -2552,6 +2799,83 @@ struct RealDeviceBackend {
     buffer_periods: u32,
     ctrl_efd: Arc<EventFd>,
     shared: Arc<SharedEngineState>,
+    /// Driver config the effective rate policy is computed from (configured
+    /// `rate_policy`, formats, quantum, max ratio).
+    config: EngineDriverConfig,
+    /// Device the cached probe belongs to (set even when the probe failed,
+    /// so a failing probe is not retried on every rate switch).
+    probed_device: Option<String>,
+    caps: Option<DeviceCapabilities>,
+    /// PCM opened for the probe, handed to the next `open_and_prepare` so the
+    /// device is opened once per reopen.
+    probe_handle: Option<OpenPcm>,
+    /// Last computed effective rate policy for `probed_device`.
+    effective: Option<RatePolicy>,
+}
+
+impl RealDeviceBackend {
+    /// Forget the probe (release, error, replug): the next open probes again.
+    fn invalidate_caps(&mut self) {
+        self.probed_device = None;
+        self.caps = None;
+        self.probe_handle = None;
+        self.effective = None;
+    }
+
+    fn caps_for(&self, device: &str) -> Option<&DeviceCapabilities> {
+        if self.probed_device.as_deref() == Some(device) {
+            self.caps.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// Probe `device` unless it is the one probed last.
+    fn ensure_caps(&mut self, device: &str) -> std::result::Result<(), String> {
+        if self.probed_device.as_deref() == Some(device) {
+            return Ok(());
+        }
+        self.invalidate_caps();
+        let open = OpenPcm::open(device, true).map_err(|e| e.to_string())?;
+        let caps = match open.probe(
+            self.channels,
+            &engine_probe_rates(self.config.max_dsp_ratio),
+        ) {
+            Ok(c) => {
+                log::info!("Device '{device}' supports {}", c.summary());
+                Some(c)
+            }
+            Err(e) => {
+                log::warn!("Probing '{device}' failed ({e}); trying rates blind");
+                None
+            }
+        };
+        self.probed_device = Some(device.to_string());
+        self.caps = caps;
+        self.probe_handle = Some(open);
+        Ok(())
+    }
+
+    /// Recompute the effective policy for the cached probe (after a config
+    /// change). `None` when the cache is for another device.
+    fn refresh_effective(
+        &mut self,
+        desired: DesiredDspConfig,
+    ) -> Option<std::result::Result<RatePolicy, String>> {
+        if self.probed_device.as_deref() != Some(self.config.device.as_str()) {
+            return None;
+        }
+        let res = compute_effective_policy(&self.config, desired, self.caps.as_ref());
+        if let Ok(p) = &res {
+            self.effective = Some(p.clone());
+            self.shared.set_direct_policy(Some(direct_rate_policy(
+                p,
+                self.caps.as_ref(),
+                &self.config.formats,
+            )));
+        }
+        Some(res)
+    }
 }
 
 impl DeviceBackend for RealDeviceBackend {
@@ -2589,6 +2913,74 @@ impl DeviceBackend for RealDeviceBackend {
         drop(res);
     }
 
+    fn resolve_graph_rate(
+        &mut self,
+        device: &str,
+        graph_rate: u32,
+        quantum: u32,
+        target_sink: SinkChoice,
+        desired_dsp: DesiredDspConfig,
+    ) -> std::result::Result<(u32, u32), String> {
+        self.ensure_caps(device)?;
+        let caps = self.caps_for(device).cloned();
+        let eff = match compute_effective_policy(&self.config, desired_dsp, caps.as_ref()) {
+            Ok(p) => p,
+            Err(msg) => {
+                // Unusable device: still report what it supports.
+                self.probe_handle = None;
+                self.shared.set_device_caps(caps);
+                self.shared.set_effective_policy(None);
+                self.shared.set_direct_policy(None);
+                return Err(msg);
+            }
+        };
+        let direct = direct_rate_policy(&eff, caps.as_ref(), &self.config.formats);
+        self.shared.set_device_caps(caps);
+        self.shared.set_effective_policy(Some(eff.clone()));
+        self.shared.set_direct_policy(Some(direct.clone()));
+        self.effective = Some(eff.clone());
+        if target_sink == SinkChoice::Direct
+            && !direct.allowed_rates.is_empty()
+            && !direct.allowed_rates.contains(&graph_rate)
+        {
+            // Direct never upsamples, and the device does not play this
+            // rate natively (it may only take it upsampled through DSP):
+            // run the graph at a native rate instead; PipeWire resamples the
+            // stream into Direct, which status reports as not bit-perfect.
+            let rate = choose_allowed_rate(graph_rate, &direct);
+            log::info!(
+                "'{device}' cannot play {graph_rate} Hz natively for Audivane Direct; moving the graph to {rate} Hz (the stream is resampled)"
+            );
+            return Ok((rate, scaled_quantum(self.config.quantum, rate)));
+        }
+        if target_sink == SinkChoice::Direct && direct.allowed_rates.is_empty() {
+            let rates: Vec<String> = eff.allowed_rates.iter().map(u32::to_string).collect();
+            let supports = self
+                .caps_for(device)
+                .map(|c| c.summary())
+                .unwrap_or_else(|| "unknown".into());
+            self.probe_handle = None;
+            return Err(format!(
+                "Audivane Direct cannot play on '{device}': it does not upsample, and none of the allowed rates ({} Hz) is native to the device (device supports {supports}). Route the app to Audivane DSP, or allow a native rate",
+                rates.join(", ")
+            ));
+        }
+        if eff.allowed_rates.is_empty() || eff.allowed_rates.contains(&graph_rate) {
+            return Ok((graph_rate, quantum));
+        }
+        // The graph is at a rate this device cannot play (device switch, or
+        // PipeWire had not applied our allowed rates yet). Open at the rate
+        // we are about to force instead; never at graph rate != device rate
+        // / ratio.
+        let rate = if eff.follow_source {
+            choose_allowed_rate(graph_rate, &eff)
+        } else {
+            eff.default_rate
+        };
+        log::info!("'{device}' cannot play a {graph_rate} Hz graph; moving the graph to {rate} Hz");
+        Ok((rate, scaled_quantum(self.config.quantum, rate)))
+    }
+
     fn open_and_prepare(
         &mut self,
         device: &str,
@@ -2606,20 +2998,29 @@ impl DeviceBackend for RealDeviceBackend {
             strict_format: false,
             nonblock: true,
         };
-        let (mut alsa, actual_ratio) = AlsaOutput::open_with_ratio_fallback(
-            &alsa_cfg,
-            graph_rate,
-            desired_ratio,
-            quantum,
-            &self.formats,
-        )
-        .map_err(|e| e.to_string())?;
+        let open = match self.probe_handle.take() {
+            Some(h) if h.device() == device => h,
+            _ => OpenPcm::open(device, true).map_err(|e| e.to_string())?,
+        };
+        let caps = self.caps_for(device).cloned();
+        let (mut alsa, actual_ratio) = open
+            .configure_with_ratio_fallback(
+                &alsa_cfg,
+                graph_rate,
+                desired_ratio,
+                quantum,
+                &self.formats,
+                caps.as_ref(),
+            )
+            .map_err(|e| e.to_string())?;
         alsa.prepare().map_err(|e| e.to_string())?;
         let output_rate = alsa.params().rate;
         Ok(OpenedDevice {
             output: Box::new(alsa),
             actual_ratio,
             output_rate,
+            graph_rate,
+            quantum,
         })
     }
 
@@ -2730,6 +3131,8 @@ where
     let teardown_res = disconnect_and_wait();
     lifecycle.finish_release_to_idle(backend, None);
     shared.format.store(0, Ordering::Release);
+    shared.set_effective_policy(None);
+    shared.set_direct_policy(None);
     shared.active_sink.store(0, Ordering::Release);
     shared.alsa_delay_frames.store(0, Ordering::Relaxed);
     *awaiting_release_teardown = false;
@@ -2760,6 +3163,8 @@ fn run_control_thread(
     channels: usize,
     init_rate: u32,
     init_actual_ratio: u32,
+    init_caps: Option<DeviceCapabilities>,
+    init_effective: RatePolicy,
     init_reservation: Option<(u32, DeviceReservation)>,
     shared: Arc<SharedEngineState>,
     cmd_efd: Arc<EventFd>,
@@ -2776,7 +3181,14 @@ fn run_control_thread(
         buffer_periods: config.buffer_periods.max(2),
         ctrl_efd: Arc::clone(&ctrl_efd),
         shared: Arc::clone(&shared),
+        config: config.clone(),
+        probed_device: Some(config.device.clone()),
+        caps: init_caps,
+        probe_handle: None,
+        effective: Some(init_effective.clone()),
     };
+    // Rate policy last sent to the PipeWire thread.
+    let mut published_policy: RatePolicy = init_effective;
     let mut lifecycle = DeviceLifecycle::<RealDeviceBackend> {
         state: EngineState::Ready,
         last_error: None,
@@ -2806,7 +3218,8 @@ fn run_control_thread(
     let perform_acquire =
         |config: &EngineDriverConfig,
          desired_dsp: DesiredDspConfig,
-         last_graph_rate: u32,
+         last_graph_rate_io: &mut u32,
+         published_policy: &mut RatePolicy,
          last_ratio: &mut u32,
          last_quantum: &mut u32,
          in_cap: &mut usize,
@@ -2823,20 +3236,22 @@ fn run_control_thread(
 
             let active_sink =
                 sink_from_u8(shared.active_sink.load(Ordering::Acquire)).unwrap_or(SinkChoice::Dsp);
-            let q = scaled_quantum(config.quantum, last_graph_rate);
+            let q = scaled_quantum(config.quantum, *last_graph_rate_io);
             let opened = match lifecycle.handoff_and_open(
                 backend,
                 None,
                 &config.device,
                 config.reserve_device,
                 config.reserve_priority,
-                last_graph_rate,
+                *last_graph_rate_io,
                 q,
                 active_sink,
                 desired_dsp,
             ) {
                 Ok(o) => o,
                 Err(msg) => {
+                    backend.invalidate_caps();
+                    shared.clear_negotiation(&config.device);
                     shared.set_error(msg.clone());
                     finish_waiters(pending_acquire_waiters, || Err(PwError::Init(msg.clone())));
                     return;
@@ -2845,6 +3260,9 @@ fn run_control_thread(
 
             let alsa = opened.output;
             let actual_ratio = opened.actual_ratio;
+            let last_graph_rate = opened.graph_rate;
+            let q = opened.quantum;
+            *last_graph_rate_io = last_graph_rate;
             let params = alsa.params();
             let fds = alsa.poll_descriptors().unwrap_or_default();
             *last_ratio = actual_ratio;
@@ -2863,7 +3281,7 @@ fn run_control_thread(
             // Rebuild DSP chain for (last_graph_rate, actual_ratio) off-RT before Resume.
             let negotiated = on_negotiated
                 .as_ref()
-                .map(|cb| cb(last_graph_rate, actual_ratio, active_sink))
+                .map(|cb| cb(last_graph_rate, actual_ratio, active_sink, params.format))
                 .unwrap_or_default();
             let (required_chain_seq, hold_error) =
                 apply_negotiated_chain(negotiated, &shared, pending_acquire_waiters);
@@ -2875,8 +3293,14 @@ fn run_control_thread(
             let (dsp_prod, dsp_cons) = rtrb::RingBuffer::<f32>::new(ring_samples);
             let (direct_prod, direct_cons) = rtrb::RingBuffer::<f32>::new(ring_samples);
             let (reply_tx, reply_rx) = mpsc::sync_channel::<Result<SendRawStream>>(1);
+            // The new session publishes the device-restricted rates.
+            let mut pw_config = config.clone();
+            if let Some(eff) = backend.effective.clone() {
+                pw_config.rate_policy = eff;
+            }
+            *published_policy = pw_config.rate_policy.clone();
             let _ = pw_tx.send(PwMsg::Reconnect {
-                config: config.clone(),
+                config: pw_config,
                 last_rate: last_graph_rate,
                 dsp_prod,
                 direct_prod,
@@ -2909,7 +3333,7 @@ fn run_control_thread(
             };
 
             let fade_in_frames = ((params.rate as usize) * FADE_MS) / 1000;
-            let negotiated_key = (desired_dsp.generation, active_sink, last_graph_rate);
+            let negotiated_key = negotiated_key(desired_dsp, active_sink, last_graph_rate);
             push_or_queue_rt_cmd(
                 pending_rt_cmds,
                 ctrl_to_rt_tx,
@@ -2971,6 +3395,23 @@ fn run_control_thread(
                     backend.formats = config.formats.clone();
                     backend.channels = config.channels.max(1);
                     backend.buffer_periods = config.buffer_periods.max(2);
+                    backend.config = config.clone();
+                    // Same device: restrict the new policy with the cached
+                    // probe right away. A new device is probed on reopen.
+                    let effective = match backend.refresh_effective(desired_dsp) {
+                        Some(Ok(p)) => {
+                            shared.set_effective_policy(Some(p.clone()));
+                            Some(p)
+                        }
+                        Some(Err(msg)) => {
+                            log::error!("{msg}");
+                            shared.set_effective_policy(None);
+                            shared.set_direct_policy(None);
+                            shared.set_error(msg);
+                            None
+                        }
+                        None => None,
+                    };
 
                     log::debug!(
                         "ctrl UpdateConfig: desired_gen={desired_gen} force_reopen={force_reopen} target={:?} dsp_enabled={}",
@@ -2985,9 +3426,12 @@ fn run_control_thread(
                         RtControlCmd::UpdateDesiredDsp(desired_dsp),
                     );
 
-                    if rate_policy_changed {
+                    if let Some(eff) = effective
+                        && (rate_policy_changed || eff != published_policy)
+                    {
+                        published_policy = eff.clone();
                         let _ = pw_tx.send(PwMsg::ApplyRatePolicy {
-                            policy: config.rate_policy.clone(),
+                            policy: eff,
                             quantum_48k: config.quantum,
                             last_rate: last_graph_rate,
                         });
@@ -3041,7 +3485,8 @@ fn run_control_thread(
                         perform_acquire(
                             &config,
                             desired_dsp,
-                            last_graph_rate,
+                            &mut last_graph_rate,
+                            &mut published_policy,
                             &mut last_ratio,
                             &mut last_quantum,
                             &mut in_cap,
@@ -3083,7 +3528,11 @@ fn run_control_thread(
                     let awaiting_cfg = reopen_gate.ctrl_take_awaiting_cfg();
 
                     let eff_rate = if awaiting_cfg && !config.rate_policy.follow_source {
-                        config.rate_policy.default_rate.max(8_000)
+                        backend
+                            .effective
+                            .as_ref()
+                            .map_or(config.rate_policy.default_rate, |p| p.default_rate)
+                            .max(8_000)
                     } else {
                         target_rate
                     };
@@ -3110,6 +3559,10 @@ fn run_control_thread(
                         desired_dsp,
                     ) {
                         Ok(opened) => {
+                            // The backend may have moved the graph to a rate
+                            // the (new) device can play.
+                            let eff_rate = opened.graph_rate;
+                            let q = opened.quantum;
                             let new_alsa = opened.output;
                             let actual_ratio = opened.actual_ratio;
                             let new_params = new_alsa.params();
@@ -3131,10 +3584,26 @@ fn run_control_thread(
                             shared.clear_error();
                             shared.clear_chain_warning();
 
+                            // A new device (or a graph PipeWire left at a rate
+                            // the device cannot play): publish the restricted
+                            // rates and force the rate we opened at.
+                            if let Some(eff) = backend.effective.clone()
+                                && (eff != published_policy || eff_rate != target_rate)
+                            {
+                                published_policy = eff.clone();
+                                let _ = pw_tx.send(PwMsg::ApplyRatePolicy {
+                                    policy: eff,
+                                    quantum_48k: config.quantum,
+                                    last_rate: eff_rate,
+                                });
+                            }
+
                             // Rebuild DSP chain for (eff_rate, actual_ratio) off-RT before Resume.
                             let negotiated = on_negotiated
                                 .as_ref()
-                                .map(|cb| cb(eff_rate, actual_ratio, target_sink))
+                                .map(|cb| {
+                                    cb(eff_rate, actual_ratio, target_sink, new_params.format)
+                                })
                                 .unwrap_or_default();
                             let (required_chain_seq, hold_error) = apply_negotiated_chain(
                                 negotiated,
@@ -3153,7 +3622,7 @@ fn run_control_thread(
                             );
 
                             let fade_in_frames = ((new_params.rate as usize) * FADE_MS) / 1000;
-                            let negotiated_key = (desired_dsp.generation, target_sink, eff_rate);
+                            let negotiated_key = negotiated_key(desired_dsp, target_sink, eff_rate);
                             push_or_queue_rt_cmd(
                                 &mut pending_rt_cmds,
                                 &mut ctrl_to_rt_tx,
@@ -3180,6 +3649,9 @@ fn run_control_thread(
                             );
                         }
                         Err(msg) => {
+                            backend.invalidate_caps();
+                            log::error!("Reopening '{}' failed: {msg}", config.device);
+                            shared.clear_negotiation(&config.device);
                             shared.set_error(msg);
                             push_or_queue_rt_cmd(
                                 &mut pending_rt_cmds,
@@ -3192,6 +3664,8 @@ fn run_control_thread(
                 }
                 RtEvent::ReleasedIdle { old_alsa, old_fds } => {
                     drop(old_fds);
+                    // Re-probe on the next acquire: the device may have changed.
+                    backend.invalidate_caps();
                     let (ack_tx, ack_rx) = mpsc::sync_channel::<Result<()>>(1);
                     let should_acquire = complete_release_teardown(
                         &mut backend,
@@ -3229,7 +3703,8 @@ fn run_control_thread(
                         perform_acquire(
                             &config,
                             desired_dsp,
-                            last_graph_rate,
+                            &mut last_graph_rate,
+                            &mut published_policy,
                             &mut last_ratio,
                             &mut last_quantum,
                             &mut in_cap,
@@ -3396,8 +3871,8 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
     let mut active_ratio = init_ratio.max(1);
     let mut active_sink = SinkChoice::Dsp;
     let mut rt_dsp_cfg = init_desired;
-    let mut last_negotiated_key: Option<(u64, SinkChoice, u32)> =
-        Some((init_desired.generation, SinkChoice::Dsp, init_rate));
+    let mut last_negotiated_key: Option<NegotiatedKey> =
+        Some(negotiated_key(init_desired, SinkChoice::Dsp, init_rate));
 
     let max_in_frames = (params.buffer_frames / active_ratio).max(4096) as usize;
     let mut dsp_in_buf = vec![0.0f32; max_in_frames * channels];
@@ -3414,7 +3889,17 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
     let mut released_idle = false;
     let mut reopen_gate = ReopenGate::new();
     let mut pending_reopen: Option<(u32, u32, SinkChoice)> = None;
-    let mut credit_in_frames: u64 = 0;
+    // (graph rate, sink) of the reopen in flight, and of the last one the
+    // control thread aborted (open failed): a later route or rate change
+    // retries from there instead of staying in `Error`.
+    let mut inflight_reopen: Option<(u32, SinkChoice)> = None;
+    let mut aborted_reopen: Option<(u32, SinkChoice)> = None;
+    let mut pacer = CyclePacer::default();
+    // Quantum, rate and DAC delay of the last written period, for cycles the
+    // pacer fires between DAC periods.
+    let mut pace_q: u64 = 0;
+    let mut pace_rate: u32 = 0;
+    let mut pace_delay_graph: i64 = 0;
     let mut first_prime_after_reopen = false;
     let mut dsp_load_ewma = 0.0_f64;
     let mut stalled_once = false;
@@ -3546,6 +4031,8 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                     released_idle = false;
                     reopen_gate.rt_finish_reopen();
                     pending_reopen = None;
+                    inflight_reopen = None;
+                    aborted_reopen = None;
                     alsa_running = false;
                     first_prime_after_reopen = true;
                     fade_ramp.start_fade_in(fade_in_frames);
@@ -3590,6 +4077,8 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                     reopen_gate.rt_finish_reopen();
                     pending_reopen = None;
                     released_idle = true;
+                    inflight_reopen = None;
+                    aborted_reopen = None;
                     // Control thread publishes `EngineState::Idle` only after full
                     // ALSA close + PipeWire restore/disconnect + ReserveDevice1 drop.
                     shared.set_state(EngineState::Switching);
@@ -3606,6 +4095,8 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                         } else {
                             scaled_quantum(config.quantum, active_graph_rate)
                         };
+                        inflight_reopen = Some((active_graph_rate, active_sink));
+                        aborted_reopen = None;
                         let _ = event_stash.push_or_stash(
                             RtEvent::NeedReopen {
                                 target_rate: active_graph_rate,
@@ -3627,6 +4118,7 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                 }
                 RtControlCmd::ReopenAborted => {
                     reopen_gate.rt_finish_reopen();
+                    aborted_reopen = inflight_reopen.take();
                 }
             }
         }
@@ -3653,6 +4145,49 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
         );
 
         if released_idle || suspended || alsa_opt.is_none() {
+            // The last reopen failed (e.g. a route to a rate the device
+            // cannot play). Retry as soon as the route or the graph rate
+            // changes, so going back to a playable path recovers from
+            // `Error` without a config apply.
+            if let Some((failed_rate, failed_sink)) = aborted_reopen
+                && !released_idle
+                && alsa_opt.is_none()
+                && awaiting_chain_for_resume.is_none()
+            {
+                let direct_running = shared.direct_streaming.load(Ordering::Acquire)
+                    && (shared.direct_client_running.load(Ordering::Acquire)
+                        || shared.direct_has_links.load(Ordering::Acquire));
+                let want_sink = if direct_running {
+                    SinkChoice::Direct
+                } else if shared.dsp_streaming.load(Ordering::Acquire) {
+                    SinkChoice::Dsp
+                } else {
+                    failed_sink
+                };
+                let fallback_q = scaled_quantum(config.quantum, failed_rate) as u64;
+                let (cur_rate, cur_q) = read_target_clock(&shared.io, failed_rate, fallback_q);
+                if (want_sink != failed_sink || cur_rate != failed_rate)
+                    && reopen_gate.rt_try_begin_reopen()
+                {
+                    aborted_reopen = None;
+                    inflight_reopen = Some((cur_rate, want_sink));
+                    let _ = event_stash.push_or_stash(
+                        RtEvent::NeedReopen {
+                            target_rate: cur_rate,
+                            target_quantum: cur_q as u32,
+                            target_sink: want_sink,
+                            old_alsa: None,
+                            old_fds: Vec::new(),
+                        },
+                        &mut rt_to_ctrl_tx,
+                        &ctrl_efd,
+                    );
+                    shared.reopens.fetch_add(1, Ordering::Relaxed);
+                    suspended = true;
+                    active_sink = want_sink;
+                    shared.set_state(EngineState::Switching);
+                }
+            }
             let n_dsp = drain_ring(&mut dsp_cons) / channels;
             let n_dir = drain_ring(&mut direct_cons) / channels;
             shared
@@ -3726,7 +4261,7 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                 }
                 processor.reset_dsp_state();
                 alsa_running = false;
-                credit_in_frames = 0;
+                pacer.reset();
                 shared.alsa_delay_frames.store(0, Ordering::Relaxed);
                 shared
                     .dsp_load_bits
@@ -3757,7 +4292,7 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                 .direct_drained_prime
                 .fetch_add(n_dir as u64, Ordering::Relaxed);
             data_efd.drain();
-            credit_in_frames = 0;
+            pacer.reset();
             clock_state.reset();
 
             let default_q = (params.period_frames / active_ratio).max(32) as u64;
@@ -3783,6 +4318,7 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
             {
                 let _ = old_alsa.drop_frames();
                 let old_fds = std::mem::take(&mut alsa_fds);
+                inflight_reopen = Some((cur_rate, target_sink));
                 let _ = event_stash.push_or_stash(
                     RtEvent::NeedReopen {
                         target_rate: cur_rate,
@@ -3824,6 +4360,7 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
             // source client's converter, which then fills a cycle with silence
             // (an audible dropout right after playback starts).
             let period_ns = (u64::from(period_in) * 1_000_000_000) / u64::from(cur_rate.max(8_000));
+            let cycle_ns = (cur_q.max(1) * 1_000_000_000) / u64::from(cur_rate.max(8_000));
             let prime_start_ns = mono_now_ns();
             let mut prime_deadline_ns = prime_start_ns;
             let pace_until = |deadline_ns: u64| {
@@ -3863,16 +4400,32 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                 let mut completion_ns = None;
                 if cons_slots < sample_len_in {
                     let completed = shared.cycle_counter(active_sink == SinkChoice::Direct);
-                    trigger_and_wait(
-                        &mut clock_state,
-                        raw_stream,
-                        cur_rate,
-                        cur_q,
-                        (p as i64) * (period_in as i64),
-                        prime_timeout_ms,
-                        completed,
-                    );
-                    completion_ns = Some(mono_now_ns());
+                    // A period may need more than one graph cycle when the
+                    // quantum PipeWire runs is smaller than the period; space
+                    // them like the steady loop does.
+                    let max_cycles = period_in.div_ceil(cur_q.max(1) as u32).max(1);
+                    for c in 0..max_cycles {
+                        if c > 0 {
+                            let slots = match active_sink {
+                                SinkChoice::Direct => direct_cons.slots(),
+                                _ => dsp_cons.slots(),
+                            };
+                            if slots >= sample_len_in || shared.stop.load(Ordering::Acquire) {
+                                break;
+                            }
+                            pace_until(mono_now_ns().saturating_add(cycle_ns / 2));
+                        }
+                        trigger_and_wait(
+                            &mut clock_state,
+                            raw_stream,
+                            cur_rate,
+                            cur_q,
+                            (p as i64) * (period_in as i64),
+                            prime_timeout_ms,
+                            completed,
+                        );
+                        completion_ns = Some(mono_now_ns());
+                    }
                 }
                 // Never fire the next cycle sooner than one nominal period
                 // after either the previous deadline or the previous cycle's
@@ -3945,13 +4498,25 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
             // Trigger one extra PipeWire cycle and wait for its completion before
             // starting ALSA DMA so the ring holds one period ahead of the first
             // hardware IRQ (avoids a startup race with PipeWire graph wakeup).
-            let cushion_slots = (period_in as usize) * channels;
-            let have_cushion = match active_sink {
-                SinkChoice::Direct => direct_cons.slots() >= cushion_slots,
-                _ => dsp_cons.slots() >= cushion_slots,
-            };
-            if !have_cushion {
-                pace_until(prime_deadline_ns);
+            // When the period and the quantum differ, the cushion also
+            // covers the cycles still owed to a period when it is written.
+            let ring_frames = dsp_cons.buffer().capacity() / channels;
+            let cushion_slots =
+                start_cushion_frames(period_in, cur_q as u32, ring_frames) * channels;
+            let max_cushion_cycles = (cushion_slots / channels).div_ceil(cur_q.max(1) as usize);
+            for c in 0..max_cushion_cycles.max(1) {
+                let have_cushion = match active_sink {
+                    SinkChoice::Direct => direct_cons.slots() >= cushion_slots,
+                    _ => dsp_cons.slots() >= cushion_slots,
+                };
+                if have_cushion || shared.stop.load(Ordering::Acquire) {
+                    break;
+                }
+                if c == 0 {
+                    pace_until(prime_deadline_ns);
+                } else {
+                    pace_until(mono_now_ns().saturating_add(cycle_ns / 2));
+                }
                 let completed = shared.cycle_counter(active_sink == SinkChoice::Direct);
                 trigger_and_wait(
                     &mut clock_state,
@@ -3962,6 +4527,21 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                     60,
                     completed,
                 );
+                // The inactive sink's ring fills too; keep it from overflowing.
+                match active_sink {
+                    SinkChoice::Direct => {
+                        let n = drain_ring(&mut dsp_cons) / channels;
+                        shared
+                            .dsp_drained_unused
+                            .fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                    _ => {
+                        let n = drain_ring(&mut direct_cons) / channels;
+                        shared
+                            .direct_drained_unused
+                            .fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                }
             }
             if alsa.start().is_err() {
                 let _ = event_stash.push_or_stash(
@@ -3990,7 +4570,32 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
             events: libc::POLLIN,
             revents: 0,
         });
-        let rc = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 200) };
+        // Wake for an owed graph cycle (period/quantum mismatch) as well as
+        // for the DAC.
+        let timeout_ns = pacer.next_due_ns().map_or(200_000_000, |due| {
+            due.saturating_sub(mono_now_ns()).min(200_000_000)
+        });
+        let timeout = libc::timespec {
+            tv_sec: (timeout_ns / 1_000_000_000) as libc::time_t,
+            tv_nsec: (timeout_ns % 1_000_000_000) as libc::c_long,
+        };
+        let rc = unsafe {
+            libc::ppoll(
+                pollfds.as_mut_ptr(),
+                pollfds.len() as libc::nfds_t,
+                &timeout,
+                std::ptr::null(),
+            )
+        };
+        if rc >= 0 && pacer.take_due(mono_now_ns(), pace_q, pace_rate) {
+            clock_state.advance_and_trigger(
+                &shared.io,
+                raw_stream.0.as_ptr(),
+                pace_rate,
+                pace_q,
+                pace_delay_graph,
+            );
+        }
         if rc < 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
@@ -4177,6 +4782,7 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                 && let Some(old_alsa) = alsa_opt.take()
             {
                 let old_fds = std::mem::take(&mut alsa_fds);
+                inflight_reopen = Some((target_rate, reopen_sink));
                 let _ = event_stash.push_or_stash(
                     RtEvent::NeedReopen {
                         target_rate,
@@ -4197,30 +4803,22 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
             pending_reopen = None;
         }
 
-        credit_in_frames += chunk_in as u64;
-        if credit_in_frames >= cur_q {
-            let delay_graph = delay / (active_ratio as i64);
-            let completed = shared.cycle_counter(active_sink == SinkChoice::Direct);
-            while credit_in_frames >= cur_q * 2 {
-                trigger_and_wait(
-                    &mut clock_state,
-                    raw_stream,
-                    cur_rate,
-                    cur_q,
-                    delay_graph,
-                    5,
-                    completed,
-                );
-                credit_in_frames -= cur_q;
-            }
+        // One graph cycle per quantum consumed. Cycles a period owes beyond
+        // the first are fired from the poll above, spaced (never back to
+        // back: the source clients could not keep up and PipeWire would
+        // fill those cycles with silence).
+        pacer.consumed(chunk_in as u64, cur_q);
+        pace_q = cur_q;
+        pace_rate = cur_rate;
+        pace_delay_graph = delay / (active_ratio as i64);
+        if pacer.take_due(mono_now_ns(), cur_q, cur_rate) {
             clock_state.advance_and_trigger(
                 &shared.io,
                 raw_stream.0.as_ptr(),
                 cur_rate,
                 cur_q,
-                delay_graph,
+                pace_delay_graph,
             );
-            credit_in_frames -= cur_q;
         }
     }
 
@@ -4450,6 +5048,79 @@ fn drain_ring(cons: &mut rtrb::Consumer<f32>) -> usize {
     avail
 }
 
+/// Steady-state graph-cycle pacing for the DAC-driven loop.
+///
+/// Each ALSA period consumes `period_in` graph frames; PipeWire produces one
+/// quantum per cycle. Normally the two are equal (see [`scaled_quantum`]) and
+/// the loop fires one cycle per period. When they differ (PipeWire runs
+/// another quantum: `clock.force-quantum`, a client asking for lower latency,
+/// a non-default `clock.power-of-two-quantum`) a period owes several cycles,
+/// or a fraction of one. Firing several back to back starves the source
+/// clients (they have not finished the previous cycle, so PipeWire fills the
+/// next with silence), so owed cycles are spread at least half a quantum
+/// apart and the ring keeps a cushion across graph cycles instead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CyclePacer {
+    credit: u64,
+    owed: u32,
+    next_ns: u64,
+}
+
+impl CyclePacer {
+    /// Cap on cycles owed (a stalled graph must not cause a burst later).
+    const MAX_OWED: u32 = 8;
+
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Account `frames` graph frames written to the DAC.
+    pub(crate) fn consumed(&mut self, frames: u64, quantum: u64) {
+        let q = quantum.max(1);
+        self.credit += frames;
+        let n = self.credit / q;
+        self.credit -= n * q;
+        self.owed = (self.owed + n as u32).min(Self::MAX_OWED);
+    }
+
+    /// Minimum spacing between two cycles, ns.
+    fn spacing_ns(quantum: u64, rate: u32) -> u64 {
+        quantum.saturating_mul(500_000_000) / u64::from(rate.max(1))
+    }
+
+    /// Whether a cycle should be fired now; if so, books it.
+    pub(crate) fn take_due(&mut self, now_ns: u64, quantum: u64, rate: u32) -> bool {
+        if self.owed == 0 || now_ns < self.next_ns {
+            return false;
+        }
+        self.owed -= 1;
+        self.next_ns = now_ns.saturating_add(Self::spacing_ns(quantum, rate));
+        true
+    }
+
+    /// When the next owed cycle is due (`None` when nothing is owed).
+    pub(crate) fn next_due_ns(&self) -> Option<u64> {
+        (self.owed > 0).then_some(self.next_ns)
+    }
+}
+
+/// Graph frames the ring must hold before the DAC starts: one period, plus
+/// two quanta when the period and the quantum differ, because then the
+/// cycles feeding a period no longer arrive right before it is written
+/// (capped so the ring never has to hold more than it can).
+pub(crate) fn start_cushion_frames(period_in: u32, quantum: u32, ring_frames: usize) -> usize {
+    let want = if period_in == quantum {
+        period_in as usize
+    } else {
+        period_in as usize + 2 * quantum as usize
+    };
+    want.min(
+        ring_frames
+            .saturating_sub(quantum as usize)
+            .max(period_in as usize),
+    )
+}
+
 /// Earliest deadline for the next priming graph cycle.
 ///
 /// A cycle must start at least one nominal period after both the previous
@@ -4482,6 +5153,167 @@ mod tests {
         assert_eq!(scaled_quantum(1024, 192_000), 4096);
         assert_eq!(scaled_quantum(1024, 44_100), 512);
         assert_eq!(scaled_quantum(256, 44_100), 128);
+    }
+
+    /// Regression (88.2 kHz zero-fill): the quantum must be the one PipeWire
+    /// runs, a power of two, at every rate, or the ALSA period does not
+    /// match the graph cycle.
+    #[test]
+    fn quantum_matches_pipewire_at_44k_family_rates() {
+        assert_eq!(scaled_quantum(1024, 88_200), 1024);
+        assert_eq!(scaled_quantum(1024, 176_400), 2048);
+        assert_eq!(scaled_quantum(1024, 352_800), 4096);
+        assert_eq!(scaled_quantum(1024, 705_600), 8192);
+        assert_eq!(scaled_quantum(1024, 384_000), 8192);
+        assert_eq!(scaled_quantum(1024, 768_000), 8192);
+        assert_eq!(scaled_quantum(8192, 192_000), 8192);
+        assert_eq!(scaled_quantum(1024, 144_000), 2048);
+        assert_eq!(scaled_quantum(16, 44_100), 32);
+        for q48 in [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192] {
+            for &rate in ALLOWED_RATES {
+                let q = scaled_quantum(q48, rate);
+                assert!(q.is_power_of_two(), "{q48}@{rate} -> {q}");
+                // PipeWire: floor to a power of two of q48 * rate / 48000.
+                let raw = (u64::from(q48.max(32)) * u64::from(rate) / 48_000).clamp(32, 8192);
+                assert!(
+                    u64::from(q) <= raw && raw < 2 * u64::from(q),
+                    "{q48}@{rate} -> {q}"
+                );
+            }
+        }
+    }
+
+    /// Simulate the steady DAC loop against a graph whose source client
+    /// needs `min_gap_ns` between cycles (closer cycles deliver silence, as
+    /// PipeWire does for an async client that has not finished). Returns
+    /// (graph frames zero-filled by the ring, silent cycles).
+    fn simulate_pacing(rate: u32, period_in: u32, quantum: u32, seconds: u64) -> (u64, u64) {
+        let ns = |frames: u64| frames * 1_000_000_000 / u64::from(rate);
+        let q = u64::from(quantum);
+        let min_gap_ns = ns(q) / 4;
+        let ring_frames = 16 * 1024;
+        let mut ring = start_cushion_frames(period_in, quantum, ring_frames) as u64;
+        let mut pacer = CyclePacer::default();
+        let (mut zero_frames, mut silent_cycles) = (0u64, 0u64);
+        let mut last_cycle_ns: Option<u64> = None;
+        let mut fire = |now: u64, ring: &mut u64| {
+            if last_cycle_ns.is_some_and(|t| now - t < min_gap_ns) {
+                silent_cycles += 1;
+            } else {
+                *ring += q;
+            }
+            last_cycle_ns = Some(now);
+        };
+        let period_ns = ns(u64::from(period_in));
+        let mut wake = period_ns;
+        while wake < seconds * 1_000_000_000 {
+            // Owed cycles fired from the poll timeout before this wake.
+            while let Some(due) = pacer.next_due_ns() {
+                if due >= wake || !pacer.take_due(due, q, rate) {
+                    break;
+                }
+                fire(due, &mut ring);
+            }
+            let take = u64::from(period_in).min(ring);
+            zero_frames += u64::from(period_in) - take;
+            ring -= take;
+            pacer.consumed(u64::from(period_in), q);
+            if pacer.take_due(wake, q, rate) {
+                fire(wake, &mut ring);
+            }
+            wake += period_ns;
+        }
+        (zero_frames, silent_cycles)
+    }
+
+    /// Regression (88.2 kHz zero-fill): even when the DAC period and the
+    /// graph quantum differ, every period is filled with real data and no
+    /// cycle fires so soon after another that the client cannot follow.
+    #[test]
+    fn period_quantum_mismatch_never_zero_fills() {
+        for (rate, period_in, quantum) in [
+            (88_200, 1881, 1024), // the bug: 1024 scaled linearly vs PipeWire
+            (176_400, 3763, 2048),
+            (48_000, 1024, 256),  // a client forcing a lower latency
+            (48_000, 1024, 1500), // quantum larger than the period
+            (96_000, 2048, 2048),
+            (88_200, 1024, 1024),
+        ] {
+            let (zeros, silent) = simulate_pacing(rate, period_in, quantum, 20);
+            assert_eq!(
+                (zeros, silent),
+                (0, 0),
+                "{rate} Hz period {period_in} quantum {quantum}"
+            );
+        }
+    }
+
+    #[test]
+    fn pacer_spaces_owed_cycles_and_caps_backlog() {
+        let mut p = CyclePacer::default();
+        p.consumed(1881, 1024);
+        assert!(p.take_due(0, 1024, 88_200));
+        assert!(p.next_due_ns().is_none());
+        p.consumed(1881, 1024); // credit 857 + 1881 = 2 cycles
+        let now = 21_000_000;
+        assert!(p.take_due(now, 1024, 88_200));
+        assert!(!p.take_due(now + 1, 1024, 88_200), "back to back");
+        let due = p.next_due_ns().unwrap();
+        assert_eq!(due - now, 1024 * 500_000_000 / 88_200);
+        assert!(p.take_due(due, 1024, 88_200));
+        p.consumed(1024 * 100, 1024);
+        let mut n = 0;
+        let mut t = due + 1_000_000_000;
+        while p.take_due(t, 1024, 88_200) {
+            n += 1;
+            t += 1_000_000_000;
+        }
+        assert_eq!(n, CyclePacer::MAX_OWED);
+        assert_eq!(start_cushion_frames(1024, 1024, 16_384), 1024);
+        assert_eq!(start_cushion_frames(1881, 1024, 16_384), 1881 + 2048);
+        assert_eq!(start_cushion_frames(16_384, 8192, 16_384), 16_384);
+    }
+
+    /// The rate of a sink's EnumFormat pod: `Some(vec![r])` for a fixed rate,
+    /// `Some([default, alternatives..])` for an enum choice, `None` when unset.
+    fn pod_rates(bytes: &[u8]) -> Option<Vec<i32>> {
+        use spa::pod::deserialize::PodDeserializer;
+        let (_, value) = PodDeserializer::deserialize_any_from(bytes).expect("pod");
+        let spa::pod::Value::Object(obj) = value else {
+            panic!("not an object");
+        };
+        let prop = obj
+            .properties
+            .iter()
+            .find(|p| p.key == spa::sys::SPA_FORMAT_AUDIO_rate)?;
+        match &prop.value {
+            spa::pod::Value::Int(r) => Some(vec![*r]),
+            spa::pod::Value::Choice(spa::pod::ChoiceValue::Int(spa::utils::Choice(
+                _,
+                spa::utils::ChoiceEnum::Enum {
+                    default,
+                    alternatives,
+                },
+            ))) => Some(
+                std::iter::once(*default)
+                    .chain(alternatives.iter().copied())
+                    .collect(),
+            ),
+            other => panic!("unexpected rate value {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sink_format_pod_constrains_rate() {
+        let one = build_sink_format_pod(2, &[48_000], 48_000).unwrap();
+        assert_eq!(pod_rates(&one), Some(vec![48_000]));
+        let many = build_sink_format_pod(2, &[48_000, 96_000], 96_000).unwrap();
+        assert_eq!(pod_rates(&many), Some(vec![96_000, 48_000, 96_000]));
+        // A default outside the set falls back to the first allowed rate.
+        let many = build_sink_format_pod(2, &[44_100, 48_000], 96_000).unwrap();
+        assert_eq!(pod_rates(&many), Some(vec![44_100, 44_100, 48_000]));
+        let none = build_sink_format_pod(2, &[], 48_000).unwrap();
+        assert_eq!(pod_rates(&none), Some(vec![48_000]));
     }
 
     #[test]
@@ -4733,6 +5565,8 @@ mod tests {
                 output: (),
                 actual_ratio: desired_ratio,
                 output_rate: 48_000 * desired_ratio,
+                graph_rate: 48_000,
+                quantum: 1024,
             })
         }
 

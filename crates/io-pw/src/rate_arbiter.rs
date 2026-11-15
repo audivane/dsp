@@ -76,6 +76,10 @@ pub struct RateInputs<'a> {
     pub direct: &'a [RateClient],
     /// Running clients of the DSP sink.
     pub dsp: &'a [RateClient],
+    /// Rates the Direct sink can run at (the device's native rates among the
+    /// effective ones, see `rate_caps::direct_rate_policy`). `None`, or an
+    /// empty list, means the same as `policy`.
+    pub direct_policy: Option<&'a RatePolicy>,
 }
 
 /// Why a rate was chosen.
@@ -149,7 +153,21 @@ impl Choice {
 /// opinion, leave the rate alone.
 pub fn choose_rate(inp: &RateInputs<'_>) -> Option<Choice> {
     let policy = inp.policy;
+    // Direct never upsamples: it only runs the graph at rates the device
+    // plays natively.
+    let direct_policy = inp
+        .direct_policy
+        .filter(|p| !p.allowed_rates.is_empty())
+        .unwrap_or(policy);
     if !policy.follow_source {
+        if inp.direct_active && !direct_policy.allowed_rates.contains(&policy.default_rate) {
+            return Some(Choice {
+                rate: direct_policy.default_rate,
+                native: None,
+                direct: true,
+                reason: Reason::FollowOff,
+            });
+        }
         return Some(Choice {
             rate: policy.default_rate,
             native: None,
@@ -160,7 +178,13 @@ pub fn choose_rate(inp: &RateInputs<'_>) -> Option<Choice> {
     if inp.direct_active {
         // Bit-perfect sink: sticky + first come, first served; never mixed
         // with DSP-sink clients.
-        return pick(inp.direct, inp.current, policy, RateConflict::KeepCurrent).map(|mut c| {
+        return pick(
+            inp.direct,
+            inp.current,
+            direct_policy,
+            RateConflict::KeepCurrent,
+        )
+        .map(|mut c| {
             c.direct = true;
             c
         });
@@ -446,6 +470,7 @@ mod tests {
             direct_active: false,
             direct: &[],
             dsp,
+            direct_policy: None,
         }
     }
 
@@ -760,6 +785,7 @@ mod tests {
             direct_active: true,
             direct: &direct,
             dsp: &dsp,
+            direct_policy: None,
         };
         let c = choose_rate(&inp).unwrap();
         assert_eq!(c.rate, 44_100);
@@ -772,6 +798,49 @@ mod tests {
         // DSP clients do not take over.
         let inp = RateInputs { direct: &[], ..inp };
         assert_eq!(choose_rate(&inp), None);
+    }
+
+    #[test]
+    fn direct_runs_at_a_native_rate() {
+        // 96k-only device, DSP x2: effective [48k, 96k], Direct [96k].
+        let p = RatePolicy {
+            allowed_rates: vec![48_000, 96_000],
+            default_rate: 48_000,
+            ..RatePolicy::default()
+        };
+        let d = RatePolicy {
+            allowed_rates: vec![96_000],
+            default_rate: 96_000,
+            ..p.clone()
+        };
+        let direct = [client(1, "player", 48_000, 0)];
+        let inp = RateInputs {
+            policy: &p,
+            current: 48_000,
+            direct_active: true,
+            direct: &direct,
+            dsp: &[],
+            direct_policy: Some(&d),
+        };
+        let c = choose_rate(&inp).unwrap();
+        assert_eq!((c.rate, c.direct), (96_000, true));
+        // Following off: the default is not native, Direct moves the graph.
+        let off = RatePolicy {
+            follow_source: false,
+            ..p.clone()
+        };
+        let inp = RateInputs {
+            policy: &off,
+            ..inp
+        };
+        assert_eq!(choose_rate(&inp).unwrap().rate, 96_000);
+        // DSP-only playback keeps the default.
+        let inp = RateInputs {
+            direct_active: false,
+            direct: &[],
+            ..inp
+        };
+        assert_eq!(choose_rate(&inp).unwrap().rate, 48_000);
     }
 
     #[test]

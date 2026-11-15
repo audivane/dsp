@@ -380,6 +380,9 @@ input[type="range"]:disabled { opacity: .45; }
 .row > .k { width: 140px; color: var(--muted); flex: none; }
 .row > .k[title] { cursor: help; text-decoration: underline dotted var(--line-strong); text-underline-offset: 3px; }
 .row .hint { color: var(--faint); font-size: 12px; }
+.rate-list { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.rate-chip { font-family: var(--mono); font-size: 12px; padding: 2px 7px; border: 1px solid var(--line); border-radius: 6px; color: var(--fg); }
+.rate-chip.off { color: var(--faint); text-decoration: line-through; border-style: dashed; }
 .facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
 .fact { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; min-width: 0; }
 .fact .k { font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -494,7 +497,13 @@ table.streams .muted { color: var(--muted); }
 .stats { color: var(--muted); font-family: var(--mono); white-space: nowrap; }
 .meters { margin-left: auto; display: flex; align-items: center; gap: 8px; }
 .meters canvas { width: 150px; height: 26px; display: block; }
-.meters .readout, .meters .headroom { font-size: 11px; white-space: nowrap; cursor: help; }
+.meters .readout, .meters .headroom {
+  font-size: 11px; white-space: nowrap; cursor: help;
+  /* Fixed width for the longest text ("peak +99.9 dBFS", "chain −99.9 dB"),
+     so a changing value never moves the bars. */
+  flex: none; width: 15ch; overflow: hidden; text-align: right;
+  font-variant-numeric: tabular-nums;
+}
 .meters .headroom { color: var(--muted); }
 .stats > span[title] { cursor: help; }
 .clip-leds { display: inline-flex; align-items: center; gap: 4px; }

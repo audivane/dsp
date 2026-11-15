@@ -72,14 +72,15 @@
 
 ```sh
 # Arch Linux
-sudo pacman -U https://github.com/audivane/dsp/releases/download/0.9.0/audivane-dsp-0.9.0-1-x86_64.pkg.tar.zst
+curl -fLO https://github.com/audivane/dsp/releases/download/0.9.1/audivane-dsp-0.9.1-1-x86_64.pkg.tar.zst
+sudo pacman -U ./audivane-dsp-0.9.1-1-x86_64.pkg.tar.zst
 
 # Ubuntu 24.04+ / Debian 13+
-curl -fLO https://github.com/audivane/dsp/releases/download/0.9.0/audivane-dsp_0.9.0-1_amd64.deb
-sudo apt install ./audivane-dsp_0.9.0-1_amd64.deb
+curl -fLO https://github.com/audivane/dsp/releases/download/0.9.1/audivane-dsp_0.9.1-1_amd64.deb
+sudo apt install ./audivane-dsp_0.9.1-1_amd64.deb
 
 # Fedora 40+
-sudo dnf install https://github.com/audivane/dsp/releases/download/0.9.0/audivane-dsp-0.9.0-1.x86_64.rpm
+sudo dnf install https://github.com/audivane/dsp/releases/download/0.9.1/audivane-dsp-0.9.1-1.x86_64.rpm
 ```
 
 Then start the engine for your user and open **Audivane DSP** from your app menu:
@@ -94,7 +95,7 @@ While it runs, the engine uses your DAC exclusively;
 [setup guide](https://audivane.app/docs/dsp/) covers choosing the DAC,
 routing and troubleshooting.
 
-> **Beta.** 0.9.0 is the first public release. It is used daily on Arch with
+> **Beta.** 0.9.x is the first public release series. It is used daily on Arch with
 > PipeWire 1.6; the Ubuntu and Fedora packages are built and install-tested
 > but have seen less real use. Reports are very welcome.
 

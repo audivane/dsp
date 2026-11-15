@@ -109,8 +109,67 @@ atomically: temp file in the same directory, `fsync`, `rename`, directory
 - `follow_source`: switch the graph to the playing stream's native rate
   (mapped to the nearest allowed rate at or above it, else the closest).
   Off: always `default_rate`.
-- `allowed_rates`: written to PipeWire's `clock.allowed-rates`; must include
-  `default_rate`.
+- `allowed_rates`: the graph rates the engine may run at; must include
+  `default_rate`. What reaches PipeWire (`clock.allowed-rates`, the sinks'
+  `audio.allowed-rates` and their format pods) is the **effective** set: these
+  rates restricted to what the open device can play (see "Device
+  capabilities" below). A stream at a rate outside it is resampled by
+  PipeWire into the graph rate, e.g. 44.1 kHz apps into a 48 kHz graph on a
+  48 kHz-only USB device.
+- The effective default rate is `default_rate` when the device can play it,
+  else the nearest effective rate (same 44.1k/48k family first, 48 kHz on a
+  tie). It is used while idle, with `follow_source` off and for
+  `conflict: default_rate`.
+
+#### Device capabilities
+
+Each time the engine opens a device (start, device switch, re-acquire after
+a release; not on rate switches) it probes it on the handle it is about to
+configure (no second open, so a device it holds is never `EBUSY`): for the
+engine's channel count and interleaved access, every (rate, format) pair over
+every allowed graph rate times every integer ratio up to the maximum DSP
+ratio (16), capped at 768 kHz, plus the significant bits ALSA reports per
+pair (`snd_pcm_hw_params_get_sbits`, e.g. 24 for a 24-in-32 S32 DAC). Formats
+are probed per rate because USB devices often tie them together (24-bit only
+up to 96 kHz). The probe leaves the device unconfigured.
+
+- A graph rate `r` is playable when the device takes `r × k` with one of
+  `formats` for some `k` on the ratio fallback ladder, from the wanted
+  upsampling ratio down to 1 (halving powers of two, otherwise minus one).
+- Effective rates = `allowed_rates` ∩ playable. If that is empty: every
+  playable rate of the engine's full list (44.1k..768k); if still empty, the
+  open fails with an error naming the parameter the device rejects and what
+  it does take (unfiltered by the engine's channel count and rate list):
+  `device 'X' needs 2 channels; device supports 1 (engine: channels 2;
+  device: rate 48000 Hz; formats S16; channels 1)`, `device 'X' supports
+  32000 Hz only, which the engine doesn't run at (device supports rate 32000
+  Hz; formats S16; channels 2)`, or `takes none of the engine's sample
+  formats`.
+- **Audivane Direct never upsamples** (it is the bit-perfect path, ×1), so it
+  only runs the graph at *Direct rates*: the effective rates the device plays
+  natively (`Status.direct_rates`). A Direct stream at a rate the device only
+  takes upsampled (e.g. 48 kHz on a 96 kHz-only DAC whose 48 kHz graph the
+  DSP sink plays ×2) moves the graph to a Direct rate (the stream's rate's
+  next higher Direct rate, else the closest; with `follow_source` off, the
+  nearest Direct rate to `default_rate` when that is not native) and PipeWire
+  resamples the stream: playback continues, and `passthrough` reports
+  `resampled` (not bit-perfect). When no effective rate is native, Direct
+  cannot play on the device: routing a stream to it puts the engine in
+  `error` (`Audivane Direct cannot play on 'X': it does not upsample, and
+  none of the allowed rates (…) is native to the device …`).
+- A failed reopen never sticks: when the route or the graph rate changes
+  afterwards (e.g. the app goes back to Audivane DSP) the engine retries the
+  open, so a playable path recovers without a config apply.
+- On open the ratio is the first ladder step the device takes, with the
+  first of `formats` it takes at that rate. There is no "nearest rate"
+  fallback: the DAC always runs at exactly graph rate × ratio. If PipeWire
+  still has the graph at a rate the device cannot play (e.g. right after a
+  device switch), the engine opens at the effective rate it then forces.
+- A config change alone (e.g. a new filter length) never reopens the device
+  when the device already fell back to a smaller ratio for the same request.
+- ALSA errors say which parameter the device rejected and what it supports,
+  e.g. `device 'hw:CARD=V3,DEV=0' does not support rate 44100 Hz (device
+  supports rates 48000 Hz; formats S16; channels 2)`.
 - `conflict` (only while `follow_source` is on): what to do when the apps
   playing into Audivane DSP at the same time want different rates.
   `keep_current` (default) keeps the current rate while any of them still
@@ -336,6 +395,15 @@ format in the engine snapshot (e.g. `S32`); the dither target in
 `chain.output.bits` is not part of the snapshot, so a 24-bit source dithered to
 16 bits inside a 32-bit container is not reported as truncated.
 
+## Output format and dither
+
+The quantizer dithers to `Status.dither_bits` = `min(chain.output.bits,
+container bits of the negotiated format)` (S16 → 16, S24/S24_3 → 24, S32 →
+32), for chain A and B, rebuilt whenever a reopen negotiates another format.
+Format choice is not strict (the first of `formats` the device takes at the
+rate), so "Dither to 24" on a device that only takes S16 dithers to 16 bits
+instead of letting the S16 packer truncate the low 8 bits.
+
 ## MPRIS
 
 `control::mpris` polls the session bus every 500 ms with `zbus::block_on`
@@ -364,8 +432,10 @@ daemon never forks, so `--foreground` is accepted for clarity but implied.
 - `LimitMEMLOCK=64M` covers ALSA/PipeWire buffers.
 - Hardening keeps ALSA (`/dev/snd`), the PipeWire socket and D-Bus working:
   `ProtectSystem=strict`, `ProtectHome=read-only` plus
-  `ReadWritePaths=%h/.config/audivane-dsp` (the config and its atomic temp
-  file) and `ReadWritePaths=%t` (`$XDG_RUNTIME_DIR`: the control socket and
+  `ConfigurationDirectory=audivane-dsp` (systemd creates
+  `$XDG_CONFIG_HOME/audivane-dsp` before the sandbox and mounts it writable —
+  `ReadWritePaths=-…` alone skips a missing directory, so a fresh install
+  could not save; the config and its atomic temp file live there) and `ReadWritePaths=%t` (`$XDG_RUNTIME_DIR`: the control socket and
   `audivane-dsp/default-sink-restore.json`); impulse responses and EQ profiles
   are read-only, `PrivateTmp`,
   `ProtectKernelTunables/Modules`, `ProtectControlGroups`, `ProtectClock`,
@@ -411,6 +481,42 @@ snapshot. Per channel, over the window since the last report:
 
 `Status.filter_latency_ms` is the filter-delay part of `latency_ms`
 (upsampler + convolution in the active chain; 0 on Direct or with DSP off).
+
+## Status: device and rate fields
+
+All `#[serde(default)]`:
+
+- `device_caps: DeviceCapabilities | null`: the last probe of the configured
+  device, also when that device turned out unusable (then `rates` is empty
+  and the other fields say why). `null` before an open, when the probe failed
+  or the device could not be opened at all. `{ device, channels,
+  channels_min, channels_max, rates: [{ rate, formats: [{ format, sbits }]
+  }], rate_min, rate_max, formats }`: `rates` ascending, only rates the
+  engine could ask for with a usable format at `channels`; `rate_min` /
+  `rate_max` (equal for a fixed-rate device) and `formats` are what the
+  device accepts at all, regardless of channel count and the engine's rate
+  list.
+- `effective_rates: number[]`: the graph rates offered to PipeWire (see
+  "Rate policy"); empty before the first open and while the output is closed
+  after a failed open.
+- `direct_rates: number[]`: the effective rates the device plays natively,
+  the only ones Audivane Direct runs at; empty when no device is open or
+  none is native.
+- `effective_default_rate: number | null` (`null` like `effective_rates`).
+- `format: SampleFormat | null` and `dither_bits: number | null`: see "Output
+  format and dither"; `null` while no format is negotiated, including in
+  `error` after a failed open or switch: status never shows the previous
+  device's negotiation.
+- `normal_output: string | null`: `node.description` of the session default
+  sink when it is not one of Audivane's (where a stream routed to `default`
+  plays in per-app routing). `null` in system-wide routing, where the default
+  is Audivane DSP, and when there is no other output. The UI offers
+  `default` only in per-app routing, as "Not through Audivane (<output>)".
+- `ratio` / `output_rate` are what the device was opened at, so a device
+  that cannot take the wanted ratio shows the fallback (e.g. `ratio: 1`).
+
+`avdsp ctl status` prints them as `rates:`, `direct:` (only when it differs
+from `rates:`), `device can:` and `dither:`.
 
 ## Spectrum
 

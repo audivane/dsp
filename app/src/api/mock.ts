@@ -23,6 +23,7 @@ import type {
   Band,
   ChainConfig,
   DaemonEvent,
+  DeviceCapabilities,
   DeviceInfo,
   EngineConfig,
   Meters,
@@ -31,6 +32,7 @@ import type {
   Preset,
   PresetInfo,
   ResponseWindowRequest,
+  SampleFormat,
   SelfTestResult,
   SetVolumeParams,
   SinkChoice,
@@ -103,7 +105,73 @@ const DEVICES: DeviceInfo[] = [
   { id: "hw:CARD=PCH,DEV=0", card: "PCH", name: "Built-in Audio", hdmi: false, loopback: false, active: false },
   { id: "hw:CARD=HDMI,DEV=3", card: "HDMI", name: "HDMI 0 (monitor)", hdmi: true, loopback: false, active: false },
   { id: "hw:CARD=Loopback,DEV=0", card: "Loopback", name: "Loopback", hdmi: false, loopback: true, active: false },
+  { id: "hw:CARD=V3,DEV=0", card: "V3", name: "Creative Pebble V3", hdmi: false, loopback: false, active: false },
 ];
+
+const RATES_44 = [44100, 88200, 176400, 352800, 705600];
+const RATES_48 = [48000, 96000, 192000, 384000, 768000];
+
+/**
+ * What each mock card accepts, like the engine's probe (`status.device_caps`):
+ * - DAC: a typical USB DAC: S16/S24/S32 (24 significant bits) up to 768k,
+ *   S24 3-byte only up to 192k.
+ * - V3: Creative Pebble V3, the 48 kHz / S16-only USB speaker from the bug
+ *   report (`?device=V3` in the browser).
+ */
+function capsFor(device: string): DeviceCapabilities | null {
+  const card = DEVICES.find((d) => sameDevice(d, device))?.card ?? "";
+  const row = (rate: number, formats: [SampleFormat, number | null][]) => ({ rate, formats: formats.map(([format, sbits]) => ({ format, sbits })) });
+  const sorted = (rates: number[]) => [...rates].sort((a, b) => a - b);
+  const caps = (rows: ReturnType<typeof row>[]): DeviceCapabilities => ({
+    device,
+    channels: 2,
+    channels_min: 2,
+    channels_max: 2,
+    rates: rows,
+    rate_min: rows[0]?.rate ?? 0,
+    rate_max: rows[rows.length - 1]?.rate ?? 0,
+    formats: (["s16", "s24", "s24_3", "s32"] as SampleFormat[]).filter((f) => rows.some((r) => r.formats.some((c) => c.format === f))),
+  });
+  switch (card) {
+    case "DAC":
+      return caps(
+        sorted([...RATES_44, ...RATES_48]).map((r) =>
+          row(r, [["s16", 16], ["s24", 24], ...(r <= 192000 ? ([["s24_3", 24]] as [SampleFormat, number][]) : []), ["s32", 24]]),
+        ),
+      );
+    case "PCH":
+      return caps([44100, 48000, 96000, 192000].map((r) => row(r, [["s16", 16], ["s24", 24], ["s32", 32]])));
+    case "HDMI":
+      return caps([44100, 48000, 96000, 192000].map((r) => row(r, [["s16", 16], ["s24", 24], ["s32", 24]])));
+    case "Loopback":
+      return caps(sorted([...RATES_44, ...RATES_48]).map((r) => row(r, [["s16", 16], ["s24", 24], ["s24_3", 24], ["s32", 32]])));
+    case "V3":
+      return caps([row(48000, [["s16", 16]])]);
+    default:
+      return null;
+  }
+}
+
+/** Ratio ladder like io-alsa `ratio_ladder`. */
+function ladder(desired: number): number[] {
+  const out: number[] = [];
+  let r = Math.max(1, desired);
+  for (;;) {
+    out.push(r);
+    if (r === 1) return out;
+    r = (r & (r - 1)) === 0 ? r / 2 : r - 1;
+  }
+}
+
+/** Like io-alsa `plan_open`: first ratio on the ladder with a usable format. */
+function planOpen(caps: DeviceCapabilities, rate: number, desired: number, formats: SampleFormat[]): { ratio: number; format: SampleFormat } | null {
+  for (const k of ladder(desired)) {
+    const at = caps.rates.find((r) => r.rate === rate * k);
+    const f = formats.find((x) => at?.formats.some((c) => c.format === x));
+    if (f) return { ratio: k, format: f };
+  }
+  return null;
+}
 
 /** Like the daemon's `mark_active`: `hw:CARD=DAC,DEV=0`, `hw:DAC,0`, `hw:DAC`, `hw:DAC,0,0` are one device. */
 function sameDevice(d: DeviceInfo, configured: string): boolean {
@@ -173,7 +241,7 @@ export class MockDaemon {
   private lastStatusJson = "";
   private latency = 40;
 
-  constructor(opts: { running?: boolean; apps?: boolean; split?: boolean; overlays?: boolean | "none"; digitalVolume?: boolean } = {}) {
+  constructor(opts: { running?: boolean; apps?: boolean; split?: boolean; overlays?: boolean | "none"; digitalVolume?: boolean; device?: string } = {}) {
     this.running = opts.running ?? true;
     if (opts.digitalVolume) this.volume = { ...this.volume, hardware: false };
     if (opts.overlays !== "none") {
@@ -190,7 +258,7 @@ export class MockDaemon {
       chain.eq.preamp_db = Math.floor(profileAutoPreampDb(chain.eq, 48000) * 10) / 10 || 0;
     }
     this.config = {
-      device: DEVICES[0].id,
+      device: (opts.device && DEVICES.find((d) => d.card === opts.device || sameDevice(d, opts.device!))?.id) || DEVICES[0].id,
       formats: ["s32", "s24", "s24_3", "s16"],
       dsp_enabled: true,
       chain,
@@ -306,17 +374,57 @@ export class MockDaemon {
    * that agree) is followed; when they disagree `rate.conflict` decides.
    * Streams are listed in start order, so the first one started first.
    */
+  /**
+   * Like the engine's io-pw `rate_caps`: the configured rates the device can
+   * play (directly or upsampled, with some format), and the default rate
+   * moved to the nearest of them (same family first, then 48k).
+   */
+  effectivePolicy(): { allowed: number[]; defaultRate: number } {
+    const policy = this.config.rate;
+    const caps = capsFor(this.config.device);
+    if (!caps) return { allowed: policy.allowed_rates, defaultRate: policy.default_rate };
+    const chain = this.chainOn();
+    const playable = (r: number) => planOpen(caps, r, this.config.dsp_enabled ? ratioOf(chain, r) : 1, this.config.formats) !== null;
+    let allowed = policy.allowed_rates.filter(playable);
+    if (allowed.length === 0) allowed = [...RATES_44, ...RATES_48].filter(playable);
+    allowed = [...allowed].sort((a, b) => a - b);
+    const fam = (r: number) => (r % 11025 === 0 ? 44100 : 48000);
+    const defaultRate = allowed.includes(policy.default_rate)
+      ? policy.default_rate
+      : ([...allowed].sort(
+          (a, b) =>
+            Number(fam(a) !== fam(policy.default_rate)) - Number(fam(b) !== fam(policy.default_rate)) ||
+            Math.abs(a - policy.default_rate) - Math.abs(b - policy.default_rate) ||
+            Number(a !== 48000) - Number(b !== 48000),
+        )[0] ?? policy.default_rate);
+    return { allowed, defaultRate };
+  }
+
+  /** Like io-pw `direct_rate_policy`: effective rates the device plays natively. */
+  directRates(): number[] {
+    const caps = capsFor(this.config.device);
+    const allowed = this.effectivePolicy().allowed;
+    if (!caps) return allowed;
+    const formats = this.config.formats.length ? this.config.formats : (["s32", "s24", "s24_3", "s16"] as SampleFormat[]);
+    return allowed.filter((r) => formats.some((f) => caps.rates.some((c) => c.rate === r && c.formats.some((x) => x.format === f))));
+  }
+
   private graphRate(): number {
     const policy = this.config.rate;
-    if (!policy.follow_source) return policy.default_rate;
+    const eff = this.effectivePolicy();
+    if (!policy.follow_source) return eff.defaultRate;
+    // A stream at a rate the device cannot play maps onto the next allowed
+    // rate (PipeWire resamples it), like `choose_allowed_rate`.
+    const toAllowed = (r: number) => (eff.allowed.includes(r) ? r : (eff.allowed.find((a) => a >= r) ?? eff.allowed[eff.allowed.length - 1]));
     const wanted = this.feeding()
       .map((s) => s.rate)
-      .filter((r): r is number => !!r && policy.allowed_rates.includes(r));
+      .filter((r): r is number => !!r && policy.allowed_rates.includes(r))
+      .map(toAllowed);
     let rate: number;
-    if (wanted.length === 0) rate = this.lastRate || policy.default_rate;
+    if (wanted.length === 0) rate = eff.allowed.includes(this.lastRate) ? this.lastRate : eff.defaultRate;
     else if (wanted.every((r) => r === wanted[0])) rate = wanted[0];
     else if (policy.conflict === "highest") rate = Math.max(...wanted);
-    else if (policy.conflict === "default_rate") rate = policy.default_rate;
+    else if (policy.conflict === "default_rate") rate = eff.defaultRate;
     else rate = wanted.includes(this.lastRate) ? this.lastRate : wanted[0];
     this.lastRate = rate;
     return rate;
@@ -324,10 +432,20 @@ export class MockDaemon {
 
   status(): Status {
     const chain = this.chainOn();
-    const rate = this.graphRate();
     const sink = this.activeSink();
+    // Direct never upsamples: it moves the graph to a native rate.
+    const directRates = this.directRates();
+    let rate = this.graphRate();
+    if (sink === "direct" && directRates.length && !directRates.includes(rate)) {
+      rate = directRates.find((r) => r >= rate) ?? directRates[directRates.length - 1];
+    }
     const dspPath = this.config.dsp_enabled && sink !== "direct";
-    const ratio = dspPath ? ratioOf(chain, rate) : 1;
+    const caps = capsFor(this.config.device);
+    const wantedRatio = dspPath ? ratioOf(chain, rate) : 1;
+    const plan = caps ? planOpen(caps, rate, wantedRatio, this.config.formats) : { ratio: wantedRatio, format: this.config.formats[0] ?? null };
+    const ratio = plan?.ratio ?? 1;
+    const format = this.released ? null : (plan?.format ?? null);
+    const eff = this.effectivePolicy();
     const feeding = this.feeding();
     const breaks: PassthroughBreak[] = [];
     if (feeding.length === 0) breaks.push({ reason: "not_playing" });
@@ -350,7 +468,7 @@ export class MockDaemon {
       state: !this.running ? "error" : this.released ? "idle" : feeding.length ? "playing" : "ready",
       device: this.config.device,
       error: null,
-      format: this.released ? null : this.config.formats[0] ?? null,
+      format,
       graph_rate: rate,
       output_rate: rate * ratio,
       ratio,
@@ -369,6 +487,14 @@ export class MockDaemon {
       ab: this.config.ab ? { enabled: true, current: this.abSide, offset_db: this.abOffset() } : null,
       volume: clone(this.volume),
       preset: preset ? { name: preset.name, modified: !deepEqual(preset.chain, this.config.chain) } : null,
+      device_caps: this.released ? null : caps,
+      effective_rates: this.released ? [] : eff.allowed,
+      direct_rates: this.released ? [] : directRates,
+      effective_default_rate: this.released ? null : eff.defaultRate,
+      dither_bits: format ? Math.min(this.config.chain.output.bits, format === "s16" ? 16 : format === "s32" ? 32 : 24) : null,
+      // System-wide routing makes Audivane DSP the default, so there is no
+      // other "normal" output to name.
+      normal_output: this.config.routing.mode === "apps" ? "Built-in Audio Analog Stereo" : null,
     };
   }
 

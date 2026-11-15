@@ -32,7 +32,9 @@ imports), devices and volume validation. URL switches: `?engine=down` (engine-no
 screen; Start engine "starts" it), `?split` (L/R split EQ), `?apps`
 (Selected-apps routing), `?overlays=demo` (adds a built-in target next to the
 simulated room measurement the mock always has), `?digital` (a DAC without a
-hardware mixer: digital volume). In the browser console
+hardware mixer: digital volume), `?device=V3` (start on a Creative Pebble V3:
+48 kHz and S16 only, so rates, formats, ratio and dither are capped). In the
+browser console
 `avdsp` is the store.
 
 ## Checks

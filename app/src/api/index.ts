@@ -13,6 +13,7 @@ export function createTransport(): Transport {
       split: q.has("split"),
       overlays: q.get("overlays") === "none" ? "none" : q.get("overlays") === "demo",
       digitalVolume: q.has("digital"),
+      device: q.get("device") ?? undefined,
     }),
   );
 }

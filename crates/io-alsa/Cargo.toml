@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 audivane-protocol.workspace = true
 alsa = "0.12"
+alsa-sys = "0.6"
 libc = "0.2"
 log.workspace = true
 thiserror.workspace = true

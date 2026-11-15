@@ -7,6 +7,7 @@ pub mod error;
 pub mod lifecycle;
 pub mod metadata;
 pub mod rate_arbiter;
+pub mod rate_caps;
 
 pub use driver::{
     AudioProcessor, DriverConfig, DriverMetrics, DriverSinkHandle, DriverSnapshot, DriverState,

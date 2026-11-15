@@ -3705,6 +3705,27 @@ mod tests {
         }
     }
 
+    /// The UI's filter-length steps (16k..4M) include 32k, 128k and 512k, and
+    /// the Kaiser presets include beta 24 for linear phase: all design.
+    #[test]
+    fn ui_length_steps_and_beta_24_design() {
+        for &taps in &[32_768usize, 131_072, 524_288] {
+            let h = design(4, taps, FilterPhase::Linear, 14.0, 0.95);
+            assert_eq!(h.len(), taps);
+            assert!(h.iter().all(|v| v.is_finite()));
+            assert!((h[0] - h[taps - 1]).abs() < 1e-15, "linear phase is symmetric");
+            let dc: f64 = h.iter().sum();
+            assert!((dc - 4.0).abs() < 1e-6, "taps={taps}: DC gain {dc}");
+        }
+        let h = design(4, 32_768, FilterPhase::Linear, 24.0, 0.95);
+        assert!(h.iter().all(|v| v.is_finite()));
+        let dc: f64 = h.iter().sum();
+        assert!((dc - 4.0).abs() < 1e-6, "beta 24: DC gain {dc}");
+        // Beta 24 is the top of the "Stop at Nyquist" range.
+        assert!(nyquist_stop_check(131_072, 4, 24.0).is_ok());
+        assert!(nyquist_stop_check(131_072, 4, 24.5).is_err());
+    }
+
     /// Full verification matrix: the requested odd/non-power-of-two lengths
     /// up to the 4M limit, every ratio, both phases, beta 8/14/20, both rate
     /// families, dense peak search over [source Nyquist, output Nyquist].

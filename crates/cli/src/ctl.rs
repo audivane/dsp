@@ -2014,6 +2014,33 @@ fn print_status(
         "rate:       {} Hz graph -> {} Hz DAC (x{})",
         status.graph_rate, status.output_rate, status.ratio
     );
+    if !status.effective_rates.is_empty() {
+        let rates: Vec<String> = status.effective_rates.iter().map(u32::to_string).collect();
+        println!(
+            "rates:      {} Hz offered (default {})",
+            rates.join(", "),
+            status
+                .effective_default_rate
+                .map_or_else(|| "-".to_string(), |r| r.to_string())
+        );
+    }
+    if !status.effective_rates.is_empty() && status.direct_rates != status.effective_rates {
+        let rates: Vec<String> = status.direct_rates.iter().map(u32::to_string).collect();
+        if rates.is_empty() {
+            println!("direct:     no native rate (Audivane Direct cannot play here)");
+        } else {
+            println!(
+                "direct:     {} Hz bit-perfect (other rates resampled)",
+                rates.join(", ")
+            );
+        }
+    }
+    if let Some(caps) = &status.device_caps {
+        println!("device can: {}", caps.summary());
+    }
+    if let Some(bits) = status.dither_bits {
+        println!("dither:     {bits} bits");
+    }
     println!(
         "buffers:    quantum {} frames, latency {:.1} ms",
         status.quantum, status.latency_ms

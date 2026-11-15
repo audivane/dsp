@@ -954,6 +954,11 @@ mod tests {
                 frames_out: 0,
                 chain_generation: 0,
                 gaps: Default::default(),
+                device_caps: None,
+                effective_rates: Vec::new(),
+                direct_rates: Vec::new(),
+                effective_default_rate: None,
+                dither_bits: None,
             }
         }
         fn meters(&self) -> audivane_protocol::ipc::Meters {

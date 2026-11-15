@@ -8,6 +8,10 @@ const HOLD_MS = 1500;
 const FALL_DB_PER_S = 24;
 const CLIP_YELLOW_DB = -6;
 const CLIP_RED_DB = -0.1;
+/** Readouts are fixed-width (see `.meters .readout` in app.css) so a changing
+ *  number never shifts the bars; values are clamped to fit, e.g.
+ *  "chain −99.9 dB" / "peak +99.9 dBFS". */
+const READOUT_MAX_DB = 99.9;
 
 const pct = (db: number) => Math.max(0, Math.min(1, (db - FLOOR) / -FLOOR));
 const YELLOW_AT = pct(CLIP_YELLOW_DB);
@@ -87,7 +91,8 @@ export function Meters() {
       }
       paint();
       const pk = Math.max(ch[0].hold, ch[1].hold);
-      const text = pk <= FLOOR + 0.5 ? "peak −∞" : `peak ${fmtDb(pk, 1, pk > 0)} dBFS`;
+      // Clamped so the text never outgrows its fixed-width box (15ch).
+      const text = pk <= FLOOR + 0.5 ? "peak −∞" : `peak ${fmtDb(Math.min(pk, READOUT_MAX_DB), 1, pk > 0)} dBFS`;
       if (text !== lastText && readout.current) {
         readout.current.textContent = text;
         lastText = text;
@@ -100,7 +105,8 @@ export function Meters() {
         // Silent, stale, or the chain is not in the path (Direct / Bypass).
         hrSmooth = null;
       }
-      const hrText = hrSmooth === null ? "chain —" : `chain ${fmtDb(hrSmooth, 1)} dB`;
+      const hrText =
+        hrSmooth === null ? "chain —" : `chain ${fmtDb(Math.max(-READOUT_MAX_DB, Math.min(READOUT_MAX_DB, hrSmooth)), 1)} dB`;
       const hrWarn = hrSmooth !== null && hrSmooth > 0.05;
       if ((hrText !== lastHrText || hrWarn !== lastHrWarn) && headroom.current) {
         headroom.current.textContent = hrText;
@@ -190,7 +196,6 @@ export function Meters() {
         className="readout mono"
         ref={readout}
         title="Output peak (held 1.5 s), the same level as the bars: the signal sent to the DAC, after the volume, just before conversion to integers. 0 dBFS is full scale; at or above it the signal clips and the clip light turns on."
-        style={{ minWidth: 98, textAlign: "right" }}
       >
         {"peak −∞"}
       </span>
@@ -198,7 +203,6 @@ export function Meters() {
         className="headroom mono"
         ref={headroom}
         title="Chain gain at the peaks: what EQ, convolution and the upsampler add (output peak before the volume minus input peak). A relative gain, not a level: +2 dB only clips if the music already peaks within 2 dB of full scale. The volume is not included."
-        style={{ minWidth: 88, textAlign: "right" }}
       >
         {"chain —"}
       </span>

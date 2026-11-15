@@ -17,14 +17,16 @@ use audivane_protocol::ipc::{
     AbSide, AbStatus, BALANCE_MAX_DB, EngineConfig, EngineState, LevelMatch, Meters, RpcError,
     SelfTestResult, SinkChoice, Spectrum, VOLUME_MAX_DB, VOLUME_MIN_DB, VolumeStatus,
 };
-use audivane_protocol::{ChainConfig, RateTarget, SampleFormat, resolve_ratio};
+use audivane_protocol::{
+    ChainConfig, RateTarget, SampleFormat, effective_dither_bits, resolve_ratio,
+};
 use ir::IrCache;
 use processor::{
     ActiveChain, DaemonProcessor, MeterBank, PendingSwap, RtDspCmd, SelfTestJob, SharedVolume,
     VolumeTarget,
 };
 use spectrum::SpectrumWorker;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -63,6 +65,8 @@ struct BuilderState {
     last_rate: u32,
     last_ratio: u32,
     last_dsp_ratio: u32,
+    /// Format ALSA negotiated on the last open: caps the dither depth.
+    out_format: Option<SampleFormat>,
     config_generation: u64,
     built_generation: u64,
     next_swap_seq: u64,
@@ -298,7 +302,7 @@ impl BuilderState {
         // failing config leaves everything untouched.
         let built = if !volume_only && !force_reopen {
             Some(build_active_chain(
-                cfg,
+                &cap_dither_bits(cfg, self.out_format),
                 &mut self.ir_cache,
                 current_rate,
                 target_ratio,
@@ -315,6 +319,9 @@ impl BuilderState {
 
         self.config_generation = next_gen;
         self.cfg = cfg.clone();
+        mirror
+            .output_bits
+            .store(cfg.chain.output.bits, Ordering::Release);
         self.ab_side = next_side;
 
         let waker = driver.map(EngineDriverHandle::waker);
@@ -364,21 +371,27 @@ impl BuilderState {
         Ok(force_reopen)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_negotiated(
         &mut self,
         graph_rate: u32,
         actual_ratio: u32,
         active_sink: SinkChoice,
+        format: SampleFormat,
         mirror: &SharedMirror,
         ab_atomic: &AtomicU8,
         waker: Option<&DriverWaker>,
     ) -> NegotiatedChain {
         let rate_changed = self.last_rate != graph_rate;
+        let format_changed = self.out_format != Some(format);
+        self.out_format = Some(format);
         let cfg_stale =
             self.built_generation != self.config_generation || self.pending_publication.is_some();
         self.last_rate = graph_rate;
         self.last_ratio = actual_ratio;
-        let cfg_clone = self.cfg.clone();
+        // The chain is built for the format just negotiated: dither never
+        // targets more bits than the DAC format carries.
+        let cfg_clone = cap_dither_bits(&self.cfg, Some(format));
         let cur_side = self.ab_side;
         let cfg_gen = self.config_generation;
         ab_atomic.store(side_to_u8(cur_side), Ordering::Release);
@@ -389,7 +402,7 @@ impl BuilderState {
         let hw_vol = self.hardware_volume;
 
         let build_ratio = if active_sink == SinkChoice::Direct {
-            if !rate_changed && !cfg_stale && self.last_dsp_ratio > 0 {
+            if !rate_changed && !format_changed && !cfg_stale && self.last_dsp_ratio > 0 {
                 // Direct only temporarily holds ALSA at 1x and no config or rate
                 // change occurred; keep the warm DSP chain untouched.
                 return NegotiatedChain {
@@ -501,6 +514,8 @@ impl BuilderState {
 /// and by the [`RatioNegotiator`] callback on ALSA reopen.
 struct SharedMirror {
     dsp_has_effect: AtomicBool,
+    /// Configured `chain.output.bits` ("Dither to"), before the format cap.
+    output_bits: AtomicU32,
     ab_enabled: AtomicBool,
     ab_side: AtomicU8,
     ab_offset_bits: AtomicU64,
@@ -513,6 +528,7 @@ impl SharedMirror {
         let has_effect = dsp_has_effect(cfg, false);
         Self {
             dsp_has_effect: AtomicBool::new(has_effect),
+            output_bits: AtomicU32::new(cfg.chain.output.bits),
             ab_enabled: AtomicBool::new(cfg.ab.is_some()),
             ab_side: AtomicU8::new(0),
             ab_offset_bits: AtomicU64::new(0.0_f64.to_bits()),
@@ -672,6 +688,7 @@ impl RealEngine {
             last_rate: init_rate,
             last_ratio: desired_ratio,
             last_dsp_ratio: desired_ratio,
+            out_format: None,
             config_generation: 0,
             built_generation: 0,
             next_swap_seq: 0,
@@ -690,7 +707,7 @@ impl RealEngine {
         let waker_slot: Arc<OnceLock<DriverWaker>> = Arc::new(OnceLock::new());
         let waker_cb = Arc::clone(&waker_slot);
         let on_negotiated: RatioNegotiator =
-            Arc::new(move |graph_rate, actual_ratio, active_sink| {
+            Arc::new(move |graph_rate, actual_ratio, active_sink, format| {
                 let Ok(mut st) = builder_cb.lock() else {
                     return NegotiatedChain {
                         required_chain_seq: None,
@@ -703,6 +720,7 @@ impl RealEngine {
                     graph_rate,
                     actual_ratio,
                     active_sink,
+                    format,
                     &mirror_cb,
                     &ab_atomic_cb,
                     waker_cb.get(),
@@ -891,6 +909,17 @@ impl Engine for RealEngine {
             frames_out: drv.frames_out,
             chain_generation: self.chain_generation.load(Ordering::Acquire),
             gaps: drv.gaps,
+            dither_bits: drv.format.map(|f| {
+                effective_dither_bits(self.mirror.output_bits.load(Ordering::Acquire), Some(f))
+            }),
+            effective_rates: drv
+                .effective_policy
+                .as_ref()
+                .map(|p| p.allowed_rates.clone())
+                .unwrap_or_default(),
+            effective_default_rate: drv.effective_policy.as_ref().map(|p| p.default_rate),
+            direct_rates: drv.direct_rates,
+            device_caps: drv.device_caps,
         }
     }
 
@@ -1276,6 +1305,18 @@ fn compute_ab_offset(cfg: &EngineConfig, rate: u32) -> f64 {
     }
 }
 
+/// `cfg` with `output.bits` (chain A and B) capped at the container width of
+/// the negotiated format: "Dither to 24" on an S16 device dithers to 16
+/// instead of leaving the S16 packer to truncate the low 8 bits.
+fn cap_dither_bits(cfg: &EngineConfig, format: Option<SampleFormat>) -> EngineConfig {
+    let mut out = cfg.clone();
+    out.chain.output.bits = effective_dither_bits(cfg.chain.output.bits, format);
+    if let Some(ab) = &mut out.ab {
+        ab.chain_b.output.bits = effective_dither_bits(ab.chain_b.output.bits, format);
+    }
+    out
+}
+
 fn with_actual_ratio(mut cfg: ChainConfig, actual_ratio: u32) -> ChainConfig {
     cfg.upsampler.target = if actual_ratio <= 1 {
         RateTarget::Off
@@ -1596,6 +1637,7 @@ mod tests {
                 last_rate: 48_000,
                 last_ratio: 1,
                 last_dsp_ratio: 1,
+                out_format: None,
                 config_generation: 0,
                 built_generation: 0,
                 next_swap_seq: 0,
@@ -1680,6 +1722,124 @@ mod tests {
         }
     }
 
+    /// Run a quiet 1 kHz tone through the published chain and return the output.
+    fn render_quiet_tone(h: &mut BuilderProcHarness) -> Vec<i32> {
+        let block_in = 1024usize;
+        let amp = 10.0_f64.powf(-70.0 / 20.0);
+        let step = 2.0 * std::f64::consts::PI * 1000.0 / 48_000.0;
+        let mut phase = 0.0_f64;
+        let mut all = Vec::new();
+        let mut out = vec![0_i32; block_in * 2];
+        for _ in 0..8 {
+            let mut inp = Vec::with_capacity(block_in * 2);
+            for _ in 0..block_in {
+                let s = (phase.sin() * amp) as f32;
+                inp.push(s);
+                inp.push(s);
+                phase += step;
+            }
+            audivane_io_pw::EngineAudioProcessor::poll_updates(
+                &mut h.proc,
+                SinkChoice::Dsp,
+                48_000,
+                1,
+                true,
+            );
+            audivane_io_pw::EngineAudioProcessor::process_block(
+                &mut h.proc,
+                SinkChoice::Dsp,
+                &inp,
+                &inp,
+                &mut out,
+                2,
+                1,
+                48_000,
+            );
+            all.extend_from_slice(&out);
+        }
+        while h.recycle_rx.pop().is_ok() {}
+        all
+    }
+
+    #[test]
+    fn s16_device_dithers_at_16_bits_even_when_configured_for_24() {
+        // "Dither to 24" (the default) with an EQ so the chain is active.
+        let mut cfg = test_cfg();
+        cfg.chain.eq = Some(eq_profile(-1.0, -1.0));
+        cfg.chain.output.bits = 24;
+        cfg.chain.output.dither = audivane_protocol::DitherKind::Tpdf;
+
+        // Device negotiated S16 (e.g. Creative Pebble V3): every sample must
+        // already be a 16-bit value with dither noise in it, so the S16
+        // packer drops nothing.
+        let mut h = BuilderProcHarness::new(cfg.clone());
+        h.state.apply_negotiated(
+            48_000,
+            1,
+            SinkChoice::Dsp,
+            SampleFormat::S16,
+            &h.mirror,
+            &h.ab_atomic,
+            None,
+        );
+        let out = render_quiet_tone(&mut h);
+        let tail = &out[out.len() / 2..];
+        assert!(
+            tail.iter().all(|s| s & 0xFFFF == 0),
+            "not quantized to 16 bits"
+        );
+        let distinct: std::collections::HashSet<i32> = tail.iter().copied().collect();
+        assert!(distinct.len() >= 3, "no dither at 16 bits: {distinct:?}");
+
+        // Same config on an S32 device keeps dithering at 24 bits: the low
+        // 16 bits carry signal.
+        let mut h = BuilderProcHarness::new(cfg);
+        h.state.apply_negotiated(
+            48_000,
+            1,
+            SinkChoice::Dsp,
+            SampleFormat::S32,
+            &h.mirror,
+            &h.ab_atomic,
+            None,
+        );
+        let out = render_quiet_tone(&mut h);
+        let tail = &out[out.len() / 2..];
+        assert!(tail.iter().all(|s| s & 0xFF == 0));
+        assert!(
+            tail.iter().any(|s| s & 0xFFFF != 0),
+            "24-bit dither expected"
+        );
+    }
+
+    #[test]
+    fn dither_cap_follows_the_format() {
+        let mut cfg = test_cfg();
+        cfg.chain.output.bits = 24;
+        assert_eq!(
+            cap_dither_bits(&cfg, Some(SampleFormat::S16))
+                .chain
+                .output
+                .bits,
+            16
+        );
+        assert_eq!(
+            cap_dither_bits(&cfg, Some(SampleFormat::S24_3))
+                .chain
+                .output
+                .bits,
+            24
+        );
+        assert_eq!(
+            cap_dither_bits(&cfg, Some(SampleFormat::S32))
+                .chain
+                .output
+                .bits,
+            24
+        );
+        assert_eq!(cap_dither_bits(&cfg, None).chain.output.bits, 24);
+    }
+
     #[test]
     fn builder_eq_then_ratio_change_in_same_cycle_preserves_eq_at_4x() {
         let mut h = BuilderProcHarness::new(test_cfg());
@@ -1707,8 +1867,15 @@ mod tests {
         assert!(reopen2);
 
         // Simulate both RT polling between apply 1 and 2, AND skipping straight to on_negotiated
-        h.state
-            .apply_negotiated(48_000, 4, SinkChoice::Dsp, &h.mirror, &h.ab_atomic, None);
+        h.state.apply_negotiated(
+            48_000,
+            4,
+            SinkChoice::Dsp,
+            SampleFormat::S32,
+            &h.mirror,
+            &h.ab_atomic,
+            None,
+        );
         audivane_io_pw::EngineAudioProcessor::poll_updates(
             &mut h.proc,
             SinkChoice::Dsp,
@@ -1769,6 +1936,7 @@ mod tests {
             48_000,
             4,
             SinkChoice::Dsp,
+            SampleFormat::S32,
             &h_before.mirror,
             &h_before.ab_atomic,
             None,
@@ -1806,6 +1974,7 @@ mod tests {
             48_000,
             4,
             SinkChoice::Dsp,
+            SampleFormat::S32,
             &h_after.mirror,
             &h_after.ab_atomic,
             None,
@@ -1889,8 +2058,15 @@ mod tests {
         );
         // `c2` triggered reopen while Direct was active, so `built_generation` is stale (0 != 2).
         // `apply_negotiated` at the same 48 kHz rate on Direct MUST rebuild gen 2 instead of skipping!
-        h.state
-            .apply_negotiated(48_000, 1, SinkChoice::Direct, &h.mirror, &h.ab_atomic, None);
+        h.state.apply_negotiated(
+            48_000,
+            1,
+            SinkChoice::Direct,
+            SampleFormat::S32,
+            &h.mirror,
+            &h.ab_atomic,
+            None,
+        );
         audivane_io_pw::EngineAudioProcessor::poll_updates(
             &mut h.proc,
             SinkChoice::Direct,
@@ -1984,9 +2160,15 @@ mod tests {
         assert_eq!(h.state.built_generation, 32);
 
         // Negotiate 4x while the swap queue is still completely full.
-        let neg1 =
-            h.state
-                .apply_negotiated(48_000, 4, SinkChoice::Dsp, &h.mirror, &h.ab_atomic, None);
+        let neg1 = h.state.apply_negotiated(
+            48_000,
+            4,
+            SinkChoice::Dsp,
+            SampleFormat::S32,
+            &h.mirror,
+            &h.ab_atomic,
+            None,
+        );
         let seq1 = neg1.required_chain_seq;
         assert!(seq1.is_some());
         assert!(neg1.error.is_none());
@@ -2046,9 +2228,15 @@ mod tests {
         );
         let gen_latest = h.state.config_generation;
         assert!(gen_latest > gen_first_4x);
-        let neg_latest =
-            h.state
-                .apply_negotiated(48_000, 4, SinkChoice::Dsp, &h.mirror, &h.ab_atomic, None);
+        let neg_latest = h.state.apply_negotiated(
+            48_000,
+            4,
+            SinkChoice::Dsp,
+            SampleFormat::S32,
+            &h.mirror,
+            &h.ab_atomic,
+            None,
+        );
         let seq_latest = neg_latest.required_chain_seq;
         assert!(seq_latest.unwrap() > seq1.unwrap());
         assert_eq!(
@@ -2167,9 +2355,15 @@ mod tests {
         // The IR becomes unavailable before the ratio-changing reopen to 48 kHz x4.
         std::fs::remove_file(&ir_path).unwrap();
 
-        let neg =
-            h.state
-                .apply_negotiated(48_000, 4, SinkChoice::Dsp, &h.mirror, &h.ab_atomic, None);
+        let neg = h.state.apply_negotiated(
+            48_000,
+            4,
+            SinkChoice::Dsp,
+            SampleFormat::S32,
+            &h.mirror,
+            &h.ab_atomic,
+            None,
+        );
         assert!(
             !neg.fatal,
             "a convolution failure must fall back to a ratio-valid chain"
@@ -2262,9 +2456,15 @@ mod tests {
                 .apply_config(&cfg, &h.mirror, EngineState::Ready, 48_000, None, None)
                 .unwrap()
         );
-        let first =
-            h.state
-                .apply_negotiated(48_000, 4, SinkChoice::Dsp, &h.mirror, &h.ab_atomic, None);
+        let first = h.state.apply_negotiated(
+            48_000,
+            4,
+            SinkChoice::Dsp,
+            SampleFormat::S32,
+            &h.mirror,
+            &h.ab_atomic,
+            None,
+        );
         assert!(first.error.is_none());
         audivane_io_pw::EngineAudioProcessor::poll_updates(
             &mut h.proc,
@@ -2278,9 +2478,15 @@ mod tests {
 
         // A same-rate device re-acquire reopens at 48 kHz x4 after the IR vanished.
         std::fs::remove_file(&ir_path).unwrap();
-        let neg =
-            h.state
-                .apply_negotiated(48_000, 4, SinkChoice::Dsp, &h.mirror, &h.ab_atomic, None);
+        let neg = h.state.apply_negotiated(
+            48_000,
+            4,
+            SinkChoice::Dsp,
+            SampleFormat::S32,
+            &h.mirror,
+            &h.ab_atomic,
+            None,
+        );
         assert!(!neg.fatal);
         let err = neg
             .error
@@ -2495,8 +2701,15 @@ mod tests {
     #[test]
     fn volume_only_fast_path_skips_chain_swap_and_sets_dsp_has_effect() {
         let mut h = BuilderProcHarness::new(test_cfg());
-        h.state
-            .apply_negotiated(48_000, 1, SinkChoice::Dsp, &h.mirror, &h.ab_atomic, None);
+        h.state.apply_negotiated(
+            48_000,
+            1,
+            SinkChoice::Dsp,
+            SampleFormat::S32,
+            &h.mirror,
+            &h.ab_atomic,
+            None,
+        );
         audivane_io_pw::EngineAudioProcessor::poll_updates(
             &mut h.proc,
             SinkChoice::Dsp,
@@ -2596,8 +2809,15 @@ mod tests {
 
         let mut h = BuilderProcHarness::with_mixer(cfg.clone(), mixer);
         // Startup negotiation opens the DAC -> applies hardware mixer.
-        h.state
-            .apply_negotiated(48_000, 1, SinkChoice::Dsp, &h.mirror, &h.ab_atomic, None);
+        h.state.apply_negotiated(
+            48_000,
+            1,
+            SinkChoice::Dsp,
+            SampleFormat::S32,
+            &h.mirror,
+            &h.ab_atomic,
+            None,
+        );
         let status = h.mirror.volume_status();
         assert!(status.hardware);
         assert_eq!(status.min_db, -64.0);
@@ -2618,8 +2838,15 @@ mod tests {
         assert!(h.mirror.dsp_has_effect.load(Ordering::Acquire));
 
         // Rate switch / re-acquire triggers apply_negotiated -> re-applies hardware mixer.
-        h.state
-            .apply_negotiated(96_000, 1, SinkChoice::Direct, &h.mirror, &h.ab_atomic, None);
+        h.state.apply_negotiated(
+            96_000,
+            1,
+            SinkChoice::Direct,
+            SampleFormat::S32,
+            &h.mirror,
+            &h.ab_atomic,
+            None,
+        );
 
         // Switching to a card without mixer (Loopback) falls back to digital.
         let mut loopback_cfg = bal_cfg;
@@ -2636,8 +2863,15 @@ mod tests {
                 )
                 .unwrap()
         );
-        h.state
-            .apply_negotiated(96_000, 1, SinkChoice::Dsp, &h.mirror, &h.ab_atomic, None);
+        h.state.apply_negotiated(
+            96_000,
+            1,
+            SinkChoice::Dsp,
+            SampleFormat::S32,
+            &h.mirror,
+            &h.ab_atomic,
+            None,
+        );
         let fallback_status = h.mirror.volume_status();
         assert!(!fallback_status.hardware);
         assert_eq!(fallback_status.min_db, VOLUME_MIN_DB);

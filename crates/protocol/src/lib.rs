@@ -9,6 +9,15 @@ use std::path::PathBuf;
 
 pub mod ipc;
 
+/// Graph (source) rates the engine can run at. `rate.allowed_rates` must be
+/// a subset of this list.
+pub const ALLOWED_RATES: &[u32] = &[
+    44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000, 705_600, 768_000,
+];
+
+/// Highest DAC rate the engine ever asks ALSA for.
+pub const MAX_OUTPUT_RATE: u32 = 768_000;
+
 // ---------------------------------------------------------------- EQ
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -329,6 +338,26 @@ impl SampleFormat {
             SampleFormat::S24 | SampleFormat::S24_3 => 24,
             SampleFormat::S32 => 32,
         }
+    }
+
+    /// Short display name ("S16", "S24", "S24_3", "S32").
+    pub fn name(self) -> &'static str {
+        match self {
+            SampleFormat::S16 => "S16",
+            SampleFormat::S24 => "S24",
+            SampleFormat::S24_3 => "S24_3",
+            SampleFormat::S32 => "S32",
+        }
+    }
+}
+
+/// Bit depth dither actually targets: the configured `output.bits`, capped at
+/// the container width of the negotiated ALSA format (dithering to 24 bits
+/// into an S16 device would leave the packer to truncate the low 8 bits).
+pub fn effective_dither_bits(configured: u32, format: Option<SampleFormat>) -> u32 {
+    match format {
+        Some(f) => configured.min(f.bits()),
+        None => configured,
     }
 }
 

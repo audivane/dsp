@@ -43,9 +43,7 @@ pub const CONFIG_VERSION: u32 = 1;
 
 /// Sample rates the engine may run at (source rates, before upsampling).
 /// The 44.1 kHz and 48 kHz families up to 768k (see `docs/architecture.md`).
-pub const ALLOWED_RATES: &[u32] = &[
-    44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000, 705_600, 768_000,
-];
+pub use audivane_protocol::ALLOWED_RATES;
 
 pub const MIN_TAPS: usize = 1;
 /// 4M = 2^22, so every length step in the UI is a power of two.
@@ -988,6 +986,20 @@ mod tests {
         assert!(validate(&cfg).unwrap_err().contains("minimum phase"));
         cfg.chain.upsampler.kaiser_beta = 20.0;
         assert!(validate(&cfg).is_ok());
+        // The UI's beta 24 preset: fine for linear phase, not for minimum.
+        cfg.chain.upsampler.kaiser_beta = 24.0;
+        assert!(validate(&cfg).unwrap_err().contains("minimum phase"));
+        cfg.chain.upsampler.phase = FilterPhase::Linear;
+        assert!(validate(&cfg).is_ok());
+        cfg.chain.upsampler = UpsamplerConfig::default();
+
+        // Every filter length the UI offers is accepted.
+        for taps in [
+            16_384, 32_768, 65_536, 131_072, 262_144, 524_288, 1_048_576, 2_097_152, 4_194_304,
+        ] {
+            cfg.chain.upsampler.taps = taps;
+            assert!(validate(&cfg).is_ok(), "taps {taps}");
+        }
         cfg.chain.upsampler = UpsamplerConfig::default();
 
         // Stop at Nyquist: designs outside the calibrated range are rejected,

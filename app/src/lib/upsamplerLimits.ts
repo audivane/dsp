@@ -116,6 +116,9 @@ export const KAISER_BETA_PRESETS: readonly KaiserBetaPreset[] = [
   { beta: 14, label: "Standard" },
   { beta: 17, label: "Deeper" },
   { beta: 20, label: "Deepest" },
+  // Linear phase only: minimum phase is designed for β 2..20 (blocked through
+  // `kaiserBetaBlockReason`); 24 is also the top of the Stop at Nyquist range.
+  { beta: 24, label: "Extreme" },
 ] as const;
 
 /** Matching preset β, or null when a custom β (e.g. from CLI) is active. */

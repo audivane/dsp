@@ -40,12 +40,12 @@ import {
   selectedKaiserPreset,
   worstCaseRatio,
 } from "../lib/upsamplerLimits";
+import { SOURCE_RATES, viewSourceRate } from "../lib/upsamplerRate";
 import { errorText, store, useApp } from "../store/store";
 import { cssVar, useSkin } from "../theme";
 import { ZoomPlot, type BoxAxis, type DragMode, type PlotGeom } from "./ZoomPlot";
 
 type RatioKey = "off" | "2" | "4" | "8" | "16" | "max384" | "max768";
-const SOURCE_RATES = [44100, 48000, 88200, 96000] as const;
 const ADVANCED_OPEN_KEY = "avdsp-upsampling-advanced";
 
 function loadAdvancedOpen(): boolean {
@@ -376,8 +376,15 @@ export function UpsamplingView() {
   const u = useApp((s) => s.config?.chain.upsampler);
   const statusState = useApp((s) => s.status?.state);
   const rawGraphRate = useApp((s) => s.status?.graph_rate);
-  const graphRate = rawGraphRate ?? 44100;
-  const playingRate = statusState === "playing" && SOURCE_RATES.includes(graphRate as (typeof SOURCE_RATES)[number]) ? graphRate : 44100;
+  const effectiveDefaultRate = useApp((s) => s.status?.effective_default_rate ?? null);
+  const statusRatio = useApp((s) => s.status?.ratio ?? null);
+  const activeSink = useApp((s) => s.status?.active_sink ?? null);
+  // A reopen (filter length, ratio...) reports "switching" for a moment: keep
+  // the last rate so the readout, plot and measurement do not jump to another
+  // rate and back.
+  const heldRate = useRef<number | null>(null);
+  const playingRate = viewSourceRate({ state: statusState, graphRate: rawGraphRate, effectiveDefaultRate, held: heldRate.current });
+  if (statusState !== "switching") heldRate.current = playingRate;
   const [chosenRate, setChosenRate] = useState<number | null>(null);
   const sourceRate = chosenRate ?? playingRate;
   const [recentPlayingRate, setRecentPlayingRate] = useState<number | null>(() =>
@@ -493,10 +500,18 @@ export function UpsamplingView() {
       ? [taps, text, `${title}. Not available with Stop at Nyquist here: it is only guaranteed from ${nyqMinTaps.toLocaleString("en-US")} taps.`, true]
       : [taps, text, title, false];
   const knownSourceRate = chosenRate ?? (statusState === "playing" && rawGraphRate && rawGraphRate > 0 ? rawGraphRate : recentPlayingRate);
-  const readoutSourceRate = knownSourceRate ?? 44100;
+  const readoutSourceRate = knownSourceRate ?? playingRate;
   const isFallbackRate = knownSourceRate === null;
   const readoutRatio = resolveRatio(u.target, readoutSourceRate);
   const readoutOutRate = readoutSourceRate * readoutRatio;
+  // The device may not take source × ratio: the engine then fell back to a
+  // smaller ratio (down to ×1) and says so in status.
+  const engineLive = (statusState === "playing" || statusState === "ready") && activeSink !== "direct";
+  const wantedRatio = rawGraphRate ? resolveRatio(u.target, rawGraphRate) : 1;
+  const ratioCapped = !off && engineLive && !!rawGraphRate && statusRatio !== null && statusRatio < wantedRatio;
+  const ratioCapNote = ratioCapped
+    ? `This device cannot run at ${fmtRate(rawGraphRate! * wantedRatio)}: ${statusRatio! <= 1 ? "upsampling is off (×1)" : `upsampling at ×${statusRatio} (${fmtRate(rawGraphRate! * statusRatio!)})`} at a ${fmtRate(rawGraphRate!)} source.`
+    : null;
   const designedAttenDb = kaiserAttenuationDb(u.kaiser_beta);
   const designedTwHz = !off && readoutRatio > 1 ? kaiserTransitionWidthHz(u.kaiser_beta, u.taps, readoutOutRate) : null;
   const selectedBeta = selectedKaiserPreset(u.kaiser_beta);
@@ -553,6 +568,7 @@ export function UpsamplingView() {
               ["max768", "Up to 768k", "Highest power-of-two multiple up to 768 kHz"],
             ]}
           />
+          {ratioCapNote && <span className="hint">{ratioCapNote}</span>}
         </div>
         <div className="row">
           <span className="k">Filter length</span>
@@ -563,14 +579,17 @@ export function UpsamplingView() {
             onChange={(taps) => set({ taps })}
             options={[
               tapsOption(16384, "16k", "16,384 taps: lightest on CPU, lowest latency, widest transition band"),
+              tapsOption(32768, "32k", "32,768 taps: half the transition band of 16k at little CPU cost. Linear-phase delay is half the length: 21 ms at 768 kHz, 0.17 s at 96 kHz"),
               tapsOption(65536, "64k", "65,536 taps: a steep filter at moderate CPU cost"),
+              tapsOption(131072, "128k", "131,072 taps: steeper, more CPU. Linear-phase delay is half the length: 85 ms at 768 kHz, 0.68 s at 96 kHz"),
               tapsOption(262144, "256k", "262,144 taps: very steep, more CPU. Linear-phase delay is half the length: 0.17 s at 768 kHz, 1.4 s at 96 kHz"),
+              tapsOption(524288, "512k", "524,288 taps: very steep, heavy on CPU. Linear-phase delay is half the length: 0.34 s at 768 kHz, 2.7 s at 96 kHz"),
               tapsOption(1048576, "1M", "1,048,576 taps: very steep, heavy on CPU. Linear-phase delay is half the length: 0.68 s at 768 kHz, 5.5 s at 96 kHz"),
               tapsOption(2097152, "2M", "⚠ 2,097,152 taps: extreme. Linear-phase delay 1.4 s at 768 kHz, 10.9 s at 96 kHz, so music only. Watch DSP % and xruns: it may not keep up in real time on every CPU. Measuring the response takes a few seconds."),
               tapsOption(4194304, "4M", "⚠ 4,194,304 taps (the maximum): extreme. Linear-phase delay 2.7 s at 768 kHz, 21.8 s at 96 kHz, so music only. Watch DSP % and xruns: it may not keep up in real time on every CPU. Measuring the response takes a few seconds."),
             ]}
           />
-          {![16384, 65536, 262144, 1048576, 2097152, 4194304].includes(u.taps) && <span className="hint">{u.taps.toLocaleString("en-US")} taps (set elsewhere)</span>}
+          {![16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304].includes(u.taps) && <span className="hint">{u.taps.toLocaleString("en-US")} taps (set elsewhere)</span>}
         </div>
         <div className="row">
           <span className="k">Phase</span>
@@ -640,7 +659,7 @@ export function UpsamplingView() {
                   ? "— (upsampling is off)"
                   : readoutRatio <= 1 || designedTwHz === null
                     ? "—"
-                    : `≈ ${fmtTransitionHz(designedTwHz)} Hz (at ${fmtRate(readoutOutRate)}${isFallbackRate ? ", fallback 44.1 kHz source" : ""})`}
+                    : `≈ ${fmtTransitionHz(designedTwHz)} Hz (at ${fmtRate(readoutOutRate)}${isFallbackRate ? `, assuming a ${fmtRate(readoutSourceRate)} source` : ""})`}
               </div>
             </div>
           )}

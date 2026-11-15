@@ -7,8 +7,8 @@
 use audivane_io_pw::DriverGapCounters;
 use audivane_protocol::SampleFormat;
 use audivane_protocol::ipc::{
-    AbSide, AbStatus, EngineConfig, EngineState, Meters, SelfTestResult, SinkChoice, Spectrum,
-    VolumeStatus,
+    AbSide, AbStatus, DeviceCapabilities, EngineConfig, EngineState, Meters, SelfTestResult,
+    SinkChoice, Spectrum, VolumeStatus,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -66,6 +66,15 @@ pub struct EngineSnapshot {
     pub chain_generation: u64,
     /// Cumulative gap/glitch telemetry from the driver.
     pub gaps: DriverGapCounters,
+    /// Probed capabilities of the open device.
+    pub device_caps: Option<DeviceCapabilities>,
+    /// Graph rates offered to PipeWire (configured ∩ device).
+    pub effective_rates: Vec<u32>,
+    /// Effective rates the device plays natively (Direct runs only at these).
+    pub direct_rates: Vec<u32>,
+    pub effective_default_rate: Option<u32>,
+    /// `chain.output.bits` capped at the negotiated format's width.
+    pub dither_bits: Option<u32>,
 }
 
 /// Implemented by `engine::RealEngine`; all methods are called from

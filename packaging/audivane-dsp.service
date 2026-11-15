@@ -36,8 +36,13 @@ LimitMEMLOCK=64M
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-# The config file and its atomic temp file live under ~/.config; impulse
-# responses and EQ profiles are only read.
+# The config file and its atomic temp file live in
+# $XDG_CONFIG_HOME/audivane-dsp; impulse responses and EQ profiles are only read.
+# ConfigurationDirectory= creates that directory before the sandbox is set up
+# and mounts it writable. ReadWritePaths= alone is not enough: with the `-`
+# prefix a missing path is skipped, so on a fresh install (no directory yet) the
+# daemon could neither create it nor save ("Read-only file system").
+ConfigurationDirectory=audivane-dsp
 ReadWritePaths=-%h/.config/audivane-dsp
 # The control socket and the default-sink crash-recovery file live in
 # $XDG_RUNTIME_DIR (`audivane-dsp.sock`, `audivane-dsp/default-sink-restore.json`).

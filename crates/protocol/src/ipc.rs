@@ -663,7 +663,8 @@ pub struct Status {
     pub device: String,
     /// Last error, if `state == Error` (or a recent recoverable one).
     pub error: Option<String>,
-    /// Negotiated ALSA format, when open.
+    /// Negotiated ALSA format, when open (`None` in `Error` after a failed
+    /// open or switch).
     pub format: Option<SampleFormat>,
     /// Graph (source) rate.
     pub graph_rate: u32,
@@ -693,6 +694,224 @@ pub struct Status {
     pub preset: Option<PresetState>,
     #[serde(default)]
     pub volume: Option<VolumeStatus>,
+    /// What the configured output device accepts, probed when it was
+    /// opened; also kept when that device turned out unusable (then `rates`
+    /// is empty and the unfiltered fields say why). `None` before the first
+    /// open, when the probe failed or the device could not be opened.
+    #[serde(default)]
+    pub device_caps: Option<DeviceCapabilities>,
+    /// Graph rates the engine actually offers PipeWire: `rate.allowed_rates`
+    /// restricted to rates the device can play (directly or upsampled).
+    /// Streams at other rates are resampled by PipeWire. Empty while no
+    /// device is open.
+    #[serde(default)]
+    pub effective_rates: Vec<u32>,
+    /// The subset of [`Self::effective_rates`] the device plays natively
+    /// (x1). Audivane Direct never upsamples, so it only runs the graph at
+    /// these: a Direct stream at another rate makes the graph move to one of
+    /// them and is resampled by PipeWire (passthrough then reports
+    /// `resampled`). Empty while no device is open, or when no effective rate
+    /// is native (Direct cannot play on the device then).
+    #[serde(default)]
+    pub direct_rates: Vec<u32>,
+    /// Rate used when idle / when following is off, after the same
+    /// restriction (`rate.default_rate` when the device supports it).
+    #[serde(default)]
+    pub effective_default_rate: Option<u32>,
+    /// Bit depth dither targets: `chain.output.bits` capped at the container
+    /// width of [`Self::format`]. `None` while no device is open.
+    #[serde(default)]
+    pub dither_bits: Option<u32>,
+    /// The session's default output when it is not one of Audivane's sinks
+    /// (its `node.description`): where a stream left unrouted plays in
+    /// per-app routing. `None` in system-wide routing (the default is
+    /// Audivane DSP) or when there is no other output.
+    #[serde(default)]
+    pub normal_output: Option<String>,
+}
+
+/// Sample formats the device accepts at one rate.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct RateCapability {
+    pub rate: u32,
+    pub formats: Vec<FormatCapability>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct FormatCapability {
+    pub format: SampleFormat,
+    /// Significant bits ALSA reports for this format at this rate (e.g. 24
+    /// for a 24-in-32 S32 device), when the driver says.
+    #[serde(default)]
+    pub sbits: Option<u32>,
+}
+
+/// What an ALSA playback device accepts for the engine's channel count with
+/// interleaved read/write access. Only rates the engine could ask for are
+/// probed (every allowed graph rate times every upsampling ratio, up to
+/// 768 kHz), as (rate, format) pairs: USB devices often tie formats to rates.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct DeviceCapabilities {
+    pub device: String,
+    /// Channel count the probe used.
+    pub channels: u32,
+    /// Channel counts the device accepts at all.
+    pub channels_min: u32,
+    pub channels_max: u32,
+    /// Ascending by rate; only rates with at least one usable format.
+    pub rates: Vec<RateCapability>,
+    /// Unfiltered rate range the device accepts (any channel count or
+    /// format, also rates the engine never runs at). Equal for a fixed-rate
+    /// device; 0 when unknown.
+    #[serde(default)]
+    pub rate_min: u32,
+    #[serde(default)]
+    pub rate_max: u32,
+    /// Engine formats the device accepts at all (any channel count or rate).
+    #[serde(default)]
+    pub formats: Vec<SampleFormat>,
+}
+
+impl DeviceCapabilities {
+    /// Rates with at least one supported format, ascending.
+    pub fn supported_rates(&self) -> Vec<u32> {
+        self.rates.iter().map(|r| r.rate).collect()
+    }
+
+    /// Formats supported at `rate` (empty when the rate is not supported).
+    pub fn formats_at(&self, rate: u32) -> Vec<SampleFormat> {
+        self.rates
+            .iter()
+            .find(|r| r.rate == rate)
+            .map(|r| r.formats.iter().map(|f| f.format).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn supports(&self, rate: u32, format: SampleFormat) -> bool {
+        self.rates
+            .iter()
+            .any(|r| r.rate == rate && r.formats.iter().any(|f| f.format == format))
+    }
+
+    pub fn supports_rate(&self, rate: u32) -> bool {
+        self.rates
+            .iter()
+            .any(|r| r.rate == rate && !r.formats.is_empty())
+    }
+
+    /// Every format supported at some rate, in `S16, S24, S24_3, S32` order.
+    pub fn all_formats(&self) -> Vec<SampleFormat> {
+        [
+            SampleFormat::S16,
+            SampleFormat::S24,
+            SampleFormat::S24_3,
+            SampleFormat::S32,
+        ]
+        .into_iter()
+        .filter(|f| {
+            self.rates
+                .iter()
+                .any(|r| r.formats.iter().any(|c| c.format == *f))
+        })
+        .collect()
+    }
+
+    /// Whether the device takes the probed channel count at all.
+    pub fn channels_ok(&self) -> bool {
+        (self.channels_min..=self.channels_max).contains(&self.channels)
+    }
+
+    /// The device's own rate range, e.g. `32000 Hz` or `8000-96000 Hz`
+    /// (`None` when unknown).
+    pub fn native_rate_range(&self) -> Option<String> {
+        match (self.rate_min, self.rate_max) {
+            (0, 0) => None,
+            (a, b) if a == b => Some(format!("{a} Hz")),
+            (a, b) => Some(format!("{a}-{b} Hz")),
+        }
+    }
+
+    fn channels_text(&self) -> String {
+        if self.channels_min == self.channels_max {
+            format!("channels {}", self.channels_min)
+        } else {
+            format!("channels {}-{}", self.channels_min, self.channels_max)
+        }
+    }
+
+    /// What the device accepts regardless of the engine's channel count and
+    /// rate list, e.g. `rate 32000 Hz; formats S16; channels 2`.
+    pub fn native_summary(&self) -> String {
+        let rates = match (self.rate_min, self.rate_max) {
+            (0, 0) => "unknown rates".to_string(),
+            (a, b) if a == b => format!("rate {a} Hz"),
+            (a, b) => format!("rates {a}-{b} Hz"),
+        };
+        let formats: Vec<&str> = self.formats.iter().map(|f| f.name()).collect();
+        let formats = if formats.is_empty() {
+            "none of S16/S24/S24_3/S32".to_string()
+        } else {
+            formats.join(", ")
+        };
+        format!("{rates}; formats {formats}; {}", self.channels_text())
+    }
+
+    /// One-line summary for error messages, e.g.
+    /// `rates 48000 Hz; formats S16; channels 2`: the usable (rate, format)
+    /// pairs, or what the device accepts at all when none is usable.
+    pub fn summary(&self) -> String {
+        let rates = self.supported_rates();
+        let formats = self.all_formats();
+        if rates.is_empty() || formats.is_empty() {
+            return self.native_summary();
+        }
+        let list: Vec<String> = rates.iter().map(u32::to_string).collect();
+        let names: Vec<&str> = formats.iter().map(|f| f.name()).collect();
+        format!(
+            "rates {} Hz; formats {}; {}",
+            list.join(", "),
+            names.join(", "),
+            self.channels_text()
+        )
+    }
+
+    /// Why a device with no usable (rate, format) pair cannot be used:
+    /// wrong channel count, only rates outside the engine's list, or no
+    /// format the engine can write. `None` when something is usable.
+    pub fn unusable_reason(&self) -> Option<String> {
+        if !self.rates.is_empty() {
+            return None;
+        }
+        let supports = self.native_summary();
+        let device = &self.device;
+        if !self.channels_ok() {
+            let has = if self.channels_min == self.channels_max {
+                self.channels_min.to_string()
+            } else {
+                format!("{}-{}", self.channels_min, self.channels_max)
+            };
+            return Some(format!(
+                "device '{device}' needs {} channels; device supports {has} (engine: channels {}; device: {supports})",
+                self.channels, self.channels
+            ));
+        }
+        if self.formats.is_empty() {
+            return Some(format!(
+                "device '{device}' takes none of the engine's sample formats S16/S24/S24_3/S32 (device supports {supports})"
+            ));
+        }
+        Some(match self.native_rate_range() {
+            Some(range) => format!(
+                "device '{device}' supports {range} only, which the engine doesn't run at (device supports {supports})"
+            ),
+            None => format!(
+                "device '{device}' supports none of the engine's sample rates (device supports {supports})"
+            ),
+        })
+    }
 }
 
 /// "Is what reaches the DAC bit-identical to the source?"
@@ -970,6 +1189,12 @@ mod tests {
                 name: "Bass".into(),
                 modified: true,
             }),
+            device_caps: None,
+            effective_rates: Vec::new(),
+            direct_rates: Vec::new(),
+            effective_default_rate: None,
+            dither_bits: None,
+            normal_output: None,
         };
         let value = serde_json::to_value(&status).unwrap();
         assert_eq!(value["preset"]["name"], "Bass");
@@ -1213,5 +1438,34 @@ mod tests {
             serde_json::from_value::<UpsamplerResponse>(value).unwrap(),
             response
         );
+    }
+
+    #[test]
+    fn device_capabilities_helpers() {
+        let caps = DeviceCapabilities {
+            device: "hw:CARD=V3,DEV=0".into(),
+            channels: 2,
+            channels_min: 2,
+            channels_max: 2,
+            rate_min: 48_000,
+            rate_max: 48_000,
+            formats: vec![SampleFormat::S16],
+            rates: vec![RateCapability {
+                rate: 48_000,
+                formats: vec![FormatCapability {
+                    format: SampleFormat::S16,
+                    sbits: Some(16),
+                }],
+            }],
+        };
+        assert_eq!(caps.supported_rates(), vec![48_000]);
+        assert!(caps.supports(48_000, SampleFormat::S16));
+        assert!(!caps.supports(48_000, SampleFormat::S32));
+        assert!(!caps.supports_rate(44_100));
+        assert_eq!(caps.all_formats(), vec![SampleFormat::S16]);
+        assert_eq!(caps.summary(), "rates 48000 Hz; formats S16; channels 2");
+        let back: DeviceCapabilities =
+            serde_json::from_value(serde_json::to_value(&caps).unwrap()).unwrap();
+        assert_eq!(back, caps);
     }
 }

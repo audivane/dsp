@@ -37,13 +37,28 @@ impl DesiredDspConfig {
     }
 }
 
+/// What the last ALSA open was asked for: `(sink, graph_rate, requested
+/// ratio)`. The device may have given a smaller ratio (rate not supported);
+/// asking again for the same thing would only reopen into the same result.
+pub type NegotiatedKey = (SinkChoice, u32, u32);
+
+/// The key for opening `sink` at `graph_rate` under `cfg`.
+pub fn negotiated_key(cfg: DesiredDspConfig, sink: SinkChoice, graph_rate: u32) -> NegotiatedKey {
+    (sink, graph_rate, cfg.resolve_ratio_for(sink, graph_rate))
+}
+
 /// Pure decision function called by the RT thread (and control startup) to
 /// decide whether a graph rate change, sink transition, or DSP config update
 /// requires reopening ALSA, returning `Some(required_ratio)` if so.
+///
+/// A config update alone (new generation, e.g. a filter-length change) never
+/// reopens when it asks for the same ratio the last open was asked for: on a
+/// device that fell back to a smaller ratio that would reopen (and gap) on
+/// every edit for nothing.
 #[inline]
 pub fn decide_rt_reopen(
     rt_cfg: DesiredDspConfig,
-    last_negotiated_key: Option<(u64, SinkChoice, u32)>,
+    last_negotiated_key: Option<NegotiatedKey>,
     active_sink: SinkChoice,
     target_sink: SinkChoice,
     active_graph_rate: u32,
@@ -57,7 +72,7 @@ pub fn decide_rt_reopen(
     if target_sink != active_sink && required_ratio != active_ratio {
         return Some(required_ratio);
     }
-    let cur_key = (rt_cfg.generation, target_sink, cur_rate);
+    let cur_key = (target_sink, cur_rate, required_ratio);
     if required_ratio != active_ratio && last_negotiated_key != Some(cur_key) {
         return Some(required_ratio);
     }
@@ -149,6 +164,21 @@ pub trait DeviceBackend {
         quantum: u32,
     ) -> std::result::Result<OpenedDevice<Self::Output>, String>;
     fn close_output(&mut self, out: Self::Output);
+
+    /// Called once the reservation is held, right before `open_and_prepare`.
+    /// The backend may move the graph rate (and its quantum) to one the
+    /// device can play; [`DeviceLifecycle::handoff_and_open`] then opens at
+    /// the returned rate and reports it in [`OpenedDevice::graph_rate`].
+    fn resolve_graph_rate(
+        &mut self,
+        _device: &str,
+        graph_rate: u32,
+        quantum: u32,
+        _target_sink: SinkChoice,
+        _desired_dsp: DesiredDspConfig,
+    ) -> std::result::Result<(u32, u32), String> {
+        Ok((graph_rate, quantum))
+    }
 }
 
 /// Result returned by [`DeviceBackend::open_and_prepare`].
@@ -157,6 +187,12 @@ pub struct OpenedDevice<O> {
     pub output: O,
     pub actual_ratio: u32,
     pub output_rate: u32,
+    /// Graph rate the device was opened for (filled in by
+    /// [`DeviceLifecycle::handoff_and_open`]; may differ from the requested
+    /// one after [`DeviceBackend::resolve_graph_rate`]).
+    pub graph_rate: u32,
+    /// Quantum used for that graph rate.
+    pub quantum: u32,
 }
 
 /// Lifecycle manager enforcing full close-old -> release-old -> reserve-new ->
@@ -279,9 +315,28 @@ impl<B: DeviceBackend> DeviceLifecycle<B> {
             self.release_reservation(backend);
         }
 
+        let (graph_rate, quantum) = match backend.resolve_graph_rate(
+            target_device,
+            graph_rate,
+            quantum,
+            target_sink,
+            desired_dsp,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                self.release_reservation(backend);
+                self.active_device = None;
+                let msg = format!("ALSA open/prepare failed for {target_device}: {e}");
+                self.last_error = Some(msg.clone());
+                self.state = EngineState::Error;
+                return Err(msg);
+            }
+        };
         let desired_ratio = desired_dsp.resolve_ratio_for(target_sink, graph_rate);
         match backend.open_and_prepare(target_device, graph_rate, desired_ratio, quantum) {
-            Ok(opened) => {
+            Ok(mut opened) => {
+                opened.graph_rate = graph_rate;
+                opened.quantum = quantum;
                 self.active_device = Some(target_device.to_string());
                 self.active_graph_rate = graph_rate;
                 self.active_ratio = opened.actual_ratio;
@@ -322,6 +377,8 @@ mod tests {
         fail_reserve_cards: HashSet<u32>,
         fail_open_devices: HashSet<String>,
         max_rate_for_device: Option<u32>,
+        /// Device plays only this graph rate (like a 48k-only USB DAC).
+        only_rate: Option<u32>,
     }
 
     impl MockBackend {
@@ -331,6 +388,7 @@ mod tests {
                 fail_reserve_cards: HashSet::new(),
                 fail_open_devices: HashSet::new(),
                 max_rate_for_device: None,
+                only_rate: None,
             }
         }
     }
@@ -400,12 +458,57 @@ mod tests {
                 output: device.to_string(),
                 actual_ratio: r,
                 output_rate: out_rate,
+                graph_rate,
+                quantum: _quantum,
             })
         }
 
         fn close_output(&mut self, out: Self::Output) {
             self.ops.push(Op::Close(out));
         }
+
+        fn resolve_graph_rate(
+            &mut self,
+            _device: &str,
+            graph_rate: u32,
+            quantum: u32,
+            _target_sink: SinkChoice,
+            _desired_dsp: DesiredDspConfig,
+        ) -> std::result::Result<(u32, u32), String> {
+            Ok(match self.only_rate {
+                Some(r) if r != graph_rate => (r, quantum * r / graph_rate),
+                _ => (graph_rate, quantum),
+            })
+        }
+    }
+
+    #[test]
+    fn resolved_graph_rate_is_opened_and_reported() {
+        let mut backend = MockBackend::new();
+        backend.only_rate = Some(48_000);
+        let mut lc = DeviceLifecycle::new();
+        let dsp = DesiredDspConfig::default();
+        let opened = lc
+            .handoff_and_open(
+                &mut backend,
+                None,
+                "hw:CardA,0",
+                true,
+                10,
+                44_100,
+                882,
+                SinkChoice::Dsp,
+                dsp,
+            )
+            .unwrap();
+        assert_eq!(opened.graph_rate, 48_000);
+        assert_eq!(opened.quantum, 960);
+        assert_eq!(lc.active_graph_rate, 48_000);
+        assert!(
+            backend
+                .ops
+                .contains(&Op::Open("hw:CardA,0".into(), 48_000, 1))
+        );
     }
 
     #[test]
@@ -596,7 +699,7 @@ mod tests {
         assert_eq!(
             decide_rt_reopen(
                 cfg2,
-                Some((1, SinkChoice::Dsp, 48_000)),
+                Some((SinkChoice::Dsp, 48_000, 1)),
                 SinkChoice::Dsp,
                 SinkChoice::Dsp,
                 48_000,
@@ -609,7 +712,7 @@ mod tests {
         assert_eq!(
             decide_rt_reopen(
                 cfg2,
-                Some((2, SinkChoice::Dsp, 48_000)),
+                Some((SinkChoice::Dsp, 48_000, 4)),
                 SinkChoice::Dsp,
                 SinkChoice::Direct,
                 48_000,
@@ -622,7 +725,7 @@ mod tests {
         assert_eq!(
             decide_rt_reopen(
                 cfg2,
-                Some((2, SinkChoice::Direct, 48_000)),
+                Some((SinkChoice::Direct, 48_000, 1)),
                 SinkChoice::Direct,
                 SinkChoice::Dsp,
                 48_000,
@@ -636,7 +739,7 @@ mod tests {
         assert_eq!(
             decide_rt_reopen(
                 cfg2,
-                Some((2, SinkChoice::Dsp, 48_000)),
+                Some((SinkChoice::Dsp, 48_000, 4)),
                 SinkChoice::Dsp,
                 SinkChoice::Dsp,
                 48_000,
@@ -662,7 +765,7 @@ mod tests {
         assert_eq!(
             decide_rt_reopen(
                 max192,
-                Some((3, SinkChoice::Dsp, 48_000)),
+                Some((SinkChoice::Dsp, 48_000, 4)),
                 SinkChoice::Dsp,
                 SinkChoice::Dsp,
                 48_000,
@@ -671,6 +774,41 @@ mod tests {
             ),
             Some(2)
         );
+    }
+
+    #[test]
+    fn config_edit_on_ratio_capped_device_does_not_reopen() {
+        // 48k-only device: x4 wanted, x1 granted. A later config change (new
+        // generation, same target) must not reopen; a new target must.
+        let gen1 = DesiredDspConfig {
+            dsp_enabled: true,
+            rate_target: RateTarget::Ratio(4),
+            max_ratio: 16,
+            generation: 1,
+        };
+        let key = negotiated_key(gen1, SinkChoice::Dsp, 48_000);
+        let gen2 = DesiredDspConfig {
+            generation: 2,
+            ..gen1
+        };
+        let r = |cfg| {
+            decide_rt_reopen(
+                cfg,
+                Some(key),
+                SinkChoice::Dsp,
+                SinkChoice::Dsp,
+                48_000,
+                48_000,
+                1,
+            )
+        };
+        assert_eq!(r(gen2), None);
+        let gen3 = DesiredDspConfig {
+            rate_target: RateTarget::Ratio(2),
+            generation: 3,
+            ..gen1
+        };
+        assert_eq!(r(gen3), Some(2));
     }
 
     #[test]

@@ -119,13 +119,32 @@ and swapped in lock-free.
   impulse responses (cached per rate), upsampler kernels.
 - Mute ramp around each switch, since the DAC needs time to relock.
 - Two streams at different rates: one gets resampled; the UI says which.
+- Only rates the DAC can play are offered. When the engine opens a device it
+  probes which (rate, format) pairs it takes (`crates/io-alsa/src/caps.rs`)
+  and publishes only the allowed rates it can play, directly or upsampled
+  (`crates/io-pw/src/rate_caps.rs`), to PipeWire. A 48 kHz-only USB device
+  therefore runs a 48 kHz graph and PipeWire resamples 44.1 kHz apps into it.
+  When the device cannot take source × the wanted ratio, a smaller ratio is
+  used (down to ×1), never a "nearest" device rate, so the graph rate is
+  always the device rate divided by the ratio.
+- Audivane Direct never upsamples, so it only runs the graph at rates the
+  DAC plays natively (`Status.direct_rates`). A Direct stream at a rate the
+  DAC only takes upsampled moves the graph to a native rate and is resampled
+  by PipeWire (reported as not bit-perfect); with no native rate at all,
+  Direct reports an error and the DSP path keeps working.
+- The DAC period is the quantum PipeWire actually runs at the graph rate
+  (power-of-two rounding included), so one graph cycle feeds one period.
+  When PipeWire runs another quantum anyway, the extra cycles are spread out
+  and the sink ring keeps a cushion, so the output is never zero-filled.
+- Dither targets at most the bit depth of the negotiated format (S16 → 16).
 
 Which rate wins is decided by `crates/io-pw/src/rate_arbiter.rs`, a pure
 function of the running clients, the current rate and the time since the
 last switch (unit-tested without PipeWire):
 
 - **Direct first.** Whatever plays into Audivane Direct (bit-perfect) decides,
-  and takes priority over the DSP sink.
+  and takes priority over the DSP sink, mapped onto the native (×1) rates
+  only.
 - **Agreeing clients are followed.** Each client's native rate is mapped to
   an allowed rate; if all running DSP-sink clients map to the same one, the
   graph runs at it.
