@@ -1,0 +1,36 @@
+   Compiling scientific-review v0.0.0 (<repo>/docs/research/scientific-review)
+    Finished `release` profile [optimized] target(s) in 0.47s
+     Running `docs/research/scientific-review/target/release/scientific-review small`
+MINPHASE new winding_full=-6.00000 maxstep=2.50098 Jensen_log_excess=6.668047453e-5 h0=2.856081239e-4 nyquist=-101.2943
+COMPARE N=16384 beta=8 r=16 cut=0.994014154 new pb_diff_db=5.845467e-3 transition_abs=1.597201e-3 all_abs=1.597201e-3 stop_lin=-82.9770 stop_min=-81.7707 ny_lin=-82.9770 ny_min=-81.7707 sb_diff_max_db=145.32@0.27265167 E50=51 E99=1274 gd_dc=37.72511 gd_pb=[37.7106,1945.2680] l1=5.7851
+cep floor=180.0000 pad=4 tail_energy=-24.17dB tail_l1=7.887e-1
+MINPHASE old winding_full=-5441.00000 maxstep=3.14158 Jensen_log_excess=1.460023077e-1 h0=1.007443872e-6 nyquist=-163.0019
+COMPARE N=16384 beta=8 r=16 cut=0.994014154 old pb_diff_db=2.326393e-1 transition_abs=2.966710e-2 all_abs=2.966710e-2 stop_lin=-82.9770 stop_min=-81.3192 ny_lin=-82.9770 ny_min=-81.3192 sb_diff_max_db=81.00@0.27265167 E50=65 E99=1304 gd_dc=50.30948 gd_pb=[50.2949,2027.4076] l1=5.9029
+cep floor=101.2953 pad=16 tail_energy=-74.89dB tail_l1=3.324e-3
+MINPHASE new_pad16 winding_full=0.00000 maxstep=2.29785 Jensen_log_excess=-3.970697103e-6 h0=2.855755564e-4 nyquist=-101.2946
+COMPARE N=16384 beta=8 r=16 cut=0.994014154 new_pad16 pb_diff_db=6.263213e-6 transition_abs=4.246074e-6 all_abs=8.653795e-6 stop_lin=-82.9770 stop_min=-82.9288 ny_lin=-82.9770 ny_min=-82.9288 sb_diff_max_db=145.32@0.27265167 E50=51 E99=1275 gd_dc=37.72501 gd_pb=[37.7105,1942.5519] l1=5.7848
+cep floor=101.2953 pad=64 tail_energy=-91.40dB tail_l1=5.427e-4
+MINPHASE new_pad64 winding_full=0.00000 maxstep=2.69000 Jensen_log_excess=-1.653849321e-6 h0=2.855745463e-4 nyquist=-101.2946
+COMPARE N=16384 beta=8 r=16 cut=0.994014154 new_pad64 pb_diff_db=7.824949e-7 transition_abs=1.457900e-6 all_abs=8.653151e-6 stop_lin=-82.9770 stop_min=-82.9744 ny_lin=-82.9770 ny_min=-82.9744 sb_diff_max_db=145.32@0.27265167 E50=51 E99=1279 gd_dc=37.72520 gd_pb=[37.7107,1943.3018] l1=5.7855
+MINPHASE new winding_full=-6.00000 maxstep=2.70806 Jensen_log_excess=4.675276825e-5 h0=7.990934407e-7 nyquist=-155.7457
+COMPARE N=16384 beta=14 r=16 cut=0.989570676 new pb_diff_db=2.020876e-3 transition_abs=4.568837e-4 all_abs=4.568837e-4 stop_lin=-136.9062 stop_min=-135.7600 ny_lin=-136.9062 ny_min=-135.7600 sb_diff_max_db=122.66@0.49975586 E50=75 E99=1663 gd_dc=58.07489 gd_pb=[58.0749,1732.8458] l1=6.4263
+cep floor=180.0000 pad=4 tail_energy=-28.43dB tail_l1=4.320e-1
+MINPHASE old winding_full=-56.00000 maxstep=3.11091 Jensen_log_excess=5.310823140e-4 h0=6.216747094e-8 nyquist=-179.8518
+COMPARE N=16384 beta=14 r=16 cut=0.989570676 old pb_diff_db=4.254424e-2 transition_abs=5.471676e-3 all_abs=5.471676e-3 stop_lin=-136.9062 stop_min=-134.0626 ny_lin=-136.9062 ny_min=-134.0626 sb_diff_max_db=98.55@0.49975586 E50=83 E99=1695 gd_dc=65.17298 gd_pb=[65.1730,1778.0956] l1=6.5106
+cep floor=155.7417 pad=16 tail_energy=-61.81dB tail_l1=1.423e-2
+MINPHASE new_pad16 winding_full=0.00000 maxstep=2.62820 Jensen_log_excess=-3.071085196e-5 h0=7.993257278e-7 nyquist=-155.7415
+COMPARE N=16384 beta=14 r=16 cut=0.989570676 new_pad16 pb_diff_db=7.668288e-5 transition_abs=2.264816e-5 all_abs=2.264816e-5 stop_lin=-136.9062 stop_min=-136.9301 ny_lin=-136.9062 ny_min=-136.9301 sb_diff_max_db=122.66@0.49975586 E50=75 E99=1663 gd_dc=58.07416 gd_pb=[58.0742,1733.2719] l1=6.4278
+cep floor=155.7417 pad=64 tail_energy=-86.74dB tail_l1=8.265e-4
+MINPHASE new_pad64 winding_full=-0.00000 maxstep=2.74970 Jensen_log_excess=-1.934733601e-5 h0=7.993171953e-7 nyquist=-155.7414
+COMPARE N=16384 beta=14 r=16 cut=0.989570676 new_pad64 pb_diff_db=2.450747e-7 transition_abs=8.884744e-8 all_abs=8.884744e-8 stop_lin=-136.9062 stop_min=-136.8691 ny_lin=-136.9062 ny_min=-136.8691 sb_diff_max_db=122.66@0.49975586 E50=75 E99=1663 gd_dc=58.07439 gd_pb=[58.0744,1733.4787] l1=6.4281
+MINPHASE new winding_full=-14.00000 maxstep=2.94607 Jensen_log_excess=3.132844900e-4 h0=2.236665523e-9 nyquist=-210.1957
+COMPARE N=16384 beta=20 r=16 cut=0.985127198 new pb_diff_db=1.275406e-3 transition_abs=5.194191e-4 all_abs=5.194191e-4 stop_lin=-190.9345 stop_min=-190.1963 ny_lin=-190.9345 ny_min=-190.1963 sb_diff_max_db=69.80@0.35968018 E50=100 E99=1945 gd_dc=78.47201 gd_pb=[78.4720,1648.0505] l1=6.9009
+cep floor=180.0000 pad=4 tail_energy=-55.52dB tail_l1=2.754e-2
+MINPHASE old winding_full=0.00000 maxstep=2.59136 Jensen_log_excess=-4.998292859e-6 h0=5.796427592e-8 nyquist=-180.0005
+COMPARE N=16384 beta=20 r=16 cut=0.985127198 old pb_diff_db=2.291021e-4 transition_abs=7.365214e-5 all_abs=7.365214e-5 stop_lin=-190.9345 stop_min=-178.9019 ny_lin=-190.9345 ny_min=-178.9019 sb_diff_max_db=100.00@0.35968018 E50=87 E99=1760 gd_dc=67.39211 gd_pb=[67.3921,1484.9423] l1=6.5751
+cep floor=210.1882 pad=16 tail_energy=-79.14dB tail_l1=1.921e-3
+MINPHASE new_pad16 winding_full=0.00000 maxstep=2.82314 Jensen_log_excess=1.819232022e-5 h0=2.236080006e-9 nyquist=-210.1881
+COMPARE N=16384 beta=20 r=16 cut=0.985127198 new_pad16 pb_diff_db=9.708764e-7 transition_abs=5.893040e-7 all_abs=5.893040e-7 stop_lin=-190.9345 stop_min=-190.8546 ny_lin=-190.9345 ny_min=-190.8546 sb_diff_max_db=69.81@0.35968018 E50=100 E99=1945 gd_dc=78.46789 gd_pb=[78.4679,1646.6364] l1=6.8993
+cep floor=210.1882 pad=64 tail_energy=-79.69dB tail_l1=1.755e-3
+MINPHASE new_pad64 winding_full=-0.00000 maxstep=2.73428 Jensen_log_excess=1.932023385e-5 h0=2.236072780e-9 nyquist=-210.1883
+COMPARE N=16384 beta=20 r=16 cut=0.985127198 new_pad64 pb_diff_db=8.934345e-7 transition_abs=2.803330e-7 all_abs=2.803330e-7 stop_lin=-190.9345 stop_min=-190.8909 ny_lin=-190.9345 ny_min=-190.8909 sb_diff_max_db=69.81@0.35968018 E50=100 E99=1945 gd_dc=78.46820 gd_pb=[78.4682,1646.8603] l1=6.8997

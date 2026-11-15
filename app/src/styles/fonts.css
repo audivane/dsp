@@ -1,0 +1,9 @@
+/* Audivane Sans Latin and Audivane Mono Latin: Latin subsets of IBM Plex Sans
+   and Mono, renamed for the Reserved Font Name "Plex" (SIL Open Font License
+   1.1, see src/assets/fonts/OFL.txt and docs/font-licensing.md). Other glyphs
+   fall back. */
+@font-face { font-family: "Audivane Sans Latin"; font-style: normal; font-weight: 400; font-display: swap; src: url("../assets/fonts/ibm-plex-sans-latin-400-normal.woff2") format("woff2"); }
+@font-face { font-family: "Audivane Sans Latin"; font-style: normal; font-weight: 500; font-display: swap; src: url("../assets/fonts/ibm-plex-sans-latin-500-normal.woff2") format("woff2"); }
+@font-face { font-family: "Audivane Sans Latin"; font-style: normal; font-weight: 600; font-display: swap; src: url("../assets/fonts/ibm-plex-sans-latin-600-normal.woff2") format("woff2"); }
+@font-face { font-family: "Audivane Mono Latin"; font-style: normal; font-weight: 400; font-display: swap; src: url("../assets/fonts/ibm-plex-mono-latin-400-normal.woff2") format("woff2"); }
+@font-face { font-family: "Audivane Mono Latin"; font-style: normal; font-weight: 500; font-display: swap; src: url("../assets/fonts/ibm-plex-mono-latin-500-normal.woff2") format("woff2"); }

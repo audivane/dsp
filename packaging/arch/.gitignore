@@ -1,0 +1,5 @@
+# Build output (see README.md): source tarball, makepkg trees and packages.
+*.tar.zst
+*.pkg.tar.zst
+src/
+pkg/

@@ -1,0 +1,5 @@
+CASE N=36 r=2 b=20.00000000000000000 cut=1.00000000000000000 tlin=0.000 tmin=0.001 L=1024 exact=true reflected=15 step=0 tail=0.0000000000000009169577247550453 floored=0
+  method=Roots check=Some(Check { passband_db: 3.857309866213149e-15, upper_db: 1.3251980910969675e-10, stopband_error_db: -312.2294972024891, max_zero_radius: Some(1.0000000010677887), max_zero_excess: Some(7.877175768971295e-5) })
+above-Nyquist grid peaks linear=-6.020599912 minimum=-6.020599912
+grid L=1024 passband=6.750293124e-15 at=0.07812500000000000 upper=1.180637810e-10 stop_error=-312.891397 bound=-215.188203 envelope=-inf
+edge direct passband=1.598721155e-14 upper=1.290402452e-9; long-double witness f=0.19612630208333334 lin=-0.834356720554 min=-0.834356720554 delta=-3.857309866e-15

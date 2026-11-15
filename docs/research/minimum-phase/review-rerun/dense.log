@@ -1,0 +1,7 @@
+$ <tmp>/review-target/release/scientific-review dense
+DENSE N=16384 beta=8 ratio=16 lin worst=-82.703049 at_offset_widths=0.036132812 target=-81.295281
+DENSE N=16384 beta=8 ratio=16 min worst=-82.703049 at_offset_widths=0.036132812 target=-81.295281
+DENSE N=16384 beta=14 ratio=16 lin worst=-136.764105 at_offset_widths=0.003906250 target=-135.741742
+DENSE N=16384 beta=14 ratio=16 min worst=-136.764105 at_offset_widths=0.003906250 target=-135.741742
+DENSE N=16384 beta=20 ratio=16 lin worst=-190.842378 at_offset_widths=0.026367188 target=-190.188203
+DENSE N=16384 beta=20 ratio=16 min worst=-190.842692 at_offset_widths=0.026367188 target=-190.188203

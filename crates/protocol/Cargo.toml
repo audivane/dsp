@@ -1,0 +1,18 @@
+[package]
+name = "audivane-protocol"
+description = "Config and IPC types shared by the Audivane DSP engine, CLI and UI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ts-rs = { version = "12", optional = true, features = ["serde-json-impl", "no-serde-warnings"] }
+
+[features]
+# TypeScript bindings for the desktop UI (`app/`). Generate with
+# `npm run gen:types` in `app/`, which runs the ts-rs export tests.
+ts = ["dep:ts-rs"]

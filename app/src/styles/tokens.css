@@ -1,0 +1,62 @@
+/* Skins: Midnight (default dark), Graphite, Light. "System" resolves to
+   Midnight or Light at runtime (src/theme.ts). Same blue accent everywhere.
+   Light is warm paper, shared with the website and the ABX app. */
+:root {
+  --bg: #f5f3ee; --panel: #fffdf9; --panel-2: #f0ece4; --raised: #fffdf9;
+  --line: #e3ddd1; --line-strong: #cbc2b2;
+  --fg: #1d1b16; --muted: #5f5a50; --faint: #8a8478;
+  --accent: #2563eb; --accent-soft: rgba(37, 99, 235, .12); --accent-fg: #ffffff;
+  --graph-bg: #fbf9f5; --grid: rgba(29, 27, 22, .07); --grid-strong: rgba(29, 27, 22, .22);
+  --spec-fill: rgba(29, 27, 22, .08); --spec-stroke: rgba(29, 27, 22, .26); --spec-pre: rgba(95, 90, 80, .42); --spec-peak: rgba(29, 27, 22, .42);
+  --ch-l: #2563eb; --ch-r: #d9622b;
+  --ok: #17915a; --ok-soft: rgba(23, 145, 90, .12);
+  --warn: #b7791f; --warn-soft: rgba(183, 121, 31, .14);
+  --bad: #d13438; --bad-soft: rgba(209, 52, 56, .12);
+  --shadow: 0 10px 30px rgba(40, 30, 15, .1);
+  --handle-ink: #0b1020;
+  --font: "Audivane Sans Latin", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "Audivane Mono Latin", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  color-scheme: light;
+}
+:root[data-skin="midnight"] {
+  --bg: #0b1020; --panel: #10172a; --panel-2: #151e35; --raised: #1a2440;
+  --line: #222d4a; --line-strong: #33415f;
+  --fg: #dce4f5; --muted: #8b98b8; --faint: #5f6c8c;
+  --accent: #4d8dff; --accent-soft: rgba(77, 141, 255, .16); --accent-fg: #ffffff;
+  --graph-bg: #0d1426; --grid: rgba(160, 180, 230, .06); --grid-strong: rgba(160, 180, 230, .22);
+  --spec-fill: rgba(160, 180, 210, .14); --spec-stroke: rgba(180, 198, 230, .38); --spec-pre: rgba(139, 152, 184, .52); --spec-peak: rgba(200, 214, 240, .48);
+  --ch-l: #4d8dff; --ch-r: #f08a4b;
+  --ok: #3ccf8e; --ok-soft: rgba(60, 207, 142, .14);
+  --warn: #f0b24a; --warn-soft: rgba(240, 178, 74, .15);
+  --bad: #ff5c62; --bad-soft: rgba(255, 92, 98, .14);
+  --shadow: 0 14px 40px rgba(0, 0, 0, .45);
+  color-scheme: dark;
+}
+:root[data-skin="graphite"] {
+  --bg: #1e1f22; --panel: #2b2d31; --panel-2: #313338; --raised: #383a40;
+  --line: #3a3c42; --line-strong: #4e5058;
+  --fg: #dbdee1; --muted: #9a9fa8; --faint: #6d717b;
+  --accent: #5b8def; --accent-soft: rgba(91, 141, 239, .17); --accent-fg: #ffffff;
+  --graph-bg: #232428; --grid: rgba(255, 255, 255, .05); --grid-strong: rgba(255, 255, 255, .2);
+  --spec-fill: rgba(210, 214, 222, .13); --spec-stroke: rgba(215, 218, 224, .36); --spec-pre: rgba(154, 159, 168, .50); --spec-peak: rgba(225, 228, 234, .46);
+  --ch-l: #5b8def; --ch-r: #ef8f55;
+  --ok: #43c47f; --ok-soft: rgba(67, 196, 127, .15);
+  --warn: #efb34f; --warn-soft: rgba(239, 179, 79, .15);
+  --bad: #f2555a; --bad-soft: rgba(242, 85, 90, .15);
+  --shadow: 0 14px 40px rgba(0, 0, 0, .5);
+  color-scheme: dark;
+}
+:root[data-skin="light"] {
+  --bg: #f5f3ee; --panel: #fffdf9; --panel-2: #f0ece4; --raised: #fffdf9;
+  --line: #e3ddd1; --line-strong: #cbc2b2;
+  --fg: #1d1b16; --muted: #5f5a50; --faint: #8a8478;
+  --accent: #2563eb; --accent-soft: rgba(37, 99, 235, .12); --accent-fg: #ffffff;
+  --graph-bg: #fbf9f5; --grid: rgba(29, 27, 22, .07); --grid-strong: rgba(29, 27, 22, .22);
+  --spec-fill: rgba(29, 27, 22, .08); --spec-stroke: rgba(29, 27, 22, .26); --spec-pre: rgba(95, 90, 80, .42); --spec-peak: rgba(29, 27, 22, .42);
+  --ch-l: #2563eb; --ch-r: #d9622b;
+  --ok: #17915a; --ok-soft: rgba(23, 145, 90, .12);
+  --warn: #b7791f; --warn-soft: rgba(183, 121, 31, .14);
+  --bad: #d13438; --bad-soft: rgba(209, 52, 56, .12);
+  --shadow: 0 10px 30px rgba(40, 30, 15, .1);
+  color-scheme: light;
+}

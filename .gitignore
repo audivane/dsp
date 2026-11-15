@@ -1,0 +1,16 @@
+/target
+*.wav
+!/tests/fixtures/*.wav
+__pycache__/
+/dist/
+node_modules/
+test-results/
+playwright-report/
+*.tsbuildinfo
+.DS_Store
+AGENTS.md
+HANDOVER*.md
+.env
+.env.*
+*.pem
+*.key

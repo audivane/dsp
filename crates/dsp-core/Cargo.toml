@@ -1,0 +1,17 @@
+[package]
+name = "audivane-dsp-core"
+description = "Pure f64 DSP for Audivane DSP: EQ, convolution, upsampling, dither, loudness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# No I/O, no threads, no allocation on the audio path. Everything here must be
+# testable offline.
+[dependencies]
+audivane-protocol.workspace = true
+rustfft.workspace = true
+realfft.workspace = true
+
+[dev-dependencies]

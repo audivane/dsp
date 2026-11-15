@@ -1,0 +1,6 @@
+DENSE N=32767 beta=8 ratio=16 lin worst=-82.716215 at_offset_widths=0.033984375 target=-81.295281
+DENSE N=32767 beta=8 ratio=16 min worst=-75.690373 at_offset_widths=0.046289062 target=-81.295281
+DENSE N=32767 beta=14 ratio=16 lin worst=-136.740700 at_offset_widths=0.003613281 target=-135.741742
+DENSE N=32767 beta=14 ratio=16 min worst=-130.213695 at_offset_widths=0.003613281 target=-135.741742
+DENSE N=32767 beta=20 ratio=16 lin worst=-190.859384 at_offset_widths=0.037890625 target=-190.188203
+DENSE N=32767 beta=20 ratio=16 min worst=-179.671383 at_offset_widths=0.001953125 target=-190.188203

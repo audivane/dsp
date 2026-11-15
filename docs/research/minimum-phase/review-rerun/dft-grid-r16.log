@@ -1,0 +1,15 @@
+$ REVIEW_DFT_GRID=1 <tmp>/review-target/release/scientific-review dft 4194304 20 16
+DFT c=0.00000000000000000 true_db=-0.0000 old_db=-0.0000 new_db=-0.0000 old_err=-285.47 new_err=-285.47
+DFT c=0.00781204234482789 true_db=-0.0000 old_db=-0.0000 new_db=-0.0000 old_err=-231.65 new_err=-302.83
+DFT c=0.02187371856551808 true_db=-0.0000 old_db=-0.0000 new_db=-0.0000 old_err=-219.23 new_err=-291.12
+DFT c=0.03124514368405807 true_db=0.0000 old_db=0.0000 new_db=0.0000 old_err=-224.49 new_err=-289.60
+DFT c=0.03124816937931155 true_db=-6.0206 old_db=-6.0206 new_db=-6.0206 old_err=-214.57 new_err=-288.18
+DFT c=0.03125119507456502 true_db=-194.7769 old_db=-195.1768 new_db=-194.7769 old_err=-221.47 new_err=-304.79
+DFT c=0.03125422076981850 true_db=-214.4659 old_db=-210.5234 new_db=-214.4659 old_err=-219.16 new_err=-305.65
+DFT c=0.03125724646507198 true_db=-223.8737 old_db=-214.2931 new_db=-223.8736 old_err=-211.91 new_err=-306.89
+DFT c=0.03126027216032545 true_db=-214.1929 old_db=-212.3573 new_db=-214.1928 old_err=-207.46 new_err=-312.38
+DFT c=0.12345678900000000 true_db=-282.9053 old_db=-235.6179 new_db=-283.5367 old_err=-235.58 new_err=-304.79
+DFT c=0.25345678900000002 true_db=-293.9696 old_db=-216.5405 new_db=-289.0491 old_err=-216.54 new_err=-289.78
+DFT c=0.45345678900000003 true_db=-290.0738 old_db=-236.6293 new_db=-289.2000 old_err=-236.65 new_err=-301.10
+DFT c=0.50000000000000000 true_db=-415.6994 old_db=-323.4911 new_db=-323.4911 old_err=-323.49 new_err=-323.49
+DFT_WORST N=4194304 beta=20 old_err=-206.91 new_err=-278.42 stop_new_err=-278.42 api_mag_err=-279.59

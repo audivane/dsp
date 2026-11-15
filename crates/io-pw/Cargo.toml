@@ -1,0 +1,24 @@
+[package]
+name = "audivane-io-pw"
+description = "PipeWire sinks, driver node and stream routing for Audivane DSP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+audivane-io-alsa.workspace = true
+audivane-protocol.workspace = true
+libc = "0.2"
+log.workspace = true
+pipewire = { version = "0.10", features = ["v1_0_0"] }
+rtrb = "0.4"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+clap.workspace = true
+env_logger.workspace = true

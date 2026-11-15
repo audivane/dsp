@@ -1,0 +1,16 @@
+[package]
+name = "minimum-phase-research"
+version = "0.0.0"
+edition = "2024"
+
+# Standalone: not part of the workspace.
+[workspace]
+
+[dependencies]
+audivane-dsp-core = { path = "../../../crates/dsp-core" }
+audivane-protocol = { path = "../../../crates/protocol" }
+realfft = "3"
+rustfft = "6"
+
+[profile.release]
+opt-level = 3

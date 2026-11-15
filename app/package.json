@@ -1,0 +1,37 @@
+{
+  "name": "audivane-dsp-ui",
+  "version": "0.9.0",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "gen:types": "node scripts/gen-types.mjs",
+    "gen:eq-fixture": "cargo run -q --manifest-path ../Cargo.toml -p audivane-dsp-ui --example eq_fixture > src/lib/__fixtures__/dsp-core-response.json",
+    "gen:targets": "node scripts/gen-targets.mjs",
+    "screenshots": "node scripts/screenshots.mjs",
+    "screenshots:showcase": "node scripts/showcase.mjs",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.12.4",
+    "@tauri-apps/plugin-clipboard-manager": "2.5.0",
+    "@tauri-apps/plugin-dialog": "2.8.4",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "@tauri-apps/cli": "2.12.4",
+    "@types/node": "24.19.2",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.3.0",
+    "typescript": "5.9.3",
+    "vite": "8.3.5",
+    "vitest": "5.1.0"
+  }
+}

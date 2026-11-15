@@ -1,0 +1,7 @@
+$ REVIEW_POINTS=256 REVIEW_SPAN=0.1 <tmp>/review-target/release/scientific-review dense 4194304
+DENSE N=4194304 beta=8 ratio=16 lin worst=-82.731688 at_offset_widths=0.039062500 target=-81.295281
+DENSE N=4194304 beta=8 ratio=16 min worst=-82.731688 at_offset_widths=0.039062500 target=-81.295281
+DENSE N=4194304 beta=14 ratio=16 lin worst=-136.727972 at_offset_widths=0.008593750 target=-135.741742
+DENSE N=4194304 beta=14 ratio=16 min worst=-136.727678 at_offset_widths=0.008593750 target=-135.741742
+DENSE N=4194304 beta=20 ratio=16 lin worst=-190.834074 at_offset_widths=0.032812500 target=-190.188203
+DENSE N=4194304 beta=20 ratio=16 min worst=-190.870250 at_offset_widths=0.033203125 target=-190.188203

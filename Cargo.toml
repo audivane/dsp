@@ -1,0 +1,70 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "app/src-tauri"]
+# `cargo build` / `cargo test` without `-p` stay on the engine crates. The UI
+# crate (`app/src-tauri`) is still a member, so `--workspace` includes it, but
+# its Tauri/WebKitGTK half sits behind the non-default `gui` feature: without
+# it only the pure daemon client and EQ maths are built and tested.
+default-members = [
+    "crates/cli",
+    "crates/daemon",
+    "crates/dsp-core",
+    "crates/io-alsa",
+    "crates/io-pw",
+    "crates/protocol",
+]
+
+[workspace.package]
+version = "0.9.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+authors = ["Triet"]
+publish = false
+
+[workspace.dependencies]
+audivane-dsp-core = { path = "crates/dsp-core" }
+audivane-protocol = { path = "crates/protocol" }
+audivane-io-pw = { path = "crates/io-pw" }
+audivane-io-alsa = { path = "crates/io-alsa" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rustfft = "6"
+realfft = "3"
+hound = "3"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+
+# DSP must be optimized even in dev/test builds: unoptimized numeric loops are
+# far too slow for real-time audio and make tests crawl.
+[profile.dev.package.audivane-dsp-core]
+opt-level = 3
+debug-assertions = true
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"
+
+# The desktop app: thin LTO and parallel codegen. Fat LTO with one codegen
+# unit (the release profile, kept for the audio engine) serialises the whole
+# Tauri/WebKit dependency graph onto one core for no runtime benefit in a GUI.
+[profile.release-ui]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+
+# Fast optimized build for local benchmarking / real-time spikes.
+[profile.fastrel]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+incremental = true

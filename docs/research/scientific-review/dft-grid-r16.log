@@ -1,0 +1,14 @@
+DFT c=0.00000000000000000 true_db=0.0000 old_db=0.0000 new_db=0.0000 old_err=-284.13 new_err=-284.13
+DFT c=0.00781204614571198 true_db=0.0000 old_db=0.0000 new_db=0.0000 old_err=-232.27 new_err=-294.82
+DFT c=0.02187372920799354 true_db=0.0000 old_db=0.0000 new_db=0.0000 old_err=-219.18 new_err=-296.39
+DFT c=0.03124515888759444 true_db=0.0000 old_db=0.0000 new_db=0.0000 old_err=-219.69 new_err=-318.12
+DFT c=0.03124818458284791 true_db=-6.0206 old_db=-6.0206 new_db=-6.0206 old_err=-216.75 new_err=-298.66
+DFT c=0.03125121027810139 true_db=-194.7768 old_db=-194.6319 new_db=-194.7768 old_err=-230.13 new_err=-304.91
+DFT c=0.03125423597335487 true_db=-214.4664 old_db=-216.7709 new_db=-214.4660 old_err=-209.86 new_err=-298.93
+DFT c=0.03125726166860834 true_db=-223.8705 old_db=-214.7168 new_db=-223.8706 old_err=-218.32 new_err=-299.11
+DFT c=0.03126028736386182 true_db=-214.1945 old_db=-219.0116 new_db=-214.1944 old_err=-221.53 new_err=-311.25
+DFT c=0.12345678900000000 true_db=-282.3613 old_db=-235.6208 new_db=-282.8295 old_err=-235.58 new_err=-305.39
+DFT c=0.25345678900000002 true_db=-293.2095 old_db=-216.5405 new_db=-288.7842 old_err=-216.54 new_err=-289.66
+DFT c=0.45345678900000003 true_db=-290.5615 old_db=-236.6303 new_db=-289.5783 old_err=-236.65 new_err=-300.76
+DFT c=0.50000000000000000 true_db=-424.5906 old_db=-324.2560 new_db=-324.2560 old_err=-324.26 new_err=-324.26
+DFT_WORST N=4194304 beta=20 old_err=-207.02 new_err=-277.62 stop_new_err=-277.62 api_mag_err=-277.79

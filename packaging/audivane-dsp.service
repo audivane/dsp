@@ -1,0 +1,57 @@
+[Unit]
+Description=Audivane DSP engine (system-wide audio processing)
+# The engine registers PipeWire driver sinks and reads the session bus
+# (MPRIS, ReserveDevice1), so it needs both running.
+After=pipewire.service wireplumber.service dbus.service
+Wants=pipewire.service wireplumber.service
+PartOf=graphical-session.target
+# A user service: start with the session, not before the audio stack exists.
+After=graphical-session-pre.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/audivane-dsp --foreground
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+# The daemon is always in the foreground (no fork); `--foreground` is accepted
+# for symmetry with the shipped default.
+
+# --- Real-time priority ------------------------------------------------------
+# The ALSA output thread asks rtkit (org.freedesktop.RealtimeKit1) for
+# SCHED_FIFO. rtkit raises RLIMIT_RTTIME itself and needs no LimitRTPRIO, so the
+# limits below are only needed on sessions without rtkit (e.g. a bare container
+# or a distro that ships rtkit disabled). Uncomment both in that case.
+#LimitRTPRIO=20
+#LimitRTTIME=infinity
+
+# --- Resource limits ---------------------------------------------------------
+# ALSA mmap buffers plus PipeWire shared memory; the default is usually enough,
+# but 64 MiB of locked memory keeps large-buffer DACs happy.
+LimitMEMLOCK=64M
+
+# --- Hardening ---------------------------------------------------------------
+# Everything here keeps ALSA (/dev/snd), PipeWire (the socket in
+# $XDG_RUNTIME_DIR) and D-Bus working.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# The config file and its atomic temp file live under ~/.config; impulse
+# responses and EQ profiles are only read.
+ReadWritePaths=-%h/.config/audivane-dsp
+# The control socket and the default-sink crash-recovery file live in
+# $XDG_RUNTIME_DIR (`audivane-dsp.sock`, `audivane-dsp/default-sink-restore.json`).
+ReadWritePaths=-%t
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=no
+LockPersonality=yes
+
+[Install]
+WantedBy=default.target

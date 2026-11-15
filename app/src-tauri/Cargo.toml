@@ -1,0 +1,57 @@
+[package]
+name = "audivane-dsp-ui"
+description = "Desktop app (Tauri) for the Audivane DSP engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+default-run = "audivane-dsp-ui"
+
+[lib]
+name = "audivane_dsp_ui"
+path = "src/lib.rs"
+
+# The window, tray and webview need WebKitGTK/GTK, so they are behind `gui`.
+# `npm run tauri build` enables it (tauri.conf.json `build.features`); by hand:
+# `cargo build -p audivane-dsp-ui --features gui`.
+[[bin]]
+name = "audivane-dsp-ui"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[features]
+default = []
+gui = [
+    "dep:tauri",
+    "dep:tauri-build",
+    "dep:tauri-plugin-dialog",
+    "dep:tauri-plugin-single-instance",
+    "dep:tauri-plugin-window-state",
+    "dep:tauri-plugin-clipboard-manager",
+]
+# Production build: serve the embedded `app/dist` instead of `devUrl`.
+# `tauri build` turns on `tauri/custom-protocol` itself; a plain cargo release
+# build (PKGBUILD) needs `--features custom-protocol`, or the window shows
+# "Could not connect to 127.0.0.1".
+custom-protocol = ["gui", "tauri/custom-protocol"]
+
+[dependencies]
+audivane-protocol.workspace = true
+audivane-dsp-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hound.workspace = true
+log.workspace = true
+libc = "0.2"
+zbus = "6"
+tempfile = "3"
+tauri = { version = "2", features = ["tray-icon", "image-png"], optional = true }
+tauri-plugin-dialog = { version = "2", optional = true }
+tauri-plugin-single-instance = { version = "2", optional = true }
+tauri-plugin-window-state = { version = "2", optional = true }
+tauri-plugin-clipboard-manager = { version = "2", optional = true }
+
+[build-dependencies]
+tauri-build = { version = "2", optional = true, features = [] }
+

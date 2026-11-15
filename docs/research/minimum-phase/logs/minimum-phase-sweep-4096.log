@@ -1,0 +1,20 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 33.96s
+     Running unittests src/lib.rs (target/release/build/audivane-dsp-core/ee721a5767455aa7/out/audivane_dsp_core-ee721a5767455aa7)
+
+running 1 test
+test resample::tests::minimum_phase_sweep_to_4096_taps has been running for over 60 seconds
+12285 designs passed; 0 winding counts not trusted (step >= 1.5 rad)
+test resample::tests::minimum_phase_sweep_to_4096_taps ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 130 filtered out; finished in 306.68s
+
+     Running tests/no_alloc.rs (target/release/build/audivane-dsp-core/b9dcf01f0ee5d455/out/no_alloc-b9dcf01f0ee5d455)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+
+real	5m40.694s
+user	31m7.038s
+sys	45m5.013s

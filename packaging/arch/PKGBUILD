@@ -1,0 +1,139 @@
+# Maintainer: Triet <https://github.com/Triet1402>
+# Audivane DSP: bit-perfect system-wide DSP engine (daemon + avdsp CLI +
+# Tauri desktop UI). The source is a local tarball of the git tree; build it
+# first with ./make-source.sh, then `makepkg -si` (see README.md).
+
+pkgname=audivane-dsp
+pkgver=0.9.0
+pkgrel=1
+pkgdesc="Bit-perfect system-wide DSP engine for PipeWire, with CLI and desktop UI"
+arch=(x86_64)
+url="https://github.com/audivane/dsp"
+license=('AGPL-3.0-only')
+depends=(
+  pipewire
+  wireplumber
+  alsa-lib
+  webkit2gtk-4.1
+  gtk3
+  libayatana-appindicator
+  dbus
+  gcc-libs
+  glibc
+)
+makedepends=(rust cargo nodejs npm clang)
+optdepends=('rtkit: real-time scheduling for the audio thread')
+# makepkg's default LTO compiles C helper objects (libspa shims) as GCC LTO
+# bitcode that the Rust link step cannot resolve; Cargo's own LTO still applies.
+options=('!lto')
+install=audivane-dsp.install
+source=("audivane-dsp-${pkgver}.tar.zst")
+sha256sums=('SKIP')
+
+# The tarball (see make-source.sh) unpacks to audivane-dsp-${pkgver}/, the
+# repository root: the cargo workspace (crates/, app/, packaging/, docs/),
+# LICENSE (AGPL-3.0-only) and assets/brand/ (logo SVG and PNG icons).
+
+# All cargo invocations share one target dir at the workspace root and never
+# use a host RUSTC_WRAPPER (sccache on the build box must not leak in).
+_audivane_cargo_env() {
+  unset RUSTC_WRAPPER
+  export CARGO_TARGET_DIR="$PWD/target"
+}
+
+prepare() {
+  cd "$srcdir/$pkgname-$pkgver"
+
+  # Fetch every locked dependency (plus the host target's std/core) now, so
+  # build()/check() stay offline.
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+
+  # The Tauri app (app/) is developed in parallel; it may be absent.
+  if [[ -f app/package.json ]]; then
+    (cd app && npm ci)
+  fi
+}
+
+build() {
+  cd "$srcdir/$pkgname-$pkgver"
+  _audivane_cargo_env
+
+  # Cargo package names differ from the installed binaries:
+  #   audivane-dsp-daemon -> /usr/bin/audivane-dsp
+  #   audivane-dsp-cli    -> /usr/bin/avdsp
+  cargo build --release --locked -p audivane-dsp-daemon -p audivane-dsp-cli
+
+  # Tauri UI: app/src-tauri is a workspace member producing audivane-dsp-ui.
+  # Build the frontend first (tauri embeds app/dist at compile time), then
+  # the Rust side. Skipped while the app is still being written.
+  if [[ -d app/src-tauri ]]; then
+    (cd app && npm run build)
+    # `custom-protocol` = the `gui` binary serving the embedded app/dist (not devUrl).
+    # Own profile (thin LTO, parallel codegen); see [profile.release-ui].
+    cargo build --profile release-ui --locked -p audivane-dsp-ui --features custom-protocol
+  fi
+}
+
+check() {
+  cd "$srcdir/$pkgname-$pkgver"
+  _audivane_cargo_env
+
+  # Only the wire-protocol crate is unit-tested in a package build; the rest
+  # of the test suite needs audio hardware or long-running engine tests.
+  cargo test --release --locked -p audivane-protocol
+}
+
+package() {
+  cd "$srcdir/$pkgname-$pkgver"
+  local ws="$srcdir/$pkgname-$pkgver"
+  local bin="$ws/target/release"
+
+  # --- binaries ------------------------------------------------------------
+  install -Dm755 "$bin/audivane-dsp" "$pkgdir/usr/bin/audivane-dsp"
+  install -Dm755 "$bin/avdsp" "$pkgdir/usr/bin/avdsp"
+  if [[ -x "$ws/target/release-ui/audivane-dsp-ui" ]]; then
+    install -Dm755 "$ws/target/release-ui/audivane-dsp-ui" "$pkgdir/usr/bin/audivane-dsp-ui"
+  else
+    echo "==> audivane-dsp-ui not built: app/src-tauri is not in this source tree yet." >&2
+  fi
+
+  # --- systemd user unit ---------------------------------------------------
+  # The repo unit already uses ExecStart=/usr/bin/audivane-dsp and %h/%t
+  # specifiers (no build paths), so it installs as-is; the sed only pins the
+  # ExecStart path against future drift in the repo file.
+  install -Dm644 "$ws/packaging/audivane-dsp.service" \
+    "$pkgdir/usr/lib/systemd/user/audivane-dsp.service"
+  sed -i 's#^ExecStart=.*#ExecStart=/usr/bin/audivane-dsp --foreground#' \
+    "$pkgdir/usr/lib/systemd/user/audivane-dsp.service"
+
+  # --- desktop entry and icons ---------------------------------------------
+  # The file name must equal the window's Wayland app ID (the binary name,
+  # audivane-dsp-ui), or KDE/GNOME cannot find the icon and show a generic one.
+  install -Dm644 "$ws/packaging/arch/audivane-dsp-ui.desktop" \
+    "$pkgdir/usr/share/applications/audivane-dsp-ui.desktop"
+
+  install -Dm644 assets/brand/audivane-dsp-icon.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/audivane-dsp.svg"
+  # Pre-rendered PNGs from the brand kit (assets/brand/icons), so the package
+  # needs no librsvg build dependency.
+  local size png
+  for size in 16 24 32 48 64 128 256 512; do
+    png="assets/brand/icons/audivane-${size}.png"
+    if [[ -f "$png" ]]; then
+      install -Dm644 "$png" \
+        "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/audivane-dsp.png"
+    fi
+  done
+
+  # --- license and docs ------------------------------------------------------
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  local lic="$pkgdir/usr/share/licenses/$pkgname"
+  install -Dm644 "$ws/packaging/THIRD_PARTY_LICENSES.txt" "$lic/THIRD_PARTY_LICENSES.txt"
+  install -Dm644 "$ws/app/src/assets/fonts/OFL.txt" "$lic/OFL-IBM-Plex.txt"
+  install -Dm644 "$ws/docs/font-licensing.md" "$lic/font-licensing.md"
+  install -Dm644 "$ws/app/src/assets/targets/SOURCES.md" "$lic/targets-SOURCES.md"
+  install -Dm644 "$ws/app/src/assets/research-targets/SOURCES.md" "$lic/research-targets-SOURCES.md"
+  install -Dm644 "$ws/DEV.md" "$pkgdir/usr/share/doc/$pkgname/DEV.md"
+  install -Dm644 "$ws/docs/control-plane.md" \
+    "$pkgdir/usr/share/doc/$pkgname/control-plane.md"
+}

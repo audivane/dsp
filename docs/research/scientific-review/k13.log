@@ -1,0 +1,8 @@
+    Finished `release` profile [optimized] target(s) in 0.02s
+     Running `docs/research/scientific-review/target/release/scientific-review dense`
+DENSE N=16384 beta=8 ratio=16 lin worst=-83.446989 at_offset_widths=0.000000000 target=-81.295281
+DENSE N=16384 beta=8 ratio=16 min worst=-81.595811 at_offset_widths=0.000000000 target=-81.295281
+DENSE N=16384 beta=14 ratio=16 lin worst=-137.696560 at_offset_widths=0.023437500 target=-135.741742
+DENSE N=16384 beta=14 ratio=16 min worst=-138.987885 at_offset_widths=0.024414062 target=-135.741742
+DENSE N=16384 beta=20 ratio=16 lin worst=-191.578596 at_offset_widths=0.039062500 target=-190.188203
+DENSE N=16384 beta=20 ratio=16 min worst=-190.997060 at_offset_widths=0.000000000 target=-190.188203

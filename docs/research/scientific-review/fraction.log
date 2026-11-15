@@ -1,0 +1,23 @@
+    Finished `release` profile [optimized] target(s) in 0.02s
+     Running `docs/research/scientific-review/target/release/scientific-review fraction 16384`
+COMPARE N=16384 beta=8 r=16 cut=0.950000000 new pb_diff_db=1.011183e-2 transition_abs=3.096435e-3 all_abs=3.096435e-3 stop_lin=-82.7770 stop_min=-78.5451 ny_lin=-100.6775 ny_min=-99.9166 sb_diff_max_db=145.27@0.49993896 E50=53 E99=1324 gd_dc=39.46518 gd_pb=[39.4655,1971.1763] l1=5.7486
+cep floor=180.0000 pad=4 tail_energy=-14.03dB tail_l1=2.015e0
+COMPARE N=16384 beta=8 r=16 cut=0.950000000 old pb_diff_db=1.223898e0 transition_abs=1.406010e-1 all_abs=1.406010e-1 stop_lin=-82.7770 stop_min=-76.4478 ny_lin=-100.6775 ny_min=-103.6436 sb_diff_max_db=96.52@0.49993896 E50=65 E99=1178 gd_dc=50.60667 gd_pb=[50.6078,2054.5288] l1=5.4957
+cep floor=101.2953 pad=16 tail_energy=-57.39dB tail_l1=2.490e-2
+COMPARE N=16384 beta=8 r=16 cut=0.950000000 new_pad16 pb_diff_db=3.551851e-4 transition_abs=1.017034e-4 all_abs=1.017034e-4 stop_lin=-82.7770 stop_min=-82.7162 ny_lin=-100.6775 ny_min=-100.8663 sb_diff_max_db=145.25@0.49993896 E50=53 E99=1316 gd_dc=39.46214 gd_pb=[39.4624,1959.9628] l1=5.7417
+cep floor=101.2953 pad=64 tail_energy=-84.71dB tail_l1=1.082e-3
+COMPARE N=16384 beta=8 r=16 cut=0.950000000 new_pad64 pb_diff_db=1.021873e-6 transition_abs=2.917794e-6 all_abs=8.624556e-6 stop_lin=-82.7770 stop_min=-82.7699 ny_lin=-100.6775 ny_min=-100.8603 sb_diff_max_db=145.25@0.49993896 E50=53 E99=1315 gd_dc=39.46185 gd_pb=[39.4621,1958.9437] l1=5.7408
+COMPARE N=16384 beta=14 r=16 cut=0.950000000 new pb_diff_db=2.545040e-3 transition_abs=5.992418e-4 all_abs=5.992418e-4 stop_lin=-136.7622 stop_min=-135.3319 ny_lin=-150.4276 ny_min=-151.0679 sb_diff_max_db=123.53@0.49951172 E50=78 E99=1701 gd_dc=60.48500 gd_pb=[60.4850,1736.1788] l1=6.3773
+cep floor=180.0000 pad=4 tail_energy=-27.66dB tail_l1=4.795e-1
+COMPARE N=16384 beta=14 r=16 cut=0.950000000 old pb_diff_db=5.537187e-2 transition_abs=7.503257e-3 all_abs=7.503257e-3 stop_lin=-136.7622 stop_min=-134.0902 ny_lin=-150.4276 ny_min=-150.6853 sb_diff_max_db=99.24@0.49951172 E50=87 E99=1729 gd_dc=67.67194 gd_pb=[67.6719,1776.9362] l1=6.4470
+cep floor=155.7417 pad=16 tail_energy=-61.45dB tail_l1=1.471e-2
+COMPARE N=16384 beta=14 r=16 cut=0.950000000 new_pad16 pb_diff_db=8.181393e-5 transition_abs=2.620516e-5 all_abs=2.620516e-5 stop_lin=-136.7622 stop_min=-136.8377 ny_lin=-150.4276 ny_min=-150.8547 sb_diff_max_db=123.53@0.49951172 E50=78 E99=1701 gd_dc=60.48387 gd_pb=[60.4839,1735.8158] l1=6.3780
+cep floor=155.7417 pad=64 tail_energy=-96.84dB tail_l1=2.115e-4
+COMPARE N=16384 beta=14 r=16 cut=0.950000000 new_pad64 pb_diff_db=1.991270e-8 transition_abs=3.082498e-9 all_abs=1.632756e-8 stop_lin=-136.7622 stop_min=-136.7263 ny_lin=-150.4276 ny_min=-150.8554 sb_diff_max_db=123.53@0.49951172 E50=78 E99=1701 gd_dc=60.48388 gd_pb=[60.4839,1735.8439] l1=6.3781
+COMPARE N=16384 beta=20 r=16 cut=0.950000000 new pb_diff_db=1.517443e-3 transition_abs=5.864570e-4 all_abs=5.864570e-4 stop_lin=-190.8985 stop_min=-191.7698 ny_lin=-201.1288 ny_min=-201.5231 sb_diff_max_db=69.81@0.33087158 E50=103 E99=1983 gd_dc=81.35797 gd_pb=[81.3580,1647.2503] l1=6.8510
+cep floor=180.0000 pad=4 tail_energy=-54.72dB tail_l1=2.965e-2
+COMPARE N=16384 beta=20 r=16 cut=0.950000000 old pb_diff_db=2.650684e-4 transition_abs=8.568957e-5 all_abs=8.568957e-5 stop_lin=-190.8985 stop_min=-178.7506 ny_lin=-201.1288 ny_min=-179.9009 sb_diff_max_db=99.99@0.33087158 E50=90 E99=1801 gd_dc=69.87710 gd_pb=[69.8771,1483.7983] l1=6.5280
+cep floor=210.1882 pad=16 tail_energy=-64.68dB tail_l1=9.758e-3
+COMPARE N=16384 beta=20 r=16 cut=0.950000000 new_pad16 pb_diff_db=2.720594e-5 transition_abs=8.977192e-6 all_abs=8.977192e-6 stop_lin=-190.8985 stop_min=-190.7806 ny_lin=-201.1288 ny_min=-201.2848 sb_diff_max_db=69.80@0.33087158 E50=103 E99=1982 gd_dc=81.35359 gd_pb=[81.3536,1645.6098] l1=6.8492
+cep floor=210.1882 pad=64 tail_energy=-78.43dB tail_l1=1.994e-3
+COMPARE N=16384 beta=20 r=16 cut=0.950000000 new_pad64 pb_diff_db=1.148077e-6 transition_abs=3.624806e-7 all_abs=3.624806e-7 stop_lin=-190.8985 stop_min=-190.8560 ny_lin=-201.1288 ny_min=-201.2998 sb_diff_max_db=69.81@0.33087158 E50=103 E99=1982 gd_dc=81.35351 gd_pb=[81.3535,1645.5336] l1=6.8490

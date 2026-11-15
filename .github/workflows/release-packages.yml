@@ -1,0 +1,68 @@
+# Builds the .deb, .rpm and Arch packages on a GitHub ubuntu-24.04 runner
+# (the same glibc 2.39 baseline as the local packaging/release/release.sh)
+# and uploads them as a workflow artifact. Manual only: releases are normally
+# built locally, and this is the fallback when no local machine is at hand.
+# It never creates a GitHub Release; attach the artifact by hand.
+name: Release packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (tag, branch or commit)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  packages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            build-essential pkg-config clang libclang-dev dpkg-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
+            libpipewire-0.3-dev libspa-0.2-dev libasound2-dev libdbus-1-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: release-${{ runner.os }}-
+
+      - name: Compile and stage
+        run: packaging/release/build.sh . target/stage
+
+      - name: Package
+        run: |
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml)
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          packaging/release/package.sh target/stage "dist/release/$version" "$version"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: audivane-dsp-${{ env.VERSION }}-packages
+          path: dist/release/${{ env.VERSION }}/
+          if-no-files-found: error

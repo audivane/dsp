@@ -1,0 +1,18 @@
+   Compiling scientific-review v0.0.0 (<repo>/docs/research/scientific-review)
+    Finished `release` profile [optimized] target(s) in 0.53s
+     Running `docs/research/scientific-review/target/release/scientific-review measure 4194304 20`
+MEASURE reported_stopband_start=24000.000000000 reported_stopband_atten=192.007585172
+CROSSING target=-0.0001 hz=23992.636279087 direct_kernel_db=-0.000100000
+CROSSING target=-0.001 hz=23996.740007889 direct_kernel_db=-0.001000000
+CROSSING target=-0.01 hz=23997.832847410 direct_kernel_db=-0.010000005
+CROSSING target=-0.1 hz=23998.025327339 direct_kernel_db=-0.099999641
+CROSSING target=-0.5 hz=23998.194272281 direct_kernel_db=-0.500000703
+CROSSING target=-1 hz=23998.284620815 direct_kernel_db=-0.999999189
+CROSSING target=-3 hz=23998.462002142 direct_kernel_db=-2.999994895
+CROSSING target=-6 hz=23998.604642577 direct_kernel_db=-5.999992804
+CROSSING target=-20 hz=23998.938165489 direct_kernel_db=-20.000005164
+CROSSING target=-60 hz=23999.365613214 direct_kernel_db=-59.999954571
+CROSSING target=-100 hz=23999.586779508 direct_kernel_db=-99.999997540
+CROSSING target=-120 hz=23999.658146524 direct_kernel_db=-119.999986337
+CROSSING target=-150 hz=23999.727227376 direct_kernel_db=-150.000043788
+MEASURE actual_peak_db=-190.030124070 hz=24000.082601480

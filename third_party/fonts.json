@@ -1,0 +1,71 @@
+{
+  "license": "OFL-1.1",
+  "tool": "fonttools[woff]==4.61.1",
+  "toolUse": "fonttools rewrote the name table of the IBM Plex Sans and Mono Latin subsets only (tools/rename-subset-fonts.py); glyphs and metrics are unchanged.",
+  "families": [
+    {
+      "family": "Audivane Sans Latin",
+      "upstream": "IBM Plex Sans",
+      "copyrightHolder": "IBM",
+      "reservedFontNames": [
+        "Plex"
+      ],
+      "notice": "OFL.txt",
+      "modification": "Latin subset renamed (primary name records only) because of the Reserved Font Name; glyphs and metrics unchanged.",
+      "use": "App interface text"
+    },
+    {
+      "family": "Audivane Mono Latin",
+      "upstream": "IBM Plex Mono",
+      "copyrightHolder": "IBM",
+      "reservedFontNames": [
+        "Plex"
+      ],
+      "notice": "OFL.txt",
+      "modification": "Latin subset renamed (primary name records only) because of the Reserved Font Name; glyphs and metrics unchanged.",
+      "use": "App numbers, values and keyboard hints"
+    }
+  ],
+  "files": [
+    {
+      "path": "app/src/assets/fonts/ibm-plex-mono-latin-400-normal.woff2",
+      "family": "Audivane Mono Latin",
+      "originalSha256": "08949f728dc52d528e69b1667d15c89a5686a4ee9a296ff90983985f99c380f7",
+      "sha256": "2b1d5894e36eb5a420c9d2fbf32adfbd6b9c9db3318e7e1e4ce88d0ca0cfdb61",
+      "originalContentSha256": "de3ff665bea72e5de0e345226f6363e4474d2d3760add3b233dd6c41576f561f",
+      "contentSha256": "de3ff665bea72e5de0e345226f6363e4474d2d3760add3b233dd6c41576f561f"
+    },
+    {
+      "path": "app/src/assets/fonts/ibm-plex-mono-latin-500-normal.woff2",
+      "family": "Audivane Mono Latin",
+      "originalSha256": "01d285447409c8a588692162439a038b8cbd7871309ee20267b0d2d91c6e8e22",
+      "sha256": "9a7b36b2fd1c01f3cc653723559eca1549480adaafef478df27490664517743d",
+      "originalContentSha256": "d41e9930f3d98d876a05dacb76b741a82e0032fe9f4392d02f20d2ff38ebd425",
+      "contentSha256": "d41e9930f3d98d876a05dacb76b741a82e0032fe9f4392d02f20d2ff38ebd425"
+    },
+    {
+      "path": "app/src/assets/fonts/ibm-plex-sans-latin-400-normal.woff2",
+      "family": "Audivane Sans Latin",
+      "originalSha256": "3b646991d30055a93a4ecc499713d4347953a74a947ecab435ab72070cbdab0e",
+      "sha256": "33423d21f03922af127238311050c636bd3b0cda212ce4a6013458655c049b67",
+      "originalContentSha256": "38123c6cb11608f7c31481c9bbdfff0ec4dbd0a4561c6d1969ed071713f5478e",
+      "contentSha256": "38123c6cb11608f7c31481c9bbdfff0ec4dbd0a4561c6d1969ed071713f5478e"
+    },
+    {
+      "path": "app/src/assets/fonts/ibm-plex-sans-latin-500-normal.woff2",
+      "family": "Audivane Sans Latin",
+      "originalSha256": "0717336fb31fcdcde4b8deb3675bb4a0f7f6d484864afcd6751ac29975962203",
+      "sha256": "778b0e60de4df0160222935d98b0c47e5a05ea51f27bc778cb170b15a1f54bc4",
+      "originalContentSha256": "41c7d4f63a45254e5ce31be2bfab4de5016ae3e7d2875b67a3ca17cf6795b0ca",
+      "contentSha256": "41c7d4f63a45254e5ce31be2bfab4de5016ae3e7d2875b67a3ca17cf6795b0ca"
+    },
+    {
+      "path": "app/src/assets/fonts/ibm-plex-sans-latin-600-normal.woff2",
+      "family": "Audivane Sans Latin",
+      "originalSha256": "8960851d691c054ed38e259bdcf1a6190d157b4203ed5bb32c632a863fb8ec2f",
+      "sha256": "c059d01628f80f79d5781fd698fbf4e80a73629ed71259efea33781c1838f219",
+      "originalContentSha256": "5bdb2782e1439815da41a08cf7e63054b6e6b53448feada9132f5c56a4ea393b",
+      "contentSha256": "5bdb2782e1439815da41a08cf7e63054b6e6b53448feada9132f5c56a4ea393b"
+    }
+  ]
+}

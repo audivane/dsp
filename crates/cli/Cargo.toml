@@ -1,0 +1,20 @@
+[package]
+name = "audivane-dsp-cli"
+description = "avdsp: offline processing, tests and daemon control for Audivane DSP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+audivane-dsp-core.workspace = true
+audivane-protocol.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+hound.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "avdsp"
+path = "src/main.rs"

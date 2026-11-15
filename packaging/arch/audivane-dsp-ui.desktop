@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Audivane DSP
+GenericName=Audio DSP
+Comment=Bit-perfect system-wide equalizer, convolution and loudness engine for PipeWire
+Exec=audivane-dsp-ui
+Icon=audivane-dsp
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+StartupWMClass=audivane-dsp-ui
+Keywords=equalizer;eq;convolution;dsp;audio;

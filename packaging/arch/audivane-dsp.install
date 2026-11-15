@@ -1,0 +1,34 @@
+post_install() {
+  cat <<'EOF'
+==> audivane-dsp installed.
+
+Start the DSP engine with your user session (the package never runs
+systemctl for you):
+
+    systemctl --user daemon-reload && systemctl --user enable --now audivane-dsp
+
+Heads-up while the engine runs:
+  * It registers itself as the PipeWire sink and takes your output DAC
+    exclusively. Audio from other apps goes through Audivane; stop or
+    disable the service to hand the device back.
+  * Check it is alive and see its state with:  avdsp ctl status
+  * The desktop app (Audivane DSP) talks to the same engine; it will show
+    "engine is not running" until you start the service above.
+EOF
+}
+
+post_upgrade() {
+  post_install "$@"
+}
+
+pre_remove() {
+  cat <<'EOF'
+==> Before removing audivane-dsp, stop and disable the engine and close the
+    desktop app, e.g.:
+
+    systemctl --user disable --now audivane-dsp
+
+    Otherwise the running engine keeps your DAC claimed until it is stopped
+    by hand (or at logout).
+EOF
+}

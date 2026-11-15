@@ -1,0 +1,12 @@
+Direct symmetric long-double cosine peak: 24134.269860706467 Hz, -92.748318008422 dB
+FFT 4096: candidate refinement covers true peak? False
+  k=684 f=24046.875000000 db=-52.752696874 candidate=False
+  k=685 f=24082.031250000 db=-66.882809154 candidate=False
+  k=686 f=24117.187500000 db=-109.946525586 candidate=False
+  k=687 f=24152.343750000 db=-100.138436825 candidate=False
+  k=688 f=24187.500000000 db=-94.226917349 candidate=True
+  k=689 f=24222.656250000 db=-100.846153978 candidate=False
+  k=690 f=24257.812500000 db=-98.266868356 candidate=False
+  refinement intervals near start: [(np.float64(24152.34375), np.float64(24222.65625)), (np.float64(24257.8125), np.float64(24328.125)), (np.float64(24363.28125), np.float64(24433.59375))]
+FFT 16384: candidate refinement covers true peak? True
+FFT 65536: candidate refinement covers true peak? True

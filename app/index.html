@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Audivane DSP</title>
+    <script>
+      (function () {
+        var skin = "system";
+        try { skin = localStorage.getItem("avdsp-skin") || skin; } catch (e) {}
+        var dark = false;
+        try { dark = window.matchMedia("(prefers-color-scheme: dark)").matches; } catch (e) {}
+        document.documentElement.setAttribute("data-skin", skin === "system" ? (dark ? "midnight" : "light") : skin);
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
