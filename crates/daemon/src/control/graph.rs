@@ -1030,7 +1030,13 @@ impl Graph {
             return;
         }
         if enabled {
-            self.enter_system_default();
+            if self.dsp_sink_present() {
+                self.enter_system_default();
+            } else {
+                // No sink to point at yet (the engine waits for its device):
+                // the supervisor takes the default once it appears.
+                self.system_default = true;
+            }
         } else {
             self.system_default = false;
             self.restore_defaults();
