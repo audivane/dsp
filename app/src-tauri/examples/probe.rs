@@ -157,7 +157,9 @@ fn exercise(ir1: &str, ir2: &str) -> usize {
     let st = call("status", None).expect("status");
     k.check(
         "subscription up with all topics",
-        wait_for(&seen, |s| s.up && s.count("config") > 0 && s.count("presets") > 0),
+        wait_for(&seen, |s| {
+            s.up && s.count("config") > 0 && s.count("presets") > 0
+        }),
         "no config/presets snapshot",
     );
     k.check(
@@ -250,14 +252,23 @@ fn exercise(ir1: &str, ir2: &str) -> usize {
         "set_volume",
         Some(json!({"volume_db": -10.5, "balance_db": 2.0, "muted": true})),
     );
-    k.check("mute", r.as_ref().is_ok_and(|v| v["muted"] == true), err_text(&r));
+    k.check(
+        "mute",
+        r.as_ref().is_ok_and(|v| v["muted"] == true),
+        err_text(&r),
+    );
     k.check(
         "config.volume persisted in config event",
         wait_for(&seen, |s| {
-            s.last("config")
-                .is_some_and(|c| c["volume"] == json!({"volume_db": -10.5, "balance_db": 2.0, "muted": true}))
+            s.last("config").is_some_and(|c| {
+                c["volume"] == json!({"volume_db": -10.5, "balance_db": 2.0, "muted": true})
+            })
         }),
-        seen.lock().unwrap().last("config").map(|c| c["volume"].clone()).unwrap_or_default(),
+        seen.lock()
+            .unwrap()
+            .last("config")
+            .map(|c| c["volume"].clone())
+            .unwrap_or_default(),
     );
 
     println!("\n# layered EQ");
@@ -301,13 +312,17 @@ fn exercise(ir1: &str, ir2: &str) -> usize {
     let got = &cfg["chain"]["convolution"];
     k.check(
         "two IRs echoed, name kept",
-        got.as_array().map(Vec::len) == Some(2) && got[0]["name"] == "Room" && got[1]["ir_path"] == ir2,
+        got.as_array().map(Vec::len) == Some(2)
+            && got[0]["name"] == "Room"
+            && got[1]["ir_path"] == ir2,
         got,
     );
     let r = call(
         "set_convolution",
-        Some(json!([{"name": "Room", "enabled": true, "ir_path": ir1, "gain_db": -1.0},
-                    {"enabled": false, "ir_path": ir2, "gain_db": 0.0}])),
+        Some(
+            json!([{"name": "Room", "enabled": true, "ir_path": ir1, "gain_db": -1.0},
+                    {"enabled": false, "ir_path": ir2, "gain_db": 0.0}]),
+        ),
     );
     let cfg = call("get_config", None).unwrap_or_default();
     k.check(
@@ -362,7 +377,10 @@ fn exercise(ir1: &str, ir2: &str) -> usize {
         r.is_ok() && cfg["chain"]["output"]["bits"] == 16 && cfg["formats"][0] == "s24",
         err_text(&r),
     );
-    let r = call("set_routing_mode", Some(json!({"mode": "apps", "rules": []})));
+    let r = call(
+        "set_routing_mode",
+        Some(json!({"mode": "apps", "rules": []})),
+    );
     k.check("set_routing_mode apps, no rules", r.is_ok(), err_text(&r));
 
     println!("\n# presets");
@@ -371,21 +389,33 @@ fn exercise(ir1: &str, ir2: &str) -> usize {
         let _ = call("delete_preset", Some(json!({"name": n})));
     }
     let presets_before = seen.lock().unwrap().count("presets");
-    let r = call("save_preset", Some(json!({"name": "Probe A", "overwrite": false})));
+    let r = call(
+        "save_preset",
+        Some(json!({"name": "Probe A", "overwrite": false})),
+    );
     k.check(
         "save_preset → PresetInfo (bands 3, convolution 2)",
         r.as_ref().is_ok_and(|v| {
-            v["name"] == "Probe A" && v["bands"] == 3 && v["convolution"] == 2 && v["modified_unix"].is_u64()
+            v["name"] == "Probe A"
+                && v["bands"] == 3
+                && v["convolution"] == 2
+                && v["modified_unix"].is_u64()
         }),
         err_text(&r),
     );
-    let r = call("save_preset", Some(json!({"name": "Probe A", "overwrite": false})));
+    let r = call(
+        "save_preset",
+        Some(json!({"name": "Probe A", "overwrite": false})),
+    );
     k.check(
         "save without overwrite refused (BAD_STATE)",
         matches!(&r, Err(e) if e.code == 1),
         err_text(&r),
     );
-    let r = call("save_preset", Some(json!({"name": "Probe A", "overwrite": true})));
+    let r = call(
+        "save_preset",
+        Some(json!({"name": "Probe A", "overwrite": true})),
+    );
     k.check("save with overwrite", r.is_ok(), err_text(&r));
     let st = call("status", None).unwrap_or_default();
     k.check(
@@ -394,13 +424,18 @@ fn exercise(ir1: &str, ir2: &str) -> usize {
         &st["preset"],
     );
     let cfg = call("get_config", None).unwrap_or_default();
-    k.check("config.active_preset", cfg["active_preset"] == "Probe A", &cfg["active_preset"]);
+    k.check(
+        "config.active_preset",
+        cfg["active_preset"] == "Probe A",
+        &cfg["active_preset"],
+    );
     k.check(
         "presets event after save",
         wait_for(&seen, |s| {
             s.count("presets") > presets_before
                 && s.last("presets").is_some_and(|l| {
-                    l.as_array().is_some_and(|a| a.iter().any(|p| p["name"] == "Probe A"))
+                    l.as_array()
+                        .is_some_and(|a| a.iter().any(|p| p["name"] == "Probe A"))
                 })
         }),
         "none",
@@ -408,23 +443,34 @@ fn exercise(ir1: &str, ir2: &str) -> usize {
     let r = call("list_presets", None);
     k.check(
         "list_presets has Probe A",
-        r.as_ref().ok().and_then(Value::as_array).is_some_and(|a| a.iter().any(|p| p["name"] == "Probe A")),
+        r.as_ref()
+            .ok()
+            .and_then(Value::as_array)
+            .is_some_and(|a| a.iter().any(|p| p["name"] == "Probe A")),
         err_text(&r),
     );
     let r = call("get_preset", Some(json!({"name": "Probe A"})));
     k.check(
         "get_preset → Preset { version 1, chain }",
-        r.as_ref().is_ok_and(|p| p["version"] == 1 && p["chain"]["eq"]["right"] == eq["right"]),
+        r.as_ref()
+            .is_ok_and(|p| p["version"] == 1 && p["chain"]["eq"]["right"] == eq["right"]),
         err_text(&r),
     );
     let mut edited = eq.clone();
     edited["bands"][0]["gain_db"] = json!(5.0);
     let _ = call("set_eq", Some(edited));
     let st = call("status", None).unwrap_or_default();
-    k.check("edit marks modified", st["preset"]["modified"] == true, &st["preset"]);
+    k.check(
+        "edit marks modified",
+        st["preset"]["modified"] == true,
+        &st["preset"],
+    );
     k.check(
         "status event reports modified",
-        wait_for(&seen, |s| s.last("status").is_some_and(|st| st["preset"]["modified"] == true)),
+        wait_for(&seen, |s| {
+            s.last("status")
+                .is_some_and(|st| st["preset"]["modified"] == true)
+        }),
         "no status event with modified",
     );
     let r = call("load_preset", Some(json!({"name": "Probe A"})));
@@ -434,7 +480,10 @@ fn exercise(ir1: &str, ir2: &str) -> usize {
         r.as_ref().is_ok_and(Value::is_null) && st["preset"]["modified"] == false,
         err_text(&r),
     );
-    let r = call("rename_preset", Some(json!({"from": "Probe A", "to": "Probe B"})));
+    let r = call(
+        "rename_preset",
+        Some(json!({"from": "Probe A", "to": "Probe B"})),
+    );
     k.check(
         "rename_preset → PresetInfo",
         r.as_ref().is_ok_and(|v| v["name"] == "Probe B"),
@@ -448,10 +497,14 @@ fn exercise(ir1: &str, ir2: &str) -> usize {
         format!("{} / {}", cfg["active_preset"], st["preset"]),
     );
     let apo = "Preamp: -5.2 dB\nFilter 1: ON LSC Fc 105 Hz Gain 5.5 dB Q 0.71\nFilter 2: ON PK Fc 2000 Hz Gain -2 dB Q 1.4\nFilter 3: ON HSC Fc 10000 Hz Gain -3 dB Q 0.71\n";
-    let r = call("import_apo", Some(json!({"name": "Probe APO", "text": apo})));
+    let r = call(
+        "import_apo",
+        Some(json!({"name": "Probe APO", "text": apo})),
+    );
     k.check(
         "import_apo → PresetInfo (3 bands, no IR)",
-        r.as_ref().is_ok_and(|v| v["name"] == "Probe APO" && v["bands"] == 3 && v["convolution"] == 0),
+        r.as_ref()
+            .is_ok_and(|v| v["name"] == "Probe APO" && v["bands"] == 3 && v["convolution"] == 0),
         err_text(&r),
     );
     let cfg = call("get_config", None).unwrap_or_default();
@@ -466,16 +519,31 @@ fn exercise(ir1: &str, ir2: &str) -> usize {
         p["chain"]["convolution"] == json!([]) && p["chain"]["eq"]["preamp_db"] == -5.2,
         &p["chain"],
     );
-    let ups_default = p["chain"]["upsampler"]["target"] == "off" && p["chain"]["output"]["bits"] == 24;
+    let ups_default =
+        p["chain"]["upsampler"]["target"] == "off" && p["chain"]["output"]["bits"] == 24;
     println!(
         "        imported upsampler/output: {} / {} ({})",
         p["chain"]["upsampler"]["target"],
         p["chain"]["output"],
-        if ups_default { "defaults" } else { "copied from chain A" }
+        if ups_default {
+            "defaults"
+        } else {
+            "copied from chain A"
+        }
     );
-    let r = call("import_apo", Some(json!({"name": "Probe APO", "text": apo})));
-    k.check("import_apo replaces an existing name", r.is_ok(), err_text(&r));
-    let r = call("import_apo", Some(json!({"name": "Probe bad", "text": "this is not an EQ"})));
+    let r = call(
+        "import_apo",
+        Some(json!({"name": "Probe APO", "text": apo})),
+    );
+    k.check(
+        "import_apo replaces an existing name",
+        r.is_ok(),
+        err_text(&r),
+    );
+    let r = call(
+        "import_apo",
+        Some(json!({"name": "Probe bad", "text": "this is not an EQ"})),
+    );
     println!("        import of junk text: {}", err_text(&r));
     if r.is_ok() {
         let _ = call("delete_preset", Some(json!({"name": "Probe bad"})));
@@ -484,12 +552,17 @@ fn exercise(ir1: &str, ir2: &str) -> usize {
     let cfg = call("get_config", None).unwrap_or_default();
     k.check(
         "load imported preset",
-        r.is_ok() && cfg["active_preset"] == "Probe APO" && cfg["chain"]["convolution"] == json!([]),
+        r.is_ok()
+            && cfg["active_preset"] == "Probe APO"
+            && cfg["chain"]["convolution"] == json!([]),
         err_text(&r),
     );
     k.check(
         "config event after load",
-        wait_for(&seen, |s| s.last("config").is_some_and(|c| c["active_preset"] == "Probe APO")),
+        wait_for(&seen, |s| {
+            s.last("config")
+                .is_some_and(|c| c["active_preset"] == "Probe APO")
+        }),
         "none",
     );
     let r = call("get_preset", Some(json!({"name": "No such preset"})));
@@ -503,12 +576,22 @@ fn exercise(ir1: &str, ir2: &str) -> usize {
     let mut chain_b = cfg["chain"].clone();
     chain_b["eq"] = json!({"name": "Flat", "preamp_db": 0.0, "bands": []});
     chain_b["convolution"] = json!([]);
-    let r = call("set_ab", Some(json!({"chain_b": chain_b, "level": {"mode": "analytic"}})));
-    k.check("set_ab flat", r.as_ref().is_ok_and(|v| v["enabled"] == true), err_text(&r));
+    let r = call(
+        "set_ab",
+        Some(json!({"chain_b": chain_b, "level": {"mode": "analytic"}})),
+    );
+    k.check(
+        "set_ab flat",
+        r.as_ref().is_ok_and(|v| v["enabled"] == true),
+        err_text(&r),
+    );
     let pb = call("get_preset", Some(json!({"name": "Probe B"}))).unwrap_or_default();
     let mut b2 = pb["chain"].clone();
     b2["eq"]["name"] = json!("Probe B");
-    let r = call("set_ab", Some(json!({"chain_b": b2, "level": {"mode": "manual", "offset_db": -1.5}})));
+    let r = call(
+        "set_ab",
+        Some(json!({"chain_b": b2, "level": {"mode": "manual", "offset_db": -1.5}})),
+    );
     k.check(
         "set_ab from a preset (other upsampler → notes, not refused)",
         r.is_ok(),
@@ -517,9 +600,19 @@ fn exercise(ir1: &str, ir2: &str) -> usize {
     if let Ok(v) = &r {
         println!("        {v}");
     }
-    let r = call("ab_select", Some(json!({"side": "b", "crossfade_ms": 10.0})));
-    k.check("ab_select b", r.as_ref().is_ok_and(|v| v["current"] == "b"), err_text(&r));
-    let r = call("ab_select", Some(json!({"side": "a", "crossfade_ms": 10.0})));
+    let r = call(
+        "ab_select",
+        Some(json!({"side": "b", "crossfade_ms": 10.0})),
+    );
+    k.check(
+        "ab_select b",
+        r.as_ref().is_ok_and(|v| v["current"] == "b"),
+        err_text(&r),
+    );
+    let r = call(
+        "ab_select",
+        Some(json!({"side": "a", "crossfade_ms": 10.0})),
+    );
     k.check("ab_select a", r.is_ok(), err_text(&r));
     let r = call("set_ab", Some(Value::Null));
     k.check("set_ab null", r.is_ok(), err_text(&r));
@@ -541,14 +634,19 @@ fn exercise(ir1: &str, ir2: &str) -> usize {
         wait_for(&seen, |s| {
             s.count("presets") > presets_before
                 && s.last("presets").is_some_and(|l| {
-                    l.as_array().is_some_and(|a| !a.iter().any(|p| p["name"] == "Probe B"))
+                    l.as_array()
+                        .is_some_and(|a| !a.iter().any(|p| p["name"] == "Probe B"))
                 })
         }),
         "none",
     );
     let r = call("set_config", Some(original.clone()));
     let cfg = call("get_config", None).unwrap_or_default();
-    k.check("restore the original config", r.is_ok() && cfg == original, err_text(&r));
+    k.check(
+        "restore the original config",
+        r.is_ok() && cfg == original,
+        err_text(&r),
+    );
     k.check(
         "last config event equals get_config",
         wait_for(&seen, |s| s.last("config").as_ref() == Some(&cfg)),
@@ -558,7 +656,9 @@ fn exercise(ir1: &str, ir2: &str) -> usize {
     let s = seen.lock().unwrap();
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for e in &s.events {
-        *counts.entry(e["event"].as_str().unwrap_or("?").to_string()).or_default() += 1;
+        *counts
+            .entry(e["event"].as_str().unwrap_or("?").to_string())
+            .or_default() += 1;
     }
     println!("        events seen (meters excluded): {counts:?}");
     k.failed

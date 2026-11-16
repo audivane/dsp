@@ -790,10 +790,7 @@ mod tests {
 
         let mut eq = Eq::new(&profile, fs, 4);
         // L-only band affects ch0 only; ch1, ch2, ch3 receive linked + preamp only.
-        assert_ne!(
-            eq.response_channel(0, 138.0),
-            eq.response_channel(1, 138.0)
-        );
+        assert_ne!(eq.response_channel(0, 138.0), eq.response_channel(1, 138.0));
         assert_eq!(eq.response(138.0), eq.response_channel(0, 138.0));
         assert_eq!(eq.response_channel(2, 138.0), eq.response_channel(1, 138.0));
         assert_eq!(eq.response_channel(3, 138.0), eq.response_channel(1, 138.0));

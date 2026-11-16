@@ -52,10 +52,7 @@ impl From<CliFormat> for SampleFormat {
 }
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "driver_spike",
-    about = "Audivane PipeWire driver-mode spike"
-)]
+#[command(name = "driver_spike", about = "Audivane PipeWire driver-mode spike")]
 struct Args {
     /// ALSA hardware device to open exclusively via ReserveDevice1
     #[arg(long, default_value = "hw:Loopback,0,0")]

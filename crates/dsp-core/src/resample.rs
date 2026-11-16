@@ -130,11 +130,7 @@ pub fn nyquist_stop_min_taps(ratio: usize, beta: f64) -> Option<usize> {
 }
 
 /// The [`CutoffMode::NyquistStop`] cutoff, or why the design is infeasible.
-pub fn nyquist_stop_check(
-    taps: usize,
-    ratio: usize,
-    beta: f64,
-) -> Result<f64, NyquistStopError> {
+pub fn nyquist_stop_check(taps: usize, ratio: usize, beta: f64) -> Result<f64, NyquistStopError> {
     if ratio <= 1 {
         return Ok(1.0);
     }
@@ -1026,15 +1022,8 @@ pub fn measure_upsampler(
         .copied()
         .filter(|&level| level >= -(stopband_atten_db - CROSSING_STOPBAND_MARGIN_DB))
         .collect();
-    let crossings = find_earliest_crossings(
-        &kept,
-        rate,
-        gain,
-        &mag,
-        &phase_flip,
-        bin_hz,
-        &active_levels,
-    );
+    let crossings =
+        find_earliest_crossings(&kept, rate, gain, &mag, &phase_flip, bin_hz, &active_levels);
     drop(mag);
     drop(phase_flip);
     let crossing_at = |level: f64| {
@@ -1659,9 +1648,7 @@ fn find_earliest_crossings(
                             && ((prev_m > a && a > b && b > next_m)
                                 || (prev_m < a && a < b && b < next_m));
                         if !strict_mono {
-                            let curv = (prev_m - 2.0 * a + b)
-                                .max(a - 2.0 * b + next_m)
-                                .max(0.0);
+                            let curv = (prev_m - 2.0 * a + b).max(a - 2.0 * b + next_m).max(0.0);
                             let may_dip = if threshold >= 0.5 {
                                 curv > 0.0 && a.min(b) - 2.0 * curv <= threshold_raw
                             } else {
@@ -1677,7 +1664,8 @@ fn find_earliest_crossings(
                 // Check narrow dips discovered inside this chunk before moving
                 // to later chunks, so the earliest crossing wins.
                 if !narrow_dips.is_empty() {
-                    if let Some(bracket) = refine_narrow_dips(h, rate, threshold_raw, &narrow_dips) {
+                    if let Some(bracket) = refine_narrow_dips(h, rate, threshold_raw, &narrow_dips)
+                    {
                         found = Some(bracket);
                         break 'batches;
                     }
@@ -2089,8 +2077,14 @@ mod tests {
         let gain = ratio as f64;
         let ma = magnitude_spectrum(lin, nfft);
         let mb = magnitude_spectrum(min, nfft);
-        let la: Vec<f64> = ma.iter().map(|m| lin_to_db((m / gain).max(1e-30))).collect();
-        let lb: Vec<f64> = mb.iter().map(|m| lin_to_db((m / gain).max(1e-30))).collect();
+        let la: Vec<f64> = ma
+            .iter()
+            .map(|m| lin_to_db((m / gain).max(1e-30)))
+            .collect();
+        let lb: Vec<f64> = mb
+            .iter()
+            .map(|m| lin_to_db((m / gain).max(1e-30)))
+            .collect();
         let (mut passband_db, mut upper_db) = (0.0_f64, 0.0_f64);
         for (a, b) in la.iter().zip(&lb) {
             let d = (a - b).abs();
@@ -2209,16 +2203,32 @@ mod tests {
         let min = design(ratio, taps, FilterPhase::Minimum, beta, cutoff);
         let t = compare_twins(&lin, &min, ratio, stopband_edge(&d), 16, -220.0);
         let what = format!("N={taps} x{ratio} beta={beta} cutoff={cutoff}");
-        assert!(t.passband_db <= 1e-4, "{what}: passband {} dB", t.passband_db);
-        assert!(t.upper_db <= 0.01, "{what}: >= -100 dB region {} dB", t.upper_db);
-        assert!(t.envelope_db <= 1.0, "{what}: stopband envelope +{} dB", t.envelope_db);
+        assert!(
+            t.passband_db <= 1e-4,
+            "{what}: passband {} dB",
+            t.passband_db
+        );
+        assert!(
+            t.upper_db <= 0.01,
+            "{what}: >= -100 dB region {} dB",
+            t.upper_db
+        );
+        assert!(
+            t.envelope_db <= 1.0,
+            "{what}: stopband envelope +{} dB",
+            t.envelope_db
+        );
         let error_bound = -(kaiser_attenuation_db(beta) + STOPBAND_ERROR_MARGIN_DB);
         assert!(
             t.stopband_error_db <= error_bound,
             "{what}: stopband error {} dB > {error_bound} dB",
             t.stopband_error_db
         );
-        assert!(t.energy_lead >= -1e-12, "{what}: energy lead {}", t.energy_lead);
+        assert!(
+            t.energy_lead >= -1e-12,
+            "{what}: energy lead {}",
+            t.energy_lead
+        );
         // The winding count needs every bin above the rounding floor; at
         // beta 24 the deep stopband of 16k+ kernels is at it (Schur-Cohn
         // covers beta 24 on short kernels).
@@ -2227,7 +2237,10 @@ mod tests {
             assert!(step < FRAC_PI_2, "{what}: winding step {step}");
             assert_eq!(outside, 0, "{what}: zeros outside 1 + 0.25/N");
             let (outside_lin, _) = zeros_outside(&lin, 0.25, (taps * 64).next_power_of_two());
-            assert!(outside_lin > 0, "{what}: the linear twin should have outside zeros");
+            assert!(
+                outside_lin > 0,
+                "{what}: the linear twin should have outside zeros"
+            );
         }
     }
 
@@ -2576,7 +2589,9 @@ mod tests {
                             t.envelope_db,
                             t.stopband_error_db
                         );
-                        assert!(t.passband_db <= 1e-4 && t.upper_db <= 0.01 && t.envelope_db <= 1.0);
+                        assert!(
+                            t.passband_db <= 1e-4 && t.upper_db <= 0.01 && t.envelope_db <= 1.0
+                        );
                         assert!(t.stopband_error_db <= -(a + STOPBAND_ERROR_MARGIN_DB));
                         assert!(t.energy_lead >= -1e-12);
                         assert!(t_min <= 15.0, "{t_min} s");
@@ -3055,7 +3070,9 @@ mod tests {
         let measured =
             measure_upsampler(&response_config(4, 2048, FilterPhase::Minimum), 44_100).unwrap();
         let rate = f64::from(measured.output_rate());
-        for f in [0.0, 1_000.0, 21_987.25, 22_050.0, 22_100.5, 40_000.0, 88_000.0] {
+        for f in [
+            0.0, 1_000.0, 21_987.25, 22_050.0, 22_100.5, 40_000.0, 88_000.0,
+        ] {
             let fast = measured.magnitude_db_at(&[f])[0];
             let slow = brute_db(&measured.impulse, rate, measured.gain, f);
             // Both sums round to ~1e-16 of the passband; deeper levels get
@@ -3258,7 +3275,11 @@ mod tests {
         let full = &measured.response;
         // A window from one plotted point to another, with points landing on
         // several plotted frequencies of the dense transition grid.
-        let lo_index = full.freqs_hz.iter().position(|&f| f >= 0.8 * 24_000.0).unwrap();
+        let lo_index = full
+            .freqs_hz
+            .iter()
+            .position(|&f| f >= 0.8 * 24_000.0)
+            .unwrap();
         let hi_index = lo_index + 40;
         let f_lo = full.freqs_hz[lo_index];
         let f_hi = full.freqs_hz[hi_index];
@@ -3613,7 +3634,8 @@ mod tests {
         let measured = measure_upsampler(&cfg, source_rate).expect("measure");
         let expected = nyquist_stop_check(taps, ratio as usize, beta).expect("feasible");
         assert!((measured.response.effective_cutoff - expected).abs() < 1e-12);
-        let (_, peak_db) = dense_peak_above(&measured.impulse, measured.gain, 0.5 / f64::from(ratio));
+        let (_, peak_db) =
+            dense_peak_above(&measured.impulse, measured.gain, 0.5 / f64::from(ratio));
         (peak_db + kaiser_attenuation_db(beta), expected)
     }
 
@@ -3642,8 +3664,14 @@ mod tests {
         assert!(nyquist_stop_check(min, 16, 20.0).unwrap() >= NYQUIST_STOP_MIN_CUTOFF);
         assert!(nyquist_stop_check(min - 1, 16, 20.0).is_err());
         assert!(err.to_string().contains(&min.to_string()));
-        assert!(matches!(nyquist_stop_check(65_536, 4, 4.0), Err(NyquistStopError::Beta(_))));
-        assert!(matches!(nyquist_stop_check(65_536, 4, 25.0), Err(NyquistStopError::Beta(_))));
+        assert!(matches!(
+            nyquist_stop_check(65_536, 4, 4.0),
+            Err(NyquistStopError::Beta(_))
+        ));
+        assert!(matches!(
+            nyquist_stop_check(65_536, 4, 25.0),
+            Err(NyquistStopError::Beta(_))
+        ));
         assert_eq!(nyquist_stop_min_taps(4, 30.0), None);
         // Shared with app/src/lib/upsamplerLimits.ts (see its test).
         for &(ratio, beta, expect) in &[
@@ -3653,7 +3681,11 @@ mod tests {
             (32, 24.0, 1653),
             (16, 5.0, 157),
         ] {
-            assert_eq!(nyquist_stop_min_taps(ratio, beta), Some(expect), "x{ratio} beta {beta}");
+            assert_eq!(
+                nyquist_stop_min_taps(ratio, beta),
+                Some(expect),
+                "x{ratio} beta {beta}"
+            );
         }
 
         // 1M taps at 48 kHz, beta 14: the cutoff shift below Nyquist.
@@ -3713,7 +3745,10 @@ mod tests {
             let h = design(4, taps, FilterPhase::Linear, 14.0, 0.95);
             assert_eq!(h.len(), taps);
             assert!(h.iter().all(|v| v.is_finite()));
-            assert!((h[0] - h[taps - 1]).abs() < 1e-15, "linear phase is symmetric");
+            assert!(
+                (h[0] - h[taps - 1]).abs() < 1e-15,
+                "linear phase is symmetric"
+            );
             let dc: f64 = h.iter().sum();
             assert!((dc - 4.0).abs() < 1e-6, "taps={taps}: DC gain {dc}");
         }

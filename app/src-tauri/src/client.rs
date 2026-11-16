@@ -506,7 +506,8 @@ impl Subscription {
         c.spectrum = enabled;
         if enabled {
             if let Some(w) = c.writer.as_mut() {
-                let line = json!({"id": 3, "method": "subscribe", "params": {"topics": ["spectrum"]}});
+                let line =
+                    json!({"id": 3, "method": "subscribe", "params": {"topics": ["spectrum"]}});
                 let _ = writeln!(w, "{line}");
                 let _ = w.flush();
             }
@@ -632,8 +633,7 @@ fn session(
             return Err("stopped".into());
         }
         if c.spectrum {
-            let line =
-                json!({"id": 3, "method": "subscribe", "params": {"topics": ["spectrum"]}});
+            let line = json!({"id": 3, "method": "subscribe", "params": {"topics": ["spectrum"]}});
             writeln!(writer, "{line}").map_err(|e| format!("Lost the engine: {e}."))?;
             let _ = writer.flush();
         }

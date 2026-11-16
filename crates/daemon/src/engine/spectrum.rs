@@ -598,11 +598,7 @@ fn is_coherent_tone(power: &[f64], peak: usize, level: f64) -> bool {
 /// interpolation never exceeds the larger of its two neighbours, so it
 /// cannot invent a peak.
 fn band_power(power: &[f64], band: &LogBand) -> f64 {
-    band.weights
-        .iter()
-        .map(|&(k, w)| power[k] * w)
-        .sum::<f64>()
-        / HANN_ENBW
+    band.weights.iter().map(|&(k, w)| power[k] * w).sum::<f64>() / HANN_ENBW
 }
 
 /// Parabolic (log-power) interpolation around `peak`, but only when `peak`
@@ -877,8 +873,11 @@ impl TapAnalyzer {
         self.bins = spectrum_bin_count(self.rate);
         let short_bin_hz = f64::from(self.analysis_rate) / FFT_SIZE as f64;
         let (analysis_rate, bins) = (self.analysis_rate, self.bins);
-        self.short
-            .set_bands(analysis_rate, bins, log_bands(analysis_rate, FFT_SIZE, None));
+        self.short.set_bands(
+            analysis_rate,
+            bins,
+            log_bands(analysis_rate, FFT_SIZE, None),
+        );
         self.long.set_bands(
             analysis_rate,
             bins,
@@ -1052,8 +1051,7 @@ mod tests {
                 (peak_db - 0.0).abs() <= 0.5,
                 "rate {rate}: full-scale 1 kHz sine reads {peak_db} dB in bin {peak_bin}"
             );
-            let peak_hz =
-                spectrum_bin_centre_hz(peak_bin);
+            let peak_hz = spectrum_bin_centre_hz(peak_bin);
             assert!(
                 (peak_hz - 1_000.0).abs() < 100.0,
                 "rate {rate}: peak bin at {peak_hz} Hz"
@@ -1284,7 +1282,10 @@ mod tests {
                 let mut tap = TapAnalyzer::new(2);
                 tap.set_rate(rate);
                 tap.feed(&tagged(sine(frames, rate, freq, 1.0), rate, 1));
-                assert!(tap.long.frames > 0, "rate {rate} {freq} Hz produced no long frames");
+                assert!(
+                    tap.long.frames > 0,
+                    "rate {rate} {freq} Hz produced no long frames"
+                );
                 let bins = tap.finish();
                 let (index, peak) = peak_bin(&bins);
                 assert!(
@@ -1318,7 +1319,8 @@ mod tests {
         // amplitude A at bin k has X[k] = (nfft / 2) * A, power A^2 / 2.
         // Wait: a frame of white-phase bins X[k] = (nfft / sqrt(2)) * amp_k produces
         // mean-square per bin sum(amp_k^2). Let's normalize directly to target band power.
-        let scale = (octave_rms * octave_rms / 2.0_f64.ln()).sqrt() * (nfft as f64) * 0.5_f64.sqrt();
+        let scale =
+            (octave_rms * octave_rms / 2.0_f64.ln()).sqrt() * (nfft as f64) * 0.5_f64.sqrt();
 
         let mut state = seed;
         let mut next_u01 = || -> f64 {
@@ -1552,13 +1554,21 @@ mod tests {
         let rate = 48_000u32;
         let mut tap = TapAnalyzer::new(2);
         tap.set_rate(rate);
-        tap.feed(&tagged(sine(LONG_FFT_SIZE + HOP * 2, rate, 60.0, 1.0), rate, 1));
+        tap.feed(&tagged(
+            sine(LONG_FFT_SIZE + HOP * 2, rate, 60.0, 1.0),
+            rate,
+            1,
+        ));
         let bins = tap.finish();
         let mut run = 1;
         for i in 1..bin_of(200.0) {
             if bins[i] > -120.0 && bins[i] == bins[i - 1] {
                 run += 1;
-                assert!(run < 3, "plateau ending at bin {i}: {:?}", &bins[..bin_of(200.0)]);
+                assert!(
+                    run < 3,
+                    "plateau ending at bin {i}: {:?}",
+                    &bins[..bin_of(200.0)]
+                );
             } else {
                 run = 1;
             }
@@ -1588,7 +1598,11 @@ mod tests {
         let rms = 0.1;
         let mut tap = TapAnalyzer::new(2);
         tap.set_rate(rate);
-        tap.feed(&tagged(white_noise(LONG_FFT_SIZE * 6, rms, 0xC0FFEE), rate, 1));
+        tap.feed(&tagged(
+            white_noise(LONG_FFT_SIZE * 6, rms, 0xC0FFEE),
+            rate,
+            1,
+        ));
         let bins = tap.finish();
         let nyquist = f64::from(rate) / 2.0;
         let half = 2.0_f64.powf(0.5 / f64::from(BINS_PER_OCTAVE));
@@ -1600,8 +1614,10 @@ mod tests {
         // which spans the crossover (about 800 Hz).
         let mut i = bin_of(100.0);
         while i + 8 <= bin_of(10_000.0) {
-            let err: f64 =
-                (i..i + 8).map(|k| f64::from(bins[k]) - expected(k)).sum::<f64>() / 8.0;
+            let err: f64 = (i..i + 8)
+                .map(|k| f64::from(bins[k]) - expected(k))
+                .sum::<f64>()
+                / 8.0;
             assert!(
                 err.abs() <= 1.5,
                 "white noise near {:.0} Hz reads {err:+.2} dB off its band power",

@@ -105,7 +105,10 @@ fn eq_conv_upsample_dsp() {
         ],
     );
     assert!(stdout.contains("EQ set (L/R)"), "{stdout}");
-    let eq = get_config(&harness.socket).chain.eq.expect("layered eq set");
+    let eq = get_config(&harness.socket)
+        .chain
+        .eq
+        .expect("layered eq set");
     assert!(eq.bands.is_empty());
     let left = eq.left.expect("left channel set");
     assert_eq!(left.bands.len(), 1);
@@ -198,7 +201,10 @@ fn eq_conv_upsample_dsp() {
     assert!(status_out.contains("conv:"), "{status_out}");
     assert!(status_out.contains("Room"), "{status_out}");
 
-    ctl_ok(&harness.socket, &["eq", "remove", "0", "--section", "right"]);
+    ctl_ok(
+        &harness.socket,
+        &["eq", "remove", "0", "--section", "right"],
+    );
     ctl_ok(&harness.socket, &["eq", "section", "right", "clear"]);
     ctl_ok(&harness.socket, &["eq", "section", "left", "clear"]);
     let eq_after = get_config(&harness.socket).chain.eq.unwrap();
@@ -226,7 +232,10 @@ fn eq_conv_upsample_dsp() {
     assert_eq!(up.taps, 8192);
     assert_eq!(up.phase, FilterPhase::Minimum);
 
-    ctl_ok(&harness.socket, &["upsample", "--cutoff-mode", "nyquist-stop"]);
+    ctl_ok(
+        &harness.socket,
+        &["upsample", "--cutoff-mode", "nyquist-stop"],
+    );
     let up = get_config(&harness.socket).chain.upsampler;
     assert_eq!(up.cutoff_mode, CutoffMode::NyquistStop);
 
@@ -294,8 +303,15 @@ fn upsample_response_prints_stats() {
     ctl_ok(
         &harness.socket,
         &[
-            "upsample", "--ratio", "4", "--taps", "16384", "--phase", "linear",
-            "--cutoff-mode", "nyquist-stop",
+            "upsample",
+            "--ratio",
+            "4",
+            "--taps",
+            "16384",
+            "--phase",
+            "linear",
+            "--cutoff-mode",
+            "nyquist-stop",
         ],
     );
     let text = ctl_ok(

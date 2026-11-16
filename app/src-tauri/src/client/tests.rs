@@ -391,8 +391,16 @@ fn slow_analysis_does_not_delay_control_calls() {
 
     // Control calls while `upsampler_response` is blocked on the daemon still finish immediately.
     let t = Instant::now();
-    assert_eq!(c.call("set_volume", Some(json!({"volume_db": -10}))).unwrap(), json!("set_volume"));
-    assert_eq!(c.call("set_dsp_enabled", Some(json!({"enabled": true}))).unwrap(), json!("set_dsp_enabled"));
+    assert_eq!(
+        c.call("set_volume", Some(json!({"volume_db": -10})))
+            .unwrap(),
+        json!("set_volume")
+    );
+    assert_eq!(
+        c.call("set_dsp_enabled", Some(json!({"enabled": true})))
+            .unwrap(),
+        json!("set_dsp_enabled")
+    );
     assert!(
         t.elapsed() < Duration::from_millis(120),
         "control calls took {:?} behind slow analysis",
@@ -444,4 +452,3 @@ fn newer_analysis_supersedes_pending_one() {
         first_started.elapsed()
     );
 }
-

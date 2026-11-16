@@ -17,8 +17,8 @@ use crate::control::persist::Persister;
 use crate::control::presets::{self, PresetError, PresetStore};
 use audivane_protocol::ipc::{
     AbConfig, AbSide, AbStatus, Call, DeviceInfo, EngineConfig, EngineState, LevelMatch, Meters,
-    NowPlaying, Passthrough, Preset, PresetInfo, PresetState, RoutingMode, RpcError, SinkChoice,
-    ResponseWindowRequest, Spectrum, Status, StreamInfo, Topic, VOLUME_MAX_DB, VOLUME_MIN_DB,
+    NowPlaying, Passthrough, Preset, PresetInfo, PresetState, ResponseWindowRequest, RoutingMode,
+    RpcError, SinkChoice, Spectrum, Status, StreamInfo, Topic, VOLUME_MAX_DB, VOLUME_MIN_DB,
     VolumeConfig, VolumeStatus,
 };
 use audivane_protocol::{ChainConfig, UpsamplerConfig, resolve_ratio};
@@ -1171,7 +1171,10 @@ fn to_value<T: serde::Serialize>(value: &T) -> Result<Value, RpcError> {
 }
 
 /// A zoom window must be finite, inside 0 .. output Nyquist and non-empty.
-fn validate_response_window(window: &ResponseWindowRequest, nyquist_out: f64) -> Result<(), String> {
+fn validate_response_window(
+    window: &ResponseWindowRequest,
+    nyquist_out: f64,
+) -> Result<(), String> {
     let (lo, hi) = (window.f_lo_hz, window.f_hi_hz);
     if !lo.is_finite() || !hi.is_finite() {
         return Err("window frequencies must be finite".into());
@@ -1182,7 +1185,9 @@ fn validate_response_window(window: &ResponseWindowRequest, nyquist_out: f64) ->
         ));
     }
     if lo >= hi {
-        return Err(format!("window needs f_lo_hz < f_hi_hz (got {lo} .. {hi} Hz)"));
+        return Err(format!(
+            "window needs f_lo_hz < f_hi_hz (got {lo} .. {hi} Hz)"
+        ));
     }
     Ok(())
 }

@@ -1173,8 +1173,16 @@ mod tests {
         let stats = chain.process_f32_with_gain_tapped(&input, &mut out, &mut gain, None);
         assert!(stats.measured);
         let db = |x: f64| 20.0 * x.log10();
-        assert!((db(stats.chain_peak_ch[0]) - 0.0).abs() < 0.1, "{:?}", stats.chain_peak_ch);
-        assert!((db(stats.peak_ch[0]) + 10.0).abs() < 0.1, "{:?}", stats.peak_ch);
+        assert!(
+            (db(stats.chain_peak_ch[0]) - 0.0).abs() < 0.1,
+            "{:?}",
+            stats.chain_peak_ch
+        );
+        assert!(
+            (db(stats.peak_ch[0]) + 10.0).abs() < 0.1,
+            "{:?}",
+            stats.peak_ch
+        );
         assert!((db(stats.peak_ch[1]) + 10.0).abs() < 0.1);
     }
 
