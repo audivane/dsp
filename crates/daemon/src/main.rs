@@ -6,14 +6,16 @@
 //! sink is restored, the device is released and the socket removed).
 
 use audivane_dsp_daemon::api::Engine;
-use audivane_dsp_daemon::control::config::ConfigStore;
+use audivane_dsp_daemon::control::config::{self, ConfigStore};
 use audivane_dsp_daemon::control::daemon::{Daemon, DaemonOptions};
 use audivane_dsp_daemon::control::ipc;
 use audivane_dsp_daemon::engine::RealEngine;
+use audivane_dsp_daemon::engine::waiting::{WaitingEngine, start_error_text};
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -77,7 +79,7 @@ fn run(args: Args) -> anyhow::Result<()> {
     if let Some(warning) = &loaded.warning {
         log::warn!("{warning}");
     }
-    let config = loaded.config;
+    let mut config = loaded.config;
     if config.device.is_empty() {
         anyhow::bail!(
             "no ALSA output device configured (set `device` in {})",
@@ -92,9 +94,33 @@ fn run(args: Args) -> anyhow::Result<()> {
     );
     log::debug!("config {}", store.path().display());
 
+    // `hw:2,0` names whatever card the kernel numbered 2 this boot. While it
+    // is present, pin it by card id so the next boot finds the same DAC.
+    if config::device_present(&config.device)
+        && let Some(stable) = config::stable_device_name(&config.device)
+    {
+        log::info!("device {} is {stable}; saving it by card id", config.device);
+        config.device = stable;
+        if let Err(err) = store.save(&config) {
+            log::warn!("cannot save {}: {err}", store.path().display());
+        }
+    }
+
+    // Without its device the engine cannot run, but the daemon still starts:
+    // the app and `avdsp ctl` then show why and can pick another device,
+    // instead of systemd restarting a failing service until it gives up.
+    let mut waiting = None;
     let engine: Arc<dyn Engine> = match RealEngine::start(&config) {
         Ok(engine) => engine,
-        Err(err) => anyhow::bail!("cannot start the engine: {err}"),
+        Err(err) => {
+            let present = config::device_present(&config.device);
+            let reason = start_error_text(&config.device, present, &err.message);
+            log::error!("cannot start the engine: {err}");
+            log::warn!("waiting: {reason}");
+            let engine = Arc::new(WaitingEngine::new(config.clone(), reason));
+            waiting = Some((Arc::clone(&engine), present));
+            engine
+        }
     };
 
     let opts = DaemonOptions::new(socket).with_store(Arc::clone(&store));
@@ -109,10 +135,74 @@ fn run(args: Args) -> anyhow::Result<()> {
 
     install_signal_handlers(Arc::clone(&daemon.shutdown_flag()))?;
 
+    let restart = Arc::new(AtomicBool::new(false));
+    if let Some((engine, present)) = waiting {
+        watch_for_device(
+            engine,
+            present,
+            daemon.shutdown_flag(),
+            Arc::clone(&restart),
+        )?;
+    }
+
     // Block until SIGTERM/SIGINT or `avdsp ctl shutdown`.
     daemon.wait();
     daemon.shutdown();
+    if restart.load(Ordering::Acquire) {
+        restart_self()?;
+    }
     Ok(())
+}
+
+/// How often a waiting daemon looks for its device.
+const DEVICE_POLL: Duration = Duration::from_secs(1);
+
+/// While the engine waits for its device: once the device appears, or the
+/// user picks another one, stop the daemon and run it again so the real
+/// engine starts. A device that is present but fails to open is only retried
+/// after a device change (or a manual restart), never in a loop.
+fn watch_for_device(
+    engine: Arc<WaitingEngine>,
+    present_at_start: bool,
+    shutdown: Arc<audivane_dsp_daemon::control::ShutdownFlag>,
+    restart: Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    let start_device = engine.device();
+    std::thread::Builder::new()
+        .name("avdsp-device-wait".into())
+        .spawn(move || {
+            let mut was_present = present_at_start;
+            while !shutdown.is_requested() {
+                std::thread::sleep(DEVICE_POLL);
+                let device = engine.device();
+                let present = config::device_present(&device);
+                let changed = device != start_device;
+                if (changed && present) || (present && !was_present) {
+                    log::info!("output device {device} is available; restarting the engine");
+                    restart.store(true, Ordering::Release);
+                    shutdown.request();
+                    return;
+                }
+                was_present = present;
+            }
+        })?;
+    Ok(())
+}
+
+/// Replace this process with a fresh copy (same arguments). The socket and
+/// the config have been released and flushed by `Daemon::shutdown`.
+fn restart_self() -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut exe = std::env::current_exe()?;
+    // A package upgrade may have replaced the binary: /proc/self/exe then
+    // reads "<path> (deleted)"; run the new file at the same path.
+    if let Some(path) = exe.to_str().and_then(|p| p.strip_suffix(" (deleted)")) {
+        exe = PathBuf::from(path);
+    }
+    let err = std::process::Command::new(&exe)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    anyhow::bail!("cannot restart {}: {err}", exe.display())
 }
 
 // ---------------------------------------------------------------- signals

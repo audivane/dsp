@@ -20,12 +20,12 @@
 //! copied to `config.json.corrupt-<unix-seconds>` and the built-in defaults are
 //! used (the daemon logs both facts).
 
+use audivane_dsp_core::minphase::{MAX_MINIMUM_PHASE_BETA, MIN_MINIMUM_PHASE_BETA};
+use audivane_dsp_core::resample::nyquist_stop_check;
 use audivane_protocol::ipc::{
     AbConfig, BALANCE_MAX_DB, DeviceInfo, EngineConfig, LevelMatch, RatePolicy, RoutingMode,
     VOLUME_MAX_DB, VOLUME_MIN_DB,
 };
-use audivane_dsp_core::minphase::{MAX_MINIMUM_PHASE_BETA, MIN_MINIMUM_PHASE_BETA};
-use audivane_dsp_core::resample::nyquist_stop_check;
 use audivane_protocol::{
     ChainConfig, CutoffMode, DitherKind, FilterPhase, RateTarget, UpsamplerConfig, resolve_ratio,
 };
@@ -288,63 +288,64 @@ fn repair(cfg: &mut EngineConfig) -> bool {
 
 // ---------------------------------------------------------------- defaults
 
-/// First `hw:` playback device in `/proc/asound/pcm` that is not HDMI.
+/// First `hw:` playback device that is not HDMI, named by card id
+/// (`hw:CARD=<id>,DEV=<n>`), so it survives card numbers moving around
+/// between boots.
 ///
 /// Loopback cards are used heavily by the test rig, so they are only chosen
 /// when nothing else is available.
 pub fn default_playback_device() -> Option<String> {
-    let text = fs::read_to_string("/proc/asound/pcm").ok()?;
-    default_device_from_listing(&text)
+    let pcm = fs::read_to_string("/proc/asound/pcm").ok()?;
+    let cards = fs::read_to_string("/proc/asound/cards").unwrap_or_default();
+    default_device_from_listing(&pcm, &cards)
 }
 
-/// Pick a default device from the contents of `/proc/asound/pcm`.
-///
-/// Lines look like:
-/// ```text
-/// 00-00: ALC892 Analog : ALC892 Analog : playback 1 : capture 1
-/// 00-03: HDMI 0 : HDMI 0 : playback 1
-/// ```
-pub fn default_device_from_listing(text: &str) -> Option<String> {
-    let mut fallback = None;
-    for line in text.lines() {
-        let mut fields = line.split(':');
-        let Some(ident) = fields.next() else { continue };
-        let rest: Vec<&str> = fields.collect();
-        if !rest.iter().any(|f| f.trim_start().starts_with("playback")) {
-            continue;
-        }
-        // `playback 1` (or more) means it can do playback at all.
-        let playback_ok = rest.iter().any(|f| {
-            let f = f.trim();
-            f.strip_prefix("playback")
-                .and_then(|n| n.trim().parse::<u32>().ok())
-                .is_some_and(|n| n > 0)
-        });
-        if !playback_ok {
-            continue;
-        }
-        let name = rest.first().map(|s| s.trim()).unwrap_or("");
-        let Some((card, device)) = ident.trim().split_once('-') else {
-            continue;
-        };
-        let (Ok(card), Ok(device)) = (card.trim().parse::<u32>(), device.trim().parse::<u32>())
-        else {
-            continue;
-        };
-        let hw = format!("hw:{card},{device}");
-        let lower = name.to_ascii_lowercase();
-        if lower.contains("hdmi") {
-            continue;
-        }
-        if lower.contains("loopback") {
-            if fallback.is_none() {
-                fallback = Some(hw);
-            }
-            continue;
-        }
-        return Some(hw);
+/// Pick a default device from the contents of `/proc/asound/pcm` and
+/// `/proc/asound/cards` (see [`devices_from_listing`]).
+pub fn default_device_from_listing(pcm: &str, cards: &str) -> Option<String> {
+    let devices = devices_from_listing(pcm, cards);
+    devices
+        .iter()
+        .find(|d| !d.hdmi && !d.loopback)
+        .or_else(|| devices.iter().find(|d| !d.hdmi))
+        .map(|d| d.id.clone())
+}
+
+/// `hw:<index>[,<dev>[,<subdev>]]` rewritten with the card's id
+/// (`hw:CARD=<id>,DEV=<dev>[,SUBDEV=<subdev>]`) while that card exists, so
+/// the name keeps pointing at the same hardware after a reboot reorders the
+/// cards. `None` for names that already use an id, are not `hw:`, or whose
+/// card is not present.
+pub fn stable_device_name(device: &str) -> Option<String> {
+    let cards = fs::read_to_string("/proc/asound/cards").ok()?;
+    stable_device_name_in(device, &cards)
+}
+
+/// [`stable_device_name`] against a given `/proc/asound/cards` listing.
+pub fn stable_device_name_in(device: &str, cards: &str) -> Option<String> {
+    let args = device.trim().strip_prefix("hw:")?;
+    let parts: Vec<&str> = args.split(',').map(str::trim).collect();
+    if parts.len() > 3 || parts.iter().any(|p| p.contains('=')) {
+        return None;
     }
-    fallback
+    let index: u32 = parts.first()?.parse().ok()?;
+    let numbers: Vec<u32> = parts[1..]
+        .iter()
+        .map(|p| p.parse().ok())
+        .collect::<Option<_>>()?;
+    let (id, _) = parse_cards(cards).remove(&index)?;
+    let mut name = format!("hw:CARD={id},DEV={}", numbers.first().copied().unwrap_or(0));
+    if let Some(sub) = numbers.get(1) {
+        name.push_str(&format!(",SUBDEV={sub}"));
+    }
+    Some(name)
+}
+
+/// Whether `device` names a playback device that exists right now (any
+/// spelling [`mark_active`] understands).
+pub fn device_present(device: &str) -> bool {
+    let mut devices = playback_devices();
+    mark_active(&mut devices, device)
 }
 
 // ---------------------------------------------------------------- devices
@@ -1090,7 +1091,10 @@ mod tests {
         cfg.chain.upsampler.kaiser_beta = 20.0;
         cfg.chain.upsampler.taps = 64;
         let err = validate(&cfg).unwrap_err();
-        assert!(err.contains("cutoff_mode") && err.contains("only guaranteed from"), "{err}");
+        assert!(
+            err.contains("cutoff_mode") && err.contains("only guaranteed from"),
+            "{err}"
+        );
         cfg.chain.upsampler.taps = 16_384;
         assert!(validate(&cfg).is_ok());
         cfg.chain.upsampler.kaiser_beta = 25.0;
@@ -1100,7 +1104,10 @@ mod tests {
         cfg.chain.upsampler.target = RateTarget::MaxRate(768_000);
         assert_eq!(worst_case_ratio(cfg.chain.upsampler.target), 16);
         cfg.chain.upsampler.taps = min16 - 1;
-        assert!(validate(&cfg).is_err(), "x16 at 44.1/48 kHz must be checked");
+        assert!(
+            validate(&cfg).is_err(),
+            "x16 at 44.1/48 kHz must be checked"
+        );
         cfg.chain.upsampler.taps = min16;
         assert!(validate(&cfg).is_ok());
         cfg.chain.upsampler.target = RateTarget::Off;
@@ -1342,12 +1349,22 @@ mod tests {
             assert_eq!(active.len(), 1, "{configured}: {devices:?}");
             assert_eq!(active[0].id, "hw:CARD=DAC,DEV=0");
         }
-        for configured in ["hw:DAC,0", "hw:DAC", "hw:2,0,0", "hw:DAC,0,0", "hw:CARD=DAC,DEV=0,SUBDEV=0"] {
+        for configured in [
+            "hw:DAC,0",
+            "hw:DAC",
+            "hw:2,0,0",
+            "hw:DAC,0,0",
+            "hw:CARD=DAC,DEV=0,SUBDEV=0",
+        ] {
             assert!(
                 mark_active_in(&mut devices, configured, cards),
                 "{configured} did not match"
             );
-            assert_eq!(devices.iter().filter(|d| d.active).count(), 1, "{configured}");
+            assert_eq!(
+                devices.iter().filter(|d| d.active).count(),
+                1,
+                "{configured}"
+            );
         }
         assert!(mark_active_in(&mut devices, "hw:Loopback,0,0", cards));
         let active: Vec<&DeviceInfo> = devices.iter().filter(|d| d.active).collect();
@@ -1365,16 +1382,57 @@ mod tests {
 01-00: ALC892 Analog : ALC892 Analog : playback 1 : capture 1
 02-00: Loopback : Loopback PCM : playback 8 : capture 8
 ";
-        assert_eq!(default_device_from_listing(text), Some("hw:1,0".into()));
+        let cards = "\
+ 0 [NVidia         ]: HDA-Intel - HDA NVidia
+                      HDA NVidia at 0xdc080000 irq 137
+ 1 [PCH            ]: HDA-Intel - HDA Intel PCH
+                      HDA Intel PCH at 0x1 irq 30
+ 2 [Loopback       ]: Loopback - Loopback
+                      Loopback 1
+10 [Loopback_1     ]: Loopback - Loopback
+                      Loopback 1
+";
+        // Named by card id, not by its (boot-order dependent) number.
+        assert_eq!(
+            default_device_from_listing(text, cards),
+            Some("hw:CARD=PCH,DEV=0".into())
+        );
 
         let only_loopback = "10-00: Loopback : Loopback PCM : playback 8 : capture 8\n";
         assert_eq!(
-            default_device_from_listing(only_loopback),
-            Some("hw:10,0".into())
+            default_device_from_listing(only_loopback, cards),
+            Some("hw:CARD=Loopback_1,DEV=0".into())
         );
 
         let capture_only = "00-00: HDMI 0 : HDMI 0 : capture 1\n";
-        assert_eq!(default_device_from_listing(capture_only), None);
+        assert_eq!(default_device_from_listing(capture_only, cards), None);
+    }
+
+    #[test]
+    fn numeric_device_names_get_the_card_id() {
+        let cards = "\
+ 0 [NVidia         ]: HDA-Intel - HDA NVidia
+                      HDA NVidia at 0xdc080000 irq 137
+ 2 [S3             ]: USB-Audio - S3
+                      Some DAC at usb-0000:00:14.0-2, high speed
+";
+        assert_eq!(
+            stable_device_name_in("hw:2,0", cards).as_deref(),
+            Some("hw:CARD=S3,DEV=0")
+        );
+        assert_eq!(
+            stable_device_name_in("hw:2", cards).as_deref(),
+            Some("hw:CARD=S3,DEV=0")
+        );
+        assert_eq!(
+            stable_device_name_in(" hw:2,1,0", cards).as_deref(),
+            Some("hw:CARD=S3,DEV=1,SUBDEV=0")
+        );
+        // Already stable, missing card, or not hw: left alone.
+        assert_eq!(stable_device_name_in("hw:CARD=S3,DEV=0", cards), None);
+        assert_eq!(stable_device_name_in("hw:S3,0", cards), None);
+        assert_eq!(stable_device_name_in("hw:5,0", cards), None);
+        assert_eq!(stable_device_name_in("plughw:2,0", cards), None);
     }
 
     #[test]

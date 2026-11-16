@@ -57,6 +57,28 @@ function UpdateBanner() {
   );
 }
 
+/**
+ * The engine runs but cannot play, e.g. its DAC is unplugged or the card
+ * was renumbered after a reboot. Takes the banner slot before the update
+ * banner: nothing plays until it is fixed.
+ */
+function EngineErrorBanner() {
+  const state = useApp((s) => s.status?.state);
+  const error = useApp((s) => s.status?.error);
+  const view = useApp((s) => s.view);
+  if (state !== "error" || !error) return <UpdateBanner />;
+  return (
+    <div className="update-banner bad" role="alert">
+      <span className="text">{error}</span>
+      {view !== "device" && (
+        <button className="btn small primary" onClick={() => store().setView("device")}>
+          Choose output
+        </button>
+      )}
+    </div>
+  );
+}
+
 function isTyping(el: EventTarget | null) {
   const t = el as HTMLElement | null;
   if (!t) return false;
@@ -138,7 +160,7 @@ export function App() {
   return (
     <div className="app">
       <TopBar />
-      <UpdateBanner />
+      <EngineErrorBanner />
       <Sidebar />
       <main className="main" id="main">
         <MainView />

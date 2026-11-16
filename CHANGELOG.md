@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- Fix: the engine no longer fails to start when its output device is
+  missing (DAC unplugged, or the card renumbered after a reboot). It starts,
+  answers the app, says which device is missing, and switches to the real
+  engine as soon as the device appears or another output is picked. The app
+  shows this in a banner with a "Choose output" button. Before, systemd
+  restarted the failing service until it gave up and the app only said the
+  engine was not answering.
+- Fix: devices are saved by card id (`hw:CARD=<id>,DEV=<n>`) instead of the
+  card number, which changes with boot order. A numeric device in an existing
+  config is converted at start-up while the device is present.
+- Fix: in system-wide routing, unplugging the DAC no longer leaves the
+  session on a silent `auto_null` sink: Audivane hands the default back while
+  its sink is gone, and takes it again when the DAC returns.
+- When the engine does not start at all, the app shows the engine's own
+  error instead of pointing to `journalctl`, and "Start engine" also clears
+  systemd's restart limit.
+- `avdsp ctl status` says `passthrough: bit-perfect` / `not bit-perfect` /
+  `nothing is playing` instead of `intact` / `broken`, with a hint for
+  volume. Volume percentages (CLI and app) use the cubic scale of desktop
+  volume sliders.
+
 ## 0.9.3
 
 - Fix: the status bar now uses the live engine input rate for `IN`, so the

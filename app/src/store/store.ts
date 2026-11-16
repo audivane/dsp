@@ -482,7 +482,15 @@ export class AppStore {
       // The subscription reconnects on its own; give it time before giving up.
       setTimeout(() => {
         if (this.state.conn !== "up" && this.state.starting) {
-          this.set({ starting: false, startError: "The engine was started but is not answering yet. Check `journalctl --user -u audivane-dsp`." });
+          void this.transport.engineLastError().then((reason) => {
+            if (this.state.conn === "up" || !this.state.starting) return;
+            this.set({
+              starting: false,
+              startError: reason
+                ? `The engine did not start: ${reason}`
+                : "The engine was started but is not answering yet. `journalctl --user -u audivane-dsp` shows why.",
+            });
+          });
         }
       }, 8000);
     } catch (e) {

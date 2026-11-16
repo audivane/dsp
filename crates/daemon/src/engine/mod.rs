@@ -4,6 +4,7 @@
 pub mod ir;
 pub mod processor;
 pub mod spectrum;
+pub mod waiting;
 
 use crate::api::{Engine, EngineError, EngineSnapshot};
 use audivane_dsp_core::bypass::{hash_i32, i32_to_f32};

@@ -292,6 +292,15 @@ async fn start_engine() -> Result<(), CallError> {
         .map_err(|message| CallError { code: 2, message })
 }
 
+/// The engine's last error from the journal, when it failed to come up.
+#[tauri::command]
+async fn engine_last_error() -> Option<String> {
+    tauri::async_runtime::spawn_blocking(systemd::last_engine_error)
+        .await
+        .ok()
+        .flatten()
+}
+
 #[tauri::command]
 async fn restart_engine() -> Result<(), CallError> {
     tauri::async_runtime::spawn_blocking(systemd::restart_engine)
@@ -727,6 +736,7 @@ pub fn run() {
             spectrum_ack,
             spectrum_enable,
             start_engine,
+            engine_last_error,
             restart_engine,
             app_version,
             restart_app,

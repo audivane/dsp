@@ -94,6 +94,10 @@ export class TauriTransport implements Transport {
     }
   }
 
+  async engineLastError(): Promise<string | null> {
+    return invoke<string | null>("engine_last_error").catch(() => null);
+  }
+
   async restartEngine(): Promise<void> {
     try {
       await invoke("restart_engine");

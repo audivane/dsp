@@ -450,7 +450,12 @@ impl GraphWatcher {
                     let stale = sup_shared
                         .facts
                         .lock()
-                        .map(|f| f.default_sink.as_deref() != Some(name.as_str()))
+                        .map(|f| {
+                            // Also when our sink vanished while still the
+                            // default: the handler then hands it back.
+                            f.default_sink.as_deref() != Some(name.as_str())
+                                || f.sink(SinkChoice::Dsp).is_none()
+                        })
                         .unwrap_or(false);
                     if stale {
                         let _ = sup_tx.send(Command::AssertSystemDefault);
@@ -1012,6 +1017,13 @@ impl Graph {
         self.pending_recovery = None;
     }
 
+    /// Whether our DSP sink is in the graph right now.
+    fn dsp_sink_present(&self) -> bool {
+        self.nodes
+            .values()
+            .any(|node| node.choice == Some(SinkChoice::Dsp))
+    }
+
     fn set_system_default(&mut self, enabled: bool) {
         if !enabled && !self.system_default && self.prev_defaults.is_none() {
             // Nothing to restore: never clobber the session default.
@@ -1039,6 +1051,20 @@ impl Graph {
                             return;
                         }
                         self.defaults_known = true;
+                    }
+                    if !self.dsp_sink_present() {
+                        // Our sink is gone (its device was unplugged and the
+                        // driver went idle): a default pointing at it would
+                        // leave the session silent. Hand the default back and
+                        // take it again when the sink returns.
+                        if self.prev_defaults.is_some() {
+                            log::info!(
+                                "system-wide routing: {} is gone; handing the default sink back",
+                                self.opts.dsp_sink_name
+                            );
+                            self.restore_defaults();
+                        }
+                        return;
                     }
                     self.enter_system_default();
                 }
@@ -1412,7 +1438,11 @@ fn run_loop(
         graph.recover_defaults();
         let system_default = graph.system_default;
         if system_default {
-            graph.enter_system_default();
+            if graph.dsp_sink_present() {
+                graph.enter_system_default();
+            }
+            // Otherwise the supervisor takes the default once the sink
+            // appears (`AssertSystemDefault`).
         } else if !graph.rules.is_empty() {
             let rules = graph.rules.clone();
             graph.handle(Command::SetRules(rules));

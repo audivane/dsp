@@ -1218,6 +1218,10 @@ export class MockTransport implements Transport {
     this.daemon.startEngine();
   }
 
+  async engineLastError(): Promise<string | null> {
+    return null;
+  }
+
   async restartEngine(): Promise<void> {
     await new Promise((r) => setTimeout(r, 300));
     this.daemon.restartEngine();

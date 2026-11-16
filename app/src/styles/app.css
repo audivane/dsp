@@ -26,6 +26,7 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
   grid-area: banner; display: flex; align-items: center; gap: 10px; min-width: 0;
   padding: 6px 12px 6px 16px; border-bottom: 1px solid var(--line); background: var(--accent-soft); color: var(--fg);
 }
+.update-banner.bad { background: var(--bad-soft); }
 .update-banner .text { flex: 1; min-width: 0; }
 .update-banner .icon-btn { width: 26px; height: 26px; flex: none; }
 .update-banner .btn { flex: none; }

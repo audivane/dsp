@@ -266,6 +266,24 @@ active }`. `active` marks the configured device (`hw:0,0`, `hw:CARD=DAC`,
 `hw:CARD=DAC,DEV=0` and the short forms are all matched); capture-only PCMs are
 skipped.
 
+Card numbers depend on boot order, so the daemon names devices by card id:
+the device it picks on first run is `hw:CARD=<id>,DEV=<n>`, and a numeric
+`hw:<card>,<dev>[,<sub>]` in the config is rewritten to the card-id form
+(and saved) at start-up while that device exists.
+
+**Device missing at start-up.** When the engine cannot open the configured
+device, the daemon still starts and answers on its socket with a stand-in
+engine: `status.state` is `error` and `status.error` says what is wrong
+(`Output device hw:CARD=ZH3,DEV=0 not found. Plug it in or pick another
+output in the device list; ...`, or `Cannot open output device ...: <ALSA
+error>` when the device is there but fails). `list_devices`, `get_config` and
+`set_config` work; DSP calls that need the engine (`selftest`, `ab_select`,
+`acquire_device`) fail with `BAD_STATE` and the same text. The daemon checks
+for the device every second and replaces itself with a fresh copy (same
+arguments, same PID) once the device appears, or once `set_config` names a
+device that exists. A device that is present but fails to open is not
+retried in a loop: only a device change or a manual restart tries again.
+
 ### Chain wire shapes (EQ & convolution)
 
 - **Per-channel EQ (`EqProfile`):** `EqProfile` has an optional
@@ -354,7 +372,12 @@ Routing modes:
   asserted at all, so the session default never points at a sink that does not
   exist; acquiring re-applies it.
   A supervisor thread re-asserts the default if WirePlumber picks something
-  else (e.g. a hot-plugged device), at most every 500 ms.
+  else (e.g. a hot-plugged device), at most every 500 ms, but only while the
+  `audivane_dsp` sink is in the graph. When the sink disappears without a
+  release (the DAC is unplugged and the driver goes idle on its own), the
+  supervisor hands the default back the same way as on leaving system mode,
+  so the session falls back to another output instead of `auto_null`; it
+  takes the default again when the sink returns.
 - **Apps** (`RoutingMode::Apps { rules }`): move individual streams by writing
   the `default` metadata for the stream's subject:
 
@@ -404,7 +427,7 @@ A negotiated PipeWire format is a container width, not a source precision:
 nothing about the file behind it. Such streams get a **caveat** instead of a
 break: `Passthrough::caveats` carries `UnknownSourcePrecision { format }`
 (`"S32LE"`), `intact` stays true, and `avdsp ctl status` renders e.g.
-`passthrough: intact (source precision unknown: S32LE container)`. `caveats`
+`passthrough: bit-perfect (source precision unknown: S32LE container)`. `caveats`
 is `#[serde(default)]`, so older clients keep working; they are not breaks and
 never appear in `broken_because`.
 

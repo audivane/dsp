@@ -54,6 +54,8 @@ export interface Transport {
   upsamplerResponse(config: UpsamplerConfig | null, sourceRate: number | null, window?: ResponseWindowRequest): Promise<UpsamplerResponse>;
   /** Start the systemd user unit `audivane-dsp.service`. */
   startEngine(): Promise<void>;
+  /** The engine's own last error line when it failed to start (`null` if unknown). */
+  engineLastError(): Promise<string | null>;
   /** Restart the systemd user unit (an upgrade left the old engine running). */
   restartEngine(): Promise<void>;
   /** This app's own version, compared with the engine's `status.version`. */

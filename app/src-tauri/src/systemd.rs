@@ -9,7 +9,45 @@ pub const UNIT: &str = "audivane-dsp.service";
 
 /// Start the unit; returns the systemd job path. Errors are plain sentences.
 pub fn start_engine() -> Result<String, String> {
+    // After a crash loop systemd refuses new starts for a while
+    // ("start-limit-hit"); the user asked explicitly, so clear that first.
+    let _ = reset_failed();
     unit_job("StartUnit")
+}
+
+fn reset_failed() -> Result<(), String> {
+    zbus::block_on(async {
+        let conn = Connection::session().await.map_err(|e| e.to_string())?;
+        conn.call_method(
+            Some("org.freedesktop.systemd1"),
+            "/org/freedesktop/systemd1",
+            Some("org.freedesktop.systemd1.Manager"),
+            "ResetFailedUnit",
+            &(UNIT,),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    })
+}
+
+/// The engine's own last error line from the journal (it prints
+/// `audivane-dsp: <reason>` before exiting), when it did not come up.
+pub fn last_engine_error() -> Option<String> {
+    let out = std::process::Command::new("journalctl")
+        .args(["--user", "-u", UNIT, "-n", "40", "-o", "cat", "--no-pager"])
+        .output()
+        .ok()?;
+    last_error_line(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn last_error_line(journal: &str) -> Option<String> {
+    journal
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("audivane-dsp: "))
+        .map(|reason| reason.trim().to_string())
+        .filter(|reason| !reason.is_empty())
 }
 
 /// Restart the unit (start it when stopped), e.g. after a package upgrade
@@ -53,5 +91,26 @@ fn describe(e: zbus::Error) -> String {
         "The systemd user manager is not running in this session.".to_string()
     } else {
         format!("systemd could not start {UNIT}: {text}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::last_error_line;
+
+    #[test]
+    fn picks_the_engines_own_last_error() {
+        let journal = "\
+[2026-11-16T16:37:31.174Z INFO  audivane_dsp] audivane-dsp 0.9.3 starting
+audivane-dsp: cannot start the engine: first
+[2026-11-16T16:37:33.932Z ERROR audivane_dsp] cannot start the engine: second
+audivane-dsp: cannot start the engine: second
+Started Audivane DSP engine.
+";
+        assert_eq!(
+            last_error_line(journal).as_deref(),
+            Some("cannot start the engine: second")
+        );
+        assert_eq!(last_error_line("nothing here\n"), None);
     }
 }
