@@ -12,6 +12,7 @@ import { EqView } from "./views/EqView";
 import { OutputView } from "./views/OutputView";
 import { RoutingView } from "./views/RoutingView";
 import { UpsamplingView } from "./views/UpsamplingView";
+import { versionSkew } from "./lib/versions";
 
 function Toast() {
   const t = useApp((s) => s.toast);
@@ -20,6 +21,36 @@ function Toast() {
     <div className={"toast " + t.tone} role={t.tone === "error" ? "alert" : "status"}>
       <span>{t.text}</span>
       <button className="icon-btn" aria-label="Dismiss" onClick={() => store().dismissToast()}>
+        <Close />
+      </button>
+    </div>
+  );
+}
+
+/** After a package upgrade: the app or the engine still runs the old code. */
+function UpdateBanner() {
+  const app = useApp((s) => s.appVersion);
+  const engine = useApp((s) => s.status?.version);
+  const dismissed = useApp((s) => s.updateDismissed);
+  const restarting = useApp((s) => s.restarting);
+  const skew = versionSkew(app, engine);
+  if (!skew || dismissed === skew.engine) return null;
+  const outdatedApp = skew.kind === "app-outdated";
+  return (
+    <div className="update-banner" role="status">
+      <span className="text">
+        {outdatedApp
+          ? `Audivane DSP was updated to ${skew.engine}. Restart the app to finish.`
+          : `The engine is still running ${skew.engine}; this app is ${skew.app}. Restart the engine to finish the update.`}
+      </span>
+      <button
+        className="btn small primary"
+        disabled={restarting}
+        onClick={() => void (outdatedApp ? store().restartApp() : store().restartEngine())}
+      >
+        {restarting ? "Restarting…" : outdatedApp ? "Restart" : "Restart engine"}
+      </button>
+      <button className="icon-btn" aria-label="Dismiss" title="Not now" onClick={() => store().dismissUpdate()}>
         <Close />
       </button>
     </div>
@@ -107,6 +138,7 @@ export function App() {
   return (
     <div className="app">
       <TopBar />
+      <UpdateBanner />
       <Sidebar />
       <main className="main" id="main">
         <MainView />

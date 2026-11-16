@@ -10,8 +10,10 @@
 #   build  <source-dir> <stage-dir>: compile inside the root with
 #          `unshare -r` + chroot at native speed
 #   shell  interactive shell inside the root
-#   deb-smoke <file.deb>: apt-install a .deb into a throwaway copy of the
-#          root and check that every binary resolves its libraries
+#   deb-smoke <file.deb> [<upgrade.deb>]: apt-install a .deb into a
+#          throwaway copy of the root and check that every binary resolves
+#          its libraries; with <upgrade.deb>, then install that over it
+#          (the postinst upgrade path)
 #
 # The host's Rust toolchain (~/.rustup) and Node (found on PATH) are bound in
 # read-only; both are built against old glibc and run unchanged on 24.04.
@@ -132,18 +134,30 @@ cmd_build() {
 }
 
 cmd_deb_smoke() {
-  local deb copy
-  deb=$(readlink -f "${1:?deb-smoke <file.deb>}")
+  local deb deb2= copy
+  deb=$(readlink -f "${1:?deb-smoke <file.deb> [<upgrade.deb>]}")
+  [ -z "${2:-}" ] || deb2=$(readlink -f "$2")
   copy=$CACHE/smoke-root
   rm -rf "$copy"; cp -a "$ROOT" "$copy"
   cp "$deb" "$copy/tmp/pkg.deb"
+  [ -z "$deb2" ] || cp "$deb2" "$copy/tmp/pkg2.deb"
   log "apt install $(basename "$deb") into a throwaway copy of the root"
+  # The postinst note goes to stdout; apt's own chatter is dropped.
   as_fake_root "$copy" sh -c 'apt-get -o APT::Sandbox::User=root update -qq \
-    && apt-get -o APT::Sandbox::User=root install -y -qq --no-install-recommends /tmp/pkg.deb >/dev/null \
+    && apt-get -o APT::Sandbox::User=root install -y -qq --no-install-recommends /tmp/pkg.deb > /tmp/install.log \
+    && grep -A7 "^==> Audivane DSP installed" /tmp/install.log \
     && dpkg -s audivane-dsp | sed -n "s/^Version: /installed version /p" \
     && for b in /usr/bin/audivane-dsp /usr/bin/avdsp /usr/bin/audivane-dsp-ui; do
          if ldd "$b" | grep -q "not found"; then echo "MISSING libs for $b"; ldd "$b" | grep "not found"; exit 1; fi
          echo "  ok   $b"; done'
+  if [ -n "$deb2" ]; then
+    log "apt install $(basename "$deb2") over it (upgrade)"
+    as_fake_root "$copy" sh -c 'apt-get -o APT::Sandbox::User=root install -y -qq --no-install-recommends --reinstall --allow-downgrades /tmp/pkg2.deb > /tmp/upgrade.log \
+      && grep -A3 "^==> " /tmp/upgrade.log \
+      && grep -q "^==> Audivane DSP updated" /tmp/upgrade.log \
+      && dpkg -s audivane-dsp | sed -n "s/^Version: /upgraded to /p"' \
+      || { cat "$copy/tmp/upgrade.log" >&2 2>/dev/null; rm -rf "$copy"; die "deb upgrade smoke test failed"; }
+  fi
   rm -rf "$copy"
   log "deb smoke test passed"
 }
@@ -154,5 +168,5 @@ case ${1:-} in
   shell) in_root /bin/bash -i ;;
   deb-smoke) shift; cmd_deb_smoke "$@" ;;
   _ns_exec) shift; cmd_ns_exec "$@" ;;
-  *) sed -n '3,22p' "$SCRIPT" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '3,24p' "$SCRIPT" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

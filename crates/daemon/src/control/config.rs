@@ -99,7 +99,7 @@ impl ConfigStore {
                     // Chain B follows chain A; an older file may still carry a
                     // chain B from before the upsampler/output changed, which
                     // would otherwise look "invalid" and be moved aside.
-                    if let Some(note) = normalize_ab(&mut cfg) {
+                    if let Some(note) = normalize_config(&mut cfg) {
                         warnings.push(format!("{}: {note}", self.path.display()));
                     }
                     // A file can parse and still be unusable (e.g. an empty
@@ -804,6 +804,51 @@ fn validate_ab(ab: &AbConfig, a: &ChainConfig, rate: &RatePolicy) -> Result<(), 
 
 // ---------------------------------------------------------------- normalization
 
+/// Everything every config edit (and the config file) goes through before
+/// validation: [`normalize_rates`] and [`normalize_ab`]. Returns the notes
+/// of what had to change.
+pub fn normalize_config(cfg: &mut EngineConfig) -> Option<String> {
+    let notes: Vec<String> = [normalize_rates(&mut cfg.rate), normalize_ab(cfg)]
+        .into_iter()
+        .flatten()
+        .collect();
+    (!notes.is_empty()).then(|| notes.join("; "))
+}
+
+/// Keep the rate policy consistent instead of rejecting it: `allowed_rates`
+/// sorted without duplicates, and a `default_rate` that is not allowed moves
+/// to the nearest allowed rate (same 44.1k/48k family first, then the
+/// closest, 48 kHz on a tie: io-pw's `nearest_rate`, which the app mirrors).
+/// An empty or unsupported list is left for [`validate`] to reject.
+pub fn normalize_rates(rate: &mut RatePolicy) -> Option<String> {
+    let mut sorted = rate.allowed_rates.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut changed = sorted != rate.allowed_rates;
+    rate.allowed_rates = sorted;
+    let mut note = None;
+    if !rate.allowed_rates.contains(&rate.default_rate) {
+        let usable: Vec<u32> = rate
+            .allowed_rates
+            .iter()
+            .copied()
+            .filter(|r| ALLOWED_RATES.contains(r))
+            .collect();
+        if let Some(next) = audivane_io_pw::rate_caps::nearest_rate(rate.default_rate, &usable) {
+            note = Some(format!(
+                "rate.default_rate {} is not allowed; using {next}",
+                rate.default_rate
+            ));
+            rate.default_rate = next;
+            changed = true;
+        }
+    }
+    if changed && note.is_none() {
+        note = Some("rate.allowed_rates sorted".to_string());
+    }
+    note
+}
+
 /// Realign chain B with chain A wherever they must agree.
 ///
 /// A/B needs both sides to resolve to the same upsampling ratio at every
@@ -943,6 +988,41 @@ mod tests {
         assert_eq!(backups.len(), 1, "{backups:?}");
         assert!(!loaded.config.device.is_empty());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rate_policy_is_normalized_not_rejected() {
+        let mut rate = RatePolicy::default();
+        assert_eq!(normalize_rates(&mut rate), None);
+
+        // Disabling the default moves it within its family first.
+        rate.allowed_rates = vec![192_000, 44_100, 88_200, 96_000, 44_100];
+        rate.default_rate = 48_000;
+        assert!(normalize_rates(&mut rate).unwrap().contains("using 96000"));
+        assert_eq!(rate.allowed_rates, vec![44_100, 88_200, 96_000, 192_000]);
+        assert_eq!(rate.default_rate, 96_000);
+
+        // No rate of the same family left: the closest one.
+        rate.allowed_rates = vec![44_100, 88_200];
+        rate.default_rate = 48_000;
+        normalize_rates(&mut rate);
+        assert_eq!(rate.default_rate, 44_100);
+
+        // The high rates are ordinary entries.
+        rate.allowed_rates = vec![352_800, 768_000];
+        rate.default_rate = 705_600;
+        normalize_rates(&mut rate);
+        assert_eq!(rate.default_rate, 352_800);
+        let mut cfg = valid();
+        cfg.rate = rate.clone();
+        assert!(validate(&cfg).is_ok());
+
+        // Nothing usable is left for validation to reject.
+        rate.allowed_rates = vec![];
+        assert_eq!(normalize_rates(&mut rate), None);
+        rate.allowed_rates = vec![123_456];
+        normalize_rates(&mut rate);
+        assert_eq!(rate.default_rate, 352_800);
     }
 
     #[test]

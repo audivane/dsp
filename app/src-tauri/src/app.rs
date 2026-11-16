@@ -293,6 +293,58 @@ async fn start_engine() -> Result<(), CallError> {
 }
 
 #[tauri::command]
+async fn restart_engine() -> Result<(), CallError> {
+    tauri::async_runtime::spawn_blocking(systemd::restart_engine)
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r.map(|_| ()))
+        .map_err(|message| CallError { code: 2, message })
+}
+
+/// This app's version, to compare with the engine's (`status.version`).
+#[tauri::command]
+fn app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// Relaunch the app, e.g. after a package upgrade replaced its binary: the
+/// new process runs the installed (new) code. Like `AppHandle::restart`, but
+/// without `--hidden`: the user clicked Restart in a visible window. The
+/// single-instance lock is released (`cleanup_before_exit`) before the new
+/// process starts.
+#[tauri::command]
+fn restart_app(app: AppHandle) {
+    let _ = app.save_window_state(StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED);
+    let state = app.state::<AppState>();
+    if let Some(mut s) = state
+        .subscription
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        s.stop();
+    }
+    state.client.reset();
+    let env = app.env();
+    let exe = tauri::process::current_binary(&env);
+    app.cleanup_before_exit();
+    match exe {
+        Ok(exe) => {
+            let args = env
+                .args_os
+                .iter()
+                .skip(1)
+                .filter(|a| a.to_str() != Some("--hidden"));
+            if let Err(e) = std::process::Command::new(&exe).args(args).spawn() {
+                log::error!("cannot relaunch {}: {e}", exe.display());
+            }
+        }
+        Err(e) => log::error!("cannot find the app binary to relaunch: {e}"),
+    }
+    std::process::exit(0);
+}
+
+#[tauri::command]
 async fn ir_info(path: String) -> Option<irinfo::IrInfo> {
     tauri::async_runtime::spawn_blocking(move || irinfo::read(std::path::Path::new(&path)))
         .await
@@ -675,6 +727,9 @@ pub fn run() {
             spectrum_ack,
             spectrum_enable,
             start_engine,
+            restart_engine,
+            app_version,
+            restart_app,
             ir_info,
             overlays_list,
             overlay_save,

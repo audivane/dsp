@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.9.2
+
+- `avdsp upgrade`: updates a packaged install in place. It reads the latest
+  release from GitHub, shows "installed X → latest Y" and the release notes,
+  asks, downloads the package for your distribution plus `SHA256SUMS`, checks
+  the SHA-256, installs the local file with `sudo pacman -U` / `apt install` /
+  `dnf install`, restarts the engine if it was running and confirms it runs
+  the new version. `--check` only reports (exit 10 when an update exists),
+  `--yes` skips the question, `--version <tag>` installs a given release
+  (reinstall or downgrade). It refuses to run as root and does not touch a
+  source build.
+- Fix: upgrading the package left the old engine running until the next
+  login or a manual restart. On upgrade (not on first install) the package
+  now reloads every running systemd user manager and restarts
+  `audivane-dsp.service` where it was running, and says for which users;
+  without systemd (containers) it only prints the note. Arch packages now
+  print a note on upgrade at all.
+- App: when the engine runs a newer version than the app (the app was open
+  during an upgrade), a banner says "Audivane DSP was updated to X. Restart
+  the app to finish." with a **Restart** button that relaunches the app. When
+  the engine is the older one, the banner offers **Restart engine** instead.
+- Fix: starting `audivane-dsp` by hand while the service already runs failed
+  with "device reservation denied for card N: current owner refused release".
+  It now stops before touching the device: "Audivane DSP is already running
+  (systemctl --user status audivane-dsp)."
+- App, Device page: the sample rates are now buttons for all ten engine
+  rates (44.1k to 768k). Click one to allow or block it; 352.8k and up stay
+  off by default and can be turned on (e.g. so DXD reaches the DAC without
+  resampling; upsampling then uses a smaller ratio). A dot marks the default
+  rate; right-click (or Shift+F10) a rate for "Use as default". Blocking the
+  default moves it to the nearest allowed rate of the same family, the last
+  allowed rate cannot be blocked, rates the device cannot play are greyed
+  ("Not supported by this device"), and the rate playing now is outlined.
+- Engine: a config whose `default_rate` is not among `allowed_rates` is
+  corrected (nearest allowed rate, same family first) instead of rejected,
+  and the list is kept sorted. New `avdsp ctl rates [--enable HZ…]
+  [--disable HZ…] [--default HZ]`.
+- App, Upsampling page: the source-rate tabs are labelled "Preview at" (only
+  a view, nothing changes in the engine) and list the rates the engine
+  actually runs at on this device, so enabled high rates appear and blocked
+  ones disappear. Previewing another rate than the one playing shows
+  "Playing: 48k", which switches back to following playback.
+- App: the Kaiser β presets say what they are: "β 10 · Steep", "β 14 ·
+  Standard", "β 17 · Deep", "β 20 · Deeper", "β 24 · Deepest" (were
+  Steeper/Standard/Deeper/Deepest/Extreme), with a one-line hint on the trade
+  between transition steepness and stopband depth.
+
 ## 0.9.1
 
 - Fix: on a fresh install the engine could not save its settings

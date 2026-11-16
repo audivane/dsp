@@ -28,6 +28,7 @@ import {
 } from "../lib/plotView";
 import { cutoffTips, fmtHzStat, fmtRipple, windowRequestFor } from "../lib/upsamplerPlot";
 import {
+  KAISER_BETA_HINT,
   KAISER_BETA_PRESETS,
   kaiserAttenuationDb,
   kaiserBetaBlockReason,
@@ -40,7 +41,8 @@ import {
   selectedKaiserPreset,
   worstCaseRatio,
 } from "../lib/upsamplerLimits";
-import { SOURCE_RATES, viewSourceRate } from "../lib/upsamplerRate";
+import { chosenPreviewRate, viewSourceRate } from "../lib/upsamplerRate";
+import { previewRates } from "../lib/rates";
 import { errorText, store, useApp } from "../store/store";
 import { cssVar, useSkin } from "../theme";
 import { ZoomPlot, type BoxAxis, type DragMode, type PlotGeom } from "./ZoomPlot";
@@ -382,11 +384,21 @@ export function UpsamplingView() {
   // A reopen (filter length, ratio...) reports "switching" for a moment: keep
   // the last rate so the readout, plot and measurement do not jump to another
   // rate and back.
+  const effectiveRates = useApp((s) => s.status?.effective_rates);
+  const allowedRates = useApp((s) => s.config?.rate.allowed_rates);
+  const rates = useMemo(() => previewRates(effectiveRates, allowedRates), [effectiveRates, allowedRates]);
   const heldRate = useRef<number | null>(null);
-  const playingRate = viewSourceRate({ state: statusState, graphRate: rawGraphRate, effectiveDefaultRate, held: heldRate.current });
+  const playingRate = viewSourceRate({ state: statusState, graphRate: rawGraphRate, effectiveDefaultRate, held: heldRate.current, rates });
   if (statusState !== "switching") heldRate.current = playingRate;
-  const [chosenRate, setChosenRate] = useState<number | null>(null);
+  // "Preview at" is only a view: a pick that is no longer offered (the rate
+  // was turned off on the Device page) falls back to following playback.
+  const [pickedRate, setPickedRate] = useState<number | null>(null);
+  const chosenRate = chosenPreviewRate(pickedRate, rates);
+  useEffect(() => {
+    if (pickedRate !== null && chosenRate === null) setPickedRate(null);
+  }, [pickedRate, chosenRate]);
   const sourceRate = chosenRate ?? playingRate;
+  const playingNow = statusState === "playing" && rawGraphRate ? rawGraphRate : null;
   const [recentPlayingRate, setRecentPlayingRate] = useState<number | null>(() =>
     statusState === "playing" && rawGraphRate && rawGraphRate > 0 ? rawGraphRate : null,
   );
@@ -515,9 +527,9 @@ export function UpsamplingView() {
   const designedAttenDb = kaiserAttenuationDb(u.kaiser_beta);
   const designedTwHz = !off && readoutRatio > 1 ? kaiserTransitionWidthHz(u.kaiser_beta, u.taps, readoutOutRate) : null;
   const selectedBeta = selectedKaiserPreset(u.kaiser_beta);
-  const betaOptions: [number, string, string, boolean][] = KAISER_BETA_PRESETS.map(({ beta, label }) => {
+  const betaOptions: [number, string, string, boolean][] = KAISER_BETA_PRESETS.map(({ beta, name, label }) => {
     const block = kaiserBetaBlockReason(u, beta);
-    return [beta, label, block ?? kaiserPresetTooltip(beta, label), block !== null && selectedBeta !== beta];
+    return [beta, label, block ?? kaiserPresetTooltip(beta, name), block !== null && selectedBeta !== beta];
   });
   const steep = r ? steepnessText(r.crossings) : null;
   const setView = (id: PlotId) => (v: ViewRange) => setViews((prev) => ({ ...prev, [id]: v }));
@@ -533,12 +545,23 @@ export function UpsamplingView() {
     <section className="view" aria-labelledby="ups-title">
       <div className="view-head">
         <h1 id="ups-title">Upsampling</h1>
-        <Seg
-          label="Source rate"
-          value={sourceRate}
-          onChange={(rate) => setChosenRate(rate)}
-          options={SOURCE_RATES.map((rate) => [rate, fmtRateShort(rate)])}
-        />
+        <span className="preview-at">
+          <span className="preview-label" id="ups-preview-label" title="The source rate the readouts and plots below are shown for. Only a view: it changes nothing in the engine.">
+            Preview at
+          </span>
+          <Seg
+            className="preview-seg"
+            label="Preview at source rate"
+            value={sourceRate}
+            onChange={(rate) => setPickedRate(rate === playingNow ? null : rate)}
+            options={rates.map((rate) => [rate, fmtRateShort(rate), rate === playingNow ? "Playing now" : `Show the filter for a ${fmtRate(rate)} source`])}
+          />
+          {playingNow !== null && sourceRate !== playingNow && (
+            <button type="button" className="preview-playing" title="Follow the playing rate again" onClick={() => setPickedRate(null)}>
+              Playing: {fmtRateShort(playingNow)}
+            </button>
+          )}
+        </span>
         {loading && (
           <span className="ups-loading" role="status">
             Measuring… (long filters take a while)
@@ -645,6 +668,7 @@ export function UpsamplingView() {
               <div className="row">
                 <span className="k">Filter shape (Kaiser β)</span>
                 <Seg<number>
+                  className="beta-seg"
                   label="Filter shape (Kaiser β)"
                   value={selectedBeta}
                   disabled={off}
@@ -653,6 +677,7 @@ export function UpsamplingView() {
                 />
                 {selectedBeta === null && <span className="hint">Custom β = {formatBeta(u.kaiser_beta)} (set from CLI)</span>}
               </div>
+              <div className="ups-adv-readout">{KAISER_BETA_HINT}</div>
               <div className="ups-adv-readout" aria-label="Kaiser filter design estimate">
                 Designed stopband ≈ {designedAttenDb.toFixed(1)} dB · transition width{" "}
                 {off

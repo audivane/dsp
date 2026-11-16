@@ -23,7 +23,14 @@ avdsp ctl  ──unix socket──▶  control::ipc ──▶ control::service �
   `$XDG_RUNTIME_DIR/audivane-dsp.sock`, else `/tmp/audivane-dsp-<uid>.sock`.
   Paths longer than 107 bytes are rejected (`sun_path`).
 - Mode `0600`. A stale socket file (nothing answers a `status` probe within
-  300 ms) is removed; a live daemon makes the new one refuse to start.
+  300 ms) is removed; a live daemon makes the new one refuse to start. The
+  daemon probes the socket first thing, before it reads the config or opens
+  the device, so a second copy started by hand exits with "Audivane DSP is
+  already running (systemctl --user status audivane-dsp)" instead of failing
+  the device reservation against the running one.
+- `status.version` is the engine's package version. The app compares it with
+  its own and, after an upgrade, offers to restart whichever side is older;
+  `avdsp upgrade` waits for it to equal the installed release.
 - Newline-delimited JSON, one object per line, cap **1 MiB** per line. An
   over-long line gets a `PARSE` error and the connection is closed (there is no
   way to resynchronise).
@@ -109,8 +116,19 @@ atomically: temp file in the same directory, `fsync`, `rename`, directory
 - `follow_source`: switch the graph to the playing stream's native rate
   (mapped to the nearest allowed rate at or above it, else the closest).
   Off: always `default_rate`.
-- `allowed_rates`: the graph rates the engine may run at; must include
-  `default_rate`. What reaches PipeWire (`clock.allowed-rates`, the sinks'
+- `allowed_rates`: the graph rates the engine may run at, any of 44.1k,
+  48k, 88.2k, 96k, 176.4k, 192k, 352.8k, 384k, 705.6k and 768k; the default
+  list stops at 192k (352.8k and up must be allowed explicitly, e.g. to let
+  DXD reach the DAC unresampled; upsampling then falls back to a smaller
+  ratio at those rates). Every config edit and the config file are
+  normalized before validation (`control::config::normalize_rates`): the
+  list is sorted without duplicates, and a `default_rate` that is not in it
+  moves to the nearest allowed rate (same 44.1k/48k family first, then the
+  closest, 48 kHz on a tie, like io-pw `nearest_rate`), so turning off the
+  default never fails; an empty list is still rejected. The app's Device
+  page toggles rates and sets the default through `set_config`;
+  `avdsp ctl rates [--enable HZ…] [--disable HZ…] [--default HZ]` does the
+  same from a shell (no arguments: print the list, `*` marks the default). What reaches PipeWire (`clock.allowed-rates`, the sinks'
   `audio.allowed-rates` and their format pods) is the **effective** set: these
   rates restricted to what the open device can play (see "Device
   capabilities" below). A stream at a rate outside it is resampled by

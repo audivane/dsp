@@ -108,8 +108,9 @@ describe("upsampler limits (mirror of dsp-core)", () => {
   });
 
   it("builds tooltips using computed attenuation and audibility note", () => {
-    for (const { beta, label } of KAISER_BETA_PRESETS) {
-      const tip = kaiserPresetTooltip(beta, label);
+    for (const { beta, name } of KAISER_BETA_PRESETS) {
+      const tip = kaiserPresetTooltip(beta, name);
+      expect(tip.startsWith(`${name} (β = ${beta},`)).toBe(true);
       expect(tip).toContain(String(Math.round(kaiserAttenuationDb(beta))));
       expect(tip).toContain("transition");
       expect(tip).toContain("stopband");
@@ -117,6 +118,16 @@ describe("upsampler limits (mirror of dsp-core)", () => {
       expect(tip).toContain("136 dB");
     }
     // β 24: 24 / 0.1102 + 8.7 ≈ 226.5 dB.
-    expect(kaiserPresetTooltip(24, "Extreme")).toContain("≈ 226 dB stopband");
+    expect(kaiserPresetTooltip(24, "Deepest")).toContain("≈ 226 dB stopband");
+    expect(kaiserPresetTooltip(10, "Steep")).toContain("steeper transition");
+    expect(kaiserPresetTooltip(10, "Steep")).toContain("shallower stopband");
+    expect(kaiserPresetTooltip(20, "Deeper")).toContain("wider transition");
+  });
+
+  it("labels presets with their β, from steep to deepest", () => {
+    expect(KAISER_BETA_PRESETS.map((p) => p.label)).toEqual(["β 10 · Steep", "β 14 · Standard", "β 17 · Deep", "β 20 · Deeper", "β 24 · Deepest"]);
+    // Stopband depth rises monotonically with the order of the buttons.
+    const depth = KAISER_BETA_PRESETS.map((p) => kaiserAttenuationDb(p.beta));
+    expect(depth).toEqual([...depth].sort((a, b) => a - b));
   });
 });

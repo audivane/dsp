@@ -72,6 +72,8 @@ pub enum CtlCommand {
     },
     /// Show or set master volume, L/R balance, and mute.
     Volume(VolumeArgs),
+    /// Show or change the allowed graph sample rates and the default rate.
+    Rates(RatesArgs),
     /// List streams in the PipeWire graph.
     Streams,
     /// Presets stored by the daemon (chain A's signal path).
@@ -100,6 +102,20 @@ pub enum CtlCommand {
     Watch(WatchArgs),
     /// Stop the daemon.
     Shutdown,
+}
+
+#[derive(Args, Debug)]
+pub struct RatesArgs {
+    /// Allow these rates in Hz (e.g. 352800 384000).
+    #[arg(long, value_name = "HZ", num_args = 1..)]
+    pub enable: Vec<u32>,
+    /// Stop allowing these rates; a disabled default moves to the nearest
+    /// allowed rate (same family first).
+    #[arg(long, value_name = "HZ", num_args = 1..)]
+    pub disable: Vec<u32>,
+    /// Make this (allowed) rate the default.
+    #[arg(long, value_name = "HZ")]
+    pub default: Option<u32>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -729,6 +745,26 @@ fn libc_getuid() -> u32 {
     }
     // SAFETY: getuid has no preconditions.
     unsafe { getuid() }
+}
+
+/// The running engine's version from `status`, or None when nothing answers
+/// within `timeout` (used by `avdsp upgrade`).
+pub(crate) fn engine_version(timeout: Duration) -> Option<String> {
+    engine_version_at(&daemon_socket_path(None).ok()?, timeout)
+}
+
+fn engine_version_at(path: &Path, timeout: Duration) -> Option<String> {
+    let stream = UnixStream::connect(path).ok()?;
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    stream.set_write_timeout(Some(timeout)).ok()?;
+    let reader = BufReader::new(stream.try_clone().ok()?);
+    let mut client = Client {
+        stream,
+        reader,
+        next_id: 1,
+    };
+    let status = client.call(Call::Status).ok()?;
+    status.get("version")?.as_str().map(str::to_owned)
 }
 
 // ---------------------------------------------------------------- entry
@@ -1401,6 +1437,59 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
                 println!("A/B off");
             }
         },
+        CtlCommand::Rates(args) => {
+            let mut current: EngineConfig = serde_json::from_value(client.call(Call::GetConfig)?)?;
+            let changing =
+                !args.enable.is_empty() || !args.disable.is_empty() || args.default.is_some();
+            if changing {
+                let rate = &mut current.rate;
+                for r in &args.enable {
+                    if !audivane_protocol::ALLOWED_RATES.contains(r) {
+                        bail!(
+                            "{r} Hz is not a rate the engine runs at ({})",
+                            audivane_protocol::ALLOWED_RATES
+                                .iter()
+                                .map(u32::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
+                    if !rate.allowed_rates.contains(r) {
+                        rate.allowed_rates.push(*r);
+                    }
+                }
+                rate.allowed_rates.retain(|r| !args.disable.contains(r));
+                if rate.allowed_rates.is_empty() {
+                    bail!("at least one rate must stay allowed");
+                }
+                if let Some(d) = args.default {
+                    if !rate.allowed_rates.contains(&d) {
+                        bail!("{d} Hz is not allowed; add it with --enable {d}");
+                    }
+                    rate.default_rate = d;
+                }
+                // The daemon sorts the list and moves a disabled default.
+                client.call(Call::SetConfig(current))?;
+                current = serde_json::from_value(client.call(Call::GetConfig)?)?;
+            }
+            if json {
+                print_json(&serde_json::to_value(&current.rate)?)?;
+            } else {
+                let list: Vec<String> = current
+                    .rate
+                    .allowed_rates
+                    .iter()
+                    .map(|&r| {
+                        if r == current.rate.default_rate {
+                            format!("{r}*")
+                        } else {
+                            r.to_string()
+                        }
+                    })
+                    .collect();
+                println!("allowed rates: {} Hz (* default)", list.join(", "));
+            }
+        }
         CtlCommand::Volume(args) => {
             if args.db.is_none() && args.balance.is_none() && !args.mute && !args.unmute {
                 let status: audivane_protocol::ipc::Status =
@@ -2601,6 +2690,33 @@ fn passthrough_caveat(caveat: &audivane_protocol::ipc::PassthroughCaveat) -> Str
 mod tests {
     use super::*;
     use audivane_protocol::ipc::{Passthrough, PassthroughBreak, PassthroughCaveat};
+
+    #[test]
+    fn engine_version_reads_status_and_skips_events() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("avdsp-ctl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "status");
+            let mut out = stream;
+            writeln!(out, r#"{{"event":"meters","data":{{}}}}"#).unwrap();
+            writeln!(out, r#"{{"id":{},"ok":{{"version":"9.8.7"}}}}"#, request["id"]).unwrap();
+        });
+        assert_eq!(
+            engine_version_at(&path, Duration::from_secs(5)).as_deref(),
+            Some("9.8.7")
+        );
+        server.join().unwrap();
+        assert_eq!(engine_version_at(&dir.join("none.sock"), Duration::from_millis(100)), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn passthrough_line_keeps_caveats_out_of_the_breaks() {

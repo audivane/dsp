@@ -10,6 +10,8 @@
 // used wherever one exists, so a change never resends fields it is not about.
 
 import { useSyncExternalStore } from "react";
+import { toggleRate, withDefaultRate } from "../lib/rates";
+import { fmtRate } from "../lib/format";
 import { DaemonError, ErrorCode, isUnknownMethod, type ConnState, type IrInfo, type Transport } from "../api/transport";
 import type {
   AbConfig,
@@ -139,6 +141,12 @@ export interface AppState {
   selfTest: SelfTestState;
   starting: boolean;
   startError: string | null;
+  /** This app's version (null until known, or in an app that cannot tell). */
+  appVersion: string | null;
+  /** The update banner was closed for this engine version. */
+  updateDismissed: string | null;
+  /** "Restart" in the update banner is in progress. */
+  restarting: boolean;
 }
 
 const UI_KEY = "avdsp-ui";
@@ -226,6 +234,9 @@ export class AppStore {
       selfTest: { state: "idle" },
       starting: false,
       startError: null,
+      appVersion: null,
+      updateDismissed: null,
+      restarting: false,
     };
     this.eqThrottle = throttleLatest(() => this.flushEq(), EQ_INTERVAL_MS);
     this.volThrottle = throttleLatest((v) => this.sendVolume(v), VOLUME_INTERVAL_MS);
@@ -322,6 +333,10 @@ export class AppStore {
 
   connect() {
     if (this.stop) return;
+    void this.transport
+      .appVersion()
+      .then((appVersion) => this.set({ appVersion }))
+      .catch(() => undefined);
     this.stop = this.transport.start({
       onEvent: (e) => this.onEvent(e),
       onConnection: (state, detail) => this.onConnection(state, detail),
@@ -473,6 +488,35 @@ export class AppStore {
     } catch (e) {
       this.set({ starting: false, startError: errorText(e) });
     }
+  }
+
+  /** Relaunch the app so it runs the newly installed code. */
+  async restartApp() {
+    this.set({ restarting: true });
+    try {
+      await this.whenIdle();
+      await this.transport.restartApp();
+    } catch (e) {
+      this.set({ restarting: false });
+      this.toast(errorText(e), "error");
+    }
+  }
+
+  /** Restart the engine service, still on the old version after an upgrade. */
+  async restartEngine() {
+    this.set({ restarting: true });
+    try {
+      await this.whenIdle();
+      await this.transport.restartEngine();
+    } catch (e) {
+      this.toast(errorText(e), "error");
+    } finally {
+      this.set({ restarting: false });
+    }
+  }
+
+  dismissUpdate() {
+    this.set({ updateDismissed: this.state.status?.version ?? null });
   }
 
   // ------------------------------------------------------------ navigation
@@ -877,6 +921,19 @@ export class AppStore {
 
   setPreferredFormat(f: SampleFormat) {
     void this.editConfig((c) => ({ ...c, formats: [f, ...c.formats.filter((x) => x !== f)] }));
+  }
+
+  /** Allow or block a graph rate; a blocked default moves to the nearest allowed rate. */
+  toggleAllowedRate(rate: number) {
+    const cur = this.state.config?.rate;
+    if (!cur || !toggleRate(cur, rate)) return;
+    const on = !cur.allowed_rates.includes(rate);
+    void this.editConfig((c) => ({ ...c, rate: toggleRate(c.rate, rate) ?? c.rate }), `${fmtRate(rate)} ${on ? "allowed" : "no longer used"}`);
+  }
+
+  /** Make an allowed graph rate the default (idle, and rate following off). */
+  setDefaultRate(rate: number) {
+    void this.editConfig((c) => ({ ...c, rate: withDefaultRate(c.rate, rate) }), `Default rate: ${fmtRate(rate)}`);
   }
 
   /** What the engine does when apps play into the DSP sink at different rates. */

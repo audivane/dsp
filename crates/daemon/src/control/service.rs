@@ -316,7 +316,7 @@ impl Service {
                 {
                     cfg.device = device;
                 }
-                if let Some(note) = config::normalize_ab(&mut cfg) {
+                if let Some(note) = config::normalize_config(&mut cfg) {
                     log::info!("set_config: {note}");
                 }
                 config::validate(&cfg).map_err(invalid_params)?;
@@ -488,7 +488,7 @@ impl Service {
         let _mutation = self.lock_mutation();
         let mut cfg = cfg;
         // Chain B is normalized by the caller; keep this a hard invariant.
-        config::normalize_ab(&mut cfg);
+        config::normalize_config(&mut cfg);
         self.engine.apply(&cfg).map_err(engine_error)?;
         let preloaded = match &cfg.active_preset {
             Some(name) => {
@@ -545,7 +545,7 @@ impl Service {
         edit(&mut next);
         // Normalize before validating: chain B must follow A, never make a
         // chain A edit fail because chain B still has the old upsampler.
-        if let Some(note) = config::normalize_ab(&mut next) {
+        if let Some(note) = config::normalize_config(&mut next) {
             log::info!("{note}");
         }
         config::validate(&next).map_err(invalid_params)?;
@@ -824,7 +824,7 @@ impl Service {
         let mut notes = Vec::new();
         let mut next = self.config();
         next.ab = ab;
-        if let Some(note) = config::normalize_ab(&mut next) {
+        if let Some(note) = config::normalize_config(&mut next) {
             notes.push(note);
         }
         config::validate(&next).map_err(invalid_params)?;

@@ -65,11 +65,15 @@ step "package .deb .rpm .pkg.tar.zst"
 done_step
 
 if [ $smoke = 1 ]; then
-  step "smoke: Arch package in the Arch root"
-  "$repo/packaging/arch/archroot.sh" smoke "$(ls "$out"/*.pkg.tar.zst)" 2>&1 | tail -3
+  # Installed twice: the second install runs the upgrade scriptlet (on a
+  # reinstall too), which must not fail without systemd.
+  step "smoke: Arch package in the Arch root (install, then upgrade)"
+  pkg=$(ls "$out"/*.pkg.tar.zst)
+  "$repo/packaging/arch/archroot.sh" smoke "$pkg" "$pkg" 2>&1 | grep -E '^(==>|SMOKE|    )' | tail -8
   done_step
-  step "smoke: .deb in a copy of the Ubuntu 24.04 root"
-  "$here/baseline.sh" deb-smoke "$(ls "$out"/*.deb)"
+  step "smoke: .deb in a copy of the Ubuntu 24.04 root (install, then upgrade)"
+  deb=$(ls "$out"/*.deb)
+  "$here/baseline.sh" deb-smoke "$deb" "$deb"
   done_step
 fi
 

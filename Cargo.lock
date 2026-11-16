@@ -313,7 +313,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "audivane-dsp-cli"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "anyhow",
  "audivane-dsp-core",
@@ -321,11 +321,12 @@ dependencies = [
  "clap",
  "hound",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
 name = "audivane-dsp-core"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "audivane-protocol",
  "realfft",
@@ -334,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "audivane-dsp-daemon"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "anyhow",
  "audivane-dsp-core",
@@ -356,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "audivane-dsp-ui"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "audivane-dsp-core",
  "audivane-protocol",
@@ -377,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "audivane-io-alsa"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "alsa",
  "alsa-sys",
@@ -390,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "audivane-io-pw"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "anyhow",
  "audivane-io-alsa",
@@ -408,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "audivane-protocol"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "serde",
  "serde_json",

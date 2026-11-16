@@ -14,6 +14,7 @@
 import { autoPreampDb, profileAutoPreampDb, profileChannelResponseDb } from "../lib/eqmath";
 import { kaiserAttenuationDb, minimumPhaseBlockReason, nyquistStopBlockReason, nyquistStopCutoff } from "../lib/upsamplerLimits";
 import { parseApo } from "../lib/apo";
+import { normalizeRatePolicy } from "../lib/rates";
 import { BUILTIN_TARGETS, DRAW_FREQS, OVERLAY_COLOURS, type OverlayData } from "../lib/overlays";
 import { bandCount, convList, deepEqual, emptyEq, eqIsActive, normalizeEq } from "../lib/chain";
 import { DaemonError, ErrorCode, type IrInfo, type Transport, type TransportHandlers } from "./transport";
@@ -45,6 +46,9 @@ import type {
   VolumeStatus,
 } from "./types";
 import { BALANCE_MAX_DB, VOLUME_MAX_DB, VOLUME_MIN_DB } from "./types";
+
+/** The mock app's own version (and the mock engine's, unless `?engine_version=`). */
+export const MOCK_APP_VERSION = "0.1.0";
 
 const clone = <T>(x: T): T => JSON.parse(JSON.stringify(x)) as T;
 
@@ -228,6 +232,8 @@ export class MockDaemon {
   abSide: AbSide = "a";
   released = false;
   running: boolean;
+  /** `status.version`; the mock app is MOCK_APP_VERSION (`?engine_version=` to differ). */
+  engineVersion: string;
   /** Overlay files, as the app process would keep them on disk. */
   overlays = new Map<string, OverlayData>();
   private listeners = new Set<Listener>();
@@ -241,8 +247,9 @@ export class MockDaemon {
   private lastStatusJson = "";
   private latency = 40;
 
-  constructor(opts: { running?: boolean; apps?: boolean; split?: boolean; overlays?: boolean | "none"; digitalVolume?: boolean; device?: string } = {}) {
+  constructor(opts: { running?: boolean; apps?: boolean; split?: boolean; overlays?: boolean | "none"; digitalVolume?: boolean; device?: string; engineVersion?: string; playRate?: number } = {}) {
     this.running = opts.running ?? true;
+    this.engineVersion = opts.engineVersion ?? MOCK_APP_VERSION;
     if (opts.digitalVolume) this.volume = { ...this.volume, hardware: false };
     if (opts.overlays !== "none") {
       const measured = mockMeasurement();
@@ -276,7 +283,7 @@ export class MockDaemon {
     this.presets.set("Room + bass shelf", { version: 1, name: "Room + bass shelf", chain: room, modified_unix: now - 86400 * 12 });
     this.presets.set("Flat", { version: 1, name: "Flat", chain: flatChain(), modified_unix: now - 86400 * 40 });
     this.streams = [
-      { node: 81, app_name: "Strawberry", binary: "strawberry", media_name: "Nils Frahm · Says", rate: 44100, channels: 2, format: "S24LE", sink: "dsp", volume: 1, muted: false },
+      { node: 81, app_name: "Strawberry", binary: "strawberry", media_name: "Nils Frahm · Says", rate: opts.playRate ?? 44100, channels: 2, format: "S24LE", sink: "dsp", volume: 1, muted: false },
       { node: 94, app_name: "Firefox", binary: "firefox", media_name: "YouTube", rate: 48000, channels: 2, format: "F32LE", sink: null, volume: 1, muted: false },
       { node: 102, app_name: "Discord", binary: "Discord", media_name: "Voice", rate: 48000, channels: 2, format: "F32LE", sink: null, volume: 0.8, muted: false },
     ];
@@ -328,6 +335,16 @@ export class MockDaemon {
   startEngine() {
     this.running = true;
     for (const l of this.connListeners) l(true);
+  }
+
+  /** Like a service restart after an upgrade: down, then up on the app's version. */
+  restartEngine() {
+    for (const l of this.connListeners) l(false);
+    this.engineVersion = MOCK_APP_VERSION;
+    this.running = true;
+    setTimeout(() => {
+      for (const l of this.connListeners) l(true);
+    }, 300);
   }
 
   private ensureMeters() {
@@ -464,7 +481,7 @@ export class MockDaemon {
     const presetName = this.config.active_preset ?? null;
     const preset = presetName ? this.presets.get(presetName) : undefined;
     return {
-      version: "0.1.0 (mock)",
+      version: this.engineVersion,
       state: !this.running ? "error" : this.released ? "idle" : feeding.length ? "playing" : "ready",
       device: this.config.device,
       error: null,
@@ -876,6 +893,9 @@ export class MockDaemon {
         return mutate(() => {
           const next = clone(params as EngineConfig);
           if (next.chain.eq) next.chain.eq = normalizeEq(next.chain.eq);
+          // Like the daemon's `normalize_rates` + `validate`.
+          if (!next.rate.allowed_rates.length) throw new DaemonError(ErrorCode.INVALID_PARAMS, "rate.allowed_rates must not be empty");
+          next.rate = normalizeRatePolicy(next.rate);
           this.validateChain(next.chain);
           // Like the daemon, the whole config is applied, volume included.
           if (next.volume) {
@@ -1196,6 +1216,19 @@ export class MockTransport implements Transport {
   async startEngine(): Promise<void> {
     await new Promise((r) => setTimeout(r, 700));
     this.daemon.startEngine();
+  }
+
+  async restartEngine(): Promise<void> {
+    await new Promise((r) => setTimeout(r, 300));
+    this.daemon.restartEngine();
+  }
+
+  async appVersion(): Promise<string | null> {
+    return MOCK_APP_VERSION;
+  }
+
+  async restartApp(): Promise<void> {
+    if (typeof location !== "undefined") location.reload();
   }
 
   async pickImpulseResponse(): Promise<string | null> {

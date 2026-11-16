@@ -18,9 +18,17 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
   height: 100%;
   display: grid;
   grid-template-columns: 248px minmax(0, 1fr);
-  grid-template-rows: auto minmax(0, 1fr) auto;
-  grid-template-areas: "top top" "side main" "status status";
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-areas: "top top" "banner banner" "side main" "status status";
 }
+/* Shown after a package upgrade until the app (or engine) is restarted. */
+.update-banner {
+  grid-area: banner; display: flex; align-items: center; gap: 10px; min-width: 0;
+  padding: 6px 12px 6px 16px; border-bottom: 1px solid var(--line); background: var(--accent-soft); color: var(--fg);
+}
+.update-banner .text { flex: 1; min-width: 0; }
+.update-banner .icon-btn { width: 26px; height: 26px; flex: none; }
+.update-banner .btn { flex: none; }
 
 /* ---------- shared controls ---------- */
 .chip {
@@ -381,8 +389,42 @@ input[type="range"]:disabled { opacity: .45; }
 .row > .k[title] { cursor: help; text-decoration: underline dotted var(--line-strong); text-underline-offset: 3px; }
 .row .hint { color: var(--faint); font-size: 12px; }
 .rate-list { display: inline-flex; flex-wrap: wrap; gap: 4px; }
-.rate-chip { font-family: var(--mono); font-size: 12px; padding: 2px 7px; border: 1px solid var(--line); border-radius: 6px; color: var(--fg); }
-.rate-chip.off { color: var(--faint); text-decoration: line-through; border-style: dashed; }
+/* Device page: one toggle per engine rate. */
+.rate-list { display: inline-flex; flex-wrap: wrap; gap: 6px; position: relative; }
+.rate-chip {
+  position: relative; display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 9px;
+  font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); border-radius: 6px;
+  background: transparent; color: var(--muted); user-select: none; -webkit-user-select: none; cursor: pointer;
+}
+/* Off: clearly dimmed (faint text, no fill); on: tinted fill and full-strength text. */
+.rate-chip[aria-pressed="false"] { color: var(--faint); border-color: transparent; background: color-mix(in srgb, var(--line) 35%, transparent); opacity: .6; }
+.rate-chip:hover:not(:disabled) { color: var(--fg); border-color: var(--line-strong); opacity: 1; }
+.rate-chip[aria-pressed="true"] { background: var(--accent-soft); color: var(--fg); border-color: color-mix(in srgb, var(--accent) 45%, var(--line-strong)); }
+.rate-chip.playing { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.rate-chip.unsupported { color: var(--faint); border-style: dashed; }
+.rate-chip.unsupported[aria-pressed="true"] { text-decoration: line-through; background: transparent; }
+.rate-chip:disabled { cursor: default; opacity: .55; }
+.rate-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.rate-chip .def-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; }
+.rate-legend { display: inline-flex; align-items: center; gap: 5px; }
+.rate-legend .def-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); display: inline-block; }
+.rate-menu {
+  position: absolute; z-index: 40; min-width: 150px; padding: 4px; border-radius: 8px;
+  background: var(--raised); border: 1px solid var(--line-strong); box-shadow: var(--shadow);
+}
+.rate-menu button { display: block; width: 100%; text-align: left; height: 28px; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: var(--fg); }
+.rate-menu button:hover:not(:disabled), .rate-menu button:focus-visible { background: var(--panel-2); outline: none; }
+.rate-menu button:disabled { color: var(--faint); }
+
+/* Upsampling: "Preview at" source-rate tabs (only a view). */
+.preview-at { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; min-width: 0; }
+.preview-label { color: var(--muted); font-size: 12px; cursor: help; }
+.preview-seg button { padding: 0 7px; font-size: 12px; }
+.preview-playing {
+  height: 24px; padding: 0 8px; border: 1px solid var(--line); border-radius: 6px; background: transparent;
+  color: var(--muted); font-size: 12px; white-space: nowrap;
+}
+.preview-playing:hover { color: var(--fg); border-color: var(--line-strong); }
 .facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
 .fact { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; min-width: 0; }
 .fact .k { font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -462,6 +504,8 @@ table.streams .muted { color: var(--muted); }
 .ups-adv-toggle:hover { color: var(--fg); background: var(--panel-2); }
 .ups-adv-body { display: flex; flex-direction: column; gap: 8px; }
 .ups-adv-readout { padding-left: 152px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+/* Five "β 14 · Standard" labels: compact so they stay beside the label down to the minimum window width. */
+.beta-seg button { padding: 0 8px; font-size: 12px; }
 
 /* ---------- status bar ---------- */
 .status {
@@ -551,7 +595,7 @@ table.streams .muted { color: var(--muted); }
   .chip select { max-width: 160px; }
 }
 @media (max-width: 900px) {
-  .app { height: auto; min-height: 100%; grid-template-columns: minmax(0, 1fr); grid-template-areas: "top" "side" "main" "status"; }
+  .app { height: auto; min-height: 100%; grid-template-columns: minmax(0, 1fr); grid-template-areas: "top" "banner" "side" "main" "status"; }
   .side { flex-direction: row; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--line); }
   .side-label, .slots, .bypass-note { display: none; }
   .nav-item { flex: none; }

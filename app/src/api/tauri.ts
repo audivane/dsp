@@ -94,6 +94,26 @@ export class TauriTransport implements Transport {
     }
   }
 
+  async restartEngine(): Promise<void> {
+    try {
+      await invoke("restart_engine");
+    } catch (e) {
+      throw toError(e);
+    }
+  }
+
+  async appVersion(): Promise<string | null> {
+    return invoke<string>("app_version").catch(() => null);
+  }
+
+  async restartApp(): Promise<void> {
+    try {
+      await invoke("restart_app");
+    } catch (e) {
+      throw toError(e);
+    }
+  }
+
   async pickImpulseResponse(): Promise<string | null> {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const picked = await open({

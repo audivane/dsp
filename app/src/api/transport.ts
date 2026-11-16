@@ -54,6 +54,12 @@ export interface Transport {
   upsamplerResponse(config: UpsamplerConfig | null, sourceRate: number | null, window?: ResponseWindowRequest): Promise<UpsamplerResponse>;
   /** Start the systemd user unit `audivane-dsp.service`. */
   startEngine(): Promise<void>;
+  /** Restart the systemd user unit (an upgrade left the old engine running). */
+  restartEngine(): Promise<void>;
+  /** This app's own version, compared with the engine's `status.version`. */
+  appVersion(): Promise<string | null>;
+  /** Relaunch the app process (it then runs the newly installed code). */
+  restartApp(): Promise<void>;
   /** Native file picker for an impulse response; null when cancelled. */
   pickImpulseResponse(): Promise<string | null>;
   /** WAV header facts of an impulse response, if readable by the UI process. */

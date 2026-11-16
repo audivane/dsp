@@ -2,7 +2,8 @@
 //! benchmarks for Audivane DSP.
 //!
 //! Exit codes: 0 success, 1 a check failed (e.g. `bypass-test` mismatch),
-//! 2 bad usage (clap), 3 any other error.
+//! 2 bad usage (clap), 3 any other error, 10 `upgrade --check` found a newer
+//! release.
 
 mod bench;
 mod bypass_test;
@@ -15,6 +16,7 @@ mod nulltest;
 mod process;
 mod profile;
 mod signal;
+mod upgrade;
 mod wavio;
 
 use anyhow::Result;
@@ -60,6 +62,8 @@ enum Command {
     Bench(BenchArgs),
     /// Control the running audivane-dsp daemon.
     Ctl(ctl::CtlArgs),
+    /// Update a packaged install to the latest release (or --version TAG).
+    Upgrade(upgrade::UpgradeArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -395,5 +399,6 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Gen(args) => gen_signal::run(args),
         Command::Bench(args) => bench::run(args),
         Command::Ctl(args) => ctl::run(args),
+        Command::Upgrade(args) => upgrade::run(args),
     }
 }

@@ -292,31 +292,31 @@ try {
   const facts = await p.locator(".fact .v").evaluateAll((els) => els.map((e) => [e.textContent, e.scrollWidth <= e.clientWidth + 1]));
   if (facts.some(([, fits]) => !fits)) fail(`a stats card overflows: ${JSON.stringify(facts)}`);
   if (!facts.some(([t]) => /\d,\d{3}\.\d{3} Hz/.test(t ?? ""))) fail(`stats lack precise Hz values: ${JSON.stringify(facts)}`);
-  await p.getByRole("group", { name: "Source rate" }).getByRole("button", { name: "96k" }).click();
+  await p.getByRole("group", { name: "Preview at source rate" }).getByRole("button", { name: "96k" }).click();
   await p.waitForFunction(() => document.body.innerText.includes("96 kHz → 384 kHz"), null, { timeout: 3000 });
   await shot(p, "upsampling-96k");
   await p.getByRole("group", { name: "Ratio" }).getByRole("button", { name: "Off" }).click();
   await p.waitForFunction(() => document.body.innerText.includes("1:1 bypass"), null, { timeout: 3000 });
   await p.getByRole("group", { name: "Ratio" }).getByRole("button", { name: "×4" }).click();
   await p.waitForFunction(() => document.body.innerText.includes("96 kHz → 384 kHz"), null, { timeout: 3000 });
-  // Advanced disclosure: starts collapsed, opens, remembers state, Deeper sets beta=17 with tooltip
+  // Advanced disclosure: starts collapsed, opens, remembers state, "β 17 · Deep" sets beta=17 with tooltip
   if ((await p.getByRole("group", { name: "Filter shape (Kaiser β)" }).count()) !== 0) fail("Advanced should start collapsed");
   await p.getByRole("button", { name: "Advanced" }).click();
   const betaGroup = p.getByRole("group", { name: "Filter shape (Kaiser β)" });
   await betaGroup.waitFor();
   if ((await p.evaluate(() => localStorage.getItem("avdsp-upsampling-advanced"))) !== "1") fail("Advanced state did not persist to localStorage");
   const betaTips = await betaGroup.getByRole("button").evaluateAll((els) => els.map((e) => [e.textContent, e.getAttribute("title") ?? ""]));
-  if (betaTips.length !== 4 || betaTips.some(([, title]) => !title || !title.includes("dB") || !title.includes("transition") || !title.includes("24-bit"))) {
+  if (betaTips.length !== 5 || betaTips.some(([, title]) => !title || !title.includes("dB") || !title.includes("transition") || !title.includes("24-bit"))) {
     fail(`Kaiser beta tooltips missing expected text: ${JSON.stringify(betaTips)}`);
   }
-  const deeperBtn = betaGroup.getByRole("button", { name: "Deeper" });
+  const deeperBtn = betaGroup.getByRole("button", { name: "β 17 · Deep", exact: true });
   await deeperBtn.click();
   await p.waitForFunction(() => window.avdsp.getState().config.chain.upsampler.kaiser_beta === 17, null, { timeout: 2000 }).catch(() =>
-    fail("clicking Deeper did not set kaiser_beta to 17"),
+    fail("clicking β 17 · Deep did not set kaiser_beta to 17"),
   );
-  if ((await deeperBtn.getAttribute("aria-pressed")) !== "true") fail("Deeper button not marked pressed");
+  if ((await deeperBtn.getAttribute("aria-pressed")) !== "true") fail("β 17 · Deep button not marked pressed");
   const deeperTitle = (await deeperBtn.getAttribute("title")) ?? "";
-  if (!deeperTitle.includes("163 dB") || !deeperTitle.includes("transition")) fail(`unexpected Deeper tooltip: ${deeperTitle}`);
+  if (!deeperTitle.includes("163 dB") || !deeperTitle.includes("transition")) fail(`unexpected β 17 tooltip: ${deeperTitle}`);
   await shot(p, "upsampling-advanced");
   // Upsampling resize handles: Nyquist transition + shared Full-range/Impulse row
   const transBefore = await p.locator(".ups-plots canvas").nth(0).boundingBox();

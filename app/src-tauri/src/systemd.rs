@@ -1,6 +1,6 @@
-//! "Start engine": ask the systemd **user** manager to start
-//! `audivane-dsp.service` over D-Bus (session bus,
-//! `org.freedesktop.systemd1.Manager.StartUnit`).
+//! "Start engine" / "Restart engine": ask the systemd **user** manager to
+//! start or restart `audivane-dsp.service` over D-Bus (session bus,
+//! `org.freedesktop.systemd1.Manager.StartUnit` / `RestartUnit`).
 
 use zbus::Connection;
 use zbus::OwnedObjectPath;
@@ -9,6 +9,16 @@ pub const UNIT: &str = "audivane-dsp.service";
 
 /// Start the unit; returns the systemd job path. Errors are plain sentences.
 pub fn start_engine() -> Result<String, String> {
+    unit_job("StartUnit")
+}
+
+/// Restart the unit (start it when stopped), e.g. after a package upgrade
+/// left the old engine running.
+pub fn restart_engine() -> Result<String, String> {
+    unit_job("RestartUnit")
+}
+
+fn unit_job(method: &'static str) -> Result<String, String> {
     zbus::block_on(async {
         let conn = Connection::session()
             .await
@@ -18,7 +28,7 @@ pub fn start_engine() -> Result<String, String> {
                 Some("org.freedesktop.systemd1"),
                 "/org/freedesktop/systemd1",
                 Some("org.freedesktop.systemd1.Manager"),
-                "StartUnit",
+                method,
                 &(UNIT, "replace"),
             )
             .await

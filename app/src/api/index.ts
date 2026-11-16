@@ -14,6 +14,8 @@ export function createTransport(): Transport {
       overlays: q.get("overlays") === "none" ? "none" : q.get("overlays") === "demo",
       digitalVolume: q.has("digital"),
       device: q.get("device") ?? undefined,
+      engineVersion: q.get("engine_version") ?? undefined,
+      playRate: q.has("playing") ? Number(q.get("playing")) || undefined : undefined,
     }),
   );
 }

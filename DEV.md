@@ -64,12 +64,28 @@ containers), so the binaries need only glibc 2.39 and run on Ubuntu/Debian
 24.04+, Fedora 40+ and Arch. nfpm (pinned, checksummed) wraps the same files
 into `.deb`, `.rpm` and `.pkg.tar.zst`, then the Arch package is installed in
 the Arch build root and the `.deb` in a throwaway copy of the Ubuntu root as
-smoke tests. Output: the three packages and `SHA256SUMS`, ready to attach to a
+smoke tests, each installed twice so the upgrade scriptlet runs too
+(`archroot.sh smoke <pkg> [<upgrade-pkg>]`, `baseline.sh deb-smoke <deb>
+[<upgrade-deb>]`). Output: the three packages and `SHA256SUMS`, ready to attach to a
 GitHub release. The `Release packages` GitHub workflow runs the same scripts
 on demand (manual trigger only) when no local machine is available.
 
 The engine uses the `release` profile (fat LTO, one codegen unit); the app
 uses `release-ui` (thin LTO, 16 units), and both compile at the same time.
+
+Scriptlets: `packaging/release/postinstall.sh` is the one post-install script
+for all three formats; `package.sh` appends a dispatch line per format (deb
+`configure <old>`, rpm `$1`, Arch `post_install`/`post_upgrade`). On upgrade
+it runs `systemctl --user -M <user>@ try-restart audivane-dsp.service` for
+each running user manager; `packaging/arch/audivane-dsp.install` (makepkg)
+mirrors it.
+
+`avdsp upgrade` can be tried against a local server instead of GitHub:
+`AUDIVANE_UPGRADE_API=http://127.0.0.1:8000` serves `releases/latest` (or
+`releases/tags/<tag>`) as GitHub's JSON with `tag_name`, `html_url` and
+`assets[].browser_download_url`. Only with that set,
+`AUDIVANE_UPGRADE_TEST_AS_ROOT=1` lets root (a build root without sudo) run the
+package step directly. Both are for testing only.
 
 ## Headless test rig (no real DAC)
 
@@ -115,6 +131,7 @@ the daemon restores PipeWire's `settings` keys and the session default sink from
 
 Offline tools (no daemon needed): `avdsp process`, `eq`, `levelmatch`,
 `kernel`, `nulltest`, `bypass-test`, `gen`, `bench` — see `avdsp --help`.
+`avdsp upgrade` updates a packaged install (see the README).
 
 ## Rig tests (loopback card, run one at a time)
 
@@ -126,6 +143,7 @@ Offline tools (no daemon needed): `avdsp process`, `eq`, `levelmatch`,
 | `tests/daemon/engine_ab.sh` | gapless A/B switching with level offset |
 | `tests/daemon/engine_swap_gap.sh` | live EQ edits on a long filter without gaps |
 | `tests/daemon/engine_rate_follow.sh` | `MaxRate` resolved per source rate (44.1/48/96k) |
+| `tests/daemon/engine_high_rates.sh` | 352.8k/384k graph rates at ×2 and 705.6k/768k at ×1 under `MaxRate(768000)`, quantum capped at 8192, level exact |
 | `tests/daemon/engine_rate_conflict.sh` | 44.1k + 48k apps at once: rate settles on the first app in both orders, hands over when it stops, 2 s dwell |
 | `tests/daemon/engine_direct_dsp_upsample.sh` | Direct ↔ DSP keeps upsampling across config changes |
 | `tests/daemon/engine_release.sh` | 20× rapid release/acquire with WirePlumber |

@@ -18,7 +18,9 @@
 #    packaging/arch/archroot.sh verify          # toolchain / Tauri prereqs
 #    packaging/arch/archroot.sh run <cmd...>    # run a command inside the root
 #    packaging/arch/archroot.sh makepkg <dir>   # build <dir>/PKGBUILD, copy *.pkg.tar.zst back
-#    packaging/arch/archroot.sh smoke <pkg>     # pacman -U into a throwaway overlay + ldd every ELF
+#    packaging/arch/archroot.sh smoke <pkg> [<pkg2>]
+#                                               # pacman -U into a throwaway overlay + ldd every ELF;
+#                                               # with <pkg2>, then upgrade to it (post_upgrade)
 #    packaging/arch/archroot.sh selftest        # build+install a hello-world package
 #    packaging/arch/archroot.sh path            # print the cache dir
 #
@@ -598,16 +600,21 @@ cmd_makepkg() {
 # ---------------------------------------------------------------------------
 cmd_smoke() {
   need_root
-  [ $# -eq 1 ] || die "usage: $SCRIPT smoke <package.tar.zst>"
-  local pkg scratch
+  [ $# -eq 1 ] || [ $# -eq 2 ] || die "usage: $SCRIPT smoke <package.tar.zst> [<upgrade.tar.zst>]"
+  local pkg pkg2= scratch
   pkg=$(readlink -f -- "$1") || die "no such file: $1"
   [ -f "$pkg" ] || die "no such file: $pkg"
   case $pkg in *.pkg.tar.*) ;; *) warn "$pkg does not look like a pacman package" ;; esac
+  if [ $# -eq 2 ]; then
+    pkg2=$(readlink -f -- "$2") || die "no such file: $2"
+    [ -f "$pkg2" ] || die "no such file: $pkg2"
+  fi
 
   ensure_dirs
   scratch=$(mktemp -d "$CACHE/tmp/smoke.XXXXXX")
   mkdir -p "$scratch/upper" "$scratch/work" "$scratch/merged"
   cp -f "$pkg" "$scratch/pkg.tar.zst"
+  [ -z "$pkg2" ] || cp -f "$pkg2" "$scratch/pkg.tar.zst.2"
 
   log "installing $(basename "$pkg") into a throwaway overlay of $ROOT"
   local rc=0
@@ -621,6 +628,7 @@ cmd_smoke() {
     mount -t proc proc "$merged/proc"
     rm -f "$merged/etc/resolv.conf"; cp /etc/resolv.conf "$merged/etc/resolv.conf"
     cp "$pkg" "$merged/tmp/archroot-smoke.pkg.tar.zst"
+    [ ! -f "$pkg.2" ] || cp "$pkg.2" "$merged/tmp/archroot-smoke-upgrade.pkg.tar.zst"
     exec chroot "$merged" /usr/bin/env -i HOME=/build TERM=dumb \
       PATH=/usr/local/sbin:/usr/local/bin:/usr/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 \
       /bin/bash -s
@@ -672,6 +680,22 @@ if [ $bad -ne 0 ]; then
   exit 1
 fi
 echo "SMOKE-OK: $name $pkgver installed and all ELF objects resolve"
+
+pkg2=/tmp/archroot-smoke-upgrade.pkg.tar.zst
+if [ -f "$pkg2" ]; then
+  echo
+  echo "--- pacman -U $(pacman -Qp "$pkg2" 2>/dev/null | awk 'NR==1{print $1 " " $2}') over $pkgver"
+  pacman -U --noconfirm "$pkg2" 2>&1 | tee /tmp/archroot-smoke-upgrade.log
+  if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+    echo "SMOKE-FAIL: upgrade failed"
+    exit 1
+  fi
+  if grep -qi "error: command failed to execute\|scriptlet" /tmp/archroot-smoke-upgrade.log; then
+    echo "SMOKE-FAIL: the upgrade scriptlet reported an error"
+    exit 1
+  fi
+  echo "SMOKE-OK: upgraded to $(pacman -Q "$name" | awk '{print $2}')"
+fi
 EOS
 
   if [ $rc -eq 0 ]; then
@@ -757,8 +781,10 @@ usage: $(basename "$SCRIPT") <subcommand> [args]
   run <cmd...>      run a command inside the root (cwd: /build, uid: 0)
   makepkg <dir>     build <dir>/PKGBUILD in a copy inside the root and copy the
                     resulting *.pkg.tar.zst back to <dir>
-  smoke <pkg>       pacman -U <pkg> into a throwaway overlay of the root, then
-                    print pacman -Qi/-Qlq and ldd every ELF file
+  smoke <pkg> [<pkg2>]
+                    pacman -U <pkg> into a throwaway overlay of the root, then
+                    print pacman -Qi/-Qlq and ldd every ELF file; with <pkg2>,
+                    then upgrade to it (runs post_upgrade)
   selftest          build and smoke-install a hello-world package plus a cargo build
   path              print the cache directory
 

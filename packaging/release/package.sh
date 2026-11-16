@@ -36,6 +36,14 @@ deb_libs=$(cat "$stage/deb-depends.txt" 2>/dev/null || true)
 [ -n "$deb_libs" ] || { echo "error: $stage/deb-depends.txt is missing or empty" >&2; exit 1; }
 yaml_list() { tr ',' '\n' | sed 's/^ *//; s/ *$//; /^$/d; s/.*/      - "&"/'; }
 
+# Scriptlets: the shared postinstall.sh plus one dispatch line per format
+# (see the table at its top). Arch has a separate post_upgrade.
+scripts=$stage/scripts
+mkdir -p "$scripts"
+for kind in deb rpm arch-install arch-upgrade; do
+  { cat "$here/postinstall.sh"; printf '\naudivane_postinst %s "$@"\nexit 0\n' "$kind"; } > "$scripts/$kind.sh"
+done
+
 # Reproducible timestamps: every entry gets the commit time (or now).
 mtime=$(date -u -d "@${SOURCE_DATE_EPOCH:-$(git -C "$here" log -1 --format=%ct 2>/dev/null || date +%s)}" +%Y-%m-%dT%H:%M:%SZ)
 # Files are listed one by one (no `type: tree`): nfpm's tree entries give
@@ -63,9 +71,11 @@ $(cd "$stage/root" && find usr -type f | sort | while read -r f; do
   printf '  - src: %s\n    dst: /%s\n    file_info:\n      mode: 0%s\n' "$stage/root/$f" "$f" "$(stat -c %a "$f")"
 done)
 scripts:
-  postinstall: $here/postinstall.sh
+  postinstall: $scripts/deb.sh
 overrides:
   deb:
+    scripts:
+      postinstall: $scripts/deb.sh
     depends:
 $(printf '%s' "$deb_libs" | yaml_list)
       - "pipewire"
@@ -75,6 +85,8 @@ $(printf '%s' "$deb_libs" | yaml_list)
     recommends:
       - "rtkit"
   rpm:
+    scripts:
+      postinstall: $scripts/rpm.sh
     depends:
       - "pipewire"
       - "wireplumber"
@@ -88,6 +100,8 @@ $(printf '%s' "$deb_libs" | yaml_list)
     recommends:
       - "rtkit"
   archlinux:
+    scripts:
+      postinstall: $scripts/arch-install.sh
     depends:
       - "pipewire"
       - "wireplumber"
@@ -105,6 +119,8 @@ rpm:
   summary: System-wide bit-perfect DSP for PipeWire
 archlinux:
   packager: "Triet (@Triet1402)"
+  scripts:
+    postupgrade: $scripts/arch-upgrade.sh
 EOF
 
 rm -f "$out"/*.deb "$out"/*.rpm "$out"/*.pkg.tar.zst "$out/SHA256SUMS"

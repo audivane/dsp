@@ -106,20 +106,29 @@ export function minimumPhaseBlockReason(beta: number): string | null {
 
 export interface KaiserBetaPreset {
   readonly beta: number;
+  /** Where it sits on the steep ↔ deep scale, e.g. "Deep". */
+  readonly name: string;
+  /** Button text: "β 17 · Deep". */
   readonly label: string;
 }
 
 export const DEFAULT_KAISER_BETA = 14;
 
+const preset = (beta: number, name: string): KaiserBetaPreset => ({ beta, name, label: `β ${beta} · ${name}` });
+
+/** Ordered from the steepest transition (lowest β) to the deepest stopband (highest β). */
 export const KAISER_BETA_PRESETS: readonly KaiserBetaPreset[] = [
-  { beta: 10, label: "Steeper" },
-  { beta: 14, label: "Standard" },
-  { beta: 17, label: "Deeper" },
-  { beta: 20, label: "Deepest" },
+  preset(10, "Steep"),
+  preset(14, "Standard"),
+  preset(17, "Deep"),
+  preset(20, "Deeper"),
   // Linear phase only: minimum phase is designed for β 2..20 (blocked through
   // `kaiserBetaBlockReason`); 24 is also the top of the Stop at Nyquist range.
-  { beta: 24, label: "Extreme" },
-] as const;
+  preset(24, "Deepest"),
+];
+
+/** One-line trade-off shown under the presets. */
+export const KAISER_BETA_HINT = "Lower β: steeper transition, less stopband rejection. Higher β: deeper rejection, wider transition.";
 
 /** Matching preset β, or null when a custom β (e.g. from CLI) is active. */
 export function selectedKaiserPreset(beta: number): number | null {
@@ -129,17 +138,18 @@ export function selectedKaiserPreset(beta: number): number | null {
 }
 
 /** Plain-language tooltip for a Kaiser β preset, computed from `kaiserAttenuationDb`. */
-export function kaiserPresetTooltip(beta: number, label: string): string {
+export function kaiserPresetTooltip(beta: number, name: string): string {
   const db = Math.round(kaiserAttenuationDb(beta));
-  const audibleRefDb = Math.round(kaiserAttenuationDb(DEFAULT_KAISER_BETA));
+  const ref = DEFAULT_KAISER_BETA;
+  const audibleRefDb = Math.round(kaiserAttenuationDb(ref));
   const trade =
-    beta < DEFAULT_KAISER_BETA
-      ? "narrowest transition from passband to stopband for the same tap count, trading a shallower stopband"
-      : beta === DEFAULT_KAISER_BETA
+    beta < ref
+      ? `steeper transition from passband to stopband than β ${ref} for the same tap count, trading a shallower stopband`
+      : beta === ref
         ? "default balance of transition width and stopband depth"
-        : "deeper stopband against a wider transition from passband to stopband";
-  const def = beta === DEFAULT_KAISER_BETA ? ", default" : "";
-  return `${label} (β = ${beta}, ≈ ${db} dB stopband${def}): ${trade}. Past about ${audibleRefDb} dB the images already sit below the analog noise of real DACs (typically 110–130 dB), so deeper settings are measurable rather than audible (ideal 24-bit quantization is about 146 dB).`;
+        : `deeper stopband than β ${ref}, against a wider transition from passband to stopband for the same tap count`;
+  const def = beta === ref ? ", default" : "";
+  return `${name} (β = ${beta}, ≈ ${db} dB stopband${def}): ${trade}. Past about ${audibleRefDb} dB the images already sit below the analog noise of real DACs (typically 110–130 dB), so deeper settings are measurable rather than audible (ideal 24-bit quantization is about 146 dB).`;
 }
 
 /** Why a candidate Kaiser β would make the current phase or cutoff mode invalid, or null. */

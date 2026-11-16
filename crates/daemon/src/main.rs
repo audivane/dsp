@@ -58,6 +58,16 @@ fn main() {
 
 fn run(args: Args) -> anyhow::Result<()> {
     let socket = ipc::socket_path(args.socket.as_deref()).map_err(anyhow::Error::msg)?;
+    // A second copy (e.g. started by hand while the service runs) would only
+    // get "device reservation denied" from the first one: say what is going on
+    // before touching the config or the device.
+    if ipc::probe(&socket) {
+        anyhow::bail!(
+            "Audivane DSP is already running (systemctl --user status audivane-dsp). \
+             Its control socket {} answers; stop it first to run another copy.",
+            socket.display()
+        );
+    }
     let store = Arc::new(ConfigStore::new(
         args.config
             .clone()

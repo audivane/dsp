@@ -1,3 +1,29 @@
+# pacman scriptlets for the makepkg build. The release packages get the same
+# logic from packaging/release/postinstall.sh; keep both in step.
+
+# Reload every running user manager and restart audivane-dsp.service where it
+# was running; prints the users it restarted. Best effort, never fails, and a
+# no-op without systemd as init (containers, build roots).
+_audivane_restart_user_engines() {
+  [ -d /run/systemd/system ] || return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+  local t= dir uid user
+  command -v timeout >/dev/null 2>&1 && t="timeout 30"
+  for dir in /run/user/[0-9]*; do
+    [ -S "$dir/systemd/private" ] || continue
+    uid=${dir##*/}
+    user=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
+    [ -n "$user" ] || continue
+    $t systemctl --no-ask-password --user -M "$user@" daemon-reload >/dev/null 2>&1 || true
+    if $t systemctl --no-ask-password --user -M "$user@" is-active --quiet audivane-dsp.service >/dev/null 2>&1; then
+      if $t systemctl --no-ask-password --user -M "$user@" try-restart audivane-dsp.service >/dev/null 2>&1; then
+        printf ' %s' "$user"
+      fi
+    fi
+  done
+  return 0
+}
+
 post_install() {
   cat <<'EOF'
 ==> audivane-dsp installed.
@@ -18,7 +44,16 @@ EOF
 }
 
 post_upgrade() {
-  post_install "$@"
+  local users
+  users=$(_audivane_restart_user_engines 2>/dev/null) || users=
+  if [ -n "$users" ]; then
+    echo "==> audivane-dsp updated: restarted the engine for:$users"
+  else
+    echo "==> audivane-dsp updated. No running engine was restarted; start it with"
+    echo "    systemctl --user daemon-reload && systemctl --user enable --now audivane-dsp"
+  fi
+  echo "    If the app is open, click Restart in its update banner (or reopen it)."
+  return 0
 }
 
 pre_remove() {

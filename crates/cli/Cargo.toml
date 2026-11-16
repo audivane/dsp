@@ -14,6 +14,9 @@ anyhow.workspace = true
 clap.workspace = true
 hound.workspace = true
 serde_json.workspace = true
+# SHA-256 of downloaded release packages (`avdsp upgrade`); already in the
+# lockfile through Tauri.
+sha2 = "0.10"
 
 [[bin]]
 name = "avdsp"
