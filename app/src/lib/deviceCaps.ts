@@ -80,6 +80,41 @@ export function suggestedDitherBits(format: SampleFormat | null | undefined, use
   return [...DITHER_TARGETS].reverse().find((t) => t <= bits) ?? 16;
 }
 
+/** The hint next to "Dither to": a short text, its tooltip, and the target a button offers (if any). */
+export interface DitherAdvice {
+  text: string;
+  title: string;
+  offer: number | null;
+}
+
+/**
+ * Advice on the dither target `current` for the format in use and the bits
+ * the DAC converts. "Matches" only when the target equals the DAC's bits; on
+ * a DAC that uses all 32 bits, 24 is recommended but 32 is fine too.
+ */
+export function ditherAdvice(current: number, format: SampleFormat | null | undefined, used: number | null): DitherAdvice | null {
+  const suggested = suggestedDitherBits(format, used);
+  if (suggested === null || !format) return null;
+  const width = formatBits(format);
+  const usesAll = used !== null && used >= width && width > suggested;
+  const why =
+    `Dither at ${suggested} bits adds noise near −141 dBFS, well below any DAC's own noise, ` +
+    `and guards against a DAC that quietly keeps fewer bits than it reports.`;
+  if (current === suggested) {
+    if (used === suggested) return { text: "Matches this DAC", title: `The DAC converts ${used} bits; dither at ${used} bits matches that.`, offer: null };
+    if (usesAll) return { text: `Recommended; ${width} bits also works`, title: `The DAC takes all ${width} bits. ${why} ${width} bits is fine too if it really uses them all.`, offer: null };
+    return { text: "Recommended for this DAC", title: used === null ? `${suggested} bits suits most DACs.` : `The DAC converts ${used} bits; ${suggested} is the nearest target at or below that.`, offer: null };
+  }
+  if (usesAll && current === width) {
+    return { text: `Fine: this DAC uses all ${width} bits. ${suggested} is the safer default`, title: `${why} Both sound the same.`, offer: suggested };
+  }
+  return {
+    text: `Suggested for this DAC: ${suggested} bits`,
+    title: used === null ? `${suggested} bits suits most DACs.` : used > suggested ? `The DAC takes ${used} bits. ${why}` : `The DAC converts ${used} bits; dither at ${suggested} bits matches that.`,
+    offer: suggested,
+  };
+}
+
 /**
  * Why the preferred format is not the one in use, for the "In use: X" hint:
  * "S32 not available at 192 kHz", or null when there is nothing to explain.

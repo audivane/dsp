@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { MockDaemon } from "../api/mock";
 import type { DeviceCapabilities } from "../api/types";
-import { directRateNote, directResamples, effectiveDitherBits, formatUnavailableReason, rateSupportNote, ratioLadder, sbitsAt, suggestedDitherBits, supportsFormat, usedBits } from "./deviceCaps";
+import { directRateNote, directResamples, ditherAdvice, effectiveDitherBits, formatUnavailableReason, rateSupportNote, ratioLadder, sbitsAt, suggestedDitherBits, supportsFormat, usedBits } from "./deviceCaps";
 
 /** Creative Pebble V3 (the bug report): S16_LE, 2 channels, 48000 Hz only. */
 const PEBBLE_V3: DeviceCapabilities = {
@@ -127,5 +127,24 @@ describe("bits in use and the suggested dither", () => {
     expect(suggestedDitherBits("s32", 18)).toBe(16);
     expect(suggestedDitherBits("s16", 16)).toBe(16);
     expect(suggestedDitherBits(null, 24)).toBeNull();
+  });
+});
+
+describe("dither advice", () => {
+  it("says matches only when the target equals the DAC's bits", () => {
+    expect(ditherAdvice(24, "s32", 24)).toMatchObject({ text: "Matches this DAC", offer: null });
+  });
+
+  it("recommends 24 on a full 32-bit DAC without calling it a match", () => {
+    expect(ditherAdvice(24, "s32", 32)).toMatchObject({ text: "Recommended; 32 bits also works", offer: null });
+    expect(ditherAdvice(32, "s32", 32)).toMatchObject({ text: "Fine: this DAC uses all 32 bits. 24 is the safer default", offer: 24 });
+  });
+
+  it("suggests the DAC's bits otherwise", () => {
+    expect(ditherAdvice(32, "s32", 24)).toMatchObject({ text: "Suggested for this DAC: 24 bits", offer: 24 });
+    expect(ditherAdvice(16, "s32", 32)).toMatchObject({ text: "Suggested for this DAC: 24 bits", offer: 24 });
+    expect(ditherAdvice(24, "s16", 16)).toMatchObject({ text: "Suggested for this DAC: 16 bits", offer: 16 });
+    expect(ditherAdvice(24, "s32", null)).toMatchObject({ text: "Recommended for this DAC", offer: null });
+    expect(ditherAdvice(24, null, null)).toBeNull();
   });
 });

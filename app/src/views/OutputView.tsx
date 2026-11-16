@@ -1,5 +1,5 @@
 import type { DitherKind, SampleFormat } from "../api/types";
-import { NOT_SUPPORTED_BY_DEVICE, effectiveDitherBits, formatBits, formatUnavailableReason, suggestedDitherBits, supportsFormat, usedBits } from "../lib/deviceCaps";
+import { NOT_SUPPORTED_BY_DEVICE, effectiveDitherBits, formatBits, ditherAdvice, formatUnavailableReason, supportsFormat, usedBits } from "../lib/deviceCaps";
 import { fmtSampleFormat } from "../lib/format";
 import { store, useApp } from "../store/store";
 import { Seg } from "../components/Seg";
@@ -25,7 +25,7 @@ export function OutputView() {
   // What the DAC really converts ("S32" may carry only 24 bits), and the
   // dither target that matches it.
   const used = usedBits(caps, outputRate, negotiated);
-  const suggested = suggestedDitherBits(negotiated, used);
+  const advice = ditherAdvice(out.bits, negotiated, used);
   const bitsOption = (bits: number, text: string, title: string): [number, string, string, boolean] =>
     maxBits !== null && bits > maxBits
       ? [bits, text, `${title} Not available: the DAC format in use (${fmtSampleFormat(negotiated)}) carries ${maxBits} bits.`, true]
@@ -78,16 +78,18 @@ export function OutputView() {
               Dithering to {ditherBits} bits (DAC format is {fmtSampleFormat(negotiated)})
             </span>
           )}
-          {suggested !== null && suggested !== out.bits && (
-            <span className="hint" title={suggestTitle(suggested, used)}>
-              Suggested for this DAC: {suggested} bits{" "}
-              <button className="link-btn" onClick={() => st.setOutput({ bits: suggested })}>
-                Use {suggested} bits
-              </button>
+          {advice && (
+            <span className="hint" title={advice.title}>
+              {advice.text}
+              {advice.offer !== null && (
+                <>
+                  {" "}
+                  <button className="link-btn" onClick={() => advice.offer !== null && st.setOutput({ bits: advice.offer })}>
+                    Use {advice.offer} bits
+                  </button>
+                </>
+              )}
             </span>
-          )}
-          {suggested !== null && suggested === out.bits && (
-            <span className="hint" title={suggestTitle(suggested, used)}>Matches this DAC</span>
           )}
         </div>
         <div className="row">
@@ -111,9 +113,3 @@ export function OutputView() {
   );
 }
 
-function suggestTitle(suggested: number, used: number | null): string {
-  if (used === null) return `${suggested} bits suits most DACs.`;
-  if (used > suggested)
-    return `The DAC takes ${used} bits, but no DAC's analog side resolves more than about ${suggested}; dither at ${suggested} bits stays below its noise.`;
-  return `The DAC converts ${used} bits; dither at ${suggested} bits matches that.`;
-}
