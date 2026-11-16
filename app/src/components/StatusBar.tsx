@@ -16,7 +16,8 @@ function bitsOf(format: string | null | undefined): string | null {
 }
 
 function sourceText(s: StreamInfo | undefined, bits: number | null | undefined, graphRate: number) {
-  const rate = fmtRateShort(s?.rate ?? graphRate);
+  // The upsampling ratio applies to the live graph rate, after client resampling.
+  const rate = fmtRateShort(graphRate);
   const b = bits ? `${bits}-bit` : bitsOf(s?.format);
   return (
     <>

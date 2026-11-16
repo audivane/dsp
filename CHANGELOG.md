@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.3
+
+- Fix: the status bar now uses the live engine input rate for `IN`, so the
+  displayed input rate × upsampling ratio matches the DAC output rate.
+  Previously it used the first connected app’s rate, which could show
+  `48k → ×4 → 384k` while a 96 kHz track was playing alongside a 48 kHz
+  browser stream. Audio processing was unaffected.
+
 ## 0.9.2
 
 - `avdsp upgrade`: updates a packaged install in place. It reads the latest
