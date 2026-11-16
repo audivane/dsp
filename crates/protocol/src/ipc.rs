@@ -951,6 +951,7 @@ pub enum PassthroughBreak {
         ratio: u32,
     },
     /// Sink or stream software volume is not exactly 1.0, or muted.
+    /// `volume` is linear; 0 when muted.
     Volume {
         node: u32,
         volume: f64,

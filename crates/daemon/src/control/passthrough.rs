@@ -124,7 +124,7 @@ pub fn compute(
         {
             broken.push(PassthroughBreak::Volume {
                 node: sink.node,
-                volume: sink.volume.unwrap_or(0.0),
+                volume: effective_volume(sink.muted, sink.volume),
             });
         }
         let mut ordered: Vec<&StreamView> = streams.iter().collect();
@@ -133,7 +133,7 @@ pub fn compute(
             if stream.muted || stream.volume.is_some_and(|v| v != 1.0) {
                 broken.push(PassthroughBreak::Volume {
                     node: stream.node,
-                    volume: stream.volume.unwrap_or(0.0),
+                    volume: effective_volume(stream.muted, stream.volume),
                 });
             }
         }
@@ -215,6 +215,12 @@ pub fn compute(
         broken_because: broken,
         caveats,
     }
+}
+
+/// The volume a break reports: 0 when muted (what is heard, and what
+/// clients show as "muted"), else the linear slider volume.
+fn effective_volume(muted: bool, volume: Option<f64>) -> f64 {
+    if muted { 0.0 } else { volume.unwrap_or(0.0) }
 }
 
 #[cfg(test)]
@@ -319,6 +325,7 @@ mod tests {
             }]
         );
 
+        // Muted at full slider volume: reported as 0 (what is heard).
         sink.volume = Some(1.0);
         sink.muted = true;
         let status = compute(&snap, &[stream()], Some(&sink), None);
@@ -326,7 +333,7 @@ mod tests {
             status.broken_because,
             vec![PassthroughBreak::Volume {
                 node: 5,
-                volume: 1.0
+                volume: 0.0
             }]
         );
     }

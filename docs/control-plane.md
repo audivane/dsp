@@ -412,7 +412,7 @@ source_bits)` is pure. Breaks, in report order:
 2. `DspActive`
 3. `Upsampling { ratio }`
 4. `Volume { node, volume }` (sink first, then streams by node id; volume ≠ 1.0
-   or muted)
+   or muted; `volume` is linear, 0 when muted)
 5. `Mixing { streams }`
 6. `Resampled { stream_rate, graph_rate }`
 7. `ChannelMix { stream_channels, sink_channels }`

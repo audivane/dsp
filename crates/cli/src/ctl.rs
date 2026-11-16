@@ -2657,9 +2657,7 @@ fn passthrough_reasons(passthrough: &audivane_protocol::ipc::Passthrough) -> Str
         .map(|reason| match reason {
             DspActive => "DSP is on".to_string(),
             Upsampling { ratio } => format!("upsampling x{ratio}"),
-            Volume { node, volume } if *volume == 0.0 => {
-                format!("node {node} is muted or at 0%")
-            }
+            Volume { node, volume } if *volume == 0.0 => format!("node {node} is muted"),
             Volume { node, volume } => format!(
                 "volume of node {node} is {}%; set it to 100% for bit-perfect playback",
                 slider_percent(*volume)
