@@ -853,7 +853,8 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
                             let current: EngineConfig =
                                 serde_json::from_value(client.call(Call::GetConfig)?)?;
                             let mut profile = loaded;
-                            if profile.left.is_none() && profile.right.is_none()
+                            if profile.left.is_none()
+                                && profile.right.is_none()
                                 && let Some(prev) = current.chain.eq
                             {
                                 profile.left = prev.left;
@@ -1013,7 +1014,9 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
                     && !enable
                     && !disable
                 {
-                    bail!("nothing to change: give --kind, --freq, --gain, --q, --enable, or --disable");
+                    bail!(
+                        "nothing to change: give --kind, --freq, --gain, --q, --enable, or --disable"
+                    );
                 }
                 let current: EngineConfig = serde_json::from_value(client.call(Call::GetConfig)?)?;
                 let mut profile = current
@@ -1134,10 +1137,16 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
                 match section {
                     EqSectionArg::Linked => profile.preamp_db = value,
                     EqSectionArg::Left => {
-                        profile.left.get_or_insert_with(ChannelEq::default).preamp_db = value;
+                        profile
+                            .left
+                            .get_or_insert_with(ChannelEq::default)
+                            .preamp_db = value;
                     }
                     EqSectionArg::Right => {
-                        profile.right.get_or_insert_with(ChannelEq::default).preamp_db = value;
+                        profile
+                            .right
+                            .get_or_insert_with(ChannelEq::default)
+                            .preamp_db = value;
                     }
                 }
                 client.call(Call::SetEq(Some(profile)))?;
@@ -2365,7 +2374,11 @@ fn summarize_eq(eq: Option<&EqProfile>) -> String {
             parts.push("R: off".to_string());
         }
     }
-    let preamp = if eq.preamp_db == 0.0 { 0.0 } else { eq.preamp_db };
+    let preamp = if eq.preamp_db == 0.0 {
+        0.0
+    } else {
+        eq.preamp_db
+    };
     parts.push(format!("preamp {preamp:.1} dB"));
     format!("{name} ({})", parts.join(", "))
 }
@@ -2418,7 +2431,11 @@ fn print_eq(eq: Option<&EqProfile>) {
     } else {
         eq.name.as_str()
     };
-    let preamp = if eq.preamp_db == 0.0 { 0.0 } else { eq.preamp_db };
+    let preamp = if eq.preamp_db == 0.0 {
+        0.0
+    } else {
+        eq.preamp_db
+    };
     println!("eq: {name} (preamp {preamp:+.2} dB)");
     println!(
         "  L+R: {} ({})",
@@ -2638,9 +2655,15 @@ fn passthrough_reasons(passthrough: &audivane_protocol::ipc::Passthrough) -> Str
         .broken_because
         .iter()
         .map(|reason| match reason {
-            DspActive => "dsp active".to_string(),
+            DspActive => "DSP is on".to_string(),
             Upsampling { ratio } => format!("upsampling x{ratio}"),
-            Volume { node, volume } => format!("volume {volume:.2} on node {node}"),
+            Volume { node, volume } if *volume == 0.0 => {
+                format!("node {node} is muted or at 0%")
+            }
+            Volume { node, volume } => format!(
+                "volume of node {node} is {}%; set it to 100% for bit-perfect playback",
+                slider_percent(*volume)
+            ),
             Mixing { streams } => format!("{streams} streams mixed"),
             Resampled {
                 stream_rate,
@@ -2655,19 +2678,36 @@ fn passthrough_reasons(passthrough: &audivane_protocol::ipc::Passthrough) -> Str
                 source_bits,
                 output_bits,
             } => format!("{source_bits}-bit source truncated to {output_bits}-bit output"),
-            NotPlaying => "not playing".to_string(),
+            NotPlaying => "nothing is playing".to_string(),
         })
         .collect::<Vec<_>>()
         .join(", ")
 }
 
+/// A linear PipeWire volume as desktop sliders (pavucontrol, KDE, GNOME)
+/// show it: they use a cubic scale, so linear 0.27 reads 65%.
+fn slider_percent(volume: f64) -> u32 {
+    (volume.max(0.0).cbrt() * 100.0).round() as u32
+}
+
 /// One line for the passthrough verdict, including anything we could not
-/// verify (a caveat never changes `intact`).
+/// verify (a caveat never changes `intact`). "Not bit-perfect" is not an
+/// error: DSP and upsampling change the samples on purpose.
 fn passthrough_line(passthrough: &audivane_protocol::ipc::Passthrough) -> String {
+    use audivane_protocol::ipc::PassthroughBreak;
+    let only_idle = passthrough
+        .broken_because
+        .iter()
+        .all(|b| matches!(b, PassthroughBreak::NotPlaying));
     let mut text = if passthrough.intact {
-        "passthrough: intact".to_string()
+        "passthrough: bit-perfect".to_string()
+    } else if only_idle {
+        "passthrough: nothing is playing".to_string()
     } else {
-        format!("passthrough: broken ({})", passthrough_reasons(passthrough))
+        format!(
+            "passthrough: not bit-perfect ({})",
+            passthrough_reasons(passthrough)
+        )
     };
     for caveat in &passthrough.caveats {
         text.push_str(" (");
@@ -2707,14 +2747,22 @@ mod tests {
             assert_eq!(request["method"], "status");
             let mut out = stream;
             writeln!(out, r#"{{"event":"meters","data":{{}}}}"#).unwrap();
-            writeln!(out, r#"{{"id":{},"ok":{{"version":"9.8.7"}}}}"#, request["id"]).unwrap();
+            writeln!(
+                out,
+                r#"{{"id":{},"ok":{{"version":"9.8.7"}}}}"#,
+                request["id"]
+            )
+            .unwrap();
         });
         assert_eq!(
             engine_version_at(&path, Duration::from_secs(5)).as_deref(),
             Some("9.8.7")
         );
         server.join().unwrap();
-        assert_eq!(engine_version_at(&dir.join("none.sock"), Duration::from_millis(100)), None);
+        assert_eq!(
+            engine_version_at(&dir.join("none.sock"), Duration::from_millis(100)),
+            None
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2730,7 +2778,7 @@ mod tests {
         };
         assert_eq!(
             passthrough_line(&intact),
-            "passthrough: intact (source precision unknown: S32LE container)"
+            "passthrough: bit-perfect (source precision unknown: S32LE container)"
         );
 
         let broken = Passthrough {
@@ -2740,15 +2788,36 @@ mod tests {
         };
         assert_eq!(
             passthrough_line(&broken),
-            "passthrough: broken (dsp active) (source precision unknown: S32LE container)"
+            "passthrough: not bit-perfect (DSP is on) (source precision unknown: S32LE container)"
         );
+
+        let volume = Passthrough {
+            intact: false,
+            broken_because: vec![PassthroughBreak::Volume {
+                node: 62,
+                volume: 0.27,
+            }],
+            caveats: Vec::new(),
+        };
+        assert_eq!(
+            passthrough_line(&volume),
+            "passthrough: not bit-perfect (volume of node 62 is 65%; set it to 100% for \
+             bit-perfect playback)"
+        );
+
+        let idle = Passthrough {
+            intact: false,
+            broken_because: vec![PassthroughBreak::NotPlaying],
+            caveats: Vec::new(),
+        };
+        assert_eq!(passthrough_line(&idle), "passthrough: nothing is playing");
 
         let plain = Passthrough {
             intact: true,
             broken_because: Vec::new(),
             caveats: Vec::new(),
         };
-        assert_eq!(passthrough_line(&plain), "passthrough: intact");
+        assert_eq!(passthrough_line(&plain), "passthrough: bit-perfect");
     }
 
     #[test]

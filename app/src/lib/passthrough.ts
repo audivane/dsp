@@ -21,6 +21,14 @@ function streamName(node: number, streams: readonly StreamInfo[]): string {
   return s.app_name || s.binary || s.media_name || "a stream";
 }
 
+/**
+ * A linear PipeWire volume as desktop volume sliders show it (pavucontrol,
+ * KDE and GNOME use a cubic scale): linear 0.27 reads 65%.
+ */
+export function sliderPercent(volume: number): number {
+  return Math.round(Math.cbrt(Math.max(0, volume)) * 100);
+}
+
 /** One break in plain words. */
 export function breakText(b: PassthroughBreak, streams: readonly StreamInfo[] = []): string {
   switch (b.reason) {
@@ -33,7 +41,7 @@ export function breakText(b: PassthroughBreak, streams: readonly StreamInfo[] = 
     case "volume": {
       const who = streamName(b.node, streams);
       if (b.volume === 0) return `${who} is muted`;
-      return `${who} volume is at ${Math.round(b.volume * 100)}%, not 100%`;
+      return `${who} volume is at ${sliderPercent(b.volume)}%, not 100%`;
     }
     case "mixing":
       return `${b.streams} streams are mixed together`;

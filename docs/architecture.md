@@ -106,8 +106,10 @@ and swapped in lock-free.
 
 - Bypass copies samples straight through: no f64 round trip, exact
   f32 → S24/S32 conversion.
-- The UI shows **passthrough: intact**, or **broken because** volume ≠ 1.0,
-  streams are mixing, the rate differs, or DSP is on.
+- The UI shows **Bit-perfect**, or **Not bit-perfect** because a volume is
+  not 100%, streams are mixing, the rate differs, or DSP is on (DSP and
+  upsampling are a choice, not a fault). Volumes are shown on the cubic
+  scale desktop sliders use (linear 0.27 is 65%).
 - Self-test: play a known signal and hash the bytes handed to ALSA. Users with
   S/PDIF loopback can also hash at the DAC input.
 

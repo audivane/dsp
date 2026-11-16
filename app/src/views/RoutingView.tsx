@@ -1,5 +1,6 @@
 import type { SinkChoice, StreamInfo } from "../api/types";
 import { fmtRateShort } from "../lib/format";
+import { sliderPercent } from "../lib/passthrough";
 import { store, useApp } from "../store/store";
 import { Close } from "../components/Icons";
 import { Seg } from "../components/Seg";
@@ -77,7 +78,7 @@ export function RoutingView() {
                           </span>
                         )}
                       </td>
-                      <td className="mono">{s.muted ? "muted" : s.volume === null || s.volume === undefined ? "—" : `${Math.round(s.volume * 100)}%`}</td>
+                      <td className="mono">{s.muted ? "muted" : s.volume === null || s.volume === undefined ? "—" : `${sliderPercent(s.volume)}%`}</td>
                       <td>
                         <select aria-label={`Output for ${name}`} value={value} onChange={(e) => void st.routeStream(s, e.target.value as SinkChoice)}>
                           {options.map(([k, label]) => (

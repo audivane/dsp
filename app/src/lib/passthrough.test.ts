@@ -28,8 +28,9 @@ describe("passthrough badge", () => {
   });
 
   it("is amber for unexpected breaks", () => {
-    const v = verdict(p([{ reason: "volume", node: 94, volume: 0.8 }, { reason: "resampled", stream_rate: 44100, graph_rate: 48000 }]), [firefox]);
+    const v = verdict(p([{ reason: "volume", node: 94, volume: 0.512 }, { reason: "resampled", stream_rate: 44100, graph_rate: 48000 }]), [firefox]);
     expect(v).toMatchObject({ kind: "warn", label: "Not bit-perfect" });
+    // Linear 0.512 is 80% on a desktop volume slider (cubic scale).
     expect(v.reasons).toEqual(["Firefox volume is at 80%, not 100%", "PipeWire resamples 44.1 kHz to 48 kHz"]);
   });
 
