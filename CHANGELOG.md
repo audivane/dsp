@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.4
 
 - Fix: the engine no longer fails to start when its output device is
   missing (DAC unplugged, or the card renumbered after a reboot). It starts,
