@@ -1047,6 +1047,10 @@ impl Engine for RealEngine {
             .map_err(|e| EngineError::new(RpcError::IO, format!("acquire_device failed: {e}")))
     }
 
+    fn needs_restart(&self) -> bool {
+        self.driver.audio_thread_ended()
+    }
+
     fn shutdown(&self) {
         self.driver.stop();
         self.reaper_stop.store(true, Ordering::Release);

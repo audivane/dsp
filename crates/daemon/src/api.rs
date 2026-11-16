@@ -102,5 +102,10 @@ pub trait Engine: Send + Sync + 'static {
     fn selftest(&self) -> Result<SelfTestResult, EngineError>;
     fn release_device(&self) -> Result<(), EngineError>;
     fn acquire_device(&self) -> Result<(), EngineError>;
+    /// `true` when the engine can no longer play and has to be started again
+    /// (its audio thread ended because the device failed or disappeared).
+    fn needs_restart(&self) -> bool {
+        false
+    }
     fn shutdown(&self);
 }

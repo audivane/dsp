@@ -143,6 +143,8 @@ fn run(args: Args) -> anyhow::Result<()> {
             daemon.shutdown_flag(),
             Arc::clone(&restart),
         )?;
+    } else {
+        watch_engine(engine, daemon.shutdown_flag(), Arc::clone(&restart))?;
     }
 
     // Block until SIGTERM/SIGINT or `avdsp ctl shutdown`.
@@ -188,6 +190,44 @@ fn watch_for_device(
         })?;
     Ok(())
 }
+
+/// Restart a running engine that can no longer play, usually because its
+/// device was unplugged. The fresh copy opens the device again, or waits for
+/// it like any start without its device (see `watch_for_device`).
+fn watch_engine(
+    engine: Arc<dyn Engine>,
+    shutdown: Arc<audivane_dsp_daemon::control::ShutdownFlag>,
+    restart: Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("avdsp-engine-watch".into())
+        .spawn(move || {
+            while !shutdown.is_requested() {
+                std::thread::sleep(DEVICE_POLL);
+                if !engine.needs_restart() {
+                    continue;
+                }
+                let device = engine.snapshot().device;
+                if config::device_present(&device) {
+                    // Still there, so not an unplug: do not restart in a
+                    // tight loop if it keeps failing.
+                    log::warn!("output device {device} stopped working; restarting the engine");
+                    std::thread::sleep(RETRY_PRESENT_DEVICE);
+                } else {
+                    log::warn!(
+                        "output device {device} is gone; restarting the engine to wait for it"
+                    );
+                }
+                restart.store(true, Ordering::Release);
+                shutdown.request();
+                return;
+            }
+        })?;
+    Ok(())
+}
+
+/// Pause before restarting an engine whose device failed but is still present.
+const RETRY_PRESENT_DEVICE: Duration = Duration::from_secs(5);
 
 /// Replace this process with a fresh copy (same arguments). The socket and
 /// the config have been released and flushed by `Daemon::shutdown`.

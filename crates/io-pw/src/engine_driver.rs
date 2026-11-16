@@ -1340,6 +1340,17 @@ impl EngineDriverHandle {
         }
     }
 
+    /// `true` once the ALSA thread has ended by itself: the device failed in a
+    /// way that restarting the stream cannot fix (usually it was unplugged).
+    /// The driver cannot play again; the owner has to start a new one.
+    pub fn audio_thread_ended(&self) -> bool {
+        !self.shared.stop.load(Ordering::Acquire)
+            && self
+                .alsa_thread
+                .lock()
+                .is_ok_and(|slot| slot.as_ref().is_some_and(JoinHandle::is_finished))
+    }
+
     /// Gracefully stop all threads, close ALSA, release `ReserveDevice1`, and
     /// restore PipeWire metadata. Idempotent.
     pub fn stop(&self) {
@@ -3736,6 +3747,7 @@ fn run_control_thread(
                     drop(old_out);
                 }
                 RtEvent::FatalError { msg } => {
+                    log::error!("audio thread stopped on '{}': {msg}", config.device);
                     shared.set_error(msg);
                     finish_waiters(&mut pending_acquire_waiters, || {
                         Err(PwError::Init(msg.to_string()))

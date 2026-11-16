@@ -9,6 +9,11 @@
   shows this in a banner with a "Choose output" button. Before, systemd
   restarted the failing service until it gave up and the app only said the
   engine was not answering.
+- Fix: unplugging the DAC while it plays no longer leaves the engine
+  stuck. Before, its audio thread stopped for good: picking another output
+  opened the device but played nothing, and "Release DAC" timed out. Now
+  the engine restarts, waits for the DAC (or plays the output you pick), and
+  takes the DAC back when it is plugged in again.
 - Fix: devices are saved by card id (`hw:CARD=<id>,DEV=<n>`) instead of the
   card number, which changes with boot order. A numeric device in an existing
   config is converted at start-up while the device is present.

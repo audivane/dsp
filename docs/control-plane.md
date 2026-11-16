@@ -284,6 +284,13 @@ arguments, same PID) once the device appears, or once `set_config` names a
 device that exists. A device that is present but fails to open is not
 retried in a loop: only a device change or a manual restart tries again.
 
+**Device lost while running.** When the device fails in a way that
+restarting the stream cannot fix (unplugged, usually), the engine's audio
+thread stops and the daemon replaces itself with a fresh copy within a
+second. That copy opens the device again, or, with the device gone, starts
+in the waiting mode above. Clients see the socket close and reconnect. A
+device that is still present when this happens is retried after 5 seconds.
+
 ### Chain wire shapes (EQ & convolution)
 
 - **Per-channel EQ (`EqProfile`):** `EqProfile` has an optional
