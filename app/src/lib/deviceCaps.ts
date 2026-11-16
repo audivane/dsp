@@ -53,6 +53,34 @@ export function sbitsAt(caps: DeviceCapabilities, rate: number, format: SampleFo
 }
 
 /**
+ * Bits the DAC converts in the format in use (its significant bits), or null
+ * while unknown. "S32" is the 4-byte container; a DAC may convert only 24 of
+ * those 32 bits and ignore the rest.
+ */
+export function usedBits(
+  caps: DeviceCapabilities | null | undefined,
+  rate: number | null | undefined,
+  format: SampleFormat | null | undefined,
+): number | null {
+  if (!caps || !rate || !format) return null;
+  return sbitsAt(caps, rate, format);
+}
+
+/** Dither targets the Output view offers. */
+export const DITHER_TARGETS = [16, 20, 24, 32] as const;
+
+/**
+ * Dither target to suggest for the format in use: the bits the DAC converts,
+ * at most 24 (no DAC's analog side resolves more, so dither below that only
+ * gets closer to plain rounding). Rounded down to an offered target.
+ */
+export function suggestedDitherBits(format: SampleFormat | null | undefined, used: number | null): number | null {
+  if (!format) return null;
+  const bits = Math.min(used ?? formatBits(format), formatBits(format), 24);
+  return [...DITHER_TARGETS].reverse().find((t) => t <= bits) ?? 16;
+}
+
+/**
  * Why the preferred format is not the one in use, for the "In use: X" hint:
  * "S32 not available at 192 kHz", or null when there is nothing to explain.
  */

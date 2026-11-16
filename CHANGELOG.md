@@ -20,6 +20,11 @@
 - Fix: in system-wide routing, unplugging the DAC no longer leaves the
   session on a silent `auto_null` sink: Audivane hands the default back while
   its sink is gone, and takes it again when the DAC returns.
+- The Device and Output views (and `avdsp ctl status`) show how many bits
+  the DAC really converts in the format in use, e.g. "S32 · 24-bit" for a
+  laptop's built-in codec, and the Output view suggests the matching dither
+  target with a one-click button. HD-Audio codecs are read from their own
+  report, since recent kernels claim all 32 bits for them.
 - When the engine does not start at all, the app shows the engine's own
   error instead of pointing to `journalctl`, and "Start engine" also clears
   systemd's restart limit.

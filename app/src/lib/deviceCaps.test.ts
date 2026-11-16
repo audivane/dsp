@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { MockDaemon } from "../api/mock";
 import type { DeviceCapabilities } from "../api/types";
-import { directRateNote, directResamples, effectiveDitherBits, formatUnavailableReason, rateSupportNote, ratioLadder, sbitsAt, supportsFormat } from "./deviceCaps";
+import { directRateNote, directResamples, effectiveDitherBits, formatUnavailableReason, rateSupportNote, ratioLadder, sbitsAt, suggestedDitherBits, supportsFormat, usedBits } from "./deviceCaps";
 
 /** Creative Pebble V3 (the bug report): S16_LE, 2 channels, 48000 Hz only. */
 const PEBBLE_V3: DeviceCapabilities = {
@@ -109,5 +109,23 @@ describe("mock daemon on a Pebble V3", () => {
     expect(st.ratio).toBe(4);
     expect(st.dither_bits).toBe(24);
     expect(st.effective_rates).toEqual([44100, 48000, 88200, 96000, 176400, 192000]);
+  });
+});
+
+describe("bits in use and the suggested dither", () => {
+  it("reads the DAC's significant bits at the rate in use", () => {
+    expect(usedBits(TIED, 96000, "s32")).toBe(24);
+    expect(usedBits(TIED, 192000, "s32")).toBeNull();
+    expect(usedBits(null, 96000, "s32")).toBeNull();
+  });
+
+  it("suggests what the DAC converts, at most 24 bits", () => {
+    expect(suggestedDitherBits("s32", 24)).toBe(24);
+    expect(suggestedDitherBits("s32", 32)).toBe(24);
+    expect(suggestedDitherBits("s32", null)).toBe(24);
+    expect(suggestedDitherBits("s32", 20)).toBe(20);
+    expect(suggestedDitherBits("s32", 18)).toBe(16);
+    expect(suggestedDitherBits("s16", 16)).toBe(16);
+    expect(suggestedDitherBits(null, 24)).toBeNull();
   });
 });

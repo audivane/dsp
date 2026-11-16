@@ -10,7 +10,7 @@ use audivane_protocol::ipc::{
 };
 use audivane_protocol::{
     Band, ChainConfig, ChannelEq, ConvolutionConfig, CutoffMode, EqProfile, FilterType, RateTarget,
-    UpsamplerConfig,
+    SampleFormat, UpsamplerConfig,
 };
 use clap::{Args, Subcommand, ValueEnum};
 use serde_json::Value;
@@ -2105,7 +2105,7 @@ fn print_status(
         "format:     {}",
         status
             .format
-            .map(|f| format!("{f:?}").to_lowercase())
+            .map(|f| format!("{f:?}").to_lowercase() + &used_bits_note(status, f))
             .unwrap_or_else(|| "not negotiated".to_string())
     );
     println!(
@@ -2684,6 +2684,27 @@ fn passthrough_reasons(passthrough: &audivane_protocol::ipc::Passthrough) -> Str
 
 /// A linear PipeWire volume as desktop sliders (pavucontrol, KDE, GNOME)
 /// show it: they use a cubic scale, so linear 0.27 reads 65%.
+/// ", DAC converts 24 of 32 bits" when the device resolves fewer bits than
+/// the format carries, ", all 32 bits used" when it uses them all.
+fn used_bits_note(status: &audivane_protocol::ipc::Status, format: SampleFormat) -> String {
+    let used = status.device_caps.as_ref().and_then(|caps| {
+        caps.rates
+            .iter()
+            .find(|r| r.rate == status.output_rate)?
+            .formats
+            .iter()
+            .find(|f| f.format == format)?
+            .sbits
+    });
+    match used {
+        Some(bits) if bits < format.bits() => {
+            format!(" (DAC converts {bits} of {} bits)", format.bits())
+        }
+        Some(bits) => format!(" (all {bits} bits used)"),
+        None => String::new(),
+    }
+}
+
 fn slider_percent(volume: f64) -> u32 {
     (volume.max(0.0).cbrt() * 100.0).round() as u32
 }

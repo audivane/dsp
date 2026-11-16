@@ -149,6 +149,12 @@ pub fn probe_pcm(
         }
     }
     per_rate.retain(|r| !r.formats.is_empty());
+    if let Some(bits) = crate::reserve::card_index_from_device(device)
+        .ok()
+        .and_then(hda_codec_bits)
+    {
+        cap_sbits(&mut per_rate, bits);
+    }
 
     Ok(DeviceCapabilities {
         device: device.to_string(),
@@ -160,6 +166,40 @@ pub fn probe_pcm(
         rate_max,
         formats: native_formats,
     })
+}
+
+/// Bits the converter of an HD-Audio card resolves, from the codecs' own
+/// report (`/proc/asound/cardN/codec#M`, "Default PCM" bits). Recent kernels
+/// report HD-Audio S32 as using all 32 bits (subformat `MSBITS_MAX`) even
+/// when the codec lists 16, 20 and 24 only. `None` for other cards.
+fn hda_codec_bits(card: u32) -> Option<u32> {
+    let dir = std::fs::read_dir(format!("/proc/asound/card{card}")).ok()?;
+    dir.filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("codec#"))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|text| codec_default_pcm_bits(&text))
+        .max()
+}
+
+/// Highest sample width in the "Default PCM" block of a codec proc file:
+/// `bits [0xe]: 16 20 24` gives 24.
+fn codec_default_pcm_bits(text: &str) -> Option<u32> {
+    let mut lines = text.lines().skip_while(|l| l.trim() != "Default PCM:");
+    lines.next()?;
+    lines
+        .take_while(|l| l.starts_with(char::is_whitespace))
+        .find_map(|l| l.trim().strip_prefix("bits ["))
+        .and_then(|rest| rest.split_once(':'))
+        .and_then(|(_, list)| list.split_whitespace().filter_map(|b| b.parse().ok()).max())
+}
+
+/// Cap every format's significant bits at `bits` (what the converter
+/// resolves), keeping narrower formats as they are.
+fn cap_sbits(per_rate: &mut [RateCapability], bits: u32) {
+    for f in per_rate.iter_mut().flat_map(|r| r.formats.iter_mut()) {
+        let width = f.sbits.unwrap_or_else(|| f.format.bits());
+        f.sbits = Some(width.min(bits));
+    }
 }
 
 /// Closed rate range of `hwp`. The `alsa` crate drops the open/closed
@@ -253,6 +293,34 @@ fn hw_params_sbits(pcm: &PCM, hwp: &HwParams<'_>) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hda_codec_bits_come_from_the_default_pcm_block() {
+        let codec = "Codec: Realtek ALC245\nAddress: 0\nDefault PCM:\n    rates [0x560]: 44100 48000 96000 192000\n    bits [0xe]: 16 20 24\n    formats [0x1]: PCM\nDefault Amp-In caps: N/A\nNode 0x02 [Audio Output] wcaps 0x41d: Stereo Amp-Out\n  PCM:\n    rates [0x40]: 48000\n    bits [0x1e]: 16 20 24 32\n";
+        assert_eq!(codec_default_pcm_bits(codec), Some(24));
+        assert_eq!(
+            codec_default_pcm_bits("Codec: HDMI\nDefault PCM:\n    N/A\n"),
+            None
+        );
+        assert_eq!(codec_default_pcm_bits(""), None);
+
+        let mut rates = vec![RateCapability {
+            rate: 48000,
+            formats: vec![
+                FormatCapability {
+                    format: SampleFormat::S16,
+                    sbits: Some(16),
+                },
+                FormatCapability {
+                    format: SampleFormat::S32,
+                    sbits: Some(32),
+                },
+            ],
+        }];
+        cap_sbits(&mut rates, 24);
+        let sbits: Vec<_> = rates[0].formats.iter().map(|f| f.sbits).collect();
+        assert_eq!(sbits, [Some(16), Some(24)]);
+    }
 
     /// The real device behind the bug report: Creative Pebble V3, USB full
     /// speed, one playback altset: S16_LE, 2 channels, 48000 Hz only.

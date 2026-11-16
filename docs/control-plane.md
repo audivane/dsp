@@ -147,7 +147,12 @@ configure (no second open, so a device it holds is never `EBUSY`): for the
 engine's channel count and interleaved access, every (rate, format) pair over
 every allowed graph rate times every integer ratio up to the maximum DSP
 ratio (16), capped at 768 kHz, plus the significant bits ALSA reports per
-pair (`snd_pcm_hw_params_get_sbits`, e.g. 24 for a 24-in-32 S32 DAC). Formats
+pair (`snd_pcm_hw_params_get_sbits`, e.g. 24 for a 24-in-32 S32 DAC). On
+HD-Audio cards those are capped at the widest sample size the codec lists
+under "Default PCM" in `/proc/asound/cardN/codec#M`, because recent kernels
+report HD-Audio S32 as using all 32 bits (`MSBITS_MAX`) even when the codec
+converts 24. `sbits` is informational: the app and `avdsp ctl status` show
+it and the app suggests a dither target from it (at most 24 bits). Formats
 are probed per rate because USB devices often tie them together (24-bit only
 up to 96 kHz). The probe leaves the device unconfigured.
 

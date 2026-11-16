@@ -1,5 +1,5 @@
 import type { DitherKind, SampleFormat } from "../api/types";
-import { NOT_SUPPORTED_BY_DEVICE, effectiveDitherBits, formatBits, formatUnavailableReason, supportsFormat } from "../lib/deviceCaps";
+import { NOT_SUPPORTED_BY_DEVICE, effectiveDitherBits, formatBits, formatUnavailableReason, suggestedDitherBits, supportsFormat, usedBits } from "../lib/deviceCaps";
 import { fmtSampleFormat } from "../lib/format";
 import { store, useApp } from "../store/store";
 import { Seg } from "../components/Seg";
@@ -22,6 +22,10 @@ export function OutputView() {
   const maxBits = negotiated ? formatBits(negotiated) : null;
   const ditherBits = statusDitherBits ?? effectiveDitherBits(out.bits, negotiated);
   const capped = negotiated !== null && ditherBits < out.bits;
+  // What the DAC really converts ("S32" may carry only 24 bits), and the
+  // dither target that matches it.
+  const used = usedBits(caps, outputRate, negotiated);
+  const suggested = suggestedDitherBits(negotiated, used);
   const bitsOption = (bits: number, text: string, title: string): [number, string, string, boolean] =>
     maxBits !== null && bits > maxBits
       ? [bits, text, `${title} Not available: the DAC format in use (${fmtSampleFormat(negotiated)}) carries ${maxBits} bits.`, true]
@@ -49,6 +53,8 @@ export function OutputView() {
           />
           <span className="hint">
             In use: {fmtSampleFormat(negotiated)}
+            {used !== null && negotiated && used < formatBits(negotiated) ? `, the DAC converts ${used} of its ${formatBits(negotiated)} bits` : ""}
+            {used !== null && negotiated && used >= formatBits(negotiated) ? `, all ${used} bits used` : ""}
             {whyNot ? ` (${whyNot})` : ""}
           </span>
         </div>
@@ -72,6 +78,17 @@ export function OutputView() {
               Dithering to {ditherBits} bits (DAC format is {fmtSampleFormat(negotiated)})
             </span>
           )}
+          {suggested !== null && suggested !== out.bits && (
+            <span className="hint" title={suggestTitle(suggested, used)}>
+              Suggested for this DAC: {suggested} bits{" "}
+              <button className="link-btn" onClick={() => st.setOutput({ bits: suggested })}>
+                Use {suggested} bits
+              </button>
+            </span>
+          )}
+          {suggested !== null && suggested === out.bits && (
+            <span className="hint" title={suggestTitle(suggested, used)}>Matches this DAC</span>
+          )}
         </div>
         <div className="row">
           <span className="k" title="Dither adds a tiny amount of noise before rounding so the rounding error becomes plain, steady noise instead of distortion that follows the music.">
@@ -92,4 +109,11 @@ export function OutputView() {
       <p className="lede">Dither is applied once, at the final conversion to the DAC format, and only when processing is on. Bypass and Direct playback are never dithered. Many 32-bit DACs resolve about 24 bits, so 24 is a good target.</p>
     </section>
   );
+}
+
+function suggestTitle(suggested: number, used: number | null): string {
+  if (used === null) return `${suggested} bits suits most DACs.`;
+  if (used > suggested)
+    return `The DAC takes ${used} bits, but no DAC's analog side resolves more than about ${suggested}; dither at ${suggested} bits stays below its noise.`;
+  return `The DAC converts ${used} bits; dither at ${suggested} bits matches that.`;
 }

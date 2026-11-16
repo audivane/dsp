@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { RateConflict } from "../api/types";
-import { directRateNote, rateSupportNote } from "../lib/deviceCaps";
+import { directRateNote, formatBits, rateSupportNote, usedBits } from "../lib/deviceCaps";
 import { rateChips, type RateChip } from "../lib/rates";
 import { fmtRate, fmtRateShort, fmtSampleFormat } from "../lib/format";
 import { store, useApp } from "../store/store";
@@ -119,6 +119,12 @@ export function DeviceView() {
   const rateNote = rateSupportNote(cfg.rate.allowed_rates, effectiveRates);
   const directNote = directRateNote(effectiveRates, status?.direct_rates);
   const defaultRate = status?.effective_default_rate ?? cfg.rate.default_rate;
+  const bits = usedBits(status?.device_caps, status?.output_rate, status?.format);
+  const bitsTitle =
+    bits !== null && status?.format
+      ? `The DAC takes ${fmtSampleFormat(status.format)} samples and converts ${bits} bits of each` +
+        (bits < formatBits(status.format) ? `; it ignores the lowest ${formatBits(status.format) - bits}.` : ".")
+      : undefined;
   return (
     <section className="view" aria-labelledby="dev-title">
       <div className="view-head">
@@ -136,7 +142,10 @@ export function DeviceView() {
           </div>
           <div className="fact">
             <div className="k">Format in use</div>
-            <div className="v">{fmtSampleFormat(status?.format)}</div>
+            <div className="v" title={bitsTitle}>
+              {fmtSampleFormat(status?.format)}
+              {bits !== null ? ` · ${bits}-bit` : ""}
+            </div>
           </div>
           <div className="fact">
             <div className="k">Rate now</div>
