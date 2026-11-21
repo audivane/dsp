@@ -60,18 +60,32 @@ pub fn significant_bits(x: f32) -> u32 {
     (1 - e).clamp(1, 32) as u32
 }
 
-/// 64-bit FNV-1a over the little-endian bytes of `samples`, for self-tests.
-pub fn hash_i32(samples: &[i32]) -> u64 {
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET_BASIS;
-    for &sample in samples {
-        for byte in sample.to_le_bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(PRIME);
-        }
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Continue a 64-bit FNV-1a hash over `bytes`.
+fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+/// 64-bit FNV-1a over the little-endian bytes of `samples`, for self-tests.
+pub fn hash_i32(samples: &[i32]) -> u64 {
+    samples
+        .iter()
+        .fold(FNV_OFFSET_BASIS, |h, s| fnv1a(h, &s.to_le_bytes()))
+}
+
+/// [`hash_i32`] for 64-bit words: FNV-1a 64 over the little-endian bytes
+/// of `words`. Hash an `f64` sequence by its bits (`v.to_bits()`); the
+/// filter fingerprint tests do.
+pub fn hash_u64(words: impl IntoIterator<Item = u64>) -> u64 {
+    words
+        .into_iter()
+        .fold(FNV_OFFSET_BASIS, |h, w| fnv1a(h, &w.to_le_bytes()))
 }
 
 #[cfg(test)]
@@ -209,5 +223,23 @@ mod tests {
         let mut changed = samples.clone();
         changed[512] = changed[512].wrapping_add(1);
         assert_ne!(h, hash_i32(&changed));
+    }
+
+    #[test]
+    fn hash_u64_is_fnv1a_64_over_the_same_bytes() {
+        assert_eq!(hash_u64([]), 0xcbf2_9ce4_8422_2325);
+        // Two i32 samples are the bytes of one u64 (low word first).
+        for (a, b) in [(0i32, 0i32), (1, 0), (-1, 7), (123_456, -987_654)] {
+            let word = u64::from(a as u32) | (u64::from(b as u32) << 32);
+            assert_eq!(hash_u64([word]), hash_i32(&[a, b]), "{a} {b}");
+        }
+        let bits: Vec<u64> = [0.0, -0.0, 1.0, f64::MIN_POSITIVE]
+            .iter()
+            .map(|v: &f64| v.to_bits())
+            .collect();
+        let h = hash_u64(bits.iter().copied());
+        assert_eq!(h, hash_u64(bits.clone()));
+        // Sensitive to the sign of zero and to the order.
+        assert_ne!(h, hash_u64([bits[1], bits[0], bits[2], bits[3]]));
     }
 }

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { Meters } from "../api/types";
-import { computeClipDeltas, meterChainGainDb, meterStore } from "./meters";
+import { computeClipDeltas, meterChainGainDb, meterStore, metersSettled, quietMeters } from "./meters";
 
 function makeMeters(patch: Partial<Meters> = {}): Meters {
   return {
@@ -106,5 +106,41 @@ describe("meter clip latching and headroom", () => {
     meterStore.push(makeMeters({ clipped: 5, clipped_ch: [] }), 300);
     expect(meterStore.clipsSinceReset()).toBe(5);
     expect(meterStore.lastClipAt).toBe(300);
+  });
+});
+
+describe("meters at rest", () => {
+  const base = { peak_db: [-150, -150], rms_db: [-150, -150], clipped: 0, clipped_ch: [0, 0], input_peak_db: [], chain_peak_db: [], xruns: 0, dsp_load: 0 };
+
+  it("a silent report is quiet; signal or limiter reduction is not", () => {
+    expect(quietMeters(base, -60)).toBe(true);
+    expect(quietMeters({ ...base, peak_db: [-150, -59] }, -60)).toBe(false);
+    expect(quietMeters({ ...base, rms_db: [-30, -150] }, -60)).toBe(false);
+    expect(quietMeters({ ...base, peak_db: [], rms_db: [] }, -60)).toBe(true);
+    const lim = { active: true, gain_reduction_db: 0, headroom_db: 0, events: 0 };
+    expect(quietMeters({ ...base, limiter: lim } as never, -60)).toBe(true);
+    expect(quietMeters({ ...base, limiter: { ...lim, gain_reduction_db: 1.2 } } as never, -60)).toBe(false);
+  });
+
+  it("the bars are settled only when peak, hold and RMS rest at the floor", () => {
+    const rest = { peak: -60, rms: -60, hold: -60 };
+    expect(metersSettled([rest, rest], -60)).toBe(true);
+    expect(metersSettled([rest, { ...rest, hold: -12 }], -60)).toBe(false);
+    expect(metersSettled([{ ...rest, peak: -59.9 }, rest], -60)).toBe(false);
+    expect(metersSettled([{ ...rest, rms: -59.99 }, rest], -60)).toBe(true);
+    expect(metersSettled([{ ...rest, rms: -59.5 }, rest], -60)).toBe(false);
+  });
+
+  it("every report, clip reset and clear tells the painters", () => {
+    meterStore.clear();
+    let n = 0;
+    const off = meterStore.onChange(() => n++);
+    meterStore.push(base, 0);
+    meterStore.resetClip();
+    meterStore.resetClip(0);
+    meterStore.clear();
+    off();
+    meterStore.push(base, 1);
+    expect(n).toBe(4);
   });
 });

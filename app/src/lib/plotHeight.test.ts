@@ -119,18 +119,18 @@ describe("plotHeight", () => {
     withLocalStorage(storage, () => {
       // Fixed default (upsampling plot).
       const ups = createHeightModel({
-        storageKey: "avdsp-height-ups-sub",
+        storageKey: "avdsp-height-ups-impulse",
         defaultHeight: 140,
         minHeight: 120,
       });
       expect(ups.height).toBe(140);
       expect(ups.step(20)).toBe(160);
-      expect(map.get("avdsp-height-ups-sub")).toBe("160");
+      expect(map.get("avdsp-height-ups-impulse")).toBe("160");
       expect(ups.step(100)).toBe(260);
       expect(ups.step(-200)).toBe(120);
       expect(ups.reset()).toBe(140);
       expect(ups.height).toBe(140);
-      expect(map.has("avdsp-height-ups-sub")).toBe(false);
+      expect(map.has("avdsp-height-ups-impulse")).toBe(false);
 
       // Flex default (EQ graph, defaultHeight = null).
       const eq = createHeightModel({

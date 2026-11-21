@@ -29,6 +29,10 @@ gui = [
     "dep:tauri-plugin-single-instance",
     "dep:tauri-plugin-window-state",
     "dep:tauri-plugin-clipboard-manager",
+    "dep:tauri-plugin-global-shortcut",
+    "dep:ksni",
+    "dep:gtk",
+    "dep:webkit2gtk",
 ]
 # Production build: serve the embedded `app/dist` instead of `devUrl`.
 # `tauri build` turns on `tauri/custom-protocol` itself; a plain cargo release
@@ -46,11 +50,33 @@ log.workspace = true
 libc = "0.2"
 zbus = "6"
 tempfile = "3"
-tauri = { version = "2", features = ["tray-icon", "image-png"], optional = true }
+tauri = { version = "2", features = ["image-png"], optional = true }
 tauri-plugin-dialog = { version = "2", optional = true }
 tauri-plugin-single-instance = { version = "2", optional = true }
 tauri-plugin-window-state = { version = "2", optional = true }
 tauri-plugin-clipboard-manager = { version = "2", optional = true }
+# X11 fallback for the volume keys when the desktop has no GlobalShortcuts portal.
+tauri-plugin-global-shortcut = { version = "2", optional = true }
+# The tray is our own StatusNotifierItem (KDE/freedesktop tray protocol over
+# D-Bus) instead of Tauri's appindicator tray: it gets left-click events
+# (Activate) and the click's Wayland activation token, which the popup needs
+# to take focus. Same crate and features as tray-icon's ksni backend.
+ksni = { version = "0.3", default-features = false, features = ["async-io", "blocking"], optional = true }
+# Only for gtk_window_set_startup_id (the activation token); already in the
+# tree through Tauri.
+gtk = { version = "0.18", optional = true }
+# Only to end a closed window's web process (webkit_web_view_terminate_web_process):
+# WebKit keeps it running after the view is destroyed. Already in the tree
+# through wry, which enables v2_40.
+webkit2gtk = { version = "2", optional = true }
+# The GlobalShortcuts portal client waits on D-Bus signals.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+futures-channel = "0.3"
+
+[dev-dependencies]
+# Tests only: a real daemon (with its hardware-free waiting engine) behind
+# the native client.
+audivane-dsp-daemon = { path = "../../crates/daemon" }
 
 [build-dependencies]
 tauri-build = { version = "2", optional = true, features = [] }

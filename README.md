@@ -52,9 +52,9 @@
 | --- | --- |
 | **Parametric EQ** | L+R, L and R sections; peaking, shelf, pass, band-pass, notch and all-pass bands; AutoEQ / Equalizer APO import; target and measurement overlays |
 | **Convolution** | WAV impulse responses for room correction or crossfeed |
-| **Upsampling** | ×2 to ×16 or up to 768 kHz, 16k–4M taps, linear or minimum phase |
+| **Resampling** | integer ×2 to ×64, or up to 3.072 MHz with fractional ratios; 1 to 8.4 M taps; linear, minimum or intermediate phase; fractional (44.1 → 48 kHz) and decimating (192 → 48 kHz) ratios with the same filters |
 | **Output** | TPDF or noise-shaped dither, S16/S24/S32, hardware or digital volume |
-| **A/B compare** | Two settings, A-weighted level matching |
+| **A/B compare** | Two settings, K-weighted level matching that never boosts |
 | **Routing** | System-wide or per app; live list of streams and formats |
 | **Monitoring** | Level meters, pre/post spectrum, stream and DSP load in the status bar |
 
@@ -72,15 +72,15 @@
 
 ```sh
 # Arch Linux
-curl -fLO https://github.com/audivane/dsp/releases/download/0.9.4/audivane-dsp-0.9.4-1-x86_64.pkg.tar.zst
-sudo pacman -U ./audivane-dsp-0.9.4-1-x86_64.pkg.tar.zst
+curl -fLO https://github.com/audivane/dsp/releases/download/0.10.0/audivane-dsp-0.10.0-1-x86_64.pkg.tar.zst
+sudo pacman -U ./audivane-dsp-0.10.0-1-x86_64.pkg.tar.zst
 
 # Ubuntu 24.04+ / Debian 13+
-curl -fLO https://github.com/audivane/dsp/releases/download/0.9.4/audivane-dsp_0.9.4-1_amd64.deb
-sudo apt install ./audivane-dsp_0.9.4-1_amd64.deb
+curl -fLO https://github.com/audivane/dsp/releases/download/0.10.0/audivane-dsp_0.10.0-1_amd64.deb
+sudo apt install ./audivane-dsp_0.10.0-1_amd64.deb
 
 # Fedora 40+
-sudo dnf install https://github.com/audivane/dsp/releases/download/0.9.4/audivane-dsp-0.9.4-1.x86_64.rpm
+sudo dnf install https://github.com/audivane/dsp/releases/download/0.10.0/audivane-dsp-0.10.0-1.x86_64.rpm
 ```
 
 Then start the engine for your user and open **Audivane DSP** from your app menu:
@@ -111,14 +111,14 @@ version. `--yes` skips the question; `--version <tag>` installs a given release
 the package restarts every running engine, and the open app offers a
 **Restart** button to load its new version.
 
-> **Beta.** 0.9.x is the first public release series. It is used daily on Arch with
-> PipeWire 1.6; the Ubuntu and Fedora packages are built and install-tested
-> but have seen less real use. Reports are very welcome.
+> **Beta.** 0.9.x is the first public release series. Development runs on
+> Arch with PipeWire 1.6; the Ubuntu and Fedora packages are built and
+> install-tested but have seen less real use. Reports are very welcome.
 
 ## Build from source
 
 Rust (stable), Node 22+, clang, and the development packages for PipeWire
-(1.0+), ALSA, GTK 3, WebKitGTK 4.1, ayatana-appindicator and D-Bus. The exact
+(1.0+), ALSA, GTK 3, WebKitGTK 4.1 and D-Bus. The exact
 package list is in [DEV.md](DEV.md#build-from-source).
 
 ```sh
@@ -135,7 +135,7 @@ cargo build --profile release-ui -p audivane-dsp-ui --features custom-protocol
 | `crates/` | `protocol`, `dsp-core`, `io-alsa`, `io-pw`, `daemon` (`audivane-dsp`), `cli` (`avdsp`) |
 | `app/` | Desktop app (Tauri 2 + React) |
 | `packaging/` | systemd user unit, release pipeline (`.deb`, `.rpm`, Arch) and `PKGBUILD` |
-| `docs/` | [Architecture](docs/architecture.md), [control plane](docs/control-plane.md), [PipeWire driver](docs/pipewire-driver.md), research |
+| `docs/` | [Architecture](docs/architecture.md), [control plane](docs/control-plane.md), [PipeWire driver](docs/pipewire-driver.md) |
 
 ## Contributing
 

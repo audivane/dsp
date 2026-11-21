@@ -34,10 +34,14 @@ export function breakText(b: PassthroughBreak, streams: readonly StreamInfo[] = 
   switch (b.reason) {
     case "not_playing":
       return "Nothing is playing";
+    case "no_output":
+      return "The output is not playing: nothing reaches the DAC";
     case "dsp_active":
       return "DSP processing is on";
     case "upsampling":
       return `Upsampling ×${b.ratio}`;
+    case "rate_conversion":
+      return `Resampling ${fmtRate(b.graph_rate)} to ${fmtRate(b.output_rate)}`;
     case "volume": {
       const who = streamName(b.node, streams);
       if (b.volume === 0) return `${who} is muted`;

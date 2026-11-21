@@ -1,9 +1,0 @@
-COMPARE N=4194304 beta=8 r=16 cut=0.999976619 new pb_diff_db=5.710452e-3 transition_abs=1.575138e-3 all_abs=1.575138e-3 stop_lin=-83.0080 stop_min=-81.8026 ny_lin=-83.0080 ny_min=-81.8026 sb_diff_max_db=178.69@0.27296236 E50=51 E99=1897 gd_dc=37.69718 gd_pb=[37.6825,495481.7643] l1=11.2126
-cep floor=180.0000 pad=4 tail_energy=-24.55dB tail_l1=3.771e0
-COMPARE N=4194304 beta=8 r=16 cut=0.999976619 old pb_diff_db=2.140193e0 transition_abs=2.253629e-1 all_abs=2.253629e-1 stop_lin=-83.0080 stop_min=-81.9983 ny_lin=-83.0080 ny_min=-81.9983 sb_diff_max_db=99.82@0.06234488 E50=83 E99=2406 gd_dc=64.81512 gd_pb=[64.8004,514918.2510] l1=11.5318
-COMPARE N=4194304 beta=14 r=16 cut=0.999959263 new pb_diff_db=2.143363e-3 transition_abs=4.713798e-4 all_abs=4.713798e-4 stop_lin=-136.8771 stop_min=-135.7548 ny_lin=-136.8771 ny_min=-135.7548 sb_diff_max_db=124.26@0.44574428 E50=75 E99=2909 gd_dc=57.94902 gd_pb=[57.9490,439812.1343] l1=13.1568
-cep floor=180.0000 pad=4 tail_energy=-50.90dB tail_l1=4.505e-1
-COMPARE N=4194304 beta=14 r=16 cut=0.999959263 old pb_diff_db=3.585198e-2 transition_abs=4.600360e-3 all_abs=4.600360e-3 stop_lin=-136.8771 stop_min=-134.1170 ny_lin=-136.8771 ny_min=-134.1170 sb_diff_max_db=100.00@0.44574428 E50=86 E99=3317 gd_dc=66.96388 gd_pb=[66.9639,450921.7992] l1=13.7053
-COMPARE N=4194304 beta=20 r=16 cut=0.999941907 new pb_diff_db=1.504117e-3 transition_abs=5.663620e-4 all_abs=5.663620e-4 stop_lin=-190.8764 stop_min=-190.2461 ny_lin=-190.8764 ny_min=-190.2461 sb_diff_max_db=69.81@0.09205610 E50=100 E99=3921 gd_dc=78.20803 gd_pb=[78.2080,416864.9036] l1=14.7228
-cep floor=180.0000 pad=4 tail_energy=-79.34dB tail_l1=2.854e-2
-COMPARE N=4194304 beta=20 r=16 cut=0.999941907 old pb_diff_db=2.356733e-4 transition_abs=7.480235e-5 all_abs=7.480235e-5 stop_lin=-190.8764 stop_min=-178.8971 ny_lin=-190.8764 ny_min=-178.8971 sb_diff_max_db=100.00@0.11845934 E50=86 E99=3365 gd_dc=66.97620 gd_pb=[66.9762,375829.9521] l1=13.8172

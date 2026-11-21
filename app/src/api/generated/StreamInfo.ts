@@ -13,4 +13,11 @@ format: string | null,
 /**
  * Sink it is linked to, if one of ours.
  */
-sink: SinkChoice | null, volume: number | null, muted: boolean, };
+sink: SinkChoice | null, volume: number | null, muted: boolean, 
+/**
+ * The level the stream plays at, in dB: its loudest channel volume
+ * times its own master volume (what `set_stream_volume` sets). Absent
+ * until the stream reports its volume, and from daemons that predate
+ * it.
+ */
+volume_db?: number, };

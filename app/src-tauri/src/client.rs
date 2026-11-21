@@ -457,6 +457,7 @@ pub const ALL_TOPICS: &[&str] = &[
     "now_playing",
     "config",
     "presets",
+    "devices",
 ];
 pub const BASE_TOPICS: &[&str] = &["meters", "status", "streams", "now_playing"];
 
@@ -468,6 +469,9 @@ pub type Sink = Arc<dyn Fn(SubMsg) + Send + Sync>;
 #[derive(Default)]
 struct SubControl {
     spectrum: bool,
+    /// `meters` left out of the topics (nothing shows them: the main
+    /// window is closed to the tray).
+    no_meters: bool,
     resubscribe: bool,
     writer: Option<UnixStream>,
     stream: Option<UnixStream>,
@@ -481,8 +485,17 @@ pub struct Subscription {
 
 impl Subscription {
     pub fn spawn(path: PathFn, sink: Sink) -> Self {
+        Self::spawn_with(path, sink, true)
+    }
+
+    /// `meters`: whether the first connection asks for the `meters` topic
+    /// (see [`Self::set_meters`]).
+    pub fn spawn_with(path: PathFn, sink: Sink, meters: bool) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let ctrl: Arc<Mutex<SubControl>> = Arc::default();
+        let ctrl: Arc<Mutex<SubControl>> = Arc::new(Mutex::new(SubControl {
+            no_meters: !meters,
+            ..SubControl::default()
+        }));
         let (s, c) = (stop.clone(), ctrl.clone());
         let thread = std::thread::Builder::new()
             .name("avdsp-ui-events".into())
@@ -508,6 +521,32 @@ impl Subscription {
             if let Some(w) = c.writer.as_mut() {
                 let line =
                     json!({"id": 3, "method": "subscribe", "params": {"topics": ["spectrum"]}});
+                let _ = writeln!(w, "{line}");
+                let _ = w.flush();
+            }
+        } else {
+            c.resubscribe = true;
+            c.writer = None;
+            if let Some(s) = c.stream.take() {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
+    /// Enable or disable the `meters` topic (on from the start). Like
+    /// [`Self::set_spectrum`]: enabling subscribes on the live socket,
+    /// disabling reconnects without it (no `Down` is reported, and the
+    /// daemon sends its snapshot again).
+    pub fn set_meters(&self, enabled: bool) {
+        let mut c = self.ctrl.lock().unwrap_or_else(|e| e.into_inner());
+        if c.no_meters != enabled {
+            return;
+        }
+        c.no_meters = !enabled;
+        if enabled {
+            if let Some(w) = c.writer.as_mut() {
+                let line =
+                    json!({"id": 4, "method": "subscribe", "params": {"topics": ["meters"]}});
                 let _ = writeln!(w, "{line}");
                 let _ = w.flush();
             }
@@ -605,7 +644,13 @@ fn session(
     }
     let mut reader = BufReader::new(stream);
     let mut subscribed = false;
+    let no_meters = ctrl.lock().unwrap_or_else(|e| e.into_inner()).no_meters;
     for (id, topics) in [(1u64, ALL_TOPICS), (2, BASE_TOPICS)] {
+        let topics: Vec<&str> = topics
+            .iter()
+            .copied()
+            .filter(|t| !(no_meters && *t == "meters"))
+            .collect();
         let line = json!({"id": id, "method": "subscribe", "params": {"topics": topics}});
         writeln!(writer, "{line}").map_err(|e| format!("Lost the engine: {e}."))?;
         match wait_reply(&mut reader, id)? {
@@ -634,6 +679,12 @@ fn session(
         }
         if c.spectrum {
             let line = json!({"id": 3, "method": "subscribe", "params": {"topics": ["spectrum"]}});
+            writeln!(writer, "{line}").map_err(|e| format!("Lost the engine: {e}."))?;
+            let _ = writer.flush();
+        }
+        // Turned on while this connection was being made.
+        if no_meters && !c.no_meters {
+            let line = json!({"id": 4, "method": "subscribe", "params": {"topics": ["meters"]}});
             writeln!(writer, "{line}").map_err(|e| format!("Lost the engine: {e}."))?;
             let _ = writer.flush();
         }

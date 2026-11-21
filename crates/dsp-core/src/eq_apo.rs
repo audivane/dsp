@@ -4,14 +4,18 @@
 //! `Preamp: -6.2 dB`
 //! `Filter 1: ON PK Fc 105 Hz Gain 3.4 dB Q 0.70`
 //! Types: PK/PEQ, LS/LSC, HS/HSC (with optional Q, default 0.7071), LP/LPQ,
-//! HP/HPQ, BP, NO, AP. `OFF` filters import as disabled bands. Unknown
-//! directives (Device:, Channel:, Include: …) are skipped with a warning.
+//! HP/HPQ, BP, NO, AP. `OFF` filters import as disabled bands.
+//! `Channel: L` / `Channel: R` put the filters (and a `Preamp`) that follow
+//! into that channel's own section (`EqProfile::left` / `right`);
+//! `Channel: all` goes back to the linked one, and any other channel list
+//! is read as all, with a warning. Unknown directives (Device:,
+//! Include: …) are skipped with a warning.
 //!
 //! Beyond the documented subset, `BW <octaves>` and `S <slope>` are accepted
 //! in place of `Q`, because Equalizer APO itself writes those.  They are
 //! converted to the equivalent Q at import time; export always writes Q.
 
-use audivane_protocol::{Band, EqProfile, FilterType};
+use audivane_protocol::{Band, ChannelEq, EqProfile, FilterType};
 use std::fmt::Write as _;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -46,6 +50,9 @@ fn err(line: usize, message: impl Into<String>) -> ParseError {
 pub fn parse(text: &str) -> Result<Parsed, ParseError> {
     let mut profile = EqProfile::default();
     let mut warnings = Vec::new();
+    // 0: linked, 1: left, 2: right.
+    let mut sides: [(f64, Vec<Band>); 3] = Default::default();
+    let mut ch = 0usize;
 
     for (index, raw) in text.lines().enumerate() {
         let line_no = index + 1;
@@ -78,17 +85,43 @@ pub fn parse(text: &str) -> Result<Parsed, ParseError> {
                 .is_some_and(|suffix| suffix.trim().parse::<u32>().is_ok());
 
         if key_lower == "preamp" {
-            profile.preamp_db = parse_preamp(rest, line_no)?;
+            sides[ch].0 = parse_preamp(rest, line_no)?;
         } else if is_filter {
             match parse_filter(rest, line_no)? {
-                Some(band) => profile.bands.push(band),
+                Some(band) => sides[ch].1.push(band),
                 None => warnings.push(format!("line {line_no}: skipped `None` filter")),
             }
+        } else if key_lower == "channel" {
+            let v = rest.trim();
+            ch = if v.eq_ignore_ascii_case("l") {
+                1
+            } else if v.eq_ignore_ascii_case("r") {
+                2
+            } else {
+                if !v.eq_ignore_ascii_case("all") {
+                    warnings.push(format!(
+                        "line {line_no}: channel `{v}` read as all channels"
+                    ));
+                }
+                0
+            };
         } else {
             warnings.push(format!("line {line_no}: ignored unknown directive `{key}`"));
         }
     }
 
+    let [(preamp_db, bands), left, right] = sides;
+    profile.preamp_db = preamp_db;
+    profile.bands = bands;
+    let side = |(preamp_db, bands): (f64, Vec<Band>)| ChannelEq {
+        enabled: true,
+        preamp_db,
+        bands,
+    };
+    if !left.1.is_empty() || left.0 != 0.0 || !right.1.is_empty() || right.0 != 0.0 {
+        profile.left = Some(side(left));
+        profile.right = Some(side(right));
+    }
     Ok(Parsed { profile, warnings })
 }
 
@@ -249,7 +282,28 @@ pub fn to_apo_string(profile: &EqProfile) -> String {
     let mut out = String::new();
     // Writing to a String cannot fail.
     let _ = writeln!(out, "Preamp: {} dB", profile.preamp_db);
-    for (i, band) in profile.bands.iter().enumerate() {
+    write_bands(&mut out, &profile.bands);
+    let mut per_channel = false;
+    for (name, c) in [("L", &profile.left), ("R", &profile.right)] {
+        let Some(c) = c else { continue };
+        if !c.enabled || (c.bands.is_empty() && c.preamp_db == 0.0) {
+            continue;
+        }
+        per_channel = true;
+        let _ = writeln!(out, "Channel: {name}");
+        if c.preamp_db != 0.0 {
+            let _ = writeln!(out, "Preamp: {} dB", c.preamp_db);
+        }
+        write_bands(&mut out, &c.bands);
+    }
+    if per_channel {
+        let _ = writeln!(out, "Channel: all");
+    }
+    out
+}
+
+fn write_bands(out: &mut String, bands: &[Band]) {
+    for (i, band) in bands.iter().enumerate() {
         let _ = write!(
             out,
             "Filter {}: {} {} Fc {} Hz",
@@ -268,7 +322,6 @@ pub fn to_apo_string(profile: &EqProfile) -> String {
         }
         let _ = writeln!(out, " Q {}", band.q);
     }
-    out
 }
 
 #[cfg(test)]
@@ -303,10 +356,24 @@ Channel: all
         assert_eq!(parsed.profile.bands[4].kind, FilterType::HighShelf);
         assert!(!parsed.profile.bands[2].enabled);
 
-        // Two unknown directives (Device, Channel) become warnings.
-        assert_eq!(parsed.warnings.len(), 2, "{:?}", parsed.warnings);
+        // Device is unknown; Channel: all is the linked section.
+        assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
         assert!(parsed.warnings[0].contains("Device"));
-        assert!(parsed.warnings[1].contains("Channel"));
+        assert_eq!(parsed.profile.left, None);
+    }
+
+    #[test]
+    fn channel_sections_round_trip() {
+        let text = "Preamp: -3 dB\nFilter 1: ON PK Fc 1000 Hz Gain -2 dB Q 1\nChannel: R\nFilter 1: ON PK Fc 138 Hz Gain -4 dB Q 3\nChannel: L\nPreamp: -1 dB\nChannel: all\n";
+        let parsed = parse(text).unwrap();
+        let p = &parsed.profile;
+        assert_eq!(p.bands.len(), 1);
+        let right = p.right.as_ref().unwrap();
+        assert_eq!(right.bands.len(), 1);
+        assert_eq!(right.bands[0].freq_hz, 138.0);
+        assert_eq!(p.left.as_ref().unwrap().preamp_db, -1.0);
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        assert_eq!(parse(&to_apo_string(p)).unwrap().profile, *p);
     }
 
     #[test]

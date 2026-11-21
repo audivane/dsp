@@ -69,6 +69,26 @@ impl MprisWatcher {
         })
     }
 
+    /// A watcher with no thread whose track the test sets
+    /// ([`Self::set_now_playing`]).
+    #[cfg(test)]
+    pub fn stub() -> Arc<Self> {
+        Arc::new(Self {
+            shared: Arc::new(Shared {
+                now: Mutex::new(None),
+                quit: AtomicBool::new(false),
+                ready: Mutex::new(true),
+                ready_cv: Condvar::new(),
+            }),
+            thread: Mutex::new(None),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn set_now_playing(&self, now: Option<NowPlaying>) {
+        *self.shared.now.lock().unwrap() = now;
+    }
+
     /// The current track, if any player is (or was recently) playing.
     pub fn now_playing(&self) -> Option<NowPlaying> {
         self.shared
@@ -137,6 +157,123 @@ fn watch(shared: Arc<Shared>, interval: Duration) {
                 .max(Duration::from_millis(10)),
         );
     }
+}
+
+/// A stream on Audivane's sinks, as [`pause_playing`] matches players
+/// against it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StreamOwner {
+    /// `application.process.id`.
+    pub pid: Option<u32>,
+    /// `application.process.binary` and `application.name`.
+    pub names: Vec<String>,
+}
+
+/// Whether the player `bus_name` (owned by process `player_pid`) plays one
+/// of `streams`: a stream from the player's own process or one it started
+/// (a browser's audio service, an Electron or CEF helper), found by walking
+/// each stream's parent processes with `parent`; or, when the processes do
+/// not tell (a sandboxed player sees other pids), a stream whose binary or
+/// app name is the bus name's player part (`org.mpris.MediaPlayer2.firefox
+/// .instance_1_2` → `firefox`), case-insensitively.
+pub fn plays_through(
+    bus_name: &str,
+    player_pid: Option<u32>,
+    streams: &[StreamOwner],
+    parent: impl Fn(u32) -> Option<u32>,
+) -> bool {
+    let by_pid = |stream: u32, player: u32| {
+        let mut cur = stream;
+        for _ in 0..64 {
+            if cur == player {
+                return true;
+            }
+            match parent(cur) {
+                Some(p) if p > 1 && p != cur => cur = p,
+                _ => return false,
+            }
+        }
+        false
+    };
+    let key = bus_name
+        .strip_prefix(PLAYER_PREFIX)
+        .unwrap_or(bus_name)
+        .split('.')
+        .next()
+        .unwrap_or("");
+    streams.iter().any(|s| {
+        matches!((s.pid, player_pid), (Some(sp), Some(pp)) if pp > 1 && by_pid(sp, pp))
+            || (!key.is_empty() && s.names.iter().any(|n| n.eq_ignore_ascii_case(key)))
+    })
+}
+
+/// A process's parent, from `/proc/<pid>/stat`.
+pub fn parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name may hold spaces and parentheses: the fields after
+    // the last `)` are state, then the parent.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Pause the MPRIS players that are playing now (the output device went away):
+/// those that play one of `streams` ([`plays_through`]), or every playing player
+/// when `streams` is `None` (no graph watcher to tell). Uses its own bus
+/// connection, as it runs rarely, away from the watcher's poll. Returns the
+/// players it paused.
+pub fn pause_playing(streams: Option<&[StreamOwner]>) -> Vec<String> {
+    let connection = match zbus::block_on(Connection::session()) {
+        Ok(connection) => connection,
+        Err(err) => {
+            log::warn!("MPRIS: cannot pause players, no session bus: {err}");
+            return Vec::new();
+        }
+    };
+    zbus::block_on(async {
+        let mut paused = Vec::new();
+        let players = list_players(&connection).await.unwrap_or_default();
+        for name in players {
+            let status = get_string(&connection, &name, "PlaybackStatus").await;
+            if status.as_deref().ok() != Some("Playing") {
+                continue;
+            }
+            if let Some(streams) = streams {
+                let pid = player_pid(&connection, &name).await;
+                if !plays_through(&name, pid, streams, parent_pid) {
+                    log::debug!("MPRIS: {name} plays elsewhere; not pausing it");
+                    continue;
+                }
+            }
+            match connection
+                .call_method(
+                    Some(name.as_str()),
+                    PLAYER_PATH,
+                    Some(PLAYER_INTERFACE),
+                    "Pause",
+                    &(),
+                )
+                .await
+            {
+                Ok(_) => paused.push(name),
+                Err(err) => log::warn!("MPRIS: cannot pause {name}: {err}"),
+            }
+        }
+        paused
+    })
+}
+
+async fn player_pid(connection: &Connection, name: &str) -> Option<u32> {
+    let reply = connection
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "GetConnectionUnixProcessID",
+            &(name,),
+        )
+        .await
+        .ok()?;
+    reply.body().deserialize::<u32>().ok()
 }
 
 fn mark_ready(shared: &Shared) {
@@ -319,6 +456,7 @@ fn build_now_playing(
         },
         native_rate: track.native_rate,
         native_bits: track.native_bits,
+        track_id: track.track_id,
     })
 }
 
@@ -329,6 +467,7 @@ struct TrackMetadata {
     album: Option<String>,
     native_rate: Option<u32>,
     native_bits: Option<u32>,
+    track_id: Option<String>,
 }
 
 impl TrackMetadata {
@@ -348,6 +487,7 @@ fn extract_metadata(metadata: &HashMap<String, OwnedVariant>) -> TrackMetadata {
         album,
         native_rate: None,
         native_bits: None,
+        track_id: take_track_id(metadata),
     };
     if let Some(key) = find_key(
         metadata,
@@ -389,6 +529,17 @@ fn find_key(values: &HashMap<String, OwnedVariant>, candidates: &[&str]) -> Opti
         .keys()
         .find(|key| candidates.contains(&normalize_key(key).as_str()))
         .cloned()
+}
+
+/// `mpris:trackid`: an object path (some players send a string); the
+/// spec's `NoTrack` path means none.
+fn take_track_id(values: &HashMap<String, OwnedVariant>) -> Option<String> {
+    let value = values.get("mpris:trackid")?;
+    let id = match <&zbus::ObjectPath<'_>>::try_from(value) {
+        Ok(path) => path.as_str().to_string(),
+        Err(_) => <&str>::try_from(value).ok()?.trim().to_string(),
+    };
+    (!id.is_empty() && id != "/org/mpris/MediaPlayer2/TrackList/NoTrack").then_some(id)
 }
 
 fn take_string(values: &HashMap<String, OwnedVariant>, key: &str) -> Option<String> {
@@ -476,6 +627,22 @@ mod tests {
         assert_eq!(track.album.as_deref(), Some("Album"));
         assert_eq!(track.native_rate, Some(96_000));
         assert_eq!(track.native_bits, Some(24));
+        assert_eq!(track.track_id, None);
+
+        // `mpris:trackid` as an object path or a string; NoTrack is none.
+        let path = |p: &str| OwnedVariant::from(zbus::ObjectPath::try_from(p.to_string()).unwrap());
+        map.insert("mpris:trackid".into(), path("/org/player/track/7"));
+        assert_eq!(
+            extract_metadata(&map).track_id.as_deref(),
+            Some("/org/player/track/7")
+        );
+        map.insert("mpris:trackid".into(), text("track-8"));
+        assert_eq!(extract_metadata(&map).track_id.as_deref(), Some("track-8"));
+        map.insert(
+            "mpris:trackid".into(),
+            path("/org/mpris/MediaPlayer2/TrackList/NoTrack"),
+        );
+        assert_eq!(extract_metadata(&map).track_id, None);
     }
 
     #[test]
@@ -485,6 +652,51 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("xesam:title".to_string(), text("   "));
         assert!(extract_metadata(&map).is_empty());
+    }
+
+    #[test]
+    fn only_players_whose_streams_go_through_audivane_match() {
+        // 100 browser -> 110 audio service; 200 another player; 300 a
+        // sandboxed player whose stream pid means nothing on the host.
+        let parent = |pid| match pid {
+            110 => Some(100),
+            100 | 200 => Some(1),
+            _ => None,
+        };
+        let streams = [
+            StreamOwner {
+                pid: Some(110),
+                names: vec!["chromium".into(), "Chromium".into()],
+            },
+            StreamOwner {
+                pid: Some(2),
+                names: vec!["spotify".into()],
+            },
+        ];
+        let chromium = "org.mpris.MediaPlayer2.chromium.instance100";
+        assert!(plays_through(chromium, Some(100), &streams, parent));
+        // The audio service's own pid, and the name alone, match too.
+        assert!(plays_through(chromium, Some(110), &streams, parent));
+        assert!(plays_through(chromium, None, &streams, parent));
+        // A player that plays to the speakers.
+        let other = "org.mpris.MediaPlayer2.vlc";
+        assert!(!plays_through(other, Some(200), &streams, parent));
+        // The sandboxed one by its name.
+        assert!(plays_through(
+            "org.mpris.MediaPlayer2.spotify",
+            Some(300),
+            &streams,
+            parent
+        ));
+        // Nothing on Audivane: nothing matches.
+        assert!(!plays_through(chromium, Some(100), &[], parent));
+    }
+
+    #[test]
+    fn parent_pid_reads_proc() {
+        let me = std::process::id();
+        let parent = parent_pid(me).expect("own parent");
+        assert_eq!(parent, std::os::unix::process::parent_id());
     }
 
     #[test]
@@ -515,6 +727,7 @@ mod tests {
                 status: status.to_string(),
                 native_rate: None,
                 native_bits: None,
+                track_id: None,
             }),
         };
         let mut tracker = Tracker::default();

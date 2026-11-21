@@ -25,7 +25,7 @@ pub fn run(args: BypassTestArgs) -> Result<i32> {
         );
     }
 
-    let config = ChainConfig::default();
+    let config = ChainConfig::neutral();
     let mut chain = Chain::new(ChainSpec {
         config,
         sample_rate: wav.rate,
@@ -34,7 +34,7 @@ pub fn run(args: BypassTestArgs) -> Result<i32> {
         irs: None,
     });
     if !chain.is_bit_transparent() {
-        bail!("the default chain is not using the bypass path");
+        bail!("the neutral chain is not using the bypass path");
     }
 
     let channels = wav.channels;

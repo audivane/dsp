@@ -59,8 +59,10 @@ grep -h 'Finished' "$stage/engine.log" "$stage/app.log" || true
 stage_end
 
 if [ "${SKIP_TESTS:-0}" != 1 ]; then
-  stage_start "protocol unit tests"
-  cargo test --locked --target-dir "$target/test" -p audivane-protocol -q
+  # In the engine's target dir: the release profile and its dependencies are
+  # already built there (no third target dir).
+  stage_start "protocol unit tests (release)"
+  cargo test --release --locked --target-dir "$target/engine" -p audivane-protocol -q
   stage_end
 fi
 

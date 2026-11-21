@@ -4,9 +4,9 @@ import type { SampleFormat } from "./SampleFormat";
 
 /**
  * What an ALSA playback device accepts for the engine's channel count with
- * interleaved read/write access. Only rates the engine could ask for are
- * probed (every allowed graph rate times every upsampling ratio, up to
- * 768 kHz), as (rate, format) pairs: USB devices often tie formats to rates.
+ * interleaved read/write access. Probed only at rates the engine could ask
+ * for (allowed rates times upsampling ratios, then the x32/x64 rates), as
+ * (rate, format) pairs: USB devices often tie formats to rates.
  */
 export type DeviceCapabilities = { device: string, 
 /**

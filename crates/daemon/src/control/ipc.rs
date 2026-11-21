@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Longest accepted request line (including the newline).
 pub const MAX_LINE: usize = 1024 * 1024;
@@ -30,39 +30,16 @@ pub const EVENT_HZ: u64 = 30;
 /// How many queued lines a connection may have before it is dropped.
 const OUT_QUEUE: usize = 256;
 
-/// Methods understood by this daemon. Used to tell an unknown method
-/// (`INVALID_REQUEST`) from bad parameters (`INVALID_PARAMS`).
-const METHODS: &[&str] = &[
-    "status",
-    "get_config",
-    "set_config",
-    "set_eq",
-    "set_convolution",
-    "set_upsampler",
-    "set_dsp_enabled",
-    "set_ab",
-    "ab_select",
-    "set_volume",
-    "list_streams",
-    "list_presets",
-    "get_preset",
-    "save_preset",
-    "load_preset",
-    "delete_preset",
-    "rename_preset",
-    "import_apo",
-    "list_devices",
-    "route",
-    "set_routing_mode",
-    "now_playing",
-    "self_test",
-    "upsampler_response",
-    "meters",
-    "release_device",
-    "acquire_device",
-    "subscribe",
-    "shutdown",
-];
+/// Whether `method` names a call this daemon understands. Used to tell an
+/// unknown method (`INVALID_REQUEST`) from bad parameters (`INVALID_PARAMS`).
+/// Derived from `Call` itself (an unknown tag is the only "unknown variant"
+/// error a params-free probe can give), so a new call can never be missed.
+fn is_known_method(method: &str) -> bool {
+    match serde_json::from_value::<Call>(serde_json::json!({ "method": method })) {
+        Ok(_) => true,
+        Err(err) => !err.to_string().starts_with("unknown variant"),
+    }
+}
 
 /// Where the daemon listens.
 ///
@@ -217,6 +194,11 @@ impl ServerInner {
         if topics.contains(&Topic::Spectrum)
             && let Some(spectrum) = self.service.spectrum()
             && let Ok(bytes) = event_bytes(&Event::Spectrum(spectrum))
+        {
+            self.send(id, bytes);
+        }
+        if topics.contains(&Topic::Devices)
+            && let Ok(bytes) = event_bytes(&Event::Devices(self.service.devices()))
         {
             self.send(id, bytes);
         }
@@ -642,7 +624,7 @@ fn handle_request(inner: &Arc<ServerInner>, conn_id: u64, line: &[u8]) -> Option
             After::None,
         ));
     };
-    if !METHODS.contains(&method.as_str()) {
+    if !is_known_method(&method) {
         return Some((
             error_response(
                 id,
@@ -718,7 +700,10 @@ fn event_loop(inner: Arc<ServerInner>) {
     let mut last_config_gen: Option<u64> = None;
     let mut last_presets_gen: Option<u64> = None;
     let mut last_spectrum_gen: Option<u64> = None;
+    let mut last_overload_gen = inner.service.overload_generation();
     let mut spectrum_enabled = false;
+    let mut last_devices: Option<Vec<audivane_protocol::ipc::DeviceInfo>> = None;
+    let mut devices_checked: Option<Instant> = None;
 
     while inner.running.load(Ordering::Relaxed) {
         let topics = inner.subscribers();
@@ -743,6 +728,16 @@ fn event_loop(inner: Arc<ServerInner>) {
             let meters = inner.service.meters();
             if let Ok(bytes) = event_bytes(&Event::Meters(meters)) {
                 inner.broadcast(Topic::Meters, bytes);
+            }
+        }
+        let overload_gen = inner.service.overload_generation();
+        if overload_gen != last_overload_gen {
+            last_overload_gen = overload_gen;
+            if topics.contains(&Topic::Status)
+                && let Some(report) = inner.service.overload_report()
+                && let Ok(bytes) = event_bytes(&Event::Overload(report))
+            {
+                inner.broadcast(Topic::Status, bytes);
             }
         }
         if topics.contains(&Topic::Status) {
@@ -803,9 +798,30 @@ fn event_loop(inner: Arc<ServerInner>) {
                 last_spectrum_gen = Some(generation);
             }
         }
+        // Sound cards come and go (a USB DAC plugged in or out): the list
+        // is read from `/proc/asound` once a second while someone listens.
+        if topics.contains(&Topic::Devices) {
+            if devices_checked.is_none_or(|at| at.elapsed() >= DEVICES_CHECK) {
+                devices_checked = Some(Instant::now());
+                let devices = inner.service.devices();
+                if last_devices.as_ref() != Some(&devices) {
+                    if last_devices.is_some()
+                        && let Ok(bytes) = event_bytes(&Event::Devices(devices.clone()))
+                    {
+                        inner.broadcast(Topic::Devices, bytes);
+                    }
+                    last_devices = Some(devices);
+                }
+            }
+        } else {
+            last_devices = None;
+        }
         thread::sleep(period);
     }
 }
+
+/// How often the event loop reads the device list for `devices` events.
+const DEVICES_CHECK: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------- framing
 
@@ -870,19 +886,29 @@ mod tests {
     use audivane_protocol::ipc::EngineConfig;
 
     #[test]
-    fn methods_cover_every_call_variant() {
+    fn every_call_variant_is_a_known_method() {
         // One representative JSON line per call; all must parse and be known.
         let lines = [
             r#"{"id":1,"method":"status"}"#,
             r#"{"id":1,"method":"get_config"}"#,
             r#"{"id":1,"method":"set_config","params":{"device":"hw:0,0"}}"#,
+            r#"{"id":1,"method":"set_dc_block","params":null}"#,
+            r#"{"id":1,"method":"set_crossfeed","params":null}"#,
             r#"{"id":1,"method":"set_eq","params":null}"#,
             r#"{"id":1,"method":"set_convolution","params":null}"#,
             r#"{"id":1,"method":"set_upsampler","params":{}}"#,
+            r#"{"id":1,"method":"set_pitch","params":{"enabled":true,"cents":100.0,"quality":"high"}}"#,
+            r#"{"id":1,"method":"set_harmonics","params":null}"#,
+            r#"{"id":1,"method":"set_limiter","params":{"mode":"limit"}}"#,
             r#"{"id":1,"method":"set_dsp_enabled","params":{"enabled":true}}"#,
+            r#"{"id":1,"method":"set_output","params":{"bits":24}}"#,
+            r#"{"id":1,"method":"set_formats","params":["s32"]}"#,
+            r#"{"id":1,"method":"set_rate","params":{}}"#,
+            r#"{"id":1,"method":"set_device","params":{"device":"hw:0,0"}}"#,
             r#"{"id":1,"method":"set_ab","params":null}"#,
             r#"{"id":1,"method":"ab_select","params":{"side":"b","crossfade_ms":10.0}}"#,
             r#"{"id":1,"method":"set_volume","params":{"volume_db":-12.0,"balance_db":0.0,"muted":false}}"#,
+            r#"{"id":1,"method":"set_volume_guarded","params":{"volume_db":-12.0,"balance_db":0.0,"muted":false,"if_instance":"a","if_revision":1}}"#,
             r#"{"id":1,"method":"list_streams"}"#,
             r#"{"id":1,"method":"list_presets"}"#,
             r#"{"id":1,"method":"get_preset","params":{"name":"X"}}"#,
@@ -906,12 +932,13 @@ mod tests {
         for line in lines {
             let value: Value = serde_json::from_str(line).unwrap();
             let method = value["method"].as_str().unwrap();
-            assert!(METHODS.contains(&method), "{method} is not in METHODS");
+            assert!(is_known_method(method), "{method} is not a known method");
             serde_json::from_value::<Call>(value).unwrap_or_else(|err| {
                 panic!("{line} does not parse as a Call: {err}");
             });
         }
-        assert_eq!(lines.len(), METHODS.len());
+        assert!(!is_known_method("set_nothing"));
+        assert!(!is_known_method(""));
     }
 
     struct NoopEngine;
@@ -929,6 +956,8 @@ mod tests {
                 enabled: true,
                 current: side,
                 offset_db: 0.0,
+                error: None,
+                ..Default::default()
             })
         }
         fn snapshot(&self) -> crate::api::EngineSnapshot {
@@ -939,7 +968,7 @@ mod tests {
                 format: None,
                 graph_rate: 48_000,
                 output_rate: 48_000,
-                ratio: 1,
+                ratio: audivane_protocol::RateRatio::ONE,
                 quantum: 1024,
                 latency_ms: 0.0,
                 filter_latency_ms: 0.0,
@@ -959,6 +988,10 @@ mod tests {
                 direct_rates: Vec::new(),
                 effective_default_rate: None,
                 dither_bits: None,
+                bypass_resampler: None,
+                rt_load_max: 0.0,
+                varispeed: None,
+                waiting_for_device: false,
             }
         }
         fn meters(&self) -> audivane_protocol::ipc::Meters {
@@ -969,6 +1002,7 @@ mod tests {
                 clipped_ch: vec![0],
                 input_peak_db: vec![-120.0],
                 chain_peak_db: Vec::new(),
+                limiter: None,
                 xruns: 0,
                 dsp_load: 0.0,
             }

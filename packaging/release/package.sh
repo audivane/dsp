@@ -43,6 +43,9 @@ mkdir -p "$scripts"
 for kind in deb rpm arch-install arch-upgrade; do
   { cat "$here/postinstall.sh"; printf '\naudivane_postinst %s "$@"\nexit 0\n' "$kind"; } > "$scripts/$kind.sh"
 done
+for kind in deb rpm arch-remove; do
+  { cat "$here/postinstall.sh"; printf '\naudivane_prerm %s "$@"\nexit 0\n' "$kind"; } > "$scripts/prerm-$kind.sh"
+done
 
 # Reproducible timestamps: every entry gets the commit time (or now).
 mtime=$(date -u -d "@${SOURCE_DATE_EPOCH:-$(git -C "$here" log -1 --format=%ct 2>/dev/null || date +%s)}" +%Y-%m-%dT%H:%M:%SZ)
@@ -72,21 +75,23 @@ $(cd "$stage/root" && find usr -type f | sort | while read -r f; do
 done)
 scripts:
   postinstall: $scripts/deb.sh
+  preremove: $scripts/prerm-deb.sh
 overrides:
   deb:
     scripts:
       postinstall: $scripts/deb.sh
+      preremove: $scripts/prerm-deb.sh
     depends:
 $(printf '%s' "$deb_libs" | yaml_list)
       - "pipewire"
       - "wireplumber"
-      - "libayatana-appindicator3-1"
       - "dbus"
     recommends:
       - "rtkit"
   rpm:
     scripts:
       postinstall: $scripts/rpm.sh
+      preremove: $scripts/prerm-rpm.sh
     depends:
       - "pipewire"
       - "wireplumber"
@@ -94,7 +99,6 @@ $(printf '%s' "$deb_libs" | yaml_list)
       - "alsa-lib"
       - "webkit2gtk4.1"
       - "gtk3"
-      - "libayatana-appindicator-gtk3"
       - "dbus"
       - "glibc >= 2.39"
     recommends:
@@ -102,13 +106,13 @@ $(printf '%s' "$deb_libs" | yaml_list)
   archlinux:
     scripts:
       postinstall: $scripts/arch-install.sh
+      preremove: $scripts/prerm-arch-remove.sh
     depends:
       - "pipewire"
       - "wireplumber"
       - "alsa-lib"
       - "webkit2gtk-4.1"
       - "gtk3"
-      - "libayatana-appindicator"
       - "dbus"
       - "gcc-libs"
       - "glibc"

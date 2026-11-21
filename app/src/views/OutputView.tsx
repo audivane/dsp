@@ -3,6 +3,10 @@ import { NOT_SUPPORTED_BY_DEVICE, effectiveDitherBits, formatBits, ditherAdvice,
 import { fmtSampleFormat } from "../lib/format";
 import { store, useApp } from "../store/store";
 import { Seg } from "../components/Seg";
+import { ClipWarning } from "../components/ClipWarning";
+import { DITHERS, ditherInfo, ditherRateWarning } from "../lib/effects";
+
+const ORIGINAL_DITHERS: readonly DitherKind[] = ["none", "tpdf", "shaped"];
 
 export function OutputView() {
   const st = store();
@@ -13,6 +17,17 @@ export function OutputView() {
   const statusDitherBits = useApp((s) => s.status?.dither_bits ?? null);
   if (!cfg) return null;
   const out = cfg.chain.output;
+  const dither = ditherInfo(out.dither);
+  // An engine without the limiter predates the newer dither kinds: only none, TPDF and shaped exist there.
+  const oldDither = useApp((s) => s.stageCaps.ditherKinds === false);
+  const ditherOptions = (group: "dither" | "shaping") =>
+    DITHERS.filter((d) => d.group === group).map((d): [DitherKind, string, string, boolean] => {
+      const unavailable = oldDither && !ORIGINAL_DITHERS.includes(d.kind);
+      return [d.kind, d.label, unavailable ? "This engine version does not have this dither. Update the engine." : d.text + (d.rateNote ? ` ${d.rateNote}` : ""), unavailable];
+    });
+  const rateWarning = ditherRateWarning(out.dither, outputRate);
+  // The newer modes run the quantizer on their own (control-plane.md, "Output format and dither").
+  const explicit = !ORIGINAL_DITHERS.includes(out.dither);
   const preferred = cfg.formats[0] ?? null;
   // Formats the device takes at no rate at all are greyed out.
   const fmtOption = (f: SampleFormat, text: string, title: string): [SampleFormat, string, string, boolean] =>
@@ -35,6 +50,7 @@ export function OutputView() {
       <div className="view-head">
         <h1 id="out-title">Output</h1>
       </div>
+      <ClipWarning />
       <div className="panel">
         <div className="row">
           <span className="k" title="The sample format the engine asks the DAC for. The first one the DAC accepts is used.">
@@ -98,14 +114,34 @@ export function OutputView() {
           </span>
           <Seg<DitherKind>
             label="Dither"
-            value={out.dither}
-            onChange={(dither) => st.setOutput({ dither })}
-            options={[
-              ["none", "Off", "Plain rounding: the rounding error stays correlated with the signal (low-level distortion)."],
-              ["tpdf", "TPDF", "Triangular (TPDF) dither: flat, signal-independent noise at the target bit depth. The safe choice."],
-              ["shaped", "Noise-shaped", "TPDF dither with the noise pushed towards high frequencies where hearing is least sensitive: lower audible noise, more total noise. Most useful at 16 bits."],
-            ]}
+            value={dither?.group === "dither" ? out.dither : null}
+            onChange={(d) => st.setOutput({ dither: d })}
+            options={ditherOptions("dither")}
           />
+        </div>
+        <div className="row">
+          <span className="k" title="Noise shaping feeds the rounding error back so its noise moves out of the audio band, to where hearing is least sensitive or above 20 kHz. Most of these need a high output rate (upsampling).">
+            Noise shaping
+          </span>
+          <Seg<DitherKind>
+            label="Noise shaping"
+            value={dither?.group === "shaping" ? out.dither : null}
+            onChange={(d) => st.setOutput({ dither: d })}
+            options={ditherOptions("shaping")}
+          />
+        </div>
+        <div className="row">
+          <span className="k" />
+          <span className="dither-desc">
+            {dither ? `${dither.label}: ${dither.text}` : out.dither}
+            {dither?.rateNote && !rateWarning ? ` ${dither.rateNote}` : ""}
+            {explicit ? " Turns the quantizer on even when no other stage runs, so the output is not bit-perfect." : ""}
+          </span>
+          {rateWarning && (
+            <span className="dither-desc warn" role="status">
+              {rateWarning}
+            </span>
+          )}
         </div>
       </div>
       <p className="lede">Dither is applied once, at the final conversion to the DAC format, and only when processing is on. Bypass and Direct playback are never dithered. Many 32-bit DACs resolve about 24 bits, so 24 is a good target.</p>

@@ -43,12 +43,12 @@ jobs:
       - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
 
+      # Only the registries: a warm target/ exceeds the 10 GB cache limit.
       - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: release-${{ runner.os }}-
 

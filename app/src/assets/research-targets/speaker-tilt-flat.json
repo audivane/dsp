@@ -6,7 +6,7 @@
   "source": "Audivane analytical curve T(f) = 0.0 * log2(f / 1000), f in Hz. Slope is an engineering choice, not a published optimum.",
   "url": "https://github.com/audivane/dsp",
   "license": "MIT",
-  "citation": "Audivane (2026), docs/research/targets.md, Speaker formulas and defaults. Context: Floyd E. Toole (2015), The Measurement and Calibration of Sound Reproducing Systems, JAES 63(7/8), 512-541, doi:10.17743/jaes.2015.0064; Toole does not prescribe these numerical slopes.",
+  "citation": "Audivane (2026), Speaker formulas and defaults. Context: Floyd E. Toole (2015), The Measurement and Calibration of Sound Reproducing Systems, JAES 63(7/8), 512-541, doi:10.17743/jaes.2015.0064; Toole does not prescribe these numerical slopes.",
   "derived": true,
   "points": [
     [20.0,-0.0],

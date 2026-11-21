@@ -8,25 +8,22 @@
 //!
 //! Each queued sample carries the rate and an epoch. The RT side bumps the
 //! epoch whenever its rate changes, and the analyser resets a tap when it sees
-//! a new epoch, so samples that were produced at the old rate are never
-//! interpreted as if they were at the new rate.
+//! a new one, so old-rate samples are never read as new-rate ones. A push
+//! that does not fit drops whole frames and starts a new epoch with the next
+//! push; reads take whole frames only, so a read during a push never swaps
+//! channels.
 //!
 //! A non-RT analysis thread runs two Hann FFTs on each tap: 8192 points
 //! (50% overlap) for every log bin and 32768 points (87.5% overlap) for the
 //! low band, where a 1/24-octave bin is narrower than a few short-FFT bins.
-//! Each log bin reads band power (interpolated power density integrated over
-//! the bin), with a sine's interpolated peak level where the bin holds a
-//! spectral peak, so the two resolutions agree and narrow bins never repeat
-//! one FFT bin as a plateau. Power is averaged over the frames since the last
-//! report on a fixed log grid (centres 20 Hz .. min(20 kHz, Nyquist) at 24
-//! bins/octave) and
-//! publishes a [`Spectrum`] at roughly the frame cadence (about 10-20 Hz,
-//! depending on the rate). Nothing is computed and no events are emitted while
-//! no client subscribes to [`audivane_protocol::ipc::Topic::Spectrum`]: the IPC
-//! event pump sets a shared atomic flag, the RT thread then stops copying, and
-//! the analyser drains its rings and reports nothing. Idle (fewer than one
-//! complete frame) likewise produces no events; clients keep the last frame
-//! they received.
+//! Each log bin reads interpolated band power (with a sine's peak level where
+//! the bin holds one), so the two resolutions agree and narrow bins never
+//! plateau. Power is averaged on a fixed log grid (20 Hz .. min(20 kHz,
+//! Nyquist) at 24 bins/octave) and a [`Spectrum`] published at roughly the
+//! frame cadence (about 10-20 Hz). Nothing is computed while no client
+//! subscribes to [`audivane_protocol::ipc::Topic::Spectrum`]: the RT thread
+//! stops copying and the analyser drains its rings and reports nothing, as
+//! with fewer than one complete frame.
 
 use audivane_dsp_core::fft::RealFftPair;
 use audivane_protocol::ipc::Spectrum;
@@ -34,7 +31,7 @@ use rustfft::num_complex::Complex64;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Short FFT: every log bin (about 5.9 Hz per FFT bin at 48 kHz).
 pub const FFT_SIZE: usize = 8192;
@@ -45,8 +42,27 @@ pub const F_MIN_HZ: f64 = 20.0;
 pub const F_MAX_HZ: f64 = 20_000.0;
 /// Log bins narrower than this many short-FFT bins come from the long FFT.
 const CROSSOVER_BINS: f64 = 4.0;
-/// Ring capacity in frames per tap (about 85 ms at 192 kHz).
+/// Ring capacity in frames of the pre tap, at the graph rate (about 85 ms
+/// at 192 kHz, 21 ms at 768 kHz).
 const RING_FRAMES: usize = 16_384;
+/// Ring capacity of the post tap, at the output rate: 42.7 ms at the
+/// highest output rate (3.072 MHz). A period larger than half of it (x64
+/// at a 2048, 4096 or 8192 quantum) is folded ([`PostFold`]) so it still
+/// fits whole; what does not fit anyway is dropped and the next push
+/// starts a new epoch, so audio is never joined across a gap.
+const POST_RING_FRAMES: usize =
+    RING_FRAMES * (audivane_protocol::MAX_OUTPUT_RATE as usize / 384_000);
+/// Frames the analyser takes from a ring per tick (10 ms): 65,536 frames,
+/// twice the highest output rate's 30,720 per tick.
+const READ_FRAMES: usize = RING_FRAMES * 4;
+// The largest period (x64 at an 8192 quantum) fits half the post ring
+// once folded, and the analyser drains faster than the highest output
+// rate fills it.
+const _: () = assert!((8192 * 64) >> MAX_FOLD_SHIFT <= POST_RING_FRAMES / 2);
+const _: () = assert!(
+    READ_FRAMES
+        >= 2 * (audivane_protocol::MAX_OUTPUT_RATE as usize * TICK.as_millis() as usize / 1000)
+);
 /// Both FFTs advance by the same hop: 50% overlap for the short one, 87.5%
 /// for the long one, so every report carries fresh data for both bands.
 const HOP: usize = FFT_SIZE / 2;
@@ -124,14 +140,17 @@ pub(crate) struct TapSample {
 struct TapEpoch {
     rate: u32,
     epoch: u32,
+    /// The last push dropped samples: the next one starts a new epoch.
+    gap: bool,
 }
 
 impl TapEpoch {
     #[inline]
     fn tag(&mut self, rate: u32) -> Self {
         let rate = rate.max(8_000);
-        if self.rate != rate || self.epoch == 0 {
+        if self.rate != rate || self.epoch == 0 || self.gap {
             self.rate = rate;
+            self.gap = false;
             self.epoch = self.epoch.wrapping_add(1);
             // Zero is the analyser's "no epoch seen yet" sentinel.
             if self.epoch == 0 {
@@ -142,22 +161,153 @@ impl TapEpoch {
     }
 }
 
+/// Push the whole frames of `samples` that fit, tagged with `epoch`'s tag
+/// for `rate`. When some do not fit (the ring is full, or the analyser is
+/// behind), the rest is dropped and the next push starts a new epoch.
+/// Wait-free: one `slots()` read, then pushes that cannot fail.
+#[inline]
+fn push_frames<T: Copy>(
+    ring: &mut rtrb::Producer<TapSample>,
+    epoch: &mut TapEpoch,
+    rate: u32,
+    channels: usize,
+    samples: &[T],
+    value: impl Fn(T) -> f32,
+) {
+    let tag = epoch.tag(rate);
+    let room = ring.slots() / channels * channels;
+    let whole = samples.len() / channels * channels;
+    let n = whole.min(room);
+    if n < samples.len() {
+        epoch.gap = true;
+    }
+    for &sample in &samples[..n] {
+        let _ = ring.push(TapSample {
+            value: value(sample),
+            rate: tag.rate,
+            epoch: tag.epoch,
+        });
+    }
+}
+
+/// Largest post-tap fold: the mean of 16 frames.
+const MAX_FOLD_SHIFT: u32 = 4;
+
+/// The post tap's pre-decimation for periods larger than half its ring
+/// (x64 at a 2048, 4096 or 8192 quantum): each queued frame is the mean of
+/// 2^`shift` output frames, tagged at the output rate / 2^`shift`, so a
+/// period still fits whole and the analyser sees contiguous audio. The mean
+/// is a mild low-pass (-0.002 dB at 20 kHz from 3.072 MHz); what it lets
+/// alias into the audio band lies near the folded Nyquist, where an
+/// upsampler's output holds only its stopband.
+struct PostFold {
+    shift: u32,
+    /// Epoch the partial sums belong to.
+    epoch: u32,
+    /// Per-channel sums of the frames since the last queued one.
+    acc: Vec<f32>,
+    frames: usize,
+}
+
+impl PostFold {
+    fn new(channels: usize) -> Self {
+        Self {
+            shift: 0,
+            epoch: 0,
+            acc: vec![0.0; channels],
+            frames: 0,
+        }
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.acc.fill(0.0);
+        self.frames = 0;
+    }
+
+    /// The smallest fold under which `frames` take at most `room` frames.
+    #[inline]
+    fn shift_for(frames: usize, room: usize) -> u32 {
+        let mut shift = 0;
+        while shift < MAX_FOLD_SHIFT && frames.div_ceil(1 << shift) > room {
+            shift += 1;
+        }
+        shift
+    }
+}
+
+/// Push `samples` to the post tap through `fold` (see [`PostFold`]). Frames
+/// that do not fit are dropped, with the partial sum, and the next push
+/// starts a new epoch. Wait-free and allocation-free.
+#[inline]
+fn push_folded<T: Copy>(
+    ring: &mut rtrb::Producer<TapSample>,
+    epoch: &mut TapEpoch,
+    fold: &mut PostFold,
+    ring_frames: usize,
+    rate: u32,
+    samples: &[T],
+    value: impl Fn(T) -> f32,
+) {
+    let channels = fold.acc.len();
+    let frames = samples.len() / channels;
+    let shift = PostFold::shift_for(frames, ring_frames / 2);
+    let tag = epoch.tag((rate.max(8_000) >> shift).max(8_000));
+    if shift != fold.shift || tag.epoch != fold.epoch {
+        fold.shift = shift;
+        fold.epoch = tag.epoch;
+        fold.clear();
+    }
+    if !samples.len().is_multiple_of(channels) {
+        epoch.gap = true;
+    }
+    let per = 1usize << shift;
+    let scale = 1.0 / per as f32;
+    let mut room = ring.slots() / channels;
+    for frame in samples.chunks_exact(channels) {
+        for (a, &x) in fold.acc.iter_mut().zip(frame) {
+            *a += value(x);
+        }
+        fold.frames += 1;
+        if fold.frames < per {
+            continue;
+        }
+        if room == 0 {
+            epoch.gap = true;
+            fold.clear();
+            return;
+        }
+        room -= 1;
+        for a in fold.acc.iter_mut() {
+            let _ = ring.push(TapSample {
+                value: *a * scale,
+                rate: tag.rate,
+                epoch: tag.epoch,
+            });
+            *a = 0.0;
+        }
+        fold.frames = 0;
+    }
+}
+
 /// RT half: producers for the two taps and the shared control words.
 pub struct SpectrumRt {
     pre: rtrb::Producer<TapSample>,
     post: rtrb::Producer<TapSample>,
     enabled: Arc<AtomicBool>,
+    channels: usize,
     pre_epoch: TapEpoch,
     post_epoch: TapEpoch,
+    post_fold: PostFold,
+    post_ring_frames: usize,
 }
 
 impl SpectrumRt {
     /// Create the rings and start the analysis thread.
     pub fn create(channels: usize) -> std::io::Result<(Self, SpectrumWorker)> {
         let channels = channels.max(1);
-        let capacity = RING_FRAMES * channels;
-        let (pre_tx, pre_rx) = rtrb::RingBuffer::<TapSample>::new(capacity);
-        let (post_tx, post_rx) = rtrb::RingBuffer::<TapSample>::new(capacity);
+        let (pre_tx, pre_rx) = rtrb::RingBuffer::<TapSample>::new(RING_FRAMES * channels);
+        let (post_tx, post_rx) = rtrb::RingBuffer::<TapSample>::new(POST_RING_FRAMES * channels);
         let enabled = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(SpectrumShared::new());
@@ -178,13 +328,7 @@ impl SpectrumRt {
                 );
             })?;
 
-        let rt = Self {
-            pre: pre_tx,
-            post: post_tx,
-            enabled: Arc::clone(&enabled),
-            pre_epoch: TapEpoch::default(),
-            post_epoch: TapEpoch::default(),
-        };
+        let rt = Self::from_rings(channels, pre_tx, post_tx, Arc::clone(&enabled));
         Ok((
             rt,
             SpectrumWorker {
@@ -194,6 +338,26 @@ impl SpectrumRt {
                 handle: Some(handle),
             },
         ))
+    }
+
+    fn from_rings(
+        channels: usize,
+        pre: rtrb::Producer<TapSample>,
+        post: rtrb::Producer<TapSample>,
+        enabled: Arc<AtomicBool>,
+    ) -> Self {
+        let channels = channels.max(1);
+        let post_ring_frames = post.buffer().capacity() / channels;
+        Self {
+            pre,
+            post,
+            enabled,
+            channels,
+            pre_epoch: TapEpoch::default(),
+            post_epoch: TapEpoch::default(),
+            post_fold: PostFold::new(channels),
+            post_ring_frames,
+        }
     }
 
     #[inline]
@@ -208,41 +372,44 @@ impl SpectrumRt {
         self.on()
     }
 
-    /// Copy chain input samples (interleaved `f32`, graph rate). Drops when
-    /// the ring is full. Never allocates.
+    /// Copy chain input samples (interleaved `f32`, graph rate). Drops
+    /// whole frames when the ring is full. Never allocates.
     #[inline]
     pub fn push_pre(&mut self, samples: &[f32], graph_rate: u32) {
-        // Keep the tag current even while disabled, so a client that
-        // subscribes after a rate change starts on a fresh epoch.
-        let tag = self.pre_epoch.tag(graph_rate);
         if !self.on() {
+            // Keep the tag current even while disabled, so a client that
+            // subscribes after a rate change starts on a fresh epoch.
+            self.pre_epoch.tag(graph_rate);
             return;
         }
-        for &value in samples {
-            let _ = self.pre.push(TapSample {
-                value,
-                rate: tag.rate,
-                epoch: tag.epoch,
-            });
-        }
+        push_frames(
+            &mut self.pre,
+            &mut self.pre_epoch,
+            graph_rate,
+            self.channels,
+            samples,
+            |v| v,
+        );
     }
 
     /// Copy the floating-point chain output at the output rate, immediately
-    /// before quantization/dither. Drops when the ring is full. Never
-    /// allocates.
+    /// before quantization/dither, folded when a period is larger than half
+    /// the ring (`PostFold`). Drops when the ring is full. Never allocates.
     #[inline]
     pub fn push_post_f32(&mut self, samples: &[f32], output_rate: u32) {
-        let tag = self.post_epoch.tag(output_rate);
         if !self.on() {
+            self.post_epoch.tag(output_rate);
             return;
         }
-        for &value in samples {
-            let _ = self.post.push(TapSample {
-                value,
-                rate: tag.rate,
-                epoch: tag.epoch,
-            });
-        }
+        push_folded(
+            &mut self.post,
+            &mut self.post_epoch,
+            &mut self.post_fold,
+            self.post_ring_frames,
+            output_rate,
+            samples,
+            |v| v,
+        );
     }
 
     /// Copy quantized output (interleaved left-justified `i32`) as `f32`.
@@ -250,18 +417,20 @@ impl SpectrumRt {
     /// allocates.
     #[inline]
     pub fn push_post_i32(&mut self, samples: &[i32], output_rate: u32) {
-        let tag = self.post_epoch.tag(output_rate);
         if !self.on() {
+            self.post_epoch.tag(output_rate);
             return;
         }
         const SCALE: f32 = 1.0 / 2_147_483_648.0;
-        for &sample in samples {
-            let _ = self.post.push(TapSample {
-                value: sample as f32 * SCALE,
-                rate: tag.rate,
-                epoch: tag.epoch,
-            });
-        }
+        push_folded(
+            &mut self.post,
+            &mut self.post_epoch,
+            &mut self.post_fold,
+            self.post_ring_frames,
+            output_rate,
+            samples,
+            |s| s as f32 * SCALE,
+        );
     }
 }
 
@@ -308,43 +477,116 @@ fn run_analyzer(
     shared: Arc<SpectrumShared>,
     stop: Arc<AtomicBool>,
 ) {
-    let mut pre = TapAnalyzer::new(channels);
-    let mut post = TapAnalyzer::new(channels);
-    let mut scratch: Vec<TapSample> = Vec::with_capacity(RING_FRAMES * channels);
+    let mut analyzer = Analyzer::new(channels);
     while !stop.load(Ordering::Acquire) {
         if !enabled.load(Ordering::Acquire) {
             drain(&mut pre_rx);
             drain(&mut post_rx);
-            pre.reset();
-            post.reset();
+            analyzer.reset();
             thread::sleep(TICK);
             continue;
         }
-        read_available(&mut pre_rx, &mut scratch);
-        pre.feed(&scratch);
-        read_available(&mut post_rx, &mut scratch);
-        post.feed(&scratch);
-        if pre.frames() > 0 && post.frames() > 0 {
-            let rate = pre.rate();
-            shared.publish(Spectrum {
-                f_min_hz: F_MIN_HZ,
-                bins_per_octave: BINS_PER_OCTAVE,
-                pre: pre.finish(),
-                post: post.finish(),
-                rate,
-            });
+        if let Some(spectrum) = analyzer.step(&mut pre_rx, &mut post_rx, Instant::now()) {
+            shared.publish(spectrum);
         }
         thread::sleep(TICK);
     }
 }
 
-fn drain(rx: &mut rtrb::Consumer<TapSample>) {
-    while rx.pop().is_ok() {}
+/// How long the pre tap's reports wait for a post one before going out
+/// without it (`post` empty): a few report periods (about 90 ms each).
+const POST_WAIT: Duration = Duration::from_millis(400);
+
+/// The analysis thread's state for both taps, one [`Analyzer::step`] per
+/// tick.
+struct Analyzer {
+    channels: usize,
+    pre: TapAnalyzer,
+    post: TapAnalyzer,
+    scratch: Vec<TapSample>,
+    /// Since when a pre report has been waiting for a post one.
+    post_wait: Option<Instant>,
 }
 
-fn read_available(rx: &mut rtrb::Consumer<TapSample>, scratch: &mut Vec<TapSample>) {
+impl Analyzer {
+    fn new(channels: usize) -> Self {
+        Self {
+            channels,
+            pre: TapAnalyzer::new(channels),
+            post: TapAnalyzer::new(channels),
+            scratch: Vec::with_capacity(READ_FRAMES * channels),
+            post_wait: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.pre.reset();
+        self.post.reset();
+        self.post_wait = None;
+    }
+
+    /// Read both rings and return a report when the pre tap has one. It
+    /// carries the post tap's report too; when the post tap has none for
+    /// [`POST_WAIT`] (it cannot complete an FFT, e.g. its periods are cut
+    /// by gaps), the pre report goes out with `post` empty rather than
+    /// freezing the whole spectrum.
+    fn step(
+        &mut self,
+        pre_rx: &mut rtrb::Consumer<TapSample>,
+        post_rx: &mut rtrb::Consumer<TapSample>,
+        now: Instant,
+    ) -> Option<Spectrum> {
+        read_available(pre_rx, &mut self.scratch, self.channels);
+        self.pre.feed(&self.scratch);
+        read_available(post_rx, &mut self.scratch, self.channels);
+        self.post.feed(&self.scratch);
+        if self.pre.frames() == 0 {
+            return None;
+        }
+        let post = if self.post.frames() > 0 {
+            self.post_wait = None;
+            self.post.finish()
+        } else {
+            let since = *self.post_wait.get_or_insert(now);
+            if now.duration_since(since) < POST_WAIT {
+                return None;
+            }
+            Vec::new()
+        };
+        Some(Spectrum {
+            f_min_hz: F_MIN_HZ,
+            bins_per_octave: BINS_PER_OCTAVE,
+            rate: self.pre.rate(),
+            pre: self.pre.finish(),
+            post,
+        })
+    }
+}
+
+/// Empty a ring a chunk at a time (the analyser is off).
+fn drain(rx: &mut rtrb::Consumer<TapSample>) {
+    loop {
+        let n = rx.slots();
+        if n == 0 {
+            return;
+        }
+        if let Ok(chunk) = rx.read_chunk(n) {
+            chunk.commit_all();
+        }
+    }
+}
+
+fn read_available(
+    rx: &mut rtrb::Consumer<TapSample>,
+    scratch: &mut Vec<TapSample>,
+    channels: usize,
+) {
+    // Whole frames only: the RT side commits one sample at a time, so the
+    // rest of a frame it is still writing stays queued for the next read.
+    let channels = channels.max(1);
+    let n = (rx.slots().min(scratch.capacity()) / channels) * channels;
     scratch.clear();
-    while scratch.len() < scratch.capacity() {
+    while scratch.len() < n {
         match rx.pop() {
             Ok(sample) => scratch.push(sample),
             Err(_) => break,
@@ -505,15 +747,13 @@ impl Resolution {
         self.frames += 1;
     }
 
-    /// Tonal readings: a narrow band only holds part of a sine's main lobe,
-    /// so for every genuine coherent tone peak in the power spectrum its
-    /// parabolically interpolated peak (the sine's true level) goes to the
-    /// log bin that contains the interpolated peak frequency, and that bin
-    /// reads the higher of its band power and this peak.
-    ///
-    /// Random local maxima in broadband noise are rejected by requiring the
-    /// peak to stand well above the surrounding noise floor outside the Hann
-    /// main lobe (`±3..=±8` bins).
+    /// Tonal readings: a narrow band only holds part of a sine's main lobe, so
+    /// for every genuine coherent tone peak in the power spectrum its
+    /// parabolically interpolated peak (the sine's true level) goes to the log
+    /// bin holding the interpolated peak frequency, and that bin reads the
+    /// higher of its band power and this peak. Random local maxima in broadband
+    /// noise are rejected by requiring the peak to stand well above the noise
+    /// floor outside the Hann main lobe (`±3..=±8` bins).
     fn find_tonal_peaks(&mut self) {
         self.tonal.fill(0.0);
         let bin_hz = f64::from(self.rate) / self.size as f64;
@@ -589,25 +829,23 @@ fn is_coherent_tone(power: &[f64], peak: usize, level: f64) -> bool {
     level >= TONAL_PROMINENCE_RATIO * median_bg
 }
 
-/// Band power of one log band from a power spectrum (0 dB = full-scale
-/// sine): the linearly interpolated power density integrated over the band,
-/// divided by the Hann equivalent noise bandwidth. This is the signal power
-/// inside the band (a full-scale sine whose main lobe fits in the band reads
-/// 0 dB, broadband noise reads its power in that band), so it does not depend
-/// on the FFT size and the short and long resolutions agree. Linear
-/// interpolation never exceeds the larger of its two neighbours, so it
-/// cannot invent a peak.
+/// Band power of one log band from a power spectrum (0 dB = full-scale sine):
+/// the linearly interpolated power density integrated over the band, divided by
+/// the Hann equivalent noise bandwidth. That is the signal power inside the
+/// band (a full-scale sine whose main lobe fits reads 0 dB, broadband noise
+/// reads its power there), so it does not depend on the FFT size and the short
+/// and long resolutions agree. Linear interpolation never exceeds the larger of
+/// its two neighbours, so it cannot invent a peak.
 fn band_power(power: &[f64], band: &LogBand) -> f64 {
     band.weights.iter().map(|&(k, w)| power[k] * w).sum::<f64>() / HANN_ENBW
 }
 
-/// Parabolic (log-power) interpolation around `peak`, but only when `peak`
-/// is a genuine local maximum of the FFT power spectrum: the fitted vertex
-/// has to stay inside ±0.5 FFT bins and its amplitude has to be plausible
-/// next to the neighbours. A bin on the shoulder of a peak that lives outside
-/// the log bin is not a local maximum; fitting it would invent a level far
-/// above the real signal.
-/// Returns the vertex offset in bins and its power.
+/// Parabolic (log-power) interpolation around `peak`, but only when `peak` is a
+/// genuine local maximum of the FFT power spectrum: the fitted vertex has to
+/// stay inside ±0.5 FFT bins and its amplitude has to be plausible next to the
+/// neighbours. A bin on the shoulder of a peak living outside the log bin is
+/// not a local maximum; fitting it would invent a level far above the real
+/// signal. Returns the vertex offset in bins and its power.
 fn interpolated_peak(power: &[f64], peak: usize) -> Option<(f64, f64)> {
     if peak == 0 || peak + 1 >= power.len() {
         return None;
@@ -825,13 +1063,13 @@ impl CascadedDecimator {
 
 /// One tap's rolling frames, the two FFT resolutions and averaged log bins.
 ///
-/// High sample rates (`>= 88.2 kHz`) are decimated on the analysis thread via
-/// a cascaded half-band anti-alias filter down to the 44.1/48 kHz family so
-/// resolution and bass calibration stay uniform from 44.1 kHz to 768 kHz.
-/// Every [`HOP`] decimated frames the short FFT ([`FFT_SIZE`]) analyses the
-/// newest frames for every log bin; once [`LONG_FFT_SIZE`] decimated frames
-/// are buffered the long FFT also analyses the low band (log bins narrower
-/// than [`CROSSOVER_BINS`] short-FFT bins, below roughly 800 Hz at 48 kHz).
+/// Rates at or above 88.2 kHz are decimated on the analysis thread by a
+/// cascaded half-band anti-alias filter to the 44.1/48 kHz family, so
+/// resolution and bass calibration stay uniform up to 768 kHz. Every [`HOP`]
+/// decimated frames the short FFT ([`FFT_SIZE`]) analyses the newest frames for
+/// every log bin; once [`LONG_FFT_SIZE`] are buffered the long FFT also
+/// analyses the low band (log bins narrower than [`CROSSOVER_BINS`] short-FFT
+/// bins, below roughly 800 Hz at 48 kHz).
 pub(crate) struct TapAnalyzer {
     channels: usize,
     rate: u32,
@@ -1117,8 +1355,8 @@ mod tests {
 
     #[test]
     fn low_frequency_sine_does_not_inflate_neighbouring_bins() {
-        // Reviewer probe: -12.04 dBFS at 35.156 Hz used to show +17.9 dBFS in
-        // bins that only contained the shoulder of the peak.
+        // A quiet 35.156 Hz tone must read at the tone, not +17.9 dB in the
+        // neighbouring bins that only hold the peak's shoulder.
         let rate = 48_000;
         let freq = 35.156_25;
         let amplitude = 10.0_f64.powf(-12.04 / 20.0);
@@ -1206,8 +1444,8 @@ mod tests {
 
     #[test]
     fn rate_change_discards_samples_from_the_old_epoch() {
-        // Reviewer probe: a 999 Hz tone at 48 kHz reappeared near 2 kHz when
-        // queued old-rate samples were analysed at 96 kHz.
+        // A 999 Hz tone must stay at 999 Hz across a rate change, not land
+        // near 2 kHz through old-rate samples analysed at the new rate.
         let mut tap = TapAnalyzer::new(2);
         let old = tagged(sine(FFT_SIZE * 3, 48_000, 999.0, 0.5), 48_000, 1);
         // Old-epoch audio is queued, then the engine changes rate. The new
@@ -1301,6 +1539,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn x32_and_x64_output_rates_decimate_to_the_base_family() {
+        for (rate, stages, analysis) in [
+            (1_411_200u32, 5, 44_100),
+            (1_536_000, 5, 48_000),
+            (2_822_400, 6, 44_100),
+            (3_072_000, 6, 48_000),
+        ] {
+            assert_eq!(decimation_stages(rate), stages);
+            assert_eq!(rate >> stages, analysis);
+            assert_eq!(spectrum_bin_count(rate), spectrum_bin_count(analysis));
+        }
+        // A sine at the top rate reads full scale at its own bin.
+        let rate = audivane_protocol::MAX_OUTPUT_RATE;
+        let frames = (LONG_FFT_SIZE + HOP * 2) << decimation_stages(rate);
+        for freq in [100.0, 10_000.0] {
+            let mut tap = TapAnalyzer::new(2);
+            tap.set_rate(rate);
+            tap.feed(&tagged(sine(frames, rate, freq, 1.0), rate, 1));
+            assert!(tap.long.frames > 0);
+            let bins = tap.finish();
+            let (index, peak) = peak_bin(&bins);
+            assert!(f64::from(peak).abs() <= 0.5, "{freq} Hz reads {peak} dB");
+            assert!(
+                index.abs_diff(bin_of(freq)) <= 1,
+                "{freq} Hz at bin {index}"
+            );
+        }
+    }
+
     /// Generate stereo independent pink noise (1/f power density across
     /// 5 Hz .. 20 kHz) calibrated to a fixed per-octave power independent of
     /// sample rate, using an inverse FFT of random-phase 1/sqrt(f) bins.
@@ -1312,13 +1580,9 @@ mod tests {
         let max_bin = ((20_000.0 / bin_hz).floor() as usize).min(spec_len - 1);
         let min_bin = ((5.0 / bin_hz).ceil() as usize).max(1);
 
-        // Normalize so total power summed across one octave equals octave_rms^2:
-        // sum_{f in [f0, 2*f0]} |X_k|^2 = (sum_{k} 1/k) * C^2 = ln(2) * C^2 = octave_rms^2
-        // => each complex FFT bin gets amplitude C / sqrt(k) * nfft / 2?
-        // In unnormalized inverse_complex_normalized (1/nfft scaling), a real sine of
-        // amplitude A at bin k has X[k] = (nfft / 2) * A, power A^2 / 2.
-        // Wait: a frame of white-phase bins X[k] = (nfft / sqrt(2)) * amp_k produces
-        // mean-square per bin sum(amp_k^2). Let's normalize directly to target band power.
+        // Pink noise: each bin k gets magnitude scale/sqrt(k), so the power summed
+        // over one octave is scale^2 * ln 2 = octave_rms^2. The 0.5 factor and the
+        // nfft/2 scaling of a real FFT turn that into the bin magnitudes below.
         let scale =
             (octave_rms * octave_rms / 2.0_f64.ln()).sqrt() * (nfft as f64) * 0.5_f64.sqrt();
 
@@ -1625,5 +1889,210 @@ mod tests {
             );
             i += 8;
         }
+    }
+
+    fn rings(channels: usize, frames: usize) -> (SpectrumRt, rtrb::Consumer<TapSample>) {
+        let (pre_tx, _pre_rx) = rtrb::RingBuffer::<TapSample>::new(frames * channels);
+        let (post_tx, post_rx) = rtrb::RingBuffer::<TapSample>::new(frames * channels);
+        let rt = SpectrumRt::from_rings(channels, pre_tx, post_tx, Arc::new(AtomicBool::new(true)));
+        (rt, post_rx)
+    }
+
+    fn pop_all(rx: &mut rtrb::Consumer<TapSample>) -> Vec<TapSample> {
+        std::iter::from_fn(|| rx.pop().ok()).collect()
+    }
+
+    #[test]
+    fn a_push_that_does_not_fit_starts_a_new_epoch() {
+        // A ring of 8 stereo frames and periods of 4 (half the ring, so not
+        // folded): the third period finds no room and is dropped. The next
+        // period must not continue the old epoch, or the analyser would
+        // join audio across the gap.
+        let (mut rt, mut rx) = rings(2, 8);
+        for v in [0.1, 0.2, 0.3] {
+            rt.push_post_f32(&[v; 8], 3_072_000);
+        }
+        let first = pop_all(&mut rx);
+        assert_eq!(first.len(), 16, "whole frames up to the ring's size");
+        assert!(first.iter().all(|s| s.epoch == first[0].epoch));
+        rt.push_post_f32(&[0.4; 8], 3_072_000);
+        let next = pop_all(&mut rx);
+        assert_eq!(next.len(), 8);
+        assert_ne!(
+            next[0].epoch, first[0].epoch,
+            "the gap did not start a new epoch"
+        );
+        assert_eq!(next[0].rate, 3_072_000);
+        // No gap: the epoch carries on.
+        rt.push_post_f32(&[0.5; 4], 3_072_000);
+        assert_eq!(pop_all(&mut rx)[0].epoch, next[0].epoch);
+        // The i32 path (Direct) follows the same rule.
+        for _ in 0..3 {
+            rt.push_post_i32(&[1; 8], 3_072_000);
+        }
+        pop_all(&mut rx);
+        rt.push_post_i32(&[1; 2], 3_072_000);
+        assert_ne!(pop_all(&mut rx)[0].epoch, next[0].epoch);
+    }
+
+    #[test]
+    fn a_period_larger_than_half_the_post_ring_is_folded_whole() {
+        // 64 frames into a ring of 32: the mean of each 4 frames, tagged
+        // at a quarter of the rate, all of it in one epoch.
+        let (mut rt, mut rx) = rings(2, 32);
+        let period: Vec<f32> = (0..64).flat_map(|n| [n as f32, -(n as f32)]).collect();
+        rt.push_post_f32(&period, 3_072_000);
+        let q = pop_all(&mut rx);
+        assert_eq!(q.len(), 32);
+        assert!(q.iter().all(|s| s.rate == 768_000 && s.epoch == q[0].epoch));
+        assert_eq!((q[0].value, q[1].value), (1.5, -1.5));
+        assert_eq!(q[30].value, 61.5);
+        // The next period continues the same epoch: nothing was dropped.
+        rt.push_post_f32(&period, 3_072_000);
+        assert_eq!(pop_all(&mut rx)[0].epoch, q[0].epoch);
+        // A period that fits half the ring is not folded.
+        rt.push_post_f32(&period[..32], 3_072_000);
+        assert!(pop_all(&mut rx).iter().all(|s| s.rate == 3_072_000));
+    }
+
+    /// Feed `periods` periods of a 1 kHz sine at 48 kHz (pre) and x64 at
+    /// 3.072 MHz (post), one analyser step per period at real time.
+    fn x64_reports(post_period: usize, periods: usize) -> Vec<Spectrum> {
+        let channels = 2;
+        let (pre_tx, mut pre_rx) = rtrb::RingBuffer::<TapSample>::new(RING_FRAMES * channels);
+        let (post_tx, mut post_rx) =
+            rtrb::RingBuffer::<TapSample>::new(POST_RING_FRAMES * channels);
+        let mut rt =
+            SpectrumRt::from_rings(channels, pre_tx, post_tx, Arc::new(AtomicBool::new(true)));
+        let mut analyzer = Analyzer::new(channels);
+        let pre_period = post_period / 64;
+        let pre = sine(pre_period * periods, 48_000, 1000.0, 0.5);
+        let post = sine(post_period * periods, 3_072_000, 1000.0, 0.5);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        for i in 0..periods {
+            rt.push_pre(&pre[i * pre_period * 2..(i + 1) * pre_period * 2], 48_000);
+            rt.push_post_f32(
+                &post[i * post_period * 2..(i + 1) * post_period * 2],
+                3_072_000,
+            );
+            let now = t0 + Duration::from_secs_f64((i + 1) as f64 * pre_period as f64 / 48_000.0);
+            out.extend(analyzer.step(&mut pre_rx, &mut post_rx, now));
+        }
+        out
+    }
+
+    #[test]
+    fn x64_at_a_4096_or_8192_quantum_keeps_both_spectra() {
+        // A 4096 quantum gives 262,144-frame periods at x64, an 8192 one
+        // 524,288: both larger than the post ring. The spectrum must keep
+        // publishing, the post side included and calibrated.
+        for period in [262_144, 524_288] {
+            let reports = x64_reports(period, 12);
+            assert!(reports.len() >= 6, "{period}: {} reports", reports.len());
+            for r in &reports {
+                assert_eq!(r.rate, 48_000);
+                let (index, peak) = peak_bin(&r.pre);
+                assert!(index.abs_diff(bin_of(1000.0)) <= 1 && (peak + 6.0).abs() <= 0.5);
+                assert!(!r.post.is_empty(), "{period}: no post spectrum");
+                let (index, peak) = peak_bin(&r.post);
+                assert!(
+                    index.abs_diff(bin_of(1000.0)) <= 1 && (peak + 6.0).abs() <= 0.5,
+                    "{period}: post peak {peak} dB at bin {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_pre_spectrum_does_not_wait_forever_for_the_post_one() {
+        // A post tap that never completes an FFT (every period cut by a
+        // gap): the pre reports go out with `post` empty after POST_WAIT,
+        // then at their own pace.
+        let channels = 2;
+        let (mut pre_tx, mut pre_rx) = rtrb::RingBuffer::<TapSample>::new(RING_FRAMES * channels);
+        let (mut post_tx, mut post_rx) = rtrb::RingBuffer::<TapSample>::new(8192 * channels);
+        let mut analyzer = Analyzer::new(channels);
+        let pre = sine(4096 * 20, 48_000, 1000.0, 0.5);
+        let t0 = Instant::now();
+        let mut first = None;
+        let mut reports = 0;
+        for i in 0..20 {
+            for &value in &pre[i * 8192..(i + 1) * 8192] {
+                pre_tx
+                    .push(TapSample {
+                        value,
+                        rate: 48_000,
+                        epoch: 1,
+                    })
+                    .unwrap();
+            }
+            for _ in 0..2048 {
+                post_tx
+                    .push(TapSample {
+                        value: 0.1,
+                        rate: 768_000,
+                        epoch: i as u32 + 1,
+                    })
+                    .unwrap();
+            }
+            let now = t0 + Duration::from_millis(85 * (i as u64 + 1));
+            if let Some(r) = analyzer.step(&mut pre_rx, &mut post_rx, now) {
+                assert!(r.post.is_empty());
+                assert!(!r.pre.is_empty());
+                first.get_or_insert(now - t0);
+                reports += 1;
+            }
+        }
+        let first = first.expect("the spectrum froze");
+        assert!(first >= Duration::from_millis(85 * 2) + POST_WAIT);
+        assert!(first <= Duration::from_millis(85 * 3) + POST_WAIT);
+        assert!(reports >= 12, "{reports} reports");
+    }
+
+    #[test]
+    fn the_disabled_analyser_drains_in_chunks() {
+        let (mut tx, mut rx) = rtrb::RingBuffer::<TapSample>::new(64);
+        for _ in 0..50 {
+            tx.push(TapSample {
+                value: 0.0,
+                rate: 48_000,
+                epoch: 1,
+            })
+            .unwrap();
+        }
+        drain(&mut rx);
+        assert_eq!(rx.slots(), 0);
+        assert_eq!(tx.slots(), 64);
+    }
+
+    #[test]
+    fn the_analyser_reads_whole_frames_only() {
+        // The RT side commits one sample at a time, so a read can land in
+        // the middle of a frame; the rest of that frame must stay queued,
+        // or every later frame would swap channels.
+        let (mut tx, mut rx) = rtrb::RingBuffer::<TapSample>::new(16);
+        for value in [1.0, 2.0, 1.0] {
+            tx.push(TapSample {
+                value,
+                rate: 48_000,
+                epoch: 1,
+            })
+            .unwrap();
+        }
+        let mut scratch = Vec::with_capacity(16);
+        read_available(&mut rx, &mut scratch, 2);
+        assert_eq!(scratch.len(), 2);
+        tx.push(TapSample {
+            value: 2.0,
+            rate: 48_000,
+            epoch: 1,
+        })
+        .unwrap();
+        read_available(&mut rx, &mut scratch, 2);
+        assert_eq!(
+            scratch.iter().map(|s| s.value).collect::<Vec<_>>(),
+            [1.0, 2.0]
+        );
     }
 }

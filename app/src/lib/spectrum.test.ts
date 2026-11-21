@@ -208,3 +208,32 @@ describe("spectrum helpers", () => {
     expect(monotoneAt(xs, ys, m, 1, 1)).toBe(30);
   });
 });
+
+describe("a report without a post spectrum", () => {
+  // The engine sends `post: []` when the post tap cannot complete an
+  // analysis (its periods are cut by gaps): the pre side keeps drawing.
+  it("smooths and animates the pre side only", () => {
+    const pre = Array.from({ length: 64 }, (_, i) => -40 - i / 4);
+    expect(smoothFractionalOctave([], 24, 6)).toEqual([]);
+    const smoothPre = new Float64Array(64).fill(SPEC_DB_MIN);
+    const smoothPost = new Float64Array(0);
+    for (const tap of ["pre", "post", "both"] as const) {
+      const step = stepSpectrumAnimation({
+        frameAgeMs: 0,
+        newFrame: true,
+        tap,
+        peakHold: true,
+        preTarget: smoothFractionalOctave(pre, 24, 6),
+        postTarget: [],
+        smoothPre,
+        smoothPost,
+        peakVals: new Float64Array(tap === "pre" ? 64 : 0),
+        peakUntil: new Float64Array(tap === "pre" ? 64 : 0),
+        nowMs: 1000,
+        dtSec: 1 / 60,
+      });
+      expect(step.clearFrame).toBe(false);
+    }
+    expect(smoothPre[10]).toBeGreaterThan(SPEC_DB_MIN);
+  });
+});

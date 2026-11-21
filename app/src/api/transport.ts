@@ -1,6 +1,7 @@
 // The UI talks to the daemon through a Transport: the Tauri process (real
 // daemon over the Unix socket) or an in-memory mock for the plain browser.
 
+import type { ShellTransport } from "./shell";
 import type { DaemonEvent, ResponseWindowRequest, UpsamplerConfig, UpsamplerResponse } from "./types";
 
 export class DaemonError extends Error {
@@ -21,6 +22,10 @@ export const ErrorCode = {
   INTERNAL: -32603,
   BAD_STATE: 1,
   IO: 2,
+  /** `set_volume_guarded` bound (`if_instance`) to a daemon that has since restarted. */
+  STALE_INSTANCE: 3,
+  /** `set_volume_guarded`'s `if_revision` is not the current level revision. */
+  STALE_REVISION: 4,
   /** Client side: no daemon connection. */
   DISCONNECTED: -1,
   /** Client side: no reply in time. */
@@ -42,7 +47,7 @@ export interface IrInfo {
   rate: number;
 }
 
-export interface Transport {
+export interface Transport extends ShellTransport {
   readonly kind: "tauri" | "mock";
   /** One request. `params === undefined` omits the field; `null` sends null. */
   call<T = unknown>(method: string, params?: unknown): Promise<T>;
@@ -54,6 +59,10 @@ export interface Transport {
   upsamplerResponse(config: UpsamplerConfig | null, sourceRate: number | null, window?: ResponseWindowRequest): Promise<UpsamplerResponse>;
   /** Start the systemd user unit `audivane-dsp.service`. */
   startEngine(): Promise<void>;
+  /** Whether the engine starts at login (`null` if systemd cannot say). */
+  engineAtLogin(): Promise<boolean | null>;
+  /** Enable or disable the engine at login (does not start or stop it). */
+  setEngineAtLogin(on: boolean): Promise<void>;
   /** The engine's own last error line when it failed to start (`null` if unknown). */
   engineLastError(): Promise<string | null>;
   /** Restart the systemd user unit (an upgrade left the old engine running). */

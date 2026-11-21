@@ -2,11 +2,16 @@
 
 export type NowPlaying = { 
 /**
- * MPRIS bus name, e.g. `org.mpris.MediaPlayer2.strawberry`.
+ * MPRIS bus name, e.g. `org.mpris.MediaPlayer2.example`.
  */
 player: string, title: string | null, artist: string | null, album: string | null, status: string, 
 /**
  * Native file rate/bit depth if the player exposes it (non-standard
  * MPRIS metadata keys; often absent).
  */
-native_rate: number | null, native_bits: number | null, };
+native_rate: number | null, native_bits: number | null, 
+/**
+ * The player's `mpris:trackid`, when it gives one: tells apart tracks
+ * whose tags are the same (or missing).
+ */
+track_id?: string, };

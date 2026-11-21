@@ -277,6 +277,58 @@ pub fn card_index_from_device(device: &str) -> Result<u32> {
     Ok(idx as u32)
 }
 
+/// Whether the card and the playback PCM `device` names (`hw:` or
+/// `plughw:`, by card index or id, `DEV=` or positional device, default 0)
+/// are in the system now. Reads `/proc/asound` only; nothing is opened, so
+/// it is cheap enough to poll and never disturbs a device someone holds.
+pub fn device_present(device: &str) -> bool {
+    device_present_in(std::path::Path::new("/proc/asound"), device)
+}
+
+/// [`device_present`] against another `/proc/asound` tree (tests).
+pub fn device_present_in(root: &std::path::Path, device: &str) -> bool {
+    let Some(rest) = device
+        .strip_prefix("hw:")
+        .or_else(|| device.strip_prefix("plughw:"))
+    else {
+        return false;
+    };
+    let mut parts = rest.split(',').map(str::trim);
+    let card = parts.next().unwrap_or("");
+    let card = card.strip_prefix("CARD=").unwrap_or(card);
+    if card.is_empty() {
+        return false;
+    }
+    let dev = match parts.next() {
+        None => 0,
+        Some(p) => match p.strip_prefix("DEV=").unwrap_or(p).parse::<u32>() {
+            Ok(d) => d,
+            Err(_) => return false,
+        },
+    };
+    let card_dir = if card.bytes().all(|b| b.is_ascii_digit()) {
+        root.join(format!("card{card}"))
+    } else {
+        // The `/proc/asound/<id>` symlink is not always there: match the
+        // id file of each card instead.
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return false;
+        };
+        let found = entries.flatten().find(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.strip_prefix("card")
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                && std::fs::read_to_string(e.path().join("id")).is_ok_and(|id| id.trim() == card)
+        });
+        match found {
+            Some(e) => e.path(),
+            None => return false,
+        }
+    };
+    card_dir.join(format!("pcm{dev}p")).exists()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +338,32 @@ mod tests {
         assert_eq!(card_index_from_device("hw:10,0,0").unwrap(), 10);
         assert_eq!(card_index_from_device("hw:0").unwrap(), 0);
         assert_eq!(card_index_from_device("plughw:2,1").unwrap(), 2);
+    }
+
+    #[test]
+    fn device_presence_reads_proc_asound() {
+        let root = std::env::temp_dir().join(format!("avdsp-asound-{}", std::process::id()));
+        let card = root.join("card3");
+        std::fs::create_dir_all(&card).unwrap();
+        std::fs::write(card.join("id"), "USB\n").unwrap();
+        std::fs::create_dir_all(card.join("pcm0p")).unwrap();
+        std::fs::create_dir_all(card.join("pcm1c")).unwrap();
+        assert!(device_present_in(&root, "hw:CARD=USB,DEV=0"));
+        assert!(device_present_in(&root, "hw:USB"));
+        assert!(device_present_in(&root, "hw:3,0,0"));
+        assert!(device_present_in(&root, "plughw:CARD=3,DEV=0"));
+        // Capture-only device, another card, a malformed name.
+        assert!(!device_present_in(&root, "hw:CARD=USB,DEV=1"));
+        assert!(!device_present_in(&root, "hw:CARD=DAC,DEV=0"));
+        assert!(!device_present_in(&root, "hw:4,0"));
+        assert!(!device_present_in(&root, "default"));
+        assert!(!device_present_in(&root, "hw:USB,x"));
+        // A card whose playback PCM is gone (unplugged mid-teardown).
+        let gone = root.join("card4");
+        std::fs::create_dir_all(&gone).unwrap();
+        std::fs::write(gone.join("id"), "DAC\n").unwrap();
+        assert!(!device_present_in(&root, "hw:CARD=DAC,DEV=0"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

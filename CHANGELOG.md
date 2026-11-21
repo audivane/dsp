@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.10.0
+
+### Highlights
+
+- **Upsampling filters**: 66 presets in families (Gaussian, flat-top,
+  Chebyshev, Kaiser, half-band, Lanczos, Nuttall, Hann, short leaky,
+  cascades, short interpolators, block FFT), a Recommended filter, and a
+  Custom editor over the whole filter design (window, length, cutoff or
+  band, linear, minimum or intermediate phase), with live plots and a cost
+  table.
+- **Any output rate**: fractional ratios (44.1 → 48 kHz) and decimation
+  (192 → 48 kHz) with the same filters, integer ratios up to ×64 and output
+  rates up to 3.072 MHz, and automatic filter lengths measured against an
+  error budget or the output bit depth.
+- **New stages**: DC blocker, tilt EQ (bass, treble or both), headphone
+  crossfeed, harmonics, tempo-preserving pitch shift and varispeed, and a
+  true-peak limiter with automatic headroom.
+- **Output**: nine new dither and noise-shaping modes, and one fixed output
+  headroom (3 dB by default) against inter-sample overs.
+- **A/B compare**: side B as a change to any stage or the filter, quick
+  compare from every stage page, level matching that never boosts (analytic
+  or measured on the track), and output compare with two quantizers.
+- **Also play on**: up to three more DACs play the same music, drift
+  tracked and aligned to the main output.
+- **Volume**: software, hardware or hybrid volume, a hard ceiling, a guard
+  against sudden jumps from apps or the desktop, per-app volume, and the
+  desktop's slider driving the engine.
+- **Desktop app**: tray volume popup, volume keys with an on-screen display,
+  start at login hidden in the tray, and a much lighter idle footprint.
+- **Robustness**: a chain that runs over real time falls back to a lighter
+  one step by step instead of crackling; an unplugged DAC leaves the music
+  where it was.
+
+### Upgrading from 0.9.x
+
+- `avdsp upgrade` installs 0.10.0 like any update.
+- Settings carry over (EQ, convolution, devices, presets, routing). The old
+  upsampler fields are not read: if upsampling was on, it keeps its rate and
+  runs the Recommended filter; pick a preset or a Custom design to change
+  it. An A/B setup from 0.9.x is dropped (the engine log says so).
+- Removing the package now stops the engine and deletes every user's
+  Audivane DSP settings.
+
 ## 0.9.4
 
 - Fix: the engine no longer fails to start when its output device is

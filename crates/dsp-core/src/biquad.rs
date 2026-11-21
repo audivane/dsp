@@ -13,6 +13,7 @@
 //! TDF-II and Direct Form I agree to ~2e-13 (about -225 dB relative to the
 //! impulse response peak), so the simpler form is used throughout.
 
+use crate::tilt::{TiltFilter, TiltState};
 use crate::{Complex64, Stage};
 use audivane_protocol::{Band, EqProfile, FilterType};
 
@@ -185,7 +186,7 @@ impl Coeffs {
 
 /// Two-word state of a transposed Direct Form II section.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct BiquadState {
+pub(crate) struct BiquadState {
     z1: f64,
     z2: f64,
 }
@@ -194,7 +195,7 @@ impl BiquadState {
     /// One TDF-II step:
     /// `y = b0 x + z1; z1 = b1 x - a1 y + z2; z2 = b2 x - a2 y`.
     #[inline]
-    fn step(&mut self, c: &Coeffs, x: f64) -> f64 {
+    pub(crate) fn step(&mut self, c: &Coeffs, x: f64) -> f64 {
         let y = c.b0 * x + self.z1;
         self.z1 = c.b1 * x - c.a1 * y + self.z2;
         self.z2 = c.b2 * x - c.a2 * y;
@@ -252,14 +253,44 @@ pub struct Eq {
     linked: ChannelFilter,
     left: ChannelFilter,
     right: ChannelFilter,
+    tilt: TiltFilter,
     sample_rate: f64,
     channels: usize,
     /// `states[channel][band]`.
     states: Vec<Vec<BiquadState>>,
+    /// `tilt_states[channel]`.
+    tilt_states: Vec<TiltState>,
 }
 
 impl Eq {
-    pub fn new(profile: &EqProfile, sample_rate: f64, channels: usize) -> Self {
+    /// Build the EQ, designing its tilt (one or two sections, if any) at
+    /// `sample_rate`. A tilt that cannot be designed is an error.
+    pub fn new(profile: &EqProfile, sample_rate: f64, channels: usize) -> Result<Self, String> {
+        let tilt = TiltFilter::design_stage(
+            profile.tilt.as_ref(),
+            profile.tilt_high.as_ref(),
+            sample_rate,
+        )?;
+        Ok(Self::with_tilt(profile, tilt, sample_rate, channels))
+    }
+
+    /// Band-only EQ (global preamp + linked bands, no tilt, no per-channel
+    /// sections). Infallible: biquad design has no error path.
+    pub fn from_bands(bands: &[Band], preamp_db: f64, sample_rate: f64, channels: usize) -> Self {
+        let profile = EqProfile {
+            preamp_db,
+            bands: bands.to_vec(),
+            ..EqProfile::default()
+        };
+        Self::with_tilt(
+            &profile,
+            TiltFilter::identity(sample_rate),
+            sample_rate,
+            channels,
+        )
+    }
+
+    fn with_tilt(profile: &EqProfile, tilt: TiltFilter, sample_rate: f64, channels: usize) -> Self {
         let linked_bands: &[Band] = if profile.linked_enabled {
             &profile.bands
         } else {
@@ -290,14 +321,23 @@ impl Eq {
                 vec![BiquadState::default(); band_count]
             })
             .collect();
+        let tilt_states = (0..channels).map(|_| tilt.new_state()).collect();
         Eq {
             linked,
             left,
             right,
+            tilt,
             sample_rate,
             channels,
             states,
+            tilt_states,
         }
+    }
+
+    /// Returns `Some(effective_end_hz)` if the tilt's `end_hz` was clamped to
+    /// `0.45 * sample_rate` at build time.
+    pub fn tilt_clamped_end_hz(&self) -> Option<f64> {
+        self.tilt.clamped_end_hz
     }
 
     fn filter_for(&self, channel: usize) -> &ChannelFilter {
@@ -317,14 +357,36 @@ impl Eq {
     /// Channel 0 applies global + linked + enabled `left`, channel 1 applies
     /// global + linked + enabled `right`, and channels >= 2 apply global + linked.
     pub fn response_channel(&self, channel: usize, f_hz: f64) -> Complex64 {
-        self.filter_for(channel).response(f_hz, self.sample_rate)
+        self.filter_for(channel).response(f_hz, self.sample_rate) * self.tilt.response(f_hz)
     }
 
     /// Preamp (dB, <= 0) that keeps the largest boost of `profile` across channels
     /// from clipping a full-scale sine: minus the peak of |H| over a dense log
     /// grid from 10 Hz to Nyquist, ignoring the profile's global `preamp_db`
-    /// while accounting for each enabled section's combined response.
-    pub fn auto_preamp_db(profile: &EqProfile, sample_rate: f64) -> f64 {
+    /// while accounting for each enabled section's combined response and tilt.
+    /// [`Self::auto_preamp_db`] for a band-only list (no tilt). Infallible.
+    pub fn bands_auto_preamp_db(bands: &[Band], sample_rate: f64) -> f64 {
+        Self::channel_auto_preamp_db(bands, 0.0, &[], None, sample_rate)
+    }
+
+    pub fn auto_preamp_db(profile: &EqProfile, sample_rate: f64) -> Result<f64, String> {
+        let [l, r] = Self::section_peaks_db(profile, sample_rate)?;
+        Ok(Self::preamp_for_peak(l).min(Self::preamp_for_peak(r)))
+    }
+
+    /// Signed peak gain (dB) of each of the left and right channels: the
+    /// largest |H| over the same grid as [`Self::auto_preamp_db`], with every
+    /// preamp included (global and per channel). Negative when a channel
+    /// only attenuates.
+    pub fn channel_peak_gains_db(
+        profile: &EqProfile,
+        sample_rate: f64,
+    ) -> Result<[f64; 2], String> {
+        Ok(Self::section_peaks_db(profile, sample_rate)?.map(|p| p + profile.preamp_db))
+    }
+
+    /// Each channel's peak (dB) without the global preamp.
+    fn section_peaks_db(profile: &EqProfile, sample_rate: f64) -> Result<[f64; 2], String> {
         let linked: &[Band] = if profile.linked_enabled {
             &profile.bands
         } else {
@@ -332,26 +394,64 @@ impl Eq {
         };
         let left = profile.left.as_ref().filter(|c| c.enabled);
         let right = profile.right.as_ref().filter(|c| c.enabled);
+        let tilt = TiltFilter::design_stage(
+            profile.tilt.as_ref(),
+            profile.tilt_high.as_ref(),
+            sample_rate,
+        )
+        .map(|t| Some(t).filter(|t| !t.is_identity()))?;
 
-        let pre_l = Self::channel_auto_preamp_db(
+        let peak_l = Self::channel_peak_db(
             linked,
             left.map_or(0.0, |c| c.preamp_db),
             left.map_or(&[][..], |c| c.bands.as_slice()),
+            tilt.as_ref(),
             sample_rate,
         );
-        let pre_r = Self::channel_auto_preamp_db(
+        let peak_r = Self::channel_peak_db(
             linked,
             right.map_or(0.0, |c| c.preamp_db),
             right.map_or(&[][..], |c| c.bands.as_slice()),
+            tilt.as_ref(),
             sample_rate,
         );
-        pre_l.min(pre_r)
+        Ok([peak_l, peak_r])
+    }
+
+    /// The preamp (dB, <= 0) that brings a peak of `peak_db` to 0 dB.
+    fn preamp_for_peak(peak_db: f64) -> f64 {
+        let preamp = (-peak_db).min(0.0);
+        // Treat numerical dust as "no preamp needed".
+        if preamp > -1e-9 || !preamp.is_finite() {
+            0.0
+        } else {
+            preamp
+        }
     }
 
     fn channel_auto_preamp_db(
         linked_bands: &[Band],
         section_preamp_db: f64,
         section_bands: &[Band],
+        tilt: Option<&TiltFilter>,
+        sample_rate: f64,
+    ) -> f64 {
+        Self::preamp_for_peak(Self::channel_peak_db(
+            linked_bands,
+            section_preamp_db,
+            section_bands,
+            tilt,
+            sample_rate,
+        ))
+    }
+
+    /// Signed peak (dB) of one channel's sections, its preamp included; 0
+    /// for a degenerate rate or response.
+    fn channel_peak_db(
+        linked_bands: &[Band],
+        section_preamp_db: f64,
+        section_bands: &[Band],
+        tilt: Option<&TiltFilter>,
         sample_rate: f64,
     ) -> f64 {
         let nyquist = 0.5 * sample_rate;
@@ -365,37 +465,72 @@ impl Eq {
             .filter(|c| !c.is_identity())
             .collect();
         let section_gain = crate::db_to_lin(section_preamp_db);
-        if bands.is_empty() {
-            let preamp = (-section_preamp_db).min(0.0);
-            return if preamp > -1e-9 || !preamp.is_finite() {
-                0.0
+        if bands.is_empty() && tilt.is_none() {
+            return if section_preamp_db.is_finite() {
+                section_preamp_db
             } else {
-                preamp
+                0.0
             };
         }
 
         // Dense log grid (16384 points) plus DC and every band centre, so
         // that a high-Q peak (or a low shelf's DC plateau) cannot slip
-        // between grid points.
+        // between grid points. The grid starts at 10 Hz or 3 octaves below
+        // the lowest band or tilt section, whichever is lower, and each band
+        // centre and tilt corner gets a dense +/-1/2 octave patch (a sharp
+        // tilt corner's overshoot sits within a fraction of an octave).
         const GRID: usize = 16_384;
-        let mut freqs = Vec::with_capacity(GRID + bands.len() + 1);
+        const PATCH: usize = 128;
+        let band_hz: Vec<f64> = linked_bands
+            .iter()
+            .chain(section_bands.iter())
+            .filter(|b| b.enabled && b.freq_hz > 0.0 && b.freq_hz < nyquist)
+            .map(|b| b.freq_hz)
+            .collect();
+        let tilt_hz: Vec<f64> = tilt.map(|t| t.critical_frequencies()).unwrap_or_default();
+        let centres: Vec<f64> = band_hz
+            .iter()
+            .chain(tilt.map_or(&[][..], |t| t.corner_hz.as_slice()))
+            .copied()
+            .filter(|f| f.is_finite() && *f > 0.0)
+            .collect();
+        let f_low = band_hz
+            .iter()
+            .chain(&tilt_hz)
+            .filter(|f| f.is_finite() && **f > 0.0)
+            .fold(10.0_f64, |lo, &f| lo.min(f / 8.0))
+            .max(1e-3);
+        let mut freqs = Vec::with_capacity(GRID + 2056 + centres.len() * (PATCH + 1) + 2);
         freqs.push(0.0);
-        let u_end = (nyquist / 10.0).ln();
+        freqs.push(nyquist);
+        // Tilt sections may sit very close to Nyquist; include their corner
+        // and centre frequencies and a linear high-frequency grid as well.
+        if tilt.is_some() {
+            freqs.extend(&tilt_hz);
+            freqs.extend((0..=2048).map(|i| nyquist * (0.9 + 0.1 * i as f64 / 2048.0)));
+        }
+        let u_end = (nyquist / f_low).ln();
         for i in 0..GRID {
             let u = u_end * (i as f64) / ((GRID - 1) as f64);
-            freqs.push(10.0 * u.exp());
+            freqs.push(f_low * u.exp());
         }
-        for b in linked_bands.iter().chain(section_bands.iter()) {
-            if b.enabled && b.freq_hz > 10.0 && b.freq_hz < nyquist {
-                freqs.push(b.freq_hz);
-            }
+        for &c in &centres {
+            freqs.extend(
+                (0..=PATCH)
+                    .map(|i| c * (i as f64 / PATCH as f64 - 0.5).exp2())
+                    .filter(|&f| f < nyquist),
+            );
         }
+        freqs.extend(band_hz.iter().copied());
 
         let mut peak: f64 = 0.0;
         for f in freqs {
             let mut mag = section_gain;
             for c in &bands {
                 mag *= c.response(f, sample_rate).norm();
+            }
+            if let Some(t) = tilt {
+                mag *= t.response(f).norm();
             }
             if mag.is_finite() && mag > peak {
                 peak = mag;
@@ -404,9 +539,7 @@ impl Eq {
         if peak <= 0.0 || !peak.is_finite() {
             return 0.0;
         }
-        let preamp = (-crate::lin_to_db(peak)).min(0.0);
-        // Treat numerical dust as "no preamp needed".
-        if preamp > -1e-9 { 0.0 } else { preamp }
+        crate::lin_to_db(peak)
     }
 }
 
@@ -429,6 +562,9 @@ impl Stage for Eq {
                     *x = st.step(band, *x);
                 }
             }
+            if !self.tilt.is_identity() {
+                self.tilt.process_channel(buf, &mut self.tilt_states[ch]);
+            }
         }
     }
 
@@ -437,6 +573,9 @@ impl Stage for Eq {
             for st in ch.iter_mut() {
                 *st = BiquadState::default();
             }
+        }
+        for st in &mut self.tilt_states {
+            st.reset();
         }
     }
 }
@@ -578,7 +717,7 @@ mod tests {
                 ..Default::default()
             };
             profile.bands.push(band(kind, f0, gain, q));
-            let mut eq = Eq::new(&profile, fs, 1);
+            let mut eq = Eq::new(&profile, fs, 1).unwrap();
             let mut x = vec![0.0; 512];
             x[0] = 1.0;
             let reference = direct_form_i(&c, &x);
@@ -605,7 +744,7 @@ mod tests {
 
         let mut profile = EqProfile::default();
         profile.bands.push(b);
-        let mut eq = Eq::new(&profile, fs, 1);
+        let mut eq = Eq::new(&profile, fs, 1).unwrap();
         let n = 200_000;
         let mut impulse = vec![0.0; n];
         impulse[0] = 1.0;
@@ -647,7 +786,7 @@ mod tests {
         ));
 
         let n = 16_384;
-        let mut eq = Eq::new(&profile, fs, 1);
+        let mut eq = Eq::new(&profile, fs, 1).unwrap();
         let mut impulse = vec![0.0; n];
         impulse[0] = 1.0;
         eq.process(&mut [&mut impulse]);
@@ -676,7 +815,7 @@ mod tests {
         profile
             .bands
             .push(band(FilterType::Peaking, 1000.0, 3.0, 1.0));
-        let eq = Eq::new(&profile, fs, 1);
+        let eq = Eq::new(&profile, fs, 1).unwrap();
         let expected = 10f64.powf(-6.0 / 20.0) * 10f64.powf(3.0 / 20.0);
         assert!((eq.response(1000.0).norm() - expected).abs() < 1e-12);
     }
@@ -692,7 +831,7 @@ mod tests {
         profile
             .bands
             .push(band(FilterType::Peaking, 1000.0, 6.0, 2.0));
-        let pre = Eq::auto_preamp_db(&profile, fs);
+        let pre = Eq::auto_preamp_db(&profile, fs).unwrap();
         assert!((pre + 6.0).abs() < 0.02, "{pre}");
 
         // Narrow high-Q band: the grid must not miss the peak.
@@ -703,7 +842,7 @@ mod tests {
         profile
             .bands
             .push(band(FilterType::Peaking, 3000.0, 10.0, 20.0));
-        let pre = Eq::auto_preamp_db(&profile, fs);
+        let pre = Eq::auto_preamp_db(&profile, fs).unwrap();
         assert!((pre + 10.0).abs() < 0.02, "{pre}");
 
         // The profile's own preamp is ignored.
@@ -714,7 +853,7 @@ mod tests {
         profile
             .bands
             .push(band(FilterType::Peaking, 1000.0, 6.0, 1.0));
-        assert!((Eq::auto_preamp_db(&profile, fs) + 6.0).abs() < 0.02);
+        assert!((Eq::auto_preamp_db(&profile, fs).unwrap() + 6.0).abs() < 0.02);
 
         // Cuts only: no attenuation needed.
         let mut profile = EqProfile {
@@ -724,7 +863,7 @@ mod tests {
         profile
             .bands
             .push(band(FilterType::Peaking, 1000.0, -6.0, 1.0));
-        assert_eq!(Eq::auto_preamp_db(&profile, fs), 0.0);
+        assert_eq!(Eq::auto_preamp_db(&profile, fs).unwrap(), 0.0);
 
         // Disabled bands are ignored.
         let mut profile = EqProfile {
@@ -734,9 +873,9 @@ mod tests {
         let mut b = band(FilterType::Peaking, 1000.0, 12.0, 1.0);
         b.enabled = false;
         profile.bands.push(b);
-        assert_eq!(Eq::auto_preamp_db(&profile, fs), 0.0);
+        assert_eq!(Eq::auto_preamp_db(&profile, fs).unwrap(), 0.0);
 
-        assert_eq!(Eq::auto_preamp_db(&EqProfile::default(), fs), 0.0);
+        assert_eq!(Eq::auto_preamp_db(&EqProfile::default(), fs).unwrap(), 0.0);
     }
 
     #[test]
@@ -749,7 +888,7 @@ mod tests {
         profile
             .bands
             .push(band(FilterType::Peaking, 500.0, 5.0, 1.5));
-        let mut eq = Eq::new(&profile, fs, 2);
+        let mut eq = Eq::new(&profile, fs, 2).unwrap();
         let mut left: Vec<f64> = (0..128).map(|i| (i as f64 * 0.1).sin()).collect();
         let mut right = vec![0.0; 128];
         let left_orig = left.clone();
@@ -757,7 +896,7 @@ mod tests {
         // Channel 2 is silent and must stay silent.
         assert!(right.iter().all(|&v| v == 0.0));
         // Re-processing a fresh copy gives the same first channel.
-        let mut eq2 = Eq::new(&profile, fs, 2);
+        let mut eq2 = Eq::new(&profile, fs, 2).unwrap();
         let mut l2 = left_orig;
         let mut r2 = vec![0.0; 128];
         eq2.process(&mut [&mut l2, &mut r2]);
@@ -788,7 +927,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut eq = Eq::new(&profile, fs, 4);
+        let mut eq = Eq::new(&profile, fs, 4).unwrap();
         // L-only band affects ch0 only; ch1, ch2, ch3 receive linked + preamp only.
         assert_ne!(eq.response_channel(0, 138.0), eq.response_channel(1, 138.0));
         assert_eq!(eq.response(138.0), eq.response_channel(0, 138.0));
@@ -814,11 +953,11 @@ mod tests {
         let mut c3 = src.clone();
         eq.process(&mut [&mut c0, &mut c1, &mut c2, &mut c3]);
 
-        let mut eq_ch0_ref = Eq::new(&flat_ch0, fs, 1);
+        let mut eq_ch0_ref = Eq::new(&flat_ch0, fs, 1).unwrap();
         let mut ref_ch0 = src.clone();
         eq_ch0_ref.process(&mut [&mut ref_ch0]);
 
-        let mut eq_linked_ref = Eq::new(&flat_linked, fs, 1);
+        let mut eq_linked_ref = Eq::new(&flat_linked, fs, 1).unwrap();
         let mut ref_linked = src;
         eq_linked_ref.process(&mut [&mut ref_linked]);
 
@@ -858,8 +997,8 @@ mod tests {
             ..Default::default()
         };
 
-        let mut eq_dis = Eq::new(&with_disabled, fs, 3);
-        let mut eq_abs = Eq::new(&absent, fs, 3);
+        let mut eq_dis = Eq::new(&with_disabled, fs, 3).unwrap();
+        let mut eq_abs = Eq::new(&absent, fs, 3).unwrap();
 
         let mut d0 = src.clone();
         let mut d1 = src.clone();
@@ -877,8 +1016,8 @@ mod tests {
     #[test]
     fn legacy_migrated_profile_matches_old_independent_behaviour() {
         let fs = 48_000.0;
-        // Post-migration shape of a legacy split profile (preamp_db: -3, bands: [...], right: Some(-6, [...])):
-        // global preamp = 0, linked bands = [], left = old left, right = old right.
+        // A split profile: global preamp 0 and no linked bands, so left and
+        // right each carry their own preamp and bands.
         let migrated = EqProfile {
             name: "legacy-split".into(),
             preamp_db: 0.0,
@@ -896,7 +1035,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let mut eq = Eq::new(&migrated, fs, 2);
+        let mut eq = Eq::new(&migrated, fs, 2).unwrap();
 
         let old_left = EqProfile {
             preamp_db: -3.0,
@@ -916,8 +1055,12 @@ mod tests {
 
         let mut ref_l = src.clone();
         let mut ref_r = src;
-        Eq::new(&old_left, fs, 1).process(&mut [&mut ref_l]);
-        Eq::new(&old_right, fs, 1).process(&mut [&mut ref_r]);
+        Eq::new(&old_left, fs, 1)
+            .unwrap()
+            .process(&mut [&mut ref_l]);
+        Eq::new(&old_right, fs, 1)
+            .unwrap()
+            .process(&mut [&mut ref_r]);
 
         assert_eq!(c0, ref_l);
         assert_eq!(c1, ref_r);
@@ -942,13 +1085,13 @@ mod tests {
             }),
             ..Default::default()
         };
-        let pre = Eq::auto_preamp_db(&combined, fs);
+        let pre = Eq::auto_preamp_db(&combined, fs).unwrap();
         assert!((pre + 8.0).abs() < 0.05, "expected ~-8 dB, got {pre}");
 
         // Disabling left drops back to linked +3 dB only.
         let mut left_off = combined.clone();
         left_off.left.as_mut().unwrap().enabled = false;
-        let pre_linked = Eq::auto_preamp_db(&left_off, fs);
+        let pre_linked = Eq::auto_preamp_db(&left_off, fs).unwrap();
         assert!(
             (pre_linked + 3.0).abs() < 0.03,
             "expected ~-3 dB, got {pre_linked}"
@@ -956,6 +1099,178 @@ mod tests {
 
         // Disabling linked section too leaves zero active boost.
         left_off.linked_enabled = false;
-        assert_eq!(Eq::auto_preamp_db(&left_off, fs), 0.0);
+        assert_eq!(Eq::auto_preamp_db(&left_off, fs).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn auto_preamp_covers_low_tilt_corners_and_bands() {
+        use audivane_protocol::{TiltConfig, TiltPivot};
+        // Independent, much denser search for the true peak, from 0.05 Hz.
+        let true_peak = |eq: &Eq, fs: f64| -> f64 {
+            let n = 100_000;
+            (0..=n)
+                .map(|i| 0.05 * (fs / 2.0 / 0.05).powf(i as f64 / n as f64))
+                .map(|f| to_db(eq.response(f)))
+                .fold(f64::NEG_INFINITY, f64::max)
+        };
+        for fs in [44_100.0, 48_000.0, 96_000.0] {
+            for (start, end) in [(20.0, 22.5), (20.0, 36.0), (20.0, 160.0)] {
+                for slope in [-6.0, -3.0, 3.0, 6.0] {
+                    for pivot in [TiltPivot::Start, TiltPivot::End] {
+                        for band in [None, Some(band(FilterType::Peaking, 25.0, 3.0, 2.0))] {
+                            let profile = EqProfile {
+                                bands: band.clone().into_iter().collect(),
+                                tilt: Some(TiltConfig {
+                                    enabled: true,
+                                    slope_db_per_oct: Some(slope),
+                                    total_db: None,
+                                    start_hz: start,
+                                    end_hz: end,
+                                    pivot,
+                                }),
+                                ..Default::default()
+                            };
+                            let pre = Eq::auto_preamp_db(&profile, fs).unwrap();
+                            let eq = Eq::new(&profile, fs, 1).unwrap();
+                            let peak = true_peak(&eq, fs);
+                            assert!(
+                                peak + pre <= 0.001,
+                                "{fs} {start}-{end} {slope} {pivot:?} {band:?}: peak {peak}, preamp {pre}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tilt_auto_preamp_covers_actual_response_through_nyquist() {
+        use audivane_protocol::{TiltConfig, TiltPivot};
+        for fs in [44_100.0, 48_000.0, 96_000.0, 192_000.0] {
+            for slope in [-6.0, -0.3, 0.3, 6.0] {
+                for pivot in [TiltPivot::Start, TiltPivot::End, TiltPivot::Hz(2100.0)] {
+                    let profile = EqProfile {
+                        tilt: Some(TiltConfig {
+                            enabled: true,
+                            slope_db_per_oct: Some(slope),
+                            total_db: None,
+                            start_hz: 2000.0,
+                            end_hz: 10_000.0,
+                            pivot,
+                        }),
+                        ..EqProfile::default()
+                    };
+                    let pre = Eq::auto_preamp_db(&profile, fs).unwrap();
+                    let eq = Eq::new(&profile, fs, 1).unwrap();
+                    let mut peak = 0.0_f64;
+                    for i in 0..=16384 {
+                        let f = fs / 2.0 * i as f64 / 16384.0;
+                        peak = peak.max(to_db(eq.response(f)));
+                    }
+                    assert!(
+                        peak + pre <= 0.001,
+                        "{fs}, {slope}, {pivot:?}: peak {peak}, preamp {pre}"
+                    );
+                    assert!((-peak - pre).abs() <= 0.01);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn eq_integrates_tilt_in_response_process_and_auto_preamp() {
+        let fs = 48_000.0;
+        let profile = EqProfile {
+            tilt: Some(audivane_protocol::TiltConfig {
+                enabled: true,
+                slope_db_per_oct: Some(1.0),
+                total_db: None,
+                start_hz: 200.0,
+                end_hz: 20_000.0,
+                pivot: audivane_protocol::TiltPivot::Start,
+            }),
+            ..Default::default()
+        };
+        // +1 dB/oct from 200 Hz to 20 kHz (~6.644 octaves) => max boost ~ +6.64 dB.
+        let auto_pre = Eq::auto_preamp_db(&profile, fs).unwrap();
+        assert!(
+            (auto_pre + 6.64).abs() < 0.2,
+            "expected ~-6.64 dB auto preamp, got {auto_pre}"
+        );
+
+        let mut eq = Eq::new(&profile, fs, 2).unwrap();
+        assert!(to_db(eq.response_channel(0, 0.0)).abs() < 1e-10);
+        // Sharp corner: the bass below the start is untouched, the start
+        // itself is 0 dB and one octave up is +1 dB.
+        assert!(to_db(eq.response_channel(0, 100.0)).abs() < 0.02);
+        assert!(to_db(eq.response_channel(0, 200.0)).abs() < 0.05);
+        assert!((to_db(eq.response_channel(0, 400.0)) - 1.0).abs() < 0.05);
+        assert!(to_db(eq.response_channel(1, 12_800.0)) > 5.5);
+
+        // Impulse through process matches response_channel.
+        let mut l = vec![0.0; 4096];
+        let mut r = vec![0.0; 4096];
+        l[0] = 1.0;
+        r[0] = 1.0;
+        eq.process(&mut [&mut l, &mut r]);
+        assert_eq!(l, r);
+        assert_ne!(l[0], 1.0);
+    }
+
+    #[test]
+    fn eq_runs_both_tilt_sections_in_cascade() {
+        use audivane_protocol::{TiltConfig, TiltPivot};
+        let fs = 48_000.0;
+        let low = TiltConfig {
+            enabled: true,
+            slope_db_per_oct: Some(-2.0),
+            total_db: None,
+            start_hz: 20.0,
+            end_hz: 200.0,
+            pivot: TiltPivot::End,
+        };
+        let high = TiltConfig {
+            slope_db_per_oct: Some(1.0),
+            start_hz: 4000.0,
+            end_hz: 20_000.0,
+            pivot: TiltPivot::Start,
+            ..low
+        };
+        let profile = EqProfile {
+            tilt: Some(low),
+            tilt_high: Some(high),
+            ..Default::default()
+        };
+        let mut eq = Eq::new(&profile, fs, 2).unwrap();
+        let single = |c: &TiltConfig, f: f64| to_db(TiltFilter::design(c, fs).unwrap().response(f));
+        for f in [10.0, 50.0, 1000.0, 8000.0, 19_000.0] {
+            let want = single(&low, f) + single(&high, f);
+            assert!(
+                (to_db(eq.response_channel(0, f)) - want).abs() < 1e-9,
+                "{f}"
+            );
+        }
+        // Bass boost of 2 * log2(10) ~ 6.64 dB below 20 Hz; the treble's
+        // +2.32 dB is smaller.
+        let pre = Eq::auto_preamp_db(&profile, fs).unwrap();
+        assert!((pre + 6.64).abs() < 0.2, "{pre}");
+        // Overlapping bands are a build error, not a silent identity.
+        let bad = EqProfile {
+            tilt_high: Some(TiltConfig {
+                start_hz: 100.0,
+                ..high
+            }),
+            ..profile.clone()
+        };
+        assert!(Eq::new(&bad, fs, 2).err().unwrap().contains("overlap"));
+        assert!(Eq::auto_preamp_db(&bad, fs).is_err());
+
+        let mut l = vec![0.0; 4096];
+        l[0] = 1.0;
+        let mut r = l.clone();
+        eq.process(&mut [&mut l, &mut r]);
+        assert_eq!(l, r);
+        assert_ne!(l[0], 1.0);
     }
 }

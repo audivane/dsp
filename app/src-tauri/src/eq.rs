@@ -4,16 +4,11 @@
 //! values from this module and a vitest test compares the two.
 
 use audivane_dsp_core::biquad::{Coeffs, Eq};
-use audivane_protocol::{Band, EqProfile};
+use audivane_protocol::Band;
 
 /// Magnitude in dB of the whole band list (preamp included) at each frequency.
 pub fn response_db(bands: &[Band], preamp_db: f64, sample_rate: f64, freqs: &[f64]) -> Vec<f64> {
-    let profile = EqProfile {
-        preamp_db,
-        bands: bands.to_vec(),
-        ..EqProfile::default()
-    };
-    let eq = Eq::new(&profile, sample_rate, 1);
+    let eq = Eq::from_bands(bands, preamp_db, sample_rate, 1);
     freqs
         .iter()
         .map(|&f| 20.0 * eq.response(f).norm().log10())
@@ -31,11 +26,7 @@ pub fn band_db(band: &Band, sample_rate: f64, freqs: &[f64]) -> Vec<f64> {
 
 /// dsp-core's automatic preamp for a band list.
 pub fn auto_preamp_db(bands: &[Band], sample_rate: f64) -> f64 {
-    let profile = EqProfile {
-        bands: bands.to_vec(),
-        ..EqProfile::default()
-    };
-    Eq::auto_preamp_db(&profile, sample_rate)
+    Eq::bands_auto_preamp_db(bands, sample_rate)
 }
 
 /// Log-spaced frequencies, inclusive.

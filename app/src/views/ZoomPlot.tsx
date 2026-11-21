@@ -50,6 +50,14 @@ export interface ZoomPlotProps {
   decorate?: (ctx: CanvasRenderingContext2D, g: PlotGeom) => void;
   /** Extra drawing over the curve, not clipped (labels, chips). */
   annotate?: (ctx: CanvasRenderingContext2D, g: PlotGeom) => void;
+  /** Replaces the default line through (freqs, mags), e.g. a min/max trace. */
+  drawCurve?: (ctx: CanvasRenderingContext2D, g: PlotGeom) => void;
+  /** Hover readout at data x: the point to mark and its label (default: Hz and dB). */
+  readout?: (x: number, g: PlotGeom) => { x: number; y: number | null; text: string };
+  /** X tick label for `v` with ticks `step` apart (default: Hz). */
+  xTick?: (v: number, step: number) => string;
+  /** Smallest gap between x ticks (linear scale), e.g. 1 for whole samples. */
+  xMinStep?: number;
   lineWidth?: number;
   pad?: { l: number; r: number; t: number; b: number };
   style?: React.CSSProperties;
@@ -133,7 +141,11 @@ export function ZoomPlot(props: ZoomPlotProps) {
 
     // X grid + labels.
     const spanX = v.x1 - v.x0;
-    const xs = p.scale === "log" ? logTicks(v.x0, v.x1) : linearTicks(v.x0, v.x1, Math.max(3, Math.round(g.w / 90))).ticks;
+    const xTarget = Math.max(3, Math.round(g.w / 90));
+    const xs =
+      p.scale === "log"
+        ? logTicks(v.x0, v.x1)
+        : linearTicks(v.x0, v.x1, p.xMinStep ? Math.max(1, Math.min(xTarget, Math.floor(spanX / p.xMinStep))) : xTarget).ticks;
     const xStep = xs.length > 1 ? xs[1] - xs[0] : spanX;
     let lastLabelX = -Infinity;
     for (const f of xs) {
@@ -144,9 +156,13 @@ export function ZoomPlot(props: ZoomPlotProps) {
       ctx.moveTo(x, g.top);
       ctx.lineTo(x, g.top + g.h);
       ctx.stroke();
-      const label = p.scale === "log" && spanX > 4 * v.x0 ? fmtLogTick(f) : fmtHzPrecise(f, xStep * 200 >= 2000 ? spanX : xStep * 200);
+      const label = p.xTick
+        ? p.xTick(f, xStep)
+        : p.scale === "log" && spanX > 4 * v.x0
+          ? fmtLogTick(f)
+          : fmtHzPrecise(f, xStep * 200 >= 2000 ? spanX : xStep * 200);
       const tw = ctx.measureText(label).width;
-      if (x - tw / 2 - lastLabelX >= 8) {
+      if (x - tw / 2 - lastLabelX >= 8 && x + tw / 2 <= size.current.w - 2) {
         ctx.fillStyle = muted;
         ctx.textAlign = "center";
         ctx.fillText(label, x, g.top + g.h + 13);
@@ -162,7 +178,13 @@ export function ZoomPlot(props: ZoomPlotProps) {
 
     // Curve.
     const n = Math.min(p.freqs.length, p.mags.length);
-    if (n >= 2) {
+    if (p.drawCurve) {
+      ctx.strokeStyle = accent;
+      ctx.fillStyle = accent;
+      ctx.lineWidth = p.lineWidth ?? 2;
+      ctx.lineJoin = "round";
+      p.drawCurve(ctx, g);
+    } else if (n >= 2) {
       ctx.strokeStyle = accent;
       ctx.lineWidth = p.lineWidth ?? 2;
       ctx.lineJoin = "round";
@@ -211,14 +233,26 @@ export function ZoomPlot(props: ZoomPlotProps) {
     const hv = hover.current;
     if (hv && !d && hv.x >= g.left && hv.x <= g.left + g.w && hv.y >= g.top && hv.y <= g.top + g.h) {
       const f = axisValue((hv.x - g.left) / g.w, v.x0, v.x1, p.scale);
-      const db = interpAt(p.freqs, p.mags, f);
+      let db: number | null;
+      let text: string;
+      let mx = hv.x;
+      if (p.readout) {
+        const ro = p.readout(f, g);
+        db = ro.y;
+        text = ro.text;
+        mx = g.xOf(ro.x);
+      } else {
+        db = interpAt(p.freqs, p.mags, f);
+        const spanHz = p.scale === "log" ? Math.max(1e-9, f * (Math.pow(v.x1 / v.x0, 1 / 200) - 1) * 200) : spanX;
+        text = `${fmtHzPrecise(f, spanHz)} Hz   ${db === null ? "—" : fmtDbPrecise(db, v.y1 - v.y0) + " dB"}`;
+      }
       ctx.save();
       ctx.strokeStyle = fg;
       ctx.globalAlpha = 0.35;
       ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.moveTo(Math.round(hv.x) + 0.5, g.top);
-      ctx.lineTo(Math.round(hv.x) + 0.5, g.top + g.h);
+      ctx.moveTo(Math.round(mx) + 0.5, g.top);
+      ctx.lineTo(Math.round(mx) + 0.5, g.top + g.h);
       if (db !== null) {
         const y = Math.round(g.yOf(db)) + 0.5;
         if (y >= g.top && y <= g.top + g.h) {
@@ -233,12 +267,10 @@ export function ZoomPlot(props: ZoomPlotProps) {
         if (y >= g.top && y <= g.top + g.h) {
           ctx.fillStyle = accent;
           ctx.beginPath();
-          ctx.arc(hv.x, y, 3, 0, Math.PI * 2);
+          ctx.arc(mx, y, 3, 0, Math.PI * 2);
           ctx.fill();
         }
       }
-      const spanHz = p.scale === "log" ? Math.max(1e-9, f * (Math.pow(v.x1 / v.x0, 1 / 200) - 1) * 200) : spanX;
-      const text = `${fmtHzPrecise(f, spanHz)} Hz   ${db === null ? "—" : fmtDbPrecise(db, v.y1 - v.y0) + " dB"}`;
       ctx.font = "500 11.5px " + mono;
       const tw = ctx.measureText(text).width;
       const bx = Math.min(g.left + g.w - tw - 12, Math.max(g.left + 4, hv.x + 10));

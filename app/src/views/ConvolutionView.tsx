@@ -1,36 +1,15 @@
-import { useState } from "react";
 import { irName } from "../lib/chain";
 import { fmtDb, fmtInt, fmtMs, fmtRate } from "../lib/format";
 import { combinedTaps } from "../lib/summary";
 import { store, useApp } from "../store/store";
 import { Plus, Power, Trash } from "../components/Icons";
+import { CompareButton } from "../components/StageParts";
+import { StepSlider } from "../components/StepSlider";
+
+const GAIN_RANGE = { min: -24, max: 12, step: 0.5 } as const;
 
 function GainSlider({ value, onCommit, label }: { value: number; onCommit: (v: number) => void; label: string }) {
-  const [draft, setDraft] = useState<number | null>(null);
-  const v = draft ?? value;
-  return (
-    <div className="gain">
-      <input
-        type="range"
-        min={-24}
-        max={12}
-        step={0.5}
-        value={v}
-        aria-label={label}
-        aria-valuetext={`${fmtDb(v)} dB`}
-        onChange={(e) => setDraft(Number(e.target.value))}
-        onPointerUp={() => {
-          if (draft !== null && draft !== value) onCommit(draft);
-          setDraft(null);
-        }}
-        onKeyUp={() => {
-          if (draft !== null && draft !== value) onCommit(draft);
-          setDraft(null);
-        }}
-      />
-      <output>{fmtDb(v)} dB</output>
-    </div>
-  );
+  return <StepSlider className="gain" value={value} label={label} range={GAIN_RANGE} format={(v) => `${fmtDb(v)} dB`} onCommit={onCommit} showValue />;
 }
 
 export function ConvolutionView() {
@@ -47,12 +26,12 @@ export function ConvolutionView() {
       <div className="view-head">
         <h1 id="conv-title">Convolution</h1>
         <div className="spacer" />
+        <CompareButton stage="conv" />
         <button className="btn primary" onClick={() => void st.addImpulseResponse()} disabled={single && list.length >= 1}>
           <Plus />
           Add impulse response
         </button>
       </div>
-      <p className="lede">The engine merges every filter that is on into one, so their order does not change the sound. Mono files apply to both channels; stereo files map left to left and right to right.</p>
       {single && list.length >= 1 && <div className="notice">This engine version runs one impulse response at a time.</div>}
       <div className="panel">
         {list.length === 0 ? (

@@ -16,7 +16,6 @@ depends=(
   alsa-lib
   webkit2gtk-4.1
   gtk3
-  libayatana-appindicator
   dbus
   gcc-libs
   glibc

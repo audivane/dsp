@@ -1,13 +1,23 @@
 //! Integer-ratio upsampler with long Kaiser-sinc kernels, plus offline
 //! arbitrary-ratio resampling (used for impulse responses).
 
+pub use crate::design::paths::standard::{
+    ManualConfig, UpsamplerDesign, design_kernel, design_ratio, try_design_kernel,
+    try_design_kernel_for,
+};
+pub use crate::design::phase::reflect::minimum_phase_contract;
+
 use crate::fft::{RealFftPair, RingFifo, SplitSpectrum, complex_mac_split, complex_mul_split};
-use crate::window::{bessel_i0, kaiser};
+use crate::window::{bessel_i0, kaiser_beta_for_attenuation};
+#[cfg(doc)]
+use audivane_protocol::CutoffMode;
 use audivane_protocol::ipc::{
     RESPONSE_CROSSING_LEVELS_DB, RESPONSE_WINDOW_MAX_POINTS, ResponseCrossing, ResponseWindow,
     ResponseWindowRequest, UpsamplerResponse,
 };
-use audivane_protocol::{CutoffMode, FilterPhase, UpsamplerConfig, resolve_ratio};
+use audivane_protocol::{
+    BandSpec, FilterPhase, FilterPreset, RateRatio, UpsamplerConfig, WindowKind, resolve_rate_ratio,
+};
 use rustfft::num_complex::Complex64;
 use std::f64::consts::PI;
 
@@ -37,12 +47,12 @@ pub fn kaiser_attenuation_db(beta: f64) -> f64 {
 /// Safety factor on Kaiser's half transition width for long filters: the
 /// upper envelope of the measured minimum, plus 0.02.
 ///
-/// The measured minimum (`docs/research/minimum-phase/`, linear phase,
-/// dense peak search, 16k and 64k taps) is a sawtooth in beta between 1.00
-/// and 1.284: Kaiser's `A(beta)` is a straight-line fit to the true sidelobe
-/// level, and each tooth starts where another sidelobe becomes the one that
-/// lands on Nyquist. Above beta 18 the fit overstates the attenuation more and
-/// more, so the teeth rise by ~0.024 per unit of beta. The envelope is
+/// The measured minimum (linear phase,
+/// dense peak search) is a sawtooth in beta between 1.00 and 1.284:
+/// Kaiser's `A(beta)` is a straight-line fit to the true sidelobe level, and
+/// each tooth starts where another sidelobe becomes the one that lands on
+/// Nyquist. The fit overstates the attenuation more and more above beta 18,
+/// so the teeth rise by ~0.024 per unit of beta; the envelope is
 /// `max(1.17, 1.19 + 0.03 (beta - 20))`.
 fn nyquist_stop_k(beta: f64) -> f64 {
     (1.21 + 0.03 * (beta - 20.0)).max(1.19)
@@ -158,18 +168,16 @@ pub fn nyquist_stop_check(taps: usize, ratio: usize, beta: f64) -> Result<f64, N
 /// `k df / 2` below the source Nyquist `f_out / (2 ratio)` gives the relative
 /// shift `y = k X`, `X = ratio (A - 7.95) / (14.36 (N - 1))`. Kaiser's
 /// estimate is empirical, so `k` is calibrated against the actual designs:
-/// [`nyquist_stop_k`] for long filters, and a growth with the shift itself for
+/// `nyquist_stop_k` for long filters, and a growth with the shift itself for
 /// short ones (where the band edges at `+-f_c` start to interact):
 ///
 /// `cutoff = 1 - y (1 + 0.7 y)`, `y = k(beta) X`.
 ///
 /// The 0.7 bounds the measured short-filter excess over the whole feasible
-/// domain (cutoff >= 0.5, taps from the feasibility edge up, ratios 2..=32).
-/// Verified with dense peak searches over the whole range from the source to
-/// the output Nyquist: 9,422 designs, beta 5..=24 in steps of 1/8, ratios 2,
-/// 3, 4, 8, 16, 32, 1x to 100x the minimum length, worst peak 0.150 dB under
-/// `-A` (`docs/research/minimum-phase/`), and the `nyquist_stop_*` tests up
-/// to 4M taps.
+/// domain (cutoff >= 0.5, taps from the feasibility edge up, ratios 2..=32),
+/// verified with dense peak searches over the whole range from the source to
+/// the output Nyquist (worst peak 0.150 dB
+/// under `-A`; the `nyquist_stop_*` tests go up to 4M taps).
 ///
 /// Designs outside the calibrated domain (see [`nyquist_stop_check`]) are
 /// rejected by the daemon; here they clamp to [`NYQUIST_STOP_MIN_CUTOFF`],
@@ -185,111 +193,281 @@ pub fn nyquist_stop_cutoff(taps: usize, ratio: usize, kaiser_beta: f64) -> f64 {
     nyquist_stop_raw(taps, ratio, beta).clamp(NYQUIST_STOP_MIN_CUTOFF, 1.0)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct UpsamplerDesign {
-    pub ratio: usize,
-    /// Kernel length at the output rate.
-    pub taps: usize,
-    pub phase: FilterPhase,
-    pub kaiser_beta: f64,
-    /// Fraction of the input Nyquist.
-    pub cutoff: f64,
-}
+/// Safety factor on the Gaussian window's analytic half transition.
+const GAUSSIAN_HALF_WIDTH_K: f64 = 1.02;
 
-impl UpsamplerDesign {
-    pub fn from_config(cfg: &UpsamplerConfig, ratio: usize) -> Self {
-        let cutoff = match cfg.cutoff_mode {
-            CutoffMode::Fraction => cfg.cutoff,
-            CutoffMode::NyquistStop => nyquist_stop_cutoff(cfg.taps, ratio, cfg.kaiser_beta),
-        };
-        Self {
-            ratio,
-            taps: cfg.taps,
-            phase: cfg.phase,
-            kaiser_beta: cfg.kaiser_beta,
-            cutoff,
-        }
-    }
-}
-
-/// Kernel at the output rate. Passband gain is `ratio` so that zero-stuffing
-/// followed by this filter has unity passband gain. Minimum phase is the
-/// linear-phase design with its zeros outside the unit circle reflected
-/// inside (same length, same magnitude; [`crate::minphase`]).
+/// Distance from the cutoff to where a Gaussian-windowed sinc of `taps`
+/// taps reaches `-a_db` dB (stopband side; the passband side is symmetric),
+/// as a fraction of the source Nyquist.
 ///
-/// Panics when a minimum-phase design fails its checks; the engine and the
-/// response measurement use [`try_design_kernel`].
-pub fn design_kernel(d: &UpsamplerDesign) -> Vec<f64> {
-    try_design_kernel(d).unwrap_or_else(|e| panic!("upsampler kernel: {e}"))
+/// A Gaussian-windowed sinc is the ideal low-pass convolved with a Gaussian
+/// of standard deviation `sigma_f = 1 / (2 pi sigma)` cycles per sample
+/// (`sigma` the window's, in taps), so its transition is
+/// `erfc((f - f_c) / (sqrt 2 sigma_f)) / 2`, which falls to `delta =
+/// 10^{-A/20}` at `f - f_c = sqrt 2 sigma_f erfcinv(2 delta)`. The window's
+/// truncation sits [`crate::window::GAUSSIAN_EDGE_MARGIN_DB`] under `-A`.
+/// Times `GAUSSIAN_HALF_WIDTH_K`.
+pub fn gaussian_half_width(taps: usize, ratio: usize, a_db: f64) -> f64 {
+    let sigma = crate::window::gaussian_sigma(taps.max(2), a_db);
+    let delta = 10.0_f64.powf(-a_db / 20.0);
+    let x_cycles =
+        std::f64::consts::SQRT_2 * crate::window::erfc_inv(2.0 * delta) / (2.0 * PI * sigma);
+    GAUSSIAN_HALF_WIDTH_K * x_cycles * 2.0 * ratio as f64
 }
 
-/// Where [`crate::minphase`] starts checking the absolute stopband error of a
-/// design: Kaiser's stopband edge estimate with 20% slack on the half
-/// transition width, in cycles per output sample.
-pub fn minimum_phase_contract(d: &UpsamplerDesign) -> crate::minphase::Contract {
-    let a = kaiser_attenuation_db(d.kaiser_beta);
-    let half = (a - 7.95).max(0.0) / (28.72 * (d.taps.max(2) - 1) as f64);
-    crate::minphase::Contract {
-        kaiser_beta: d.kaiser_beta,
-        stopband_edge: d.cutoff / (2.0 * d.ratio.max(1) as f64) + 1.2 * half,
+/// Calibrated half transition (fraction of the source Nyquist) of `window`:
+/// the distance from the cutoff to the stopband edge at `-A`, `A =
+/// kaiser_attenuation_db(beta)`, and from the passband edge to the cutoff.
+///
+/// Tukey has no calibrated transition: it uses Kaiser's formula, and the
+/// daemon only accepts it in fraction mode with linear phase.
+pub fn half_transition(window: WindowKind, taps: usize, ratio: usize, beta: f64) -> f64 {
+    match window {
+        WindowKind::Kaiser | WindowKind::Tukey => {
+            let y = nyquist_stop_k(beta) * kaiser_half_width(taps, ratio, beta);
+            y * (1.0 + NYQUIST_STOP_SHORT_GAIN * y)
+        }
+        WindowKind::Gaussian => gaussian_half_width(taps, ratio, kaiser_attenuation_db(beta)),
     }
 }
 
-/// [`design_kernel`], or why the minimum-phase twin could not be made to
-/// its tolerances (the design is then rejected, never approximated).
-pub fn try_design_kernel(
-    d: &UpsamplerDesign,
-) -> Result<Vec<f64>, crate::minphase::MinimumPhaseError> {
-    assert!(d.ratio >= 1, "upsampler ratio must be >= 1");
-    if d.taps == 0 {
-        return Ok(Vec::new());
-    }
-
-    let r = d.ratio as f64;
-    let win = kaiser(d.taps, d.kaiser_beta);
-    let mut h = vec![0.0; d.taps];
-    let center = (d.taps - 1) as f64 / 2.0;
-    let half = d.taps.div_ceil(2);
-
-    for k in 0..half {
-        let t = k as f64 - center;
-        let sinc_val = if t == 0.0 {
-            1.0
-        } else {
-            let arg = PI * d.cutoff * t / r;
-            arg.sin() / arg
-        };
-        let val = win[k] * d.cutoff * sinc_val;
-        h[k] = val;
-        h[d.taps - 1 - k] = val;
-    }
-    // Long kernels: do not keep a second full-length Vec alive through the
-    // cepstral FFT below.
-    drop(win);
-
-    let sum: f64 = h.iter().sum();
-    if sum.abs() > 0.0 {
-        let scale = r / sum;
-        for v in &mut h {
-            *v *= scale;
+/// [`nyquist_stop_cutoff`] for any window (Kaiser: the same function).
+pub fn nyquist_stop_cutoff_for(window: WindowKind, taps: usize, ratio: usize, beta: f64) -> f64 {
+    match window {
+        WindowKind::Kaiser | WindowKind::Tukey => nyquist_stop_cutoff(taps, ratio, beta),
+        WindowKind::Gaussian => {
+            if ratio <= 1 {
+                return 1.0;
+            }
+            let beta = beta.clamp(NYQUIST_STOP_BETA_RANGE.0, NYQUIST_STOP_BETA_RANGE.1);
+            (1.0 - half_transition(window, taps, ratio, beta)).clamp(NYQUIST_STOP_MIN_CUTOFF, 1.0)
         }
     }
+}
 
-    if d.phase == FilterPhase::Minimum && d.taps > 1 {
-        // Same magnitude, zeros reflected inside the unit circle, checked;
-        // see `crate::minphase` for the methods, tolerances and limits.
-        h = crate::minphase::minimum_phase(&h, &minimum_phase_contract(d))?.kernel;
-        let min_sum: f64 = h.iter().sum();
-        if min_sum.abs() > 0.0 {
-            let scale = r / min_sum;
-            for v in &mut h {
-                *v *= scale;
+/// Fewest taps (at least 2) whose half transition fits in `w` (fraction of
+/// the source Nyquist), by doubling and bisection: `half_transition` falls
+/// with the length.
+fn min_taps_for_half_width(window: WindowKind, ratio: usize, beta: f64, w: f64) -> usize {
+    let fits = |taps: usize| half_transition(window, taps, ratio, beta) <= w;
+    if fits(2) {
+        return 2;
+    }
+    let mut hi = 4usize;
+    while !fits(hi) {
+        if hi >= 1 << 40 {
+            return usize::MAX;
+        }
+        hi *= 2;
+    }
+    let mut lo = hi / 2;
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    hi
+}
+
+/// [`nyquist_stop_min_taps`] for any window.
+pub fn nyquist_stop_min_taps_for(window: WindowKind, ratio: usize, beta: f64) -> Option<usize> {
+    if window == WindowKind::Kaiser {
+        return nyquist_stop_min_taps(ratio, beta);
+    }
+    let (lo, hi) = NYQUIST_STOP_BETA_RANGE;
+    if !(lo..=hi).contains(&beta) {
+        return None;
+    }
+    if ratio <= 1 {
+        return Some(1);
+    }
+    Some(min_taps_for_half_width(
+        window,
+        ratio,
+        beta,
+        1.0 - NYQUIST_STOP_MIN_CUTOFF,
+    ))
+}
+
+/// [`nyquist_stop_check`] for any window.
+pub fn nyquist_stop_check_for(
+    window: WindowKind,
+    taps: usize,
+    ratio: usize,
+    beta: f64,
+) -> Result<f64, NyquistStopError> {
+    if window == WindowKind::Kaiser || ratio <= 1 {
+        return nyquist_stop_check(taps, ratio, beta);
+    }
+    let (lo, hi) = NYQUIST_STOP_BETA_RANGE;
+    if !(lo..=hi).contains(&beta) {
+        return Err(NyquistStopError::Beta(beta));
+    }
+    let cutoff = 1.0 - half_transition(window, taps, ratio, beta);
+    if taps < 2 || cutoff < NYQUIST_STOP_MIN_CUTOFF {
+        return Err(NyquistStopError::TooShort {
+            taps,
+            min_taps: nyquist_stop_min_taps_for(window, ratio, beta).unwrap_or(usize::MAX),
+            ratio,
+        });
+    }
+    Ok(cutoff.min(1.0))
+}
+
+/// `20 log10(x)`, floored at -400 dB (also for 0).
+fn lin_to_db_floor(x: f64) -> f64 {
+    if x > 1.0e-20 {
+        20.0 * x.log10()
+    } else {
+        -400.0
+    }
+}
+
+/// Attenuation range of [`CutoffMode::Band`] designs (dB): the Kaiser beta
+/// range over which the transition-width calibration of
+/// [`nyquist_stop_cutoff`] holds ([`NYQUIST_STOP_BETA_RANGE`], 54.1 to
+/// 226.5 dB), rounded inwards.
+pub const BAND_ATTENUATION_RANGE_DB: (f64, f64) = (55.0, 225.0);
+
+/// Smallest passband end of a [`CutoffMode::Band`] design (fraction of the
+/// source Nyquist). Keeps the cutoff inside the calibrated domain (>= 0.5).
+pub const BAND_MIN_PASSBAND_END: f64 = 0.5;
+
+/// Largest stopband start of a [`CutoffMode::Band`] design (fraction of the
+/// source Nyquist). Past 1.0 images of the top of the band leak through.
+pub const BAND_MAX_STOPBAND_START: f64 = 1.5;
+
+/// Why a [`CutoffMode::Band`] specification cannot be designed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BandError {
+    /// An edge is out of range or the passband ends at or after the
+    /// stopband start.
+    Edges {
+        passband_end: f64,
+        stopband_start: f64,
+    },
+    /// Attenuation outside [`BAND_ATTENUATION_RANGE_DB`].
+    Attenuation(f64),
+    Automatic(String),
+    Length,
+}
+
+impl std::fmt::Display for BandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Length => write!(f, "band transition needs an unrepresentable kernel length"),
+            Self::Automatic(reason) => write!(f, "automatic taps: {reason}"),
+            Self::Edges {
+                passband_end,
+                stopband_start,
+            } => write!(
+                f,
+                "band edges need {BAND_MIN_PASSBAND_END} <= passband end ({passband_end}) <= 1 \
+                 and passband end < stopband start ({stopband_start}) <= \
+                 {BAND_MAX_STOPBAND_START} (fractions of the source Nyquist)"
+            ),
+            Self::Attenuation(a) => {
+                let (lo, hi) = BAND_ATTENUATION_RANGE_DB;
+                write!(
+                    f,
+                    "band attenuation must be between {lo} and {hi} dB (got {a})"
+                )
             }
         }
     }
-
-    Ok(h)
 }
+
+/// Taps, Kaiser beta and cutoff of a [`CutoffMode::Band`] design at `ratio`.
+///
+/// Beta comes from the attenuation (Kaiser's formula), the
+/// cutoff sits midway between the edges, and the length is the shortest whose
+/// calibrated half transition `y (1 + 0.7 y)` ([`nyquist_stop_cutoff`]) fits
+/// in half the gap between the edges. A windowed sinc's transition is
+/// symmetric about the cutoff, so the same margin that puts the stopband
+/// edge at or under `-A` dB keeps the passband edge within the same relative
+/// error of 0 dB. The length grows with the ratio, so the kernel lasts the
+/// same time at every ratio.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BandDesign {
+    pub taps: usize,
+    pub kaiser_beta: f64,
+    pub cutoff: f64,
+}
+
+pub fn band_design(spec: &BandSpec, ratio: usize) -> Result<BandDesign, BandError> {
+    band_design_for(WindowKind::Kaiser, spec, ratio)
+}
+
+/// [`band_design`] for any window. The Gaussian window's length comes from
+/// its analytic transition ([`gaussian_half_width`]).
+pub fn band_design_for(
+    window: WindowKind,
+    spec: &BandSpec,
+    ratio: usize,
+) -> Result<BandDesign, BandError> {
+    let (pe, se, a) = (spec.passband_end, spec.stopband_start, spec.attenuation_db);
+    if !(pe.is_finite() && se.is_finite())
+        || pe < BAND_MIN_PASSBAND_END
+        || pe > 1.0
+        || se <= pe
+        || se > BAND_MAX_STOPBAND_START
+    {
+        return Err(BandError::Edges {
+            passband_end: pe,
+            stopband_start: se,
+        });
+    }
+    let (lo, hi) = BAND_ATTENUATION_RANGE_DB;
+    if !(a.is_finite() && (lo..=hi).contains(&a)) {
+        return Err(BandError::Attenuation(a));
+    }
+    let beta = kaiser_beta_for_attenuation(a);
+    let cutoff = 0.5 * (pe + se);
+    if ratio <= 1 {
+        return Ok(BandDesign {
+            taps: 1,
+            kaiser_beta: beta,
+            cutoff,
+        });
+    }
+    let w = 0.5 * (se - pe);
+    if window == WindowKind::Gaussian {
+        return Ok(BandDesign {
+            taps: min_taps_for_half_width(window, ratio, beta, w),
+            kaiser_beta: beta,
+            cutoff,
+        });
+    }
+    // Largest y with y (1 + g y) <= half gap.
+    let g = NYQUIST_STOP_SHORT_GAIN;
+    let y_max = ((1.0 + 4.0 * g * w).sqrt() - 1.0) / (2.0 * g);
+    let fits = |taps: usize| {
+        let y = nyquist_stop_k(beta) * kaiser_half_width(taps, ratio, beta);
+        y * (1.0 + g * y) <= w
+    };
+    let need = nyquist_stop_k(beta) * (ratio as f64) * (kaiser_attenuation_db(beta) - 7.95)
+        / (14.36 * y_max);
+    if !need.is_finite() || need >= (usize::MAX - 1) as f64 {
+        return Err(BandError::Length);
+    }
+    let mut taps = (need.ceil() as usize + 1).max(2);
+    while taps > 2 && fits(taps - 1) {
+        taps -= 1;
+    }
+    while !fits(taps) {
+        taps += 1;
+    }
+    Ok(BandDesign {
+        taps,
+        kaiser_beta: beta,
+        cutoff,
+    })
+}
+
+use crate::design::budget::RATIONAL_SWAP_PIPELINES;
 
 struct UpsamplerChannel {
     in_fifo: RingFifo,
@@ -303,8 +481,10 @@ pub struct Upsampler {
     ratio: usize,
     channels: usize,
     max_block_in: usize,
+    /// Kernel length at the output rate.
     taps: usize,
-    phase: FilterPhase,
+    /// The kernel's own delay in output frames (see `latency_out_frames`).
+    kernel_delay: usize,
     block_in: usize,
     block_latency_out: usize,
     num_parts: usize,
@@ -318,6 +498,9 @@ pub struct Upsampler {
     time_out: Vec<f64>,
     block_out_interleaved: Vec<f64>,
 }
+
+/// Largest integer ratio [`Upsampler`] runs at (44.1 kHz x64 = 2.8224 MHz).
+pub const MAX_UPSAMPLER_RATIO: usize = audivane_protocol::MAX_INTEGER_RATIO as usize;
 
 impl Upsampler {
     /// Panics when the kernel cannot be designed (see [`Upsampler::try_new`]).
@@ -346,8 +529,8 @@ impl Upsampler {
         block_override: Option<usize>,
     ) -> Result<Self, crate::minphase::MinimumPhaseError> {
         assert!(
-            (1..=32).contains(&d.ratio),
-            "upsampler ratio must be in 1..=32, got {}",
+            (1..=MAX_UPSAMPLER_RATIO).contains(&d.ratio),
+            "upsampler ratio must be in 1..={MAX_UPSAMPLER_RATIO}, got {}",
             d.ratio
         );
 
@@ -357,7 +540,7 @@ impl Upsampler {
                 channels,
                 max_block_in,
                 taps: d.taps,
-                phase: d.phase,
+                kernel_delay: 0,
                 block_in: 0,
                 block_latency_out: 0,
                 num_parts: 0,
@@ -371,13 +554,84 @@ impl Upsampler {
             });
         }
 
-        let ratio = d.ratio;
         let kernel = try_design_kernel(d)?;
+        let kernel_delay = crate::design::paths::standard::kernel_delay(&kernel, d.phase);
+        Ok(Self::build_from_kernel(
+            &kernel,
+            d.ratio,
+            kernel_delay,
+            channels,
+            max_block_in,
+            block_override,
+        ))
+    }
+
+    /// Run a ready-made kernel at the output rate (for example a
+    /// [`crate::presets`] recipe). The kernel's passband gain is `ratio`
+    /// (each polyphase branch sums to about 1), so an impulse of amplitude
+    /// `A` comes out as `A * kernel` after the block latency.
+    /// `kernel_delay` is the kernel's own delay in output frames, reported
+    /// by [`Self::latency_out_frames`].
+    pub fn from_kernel(
+        kernel: &[f64],
+        ratio: usize,
+        kernel_delay: usize,
+        channels: usize,
+        max_block_in: usize,
+    ) -> Self {
+        assert!(
+            (1..=MAX_UPSAMPLER_RATIO).contains(&ratio),
+            "upsampler ratio must be in 1..={MAX_UPSAMPLER_RATIO}, got {ratio}"
+        );
+        if ratio == 1 || channels == 0 {
+            let mut up = Self::build(
+                &UpsamplerDesign::linear(ratio, kernel.len(), 14.0, 1.0),
+                channels,
+                max_block_in,
+                None,
+            )
+            .expect("ratio-1 upsampler needs no kernel");
+            up.taps = kernel.len();
+            return up;
+        }
+        Self::build_from_kernel(kernel, ratio, kernel_delay, channels, max_block_in, None)
+    }
+
+    /// [`Self::from_kernel`] with the offline measurement's block size.
+    pub(crate) fn from_kernel_with_block(
+        kernel: &[f64],
+        ratio: usize,
+        kernel_delay: usize,
+        channels: usize,
+        block: usize,
+    ) -> Self {
+        Self::build_from_kernel(kernel, ratio, kernel_delay, channels, block, Some(block))
+    }
+
+    fn build_from_kernel(
+        kernel: &[f64],
+        ratio: usize,
+        kernel_delay: usize,
+        channels: usize,
+        max_block_in: usize,
+        block_override: Option<usize>,
+    ) -> Self {
         let block_in = match block_override {
             Some(block) => block.next_power_of_two().max(2),
             None if max_block_in == 0 => 64,
             None => max_block_in.next_power_of_two().clamp(64, 1024),
         };
+        crate::test_support::record("upsampler", || {
+            crate::test_support::words(
+                &[
+                    ratio as u64,
+                    kernel_delay as u64,
+                    block_in as u64,
+                    kernel.len() as u64,
+                ],
+                kernel,
+            )
+        });
         let fft_len = 2 * block_in;
         let mut fft = RealFftPair::new(fft_len);
         let spec_len = fft.spec_len();
@@ -433,12 +687,12 @@ impl Upsampler {
 
         let acc_branches = (0..ratio).map(|_| SplitSpectrum::new(spec_len)).collect();
 
-        Ok(Self {
+        Self {
             ratio,
             channels,
             max_block_in,
-            taps: d.taps,
-            phase: d.phase,
+            taps: kernel.len(),
+            kernel_delay,
             block_in,
             block_latency_out,
             num_parts,
@@ -449,7 +703,7 @@ impl Upsampler {
             acc_branches,
             time_out: vec![0.0; fft_len],
             block_out_interleaved: vec![0.0; block_latency_out],
-        })
+        }
     }
 
     pub fn ratio(&self) -> usize {
@@ -463,14 +717,32 @@ impl Upsampler {
         self.block_latency_out
     }
 
-    /// Delay in output frames (linear phase: ~taps/2 plus block latency).
+    /// Delay in output frames: the block latency plus the kernel's own
+    /// delay (linear phase: `(taps - 1) / 2`; minimum and intermediate
+    /// phase: the position of the impulse peak).
     pub fn latency_out_frames(&self) -> usize {
         if self.ratio == 1 {
             return 0;
         }
-        match self.phase {
-            FilterPhase::Linear => self.block_latency_out + (self.taps.saturating_sub(1)) / 2,
-            FilterPhase::Minimum => self.block_latency_out,
+        self.block_latency_out + self.kernel_delay
+    }
+
+    /// Kernel length at the output rate (for intermediate phase usually
+    /// longer than the design's `taps`).
+    pub fn kernel_taps(&self) -> usize {
+        self.taps
+    }
+
+    /// Scale the output by `gain` (headroom). Exact: the gain is folded into
+    /// the kernel spectra, so it costs nothing per sample.
+    pub fn scale_output(&mut self, gain: f64) {
+        for part in &mut self.part_branch_ir {
+            for branch in part {
+                for (re, im) in branch.re.iter_mut().zip(branch.im.iter_mut()) {
+                    *re *= gain;
+                    *im *= gain;
+                }
+            }
         }
     }
 
@@ -726,11 +998,59 @@ pub struct MeasuredUpsampler {
     impulse: Vec<f64>,
     /// Divides the raw DFT magnitude so the passband reads 0 dB.
     gain: f64,
+    /// Sample rate of `impulse`: the output rate, or the intermediate grid
+    /// rate for a rational ratio.
+    impulse_rate: u32,
+    /// The plan of the prepared design (none at x1).
+    plan: Option<crate::design::Plan>,
 }
 
 impl MeasuredUpsampler {
+    /// Measured relative amplitude error in protected bands, whose edges
+    /// are fractions of the input Nyquist (of the lower of the two
+    /// Nyquists at a rational ratio, as the design takes them). Uses the
+    /// full engine impulse, on its own grid ([`design_ratio`] impulse
+    /// samples per sample at the lower rate).
+    pub fn protected_band_error(&self, passband_end: f64, stopband_start: f64) -> f64 {
+        let scale = 2.0 * design_ratio(self.response.rate_ratio) as f64;
+        crate::design::auto::protected_error(
+            &self.impulse,
+            self.gain,
+            passband_end / scale,
+            stopband_start / scale,
+        )
+    }
+
     pub fn output_rate(&self) -> u32 {
         self.response.output_rate
+    }
+
+    /// The plan of the design as prepared (an automatic length searched);
+    /// `None` at x1.
+    pub fn plan(&self) -> Option<&crate::design::Plan> {
+        self.plan.as_ref()
+    }
+
+    /// Record the prepared design `p` of `cfg` (its resolved design and
+    /// plan, the bounded-input peak).
+    fn with_prepared(mut self, cfg: &UpsamplerConfig, p: &crate::design::Prepared) -> Self {
+        let based_on = cfg
+            .preset
+            .clone()
+            .or_else(|| cfg.design.as_ref().and_then(|d| d.based_on.clone()));
+        self.response.design = Some(audivane_protocol::StoredDesign {
+            based_on,
+            design: p.design.clone(),
+        });
+        self.response.plan = Some(p.plan.wire(None, Some(p.safety.l1_db)));
+        self.plan = Some(p.plan);
+        self
+    }
+
+    /// Rate the response runs to the Nyquist of: the output rate, or the
+    /// intermediate grid rate (source x `up`) for a rational ratio.
+    pub fn impulse_rate(&self) -> u32 {
+        self.impulse_rate
     }
 
     /// Number of impulse samples kept (for cache accounting).
@@ -741,7 +1061,7 @@ impl MeasuredUpsampler {
     /// Magnitude in dB at each frequency, evaluated directly from the
     /// impulse.
     pub fn magnitude_db_at(&self, freqs: &[f64]) -> Vec<f64> {
-        let rate = f64::from(self.response.output_rate);
+        let rate = f64::from(self.impulse_rate);
         dft_magnitudes(&self.impulse, rate, freqs)
             .into_iter()
             .map(|m| crate::lin_to_db((m / self.gain).max(1.0e-30)))
@@ -787,42 +1107,73 @@ pub fn upsampler_response(
     measure_upsampler(cfg, source_rate).map(|m| m.response)
 }
 
-/// Measure what the engine's own [`Upsampler`] does for `cfg` at
-/// `source_rate`.
+/// Stopband detection threshold (dB) used when measuring a [`FilterPreset`]
+/// (presets do not carry a Kaiser beta).
+const PRESET_STOPBAND_TARGET_DB: f64 = 150.0;
+
+/// Measure what the engine's own [`Upsampler`] (or a [`FilterPreset`] runtime)
+/// does for `cfg` at `source_rate`.
 ///
-/// A full-scale unit impulse is pushed through a real `Upsampler`; only the
-/// actual impulse tail (kernel length at the output rate plus the block
-/// latency) is clocked through and FFTed. The transform is sized to the next
-/// power of two at or above that length, so zero padding is at most 2x. The
-/// FFT gives the stats and brackets the threshold crossings; the plotted
-/// points and the crossings themselves are evaluated directly from the
-/// impulse, so a zoom window agrees with them exactly. Ratio 1 is reported as
-/// flat without building a filter.
+/// A full-scale unit impulse is pushed through the runtime; only the actual
+/// impulse tail (`impulse_span_out_frames` for presets, or kernel length at the
+/// output rate plus block latency for manual designs) is clocked through and
+/// FFTed. The transform is sized to the next power of two at or above that
+/// length, so zero padding is at most 2x. The FFT gives the stats and brackets
+/// the threshold crossings; the plotted points and the crossings themselves
+/// are evaluated directly from the impulse, so a zoom window agrees with them
+/// exactly. Ratio 1 is reported as flat without building a filter.
 ///
-/// Returns an error when the sizes do not fit in `usize` (the control plane
-/// validates the config before calling this).
+/// For presets, `taps` reports the measured non-zero impulse span,
+/// `stopband_start_hz` uses a fixed `-150 dB` target (`PRESET_STOPBAND_TARGET_DB`)
+/// in place of a Kaiser beta, and `filter_window` / `effective_cutoff` /
+/// `effective_kaiser_beta` carry neutral placeholders (`Kaiser` / `1.0` / `0.0`).
+/// Time-varying block FFT presets (`block_fft*`) give the response for one
+/// block position (an impulse at the start of a block).
+///
+/// Returns an error when the sizes do not fit in `usize` or the preset cannot
+/// be built (the control plane validates the config before calling this).
 pub fn measure_upsampler(
     cfg: &UpsamplerConfig,
     source_rate: u32,
 ) -> Result<MeasuredUpsampler, String> {
     let source_rate = source_rate.max(1);
-    let ratio = resolve_ratio(cfg.target, source_rate).max(1);
+    let rate_ratio = resolve_rate_ratio(cfg.target, source_rate);
+    if !rate_ratio.is_integer() {
+        return measure_rational(cfg, source_rate, rate_ratio);
+    }
+    let ratio = rate_ratio.up;
     let output_rate = source_rate
         .checked_mul(ratio)
         .ok_or_else(|| format!("output rate for {source_rate} Hz x{ratio} overflows"))?;
-    let nyquist_in = f64::from(source_rate) / 2.0;
-    let nyquist_out = f64::from(output_rate) / 2.0;
+
+    let named = crate::design::Named::of(cfg).map_err(|e| e.to_string())?;
+    let standard_manual = if named.preset.is_none()
+        && let crate::design::FilterDesign::Kernel(k) = &named.design
+        && k.numerics.path == crate::design::ArithmeticPath::Standard
+    {
+        crate::design::paths::standard::legacy_config(k, source_rate).ok()
+    } else {
+        None
+    };
 
     if ratio == 1 {
         let freqs = response_freqs(source_rate, output_rate);
+        let (taps, filter_window, effective_kaiser_beta) = match &standard_manual {
+            Some(m) => (m.taps, m.window, m.kaiser_beta),
+            None => (0, WindowKind::default(), 0.0),
+        };
         return Ok(MeasuredUpsampler {
             response: UpsamplerResponse {
                 source_rate,
                 output_rate,
                 ratio,
-                taps: cfg.taps,
-                phase: cfg.phase,
+                rate_ratio: RateRatio::ONE,
+                taps,
+                phase: named.design.filter_phase(),
+                filter_window,
                 effective_cutoff: 1.0,
+                effective_kaiser_beta,
+                sample_leak_db: -400.0,
                 magnitude_db: vec![0.0; freqs.len()],
                 freqs_hz: freqs,
                 impulse: vec![1.0],
@@ -835,53 +1186,178 @@ pub fn measure_upsampler(
                 latency_samples: 0,
                 crossings: Vec::new(),
                 window: None,
+                preset: named.preset,
+                design: None,
+                plan: None,
             },
             impulse: vec![1.0],
             gain: 1.0,
+            impulse_rate: output_rate,
+            plan: None,
         });
     }
 
-    let design = UpsamplerDesign::from_config(cfg, ratio as usize);
+    let Some(manual) = standard_manual else {
+        const PRESET_MEASUREMENT_BLOCK: usize = 1024;
+        let cx = crate::design::BuildContext {
+            source_rate,
+            ratio: rate_ratio,
+            channels: 1,
+            max_block: PRESET_MEASUREMENT_BLOCK,
+            pipelines: RATIONAL_SWAP_PIPELINES,
+            output: audivane_protocol::OutputConfig::default(),
+            workspace: crate::design::budget::design_workspace(),
+        };
+        let prepared = crate::design::upsampler::prepare(&named, &cx).map_err(|e| e.to_string())?;
+        let mut rt = crate::design::build(&prepared, &cx, 0.0)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("no upsampler at {rate_ratio}"))?;
+        let latency_samples = rt.latency_out_frames();
+        let impulse_len = rt.impulse_span_out_frames().max(1);
+        let (output, output_len, n_fft) = clock_impulse(
+            &mut *rt,
+            ratio as usize,
+            PRESET_MEASUREMENT_BLOCK,
+            impulse_len,
+        )?;
+        drop(rt);
+
+        let phase = named.design.filter_phase();
+        return Ok(analyze_measured_impulse(
+            output,
+            output_len,
+            n_fft,
+            MeasuredMeta {
+                source_rate,
+                output_rate,
+                ratio,
+                taps_override: None,
+                phase,
+                filter_window: WindowKind::default(),
+                effective_cutoff: 1.0,
+                effective_kaiser_beta: 0.0,
+                target_atten_db: PRESET_STOPBAND_TARGET_DB,
+                latency_samples,
+                preset: named.preset,
+            },
+        )
+        .with_prepared(cfg, &prepared));
+    };
+
+    // The kernel as the engine prepares it at this very ratio (the source
+    // rate here need not be one validation saw): the length, workspace
+    // and ratio rules, and the safety gate.
+    let cx = crate::design::BuildContext {
+        source_rate,
+        ratio: rate_ratio,
+        channels: 1,
+        max_block: 1024,
+        pipelines: RATIONAL_SWAP_PIPELINES,
+        output: audivane_protocol::OutputConfig::default(),
+        workspace: crate::design::budget::design_workspace(),
+    };
+    let prepared = crate::design::upsampler::prepare(&named, &cx).map_err(|e| e.to_string())?;
+    let kernel = prepared
+        .kernel
+        .clone()
+        .ok_or_else(|| "the design was not prepared".to_string())?;
+    // The resolved design (an automatic length is cached): its metadata
+    // and the offline partition block.
+    let design =
+        UpsamplerDesign::try_from_config(&manual, ratio as usize).map_err(|e| e.to_string())?;
     let block_in = measurement_block(design.taps, ratio as usize);
     let mut up =
-        Upsampler::build(&design, 1, block_in, Some(block_in)).map_err(|e| e.to_string())?;
+        Upsampler::from_kernel_with_block(&kernel.taps, ratio as usize, kernel.delay, 1, block_in);
     let block_latency = up.block_latency_out_frames();
     let latency_samples = up.latency_out_frames();
 
     // The response is the kernel tail (`taps` output frames) shifted by the
     // upsampler's block latency. Anything after that is exactly zero, so there
     // is no need to push a fixed multiple of the kernel through.
-    let impulse_len = design
-        .taps
+    let kernel_taps = up.kernel_taps();
+    let impulse_len = kernel_taps
         .checked_add(block_latency)
-        .ok_or_else(|| format!("{} taps is too large", design.taps))?;
-    let total_in = impulse_len.div_ceil(ratio as usize);
+        .ok_or_else(|| format!("{kernel_taps} taps is too large"))?;
+    let (output, output_len, n_fft) =
+        clock_impulse(&mut up, ratio as usize, block_in, impulse_len)?;
+    // Free the partitioned convolver before the response FFT: that is where
+    // most of the remaining peak memory would otherwise overlap.
+    drop(up);
+
+    let target_atten_db = kaiser_attenuation_db(design.kaiser_beta).clamp(40.0, 230.0);
+    Ok(analyze_measured_impulse(
+        output,
+        output_len,
+        n_fft,
+        MeasuredMeta {
+            source_rate,
+            output_rate,
+            ratio,
+            taps_override: Some(kernel_taps),
+            phase: design.phase,
+            filter_window: design.window,
+            effective_cutoff: design.cutoff,
+            effective_kaiser_beta: design.kaiser_beta,
+            target_atten_db,
+            latency_samples,
+            preset: None,
+        },
+    )
+    .with_prepared(cfg, &prepared))
+}
+
+fn clock_impulse(
+    rt: &mut dyn crate::presets::UpsamplerRuntime,
+    ratio: usize,
+    block_in: usize,
+    impulse_len: usize,
+) -> Result<(Vec<f64>, usize, usize), String> {
+    let total_in = impulse_len.div_ceil(ratio).max(1);
     let output_len = total_in
-        .checked_mul(ratio as usize)
-        .ok_or_else(|| format!("{} output frames is too large", total_in))?;
+        .checked_mul(ratio)
+        .ok_or_else(|| format!("{total_in} output frames is too large"))?;
     let n_fft = response_fft_len(impulse_len)?;
 
     let mut input = vec![0.0; total_in];
     input[0] = 1.0;
     let mut output = vec![0.0; output_len];
-    let mut block_out = vec![0.0; block_in * ratio as usize];
+    let mut block_out = vec![0.0; block_in * ratio];
     let mut offset = 0;
     while offset < total_in {
         let take = (total_in - offset).min(block_in);
-        let out_len = take * ratio as usize;
-        up.process(
+        let out_len = take * ratio;
+        rt.process(
             &[&input[offset..offset + take]],
             &mut [&mut block_out[..out_len]],
         );
-        output[offset * ratio as usize..(offset + take) * ratio as usize]
-            .copy_from_slice(&block_out[..out_len]);
+        output[offset * ratio..(offset + take) * ratio].copy_from_slice(&block_out[..out_len]);
         offset += take;
     }
-    // Free the partitioned convolver before the response FFT: that is where
-    // most of the remaining peak memory would otherwise overlap.
-    drop(up);
-    drop(input);
-    drop(block_out);
+    Ok((output, output_len, n_fft))
+}
+
+struct MeasuredMeta {
+    source_rate: u32,
+    output_rate: u32,
+    ratio: u32,
+    taps_override: Option<usize>,
+    phase: FilterPhase,
+    filter_window: WindowKind,
+    effective_cutoff: f64,
+    effective_kaiser_beta: f64,
+    target_atten_db: f64,
+    latency_samples: usize,
+    preset: Option<FilterPreset>,
+}
+
+fn analyze_measured_impulse(
+    mut output: Vec<f64>,
+    output_len: usize,
+    n_fft: usize,
+    meta: MeasuredMeta,
+) -> MeasuredUpsampler {
+    let nyquist_in = f64::from(meta.source_rate) / 2.0;
+    let nyquist_out = f64::from(meta.output_rate) / 2.0;
 
     let peak_index = output
         .iter()
@@ -902,6 +1378,23 @@ pub fn measure_upsampler(
     impulse_end = (impulse_start + 256).min(output.len());
     let impulse = output[impulse_start..impulse_end].to_vec();
     let impulse_peak = peak_index - impulse_start;
+    let sample_leak_db = {
+        let top = output[peak_index].abs();
+        let r = meta.ratio as usize;
+        let mut leak = 0.0_f64;
+        let mut i = peak_index % r;
+        while i < output.len() {
+            if i != peak_index {
+                leak = leak.max(output[i].abs());
+            }
+            i += r;
+        }
+        if top > 0.0 {
+            lin_to_db_floor(leak / top)
+        } else {
+            0.0
+        }
+    };
 
     let mut fft = RealFftPair::new(n_fft);
     let mut spec = vec![Complex64::new(0.0, 0.0); fft.spec_len()];
@@ -913,7 +1406,7 @@ pub fn measure_upsampler(
     drop(fft);
     // The kernel sums to the ratio (zero-stuffing divides the spectrum by the
     // ratio), so passband gain is unity after this normalisation.
-    let gain = ratio as f64;
+    let gain = meta.ratio as f64;
     let inv_ratio = 1.0 / gain;
     let mag: Vec<f64> = spec.iter().map(|c| c.norm() * inv_ratio).collect();
     // Record bins where the phase of a linear-phase centered spectrum flips
@@ -921,9 +1414,9 @@ pub fn measure_upsampler(
     // two FFT samples that are both above a deep threshold.
     let rot = Complex64::from_polar(1.0, -2.0 * PI * peak_index as f64 / n_fft as f64);
     let max_bin = n_fft / 2;
-    let bin_hz = f64::from(output_rate) / n_fft as f64;
+    let bin_hz = f64::from(meta.output_rate) / n_fft as f64;
     let mut phase_flip = vec![0u64; max_bin.div_ceil(64)];
-    if design.phase == FilterPhase::Linear {
+    if meta.phase == FilterPhase::Linear {
         for k in 0..max_bin {
             if mag[k] < 0.5 && mag[k + 1] < 0.5 {
                 let prod = spec[k] * spec[k + 1].conj() * rot;
@@ -946,11 +1439,12 @@ pub fn measure_upsampler(
     output.drain(..first);
     output.shrink_to_fit();
     let kept = output;
+    let taps = meta.taps_override.unwrap_or(kept.len());
 
     // The FFT grid is at or below 0.5 samples per impulse length, so linear
     // interpolation between bins resolves the stats grid below.
     let magnitude_at = |f: f64| -> f64 {
-        let x = (f / f64::from(output_rate) * n_fft as f64).clamp(0.0, max_bin as f64);
+        let x = (f / f64::from(meta.output_rate) * n_fft as f64).clamp(0.0, max_bin as f64);
         let k = x.floor() as usize;
         let frac = x - k as f64;
         let k2 = (k + 1).min(max_bin);
@@ -992,13 +1486,20 @@ pub fn measure_upsampler(
     // Nyquist, i.e. all points at or after it stay at or below -attenuation.
     // Both come from certified bounds on the continuous response, not from
     // grid samples (see `stopband_summary`).
-    let target_atten_db = kaiser_attenuation_db(design.kaiser_beta).clamp(40.0, 230.0);
-    let rate = f64::from(output_rate);
-    let summary = stopband_summary(&kept, rate, gain, n_fft, &mag, nyquist_in, target_atten_db);
+    let rate = f64::from(meta.output_rate);
+    let summary = stopband_summary(
+        &kept,
+        rate,
+        gain,
+        n_fft,
+        &mag,
+        nyquist_in,
+        meta.target_atten_db,
+    );
     let stopband_start_hz = summary.start_hz;
 
     // The plotted points, evaluated directly from the impulse.
-    let freqs_hz = response_freqs(source_rate, output_rate);
+    let freqs_hz = response_freqs(meta.source_rate, meta.output_rate);
     let magnitude_db: Vec<f64> = dft_magnitudes(&kept, rate, &freqs_hz)
         .into_iter()
         .map(|m| crate::lin_to_db((m / gain).max(1.0e-30)))
@@ -1020,7 +1521,14 @@ pub fn measure_upsampler(
     let active_levels: Vec<f64> = RESPONSE_CROSSING_LEVELS_DB
         .iter()
         .copied()
-        .filter(|&level| level >= -(stopband_atten_db - CROSSING_STOPBAND_MARGIN_DB))
+        // The -0.1 and -3 dB points are always reported: a shallow
+        // stopband (e.g. a block FFT preset judged against the fixed preset
+        // target) must not hide them.
+        .filter(|&level| {
+            level == -0.1
+                || level == -3.0
+                || level >= -(stopband_atten_db - CROSSING_STOPBAND_MARGIN_DB)
+        })
         .collect();
     let crossings =
         find_earliest_crossings(&kept, rate, gain, &mag, &phase_flip, bin_hz, &active_levels);
@@ -1035,14 +1543,18 @@ pub fn measure_upsampler(
     let minus_0_1_db_hz = crossing_at(-0.1);
     let minus_3_db_hz = crossing_at(-3.0);
 
-    Ok(MeasuredUpsampler {
+    MeasuredUpsampler {
         response: UpsamplerResponse {
-            source_rate,
-            output_rate,
-            ratio,
-            taps: design.taps,
-            phase: design.phase,
-            effective_cutoff: design.cutoff,
+            source_rate: meta.source_rate,
+            output_rate: meta.output_rate,
+            ratio: meta.ratio,
+            rate_ratio: RateRatio::integer(meta.ratio),
+            taps,
+            phase: meta.phase,
+            filter_window: meta.filter_window,
+            effective_cutoff: meta.effective_cutoff,
+            effective_kaiser_beta: meta.effective_kaiser_beta,
+            sample_leak_db,
             freqs_hz,
             magnitude_db,
             impulse,
@@ -1052,13 +1564,133 @@ pub fn measure_upsampler(
             minus_3_db_hz,
             stopband_start_hz,
             stopband_atten_db,
-            latency_samples,
+            latency_samples: meta.latency_samples,
             crossings,
             window: None,
+            preset: meta.preset,
+            design: None,
+            plan: None,
         },
         impulse: kept,
         gain,
-    })
+        impulse_rate: meta.output_rate,
+        plan: None,
+    }
+}
+
+/// [`measure_upsampler`] for a rational ratio: the response of the kernel on
+/// the intermediate grid (rate `source x up`), which every output phase
+/// samples. The band edge is the lower Nyquist; the stopband runs to the
+/// grid's Nyquist, because everything there is folded into the output band
+/// by the decimation. The latency is the kernel delay in output frames.
+fn measure_rational(
+    cfg: &UpsamplerConfig,
+    source_rate: u32,
+    ratio: RateRatio,
+) -> Result<MeasuredUpsampler, String> {
+    let output_rate = ratio
+        .output_rate(source_rate)
+        .ok_or_else(|| format!("{source_rate} Hz x {ratio} is not a whole output rate"))?;
+    let grid_rate = source_rate
+        .checked_mul(ratio.up)
+        .ok_or_else(|| format!("the {ratio} grid rate from {source_rate} Hz overflows"))?;
+    let band_rate = source_rate.min(output_rate);
+    let up = ratio.up;
+
+    struct Built {
+        kernel: Vec<f64>,
+        delay: f64,
+        phase: FilterPhase,
+        window: WindowKind,
+        cutoff: f64,
+        beta: f64,
+        target_db: f64,
+        taps: Option<usize>,
+    }
+    let named = crate::design::Named::of(cfg).map_err(|e| e.to_string())?;
+    let standard_manual = if named.preset.is_none()
+        && let crate::design::FilterDesign::Kernel(k) = &named.design
+        && k.numerics.path == crate::design::ArithmeticPath::Standard
+    {
+        crate::design::paths::standard::legacy_config(k, source_rate).ok()
+    } else {
+        None
+    };
+    let cx = crate::design::BuildContext {
+        source_rate,
+        ratio,
+        channels: 1,
+        max_block: 1024,
+        pipelines: 1,
+        output: audivane_protocol::OutputConfig::default(),
+        workspace: crate::design::budget::design_workspace(),
+    };
+    let prepared = crate::design::upsampler::prepare(&named, &cx).map_err(|e| e.to_string())?;
+    let b = if let Some(manual) = standard_manual {
+        let k = prepared
+            .kernel
+            .clone()
+            .ok_or_else(|| "the design was not prepared".to_string())?;
+        let design = UpsamplerDesign::try_for_ratio(&manual, ratio).map_err(|e| e.to_string())?;
+        let (kernel, delay) = (k.taps, k.delay_exact);
+        let taps = kernel.len();
+        Built {
+            kernel,
+            delay,
+            phase: design.phase,
+            window: design.window,
+            cutoff: design.cutoff,
+            beta: design.kaiser_beta,
+            target_db: kaiser_attenuation_db(design.kaiser_beta).clamp(40.0, 230.0),
+            taps: Some(taps),
+        }
+    } else {
+        let phase = named.design.filter_phase();
+        let k = prepared
+            .kernel
+            .clone()
+            .ok_or_else(|| "the design has no single kernel".to_string())?;
+        Built {
+            kernel: k.taps,
+            delay: k.delay as f64,
+            phase,
+            window: WindowKind::default(),
+            cutoff: 1.0,
+            beta: 0.0,
+            target_db: PRESET_STOPBAND_TARGET_DB,
+            taps: None,
+        }
+    };
+    let len = b.kernel.len().max(1);
+    let n_fft = response_fft_len(len)?;
+    let mut m = analyze_measured_impulse(
+        b.kernel,
+        len,
+        n_fft,
+        MeasuredMeta {
+            source_rate: band_rate,
+            output_rate: grid_rate,
+            ratio: up,
+            taps_override: b.taps,
+            phase: b.phase,
+            filter_window: b.window,
+            effective_cutoff: b.cutoff,
+            effective_kaiser_beta: b.beta,
+            target_atten_db: b.target_db,
+            latency_samples: (b.delay / f64::from(ratio.down) + 0.5).floor() as usize,
+            preset: named.preset,
+        },
+    );
+    m.response.source_rate = source_rate;
+    m.response.output_rate = output_rate;
+    m.response.ratio = 0;
+    m.response.rate_ratio = ratio;
+    if up == 1 {
+        // Decimation: the output keeps no input instants, so a leak at them
+        // means nothing.
+        m.response.sample_leak_db = 0.0;
+    }
+    Ok(m.with_prepared(cfg, &prepared))
 }
 
 /// The stopband part of the response summary: where it starts and an upper
@@ -1330,8 +1962,8 @@ impl TaylorBound {
 /// for the target attenuation `target_db`.
 ///
 /// Sampled maxima of an FFT miss lobes narrower than a bin (the first lobe
-/// after a Kaiser transition can be: `docs/research/scientific-review-2/`),
-/// so every point of the band gets a bound instead:
+/// after a Kaiser transition can be), so every point of the band gets a
+/// bound instead:
 ///
 /// 1. Every bin's interval (one bin wide, centred on the bin) gets the
 ///    Taylor bound `sum_{j<p} |Hc^(j)(f_k)| r^j / j! + (M r / 2)^p / p!
@@ -1344,11 +1976,10 @@ impl TaylorBound {
 /// The truncation terms stay [`STOPBAND_START_FLOOR_DB`] under the target for
 /// the start and [`STOPBAND_BOUND_FLOOR_DB`] under the peak found for the
 /// peak, but not below 20 dB under the evaluation floor `u sqrt(M) |h|_2`
-/// (the rms f64 rounding of one M-term sum: -265 dB re the passband at 4M
-/// taps, -300 dB at 1k). So the returned peak is an upper bound on the
-/// continuous response from the start to the output Nyquist, and above its
-/// true value by at most `STOPBAND_PEAK_TOLERANCE_DB` + 0.002 dB, or by the
-/// evaluation floor (absolute), whichever is larger. That is exact
+/// (the rms f64 rounding of one M-term sum). So the returned peak is an upper
+/// bound on the continuous response from the start to the output Nyquist, and
+/// above its true value by at most `STOPBAND_PEAK_TOLERANCE_DB` + 0.002 dB,
+/// or by the evaluation floor (absolute), whichever is larger. That is exact
 /// arithmetic; the f64 rounding of the evaluations comes on top. The start
 /// is the end of the last cell whose bound exceeds the target (or of the
 /// last sample above it).
@@ -1971,7 +2602,30 @@ pub fn resample_offline(x: &[f64], from_hz: u32, to_hz: u32) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn upsampler_response(
+        cfg: &ManualConfig,
+        source_rate: u32,
+    ) -> Result<UpsamplerResponse, String> {
+        let up = cfg
+            .clone()
+            .into_upsampler_config()
+            .map_err(|e| e.to_string())?;
+        super::upsampler_response(&up, source_rate)
+    }
+
+    fn measure_upsampler(
+        cfg: &ManualConfig,
+        source_rate: u32,
+    ) -> Result<MeasuredUpsampler, String> {
+        let up = cfg
+            .clone()
+            .into_upsampler_config()
+            .map_err(|e| e.to_string())?;
+        super::measure_upsampler(&up, source_rate)
+    }
     use crate::lin_to_db;
+    use audivane_protocol::CutoffMode;
     use std::f64::consts::FRAC_PI_2;
 
     fn lcg(seed: &mut u64) -> f64 {
@@ -2015,6 +2669,10 @@ mod tests {
             phase: FilterPhase::Linear,
             kaiser_beta: 14.0,
             cutoff: 1.0,
+            phase_mix: 1.0,
+            preserve_samples: false,
+            window: audivane_protocol::WindowKind::Kaiser,
+            taper: 0.25,
         };
         let h = design_kernel(&d);
         assert_eq!(h.len(), 1025);
@@ -2177,6 +2835,10 @@ mod tests {
             phase,
             kaiser_beta: beta,
             cutoff,
+            phase_mix: 1.0,
+            preserve_samples: false,
+            window: audivane_protocol::WindowKind::Kaiser,
+            taper: 0.25,
         })
     }
 
@@ -2195,6 +2857,10 @@ mod tests {
             phase: FilterPhase::Linear,
             kaiser_beta: beta,
             cutoff,
+            phase_mix: 1.0,
+            preserve_samples: false,
+            window: audivane_protocol::WindowKind::Kaiser,
+            taper: 0.25,
         };
         let lin = design_kernel(&d);
         let report = crate::minphase::minimum_phase(&lin, &minimum_phase_contract(&d))
@@ -2325,6 +2991,10 @@ mod tests {
             phase: FilterPhase::Linear,
             kaiser_beta: beta,
             cutoff,
+            phase_mix: 1.0,
+            preserve_samples: false,
+            window: audivane_protocol::WindowKind::Kaiser,
+            taper: 0.25,
         };
         let what = format!("N={taps} x{ratio} beta={beta} cutoff={cutoff}");
         let lin = design_kernel(&d);
@@ -2368,9 +3038,9 @@ mod tests {
 
     #[test]
     fn minimum_phase_review_counterexamples() {
-        // docs/research/scientific-review-2: the scaled cepstrum left the
-        // 15-tap pair at |z| = 1.035 outside and reported success; the other
-        // two silently fell back and missed the magnitude tolerances.
+        // The scaled cepstrum left the 15-tap pair at |z| = 1.035 outside
+        // and reported success; the other two silently fell back and missed
+        // the magnitude tolerances.
         let cases = [
             (16usize, 15usize, 14.0_f64, 1.0_f64),
             (2, 36, 20.0, 1.0),
@@ -2387,7 +3057,7 @@ mod tests {
             .into_iter()
             .filter(|z| (z.norm() - 1.034_996_6).abs() < 1e-6)
             .count();
-        assert_eq!(outside, 2, "the review's conjugate pair at 1.035");
+        assert_eq!(outside, 2, "the conjugate pair at 1.035");
         let min = design(16, 15, FilterPhase::Minimum, 14.0, 1.0);
         let worst = crate::minphase::zeros(&min)
             .unwrap()
@@ -2470,6 +3140,10 @@ mod tests {
                             phase: FilterPhase::Linear,
                             kaiser_beta: beta,
                             cutoff,
+                            phase_mix: 1.0,
+                            preserve_samples: false,
+                            window: audivane_protocol::WindowKind::Kaiser,
+                            taper: 0.25,
                         };
                         let lin = design_kernel(&d);
                         let min = try_design_kernel(&UpsamplerDesign {
@@ -2529,6 +3203,10 @@ mod tests {
                 phase: FilterPhase::Minimum,
                 kaiser_beta: 40.0,
                 cutoff: 1.0,
+                phase_mix: 1.0,
+                preserve_samples: false,
+                window: audivane_protocol::WindowKind::Kaiser,
+                taper: 0.25,
             };
             let err = try_design_kernel(&d).unwrap_err();
             assert!(
@@ -2537,13 +3215,14 @@ mod tests {
                 "{taps}: {err}"
             );
             assert!(Upsampler::try_new(&d, 2, 256).is_err());
-            let cfg = UpsamplerConfig {
+            let cfg = ManualConfig {
                 target: audivane_protocol::RateTarget::Ratio(4),
                 taps,
                 phase: FilterPhase::Minimum,
                 kaiser_beta: 40.0,
                 cutoff: 1.0,
                 cutoff_mode: CutoffMode::Fraction,
+                ..Default::default()
             };
             let msg = measure_upsampler(&cfg, 48_000).unwrap_err();
             assert!(msg.contains("minimum-phase"), "{msg}");
@@ -2567,6 +3246,10 @@ mod tests {
                             phase: FilterPhase::Linear,
                             kaiser_beta: beta,
                             cutoff,
+                            phase_mix: 1.0,
+                            preserve_samples: false,
+                            window: audivane_protocol::WindowKind::Kaiser,
+                            taper: 0.25,
                         };
                         let started = Instant::now();
                         let lin = design_kernel(&d);
@@ -2610,6 +3293,10 @@ mod tests {
             phase: FilterPhase::Linear,
             kaiser_beta: 14.0,
             cutoff: 1.0,
+            phase_mix: 1.0,
+            preserve_samples: false,
+            window: audivane_protocol::WindowKind::Kaiser,
+            taper: 0.25,
         };
         let mut up = Upsampler::new(&d, 2, 128);
         assert_eq!(up.ratio(), 1);
@@ -2647,10 +3334,10 @@ mod tests {
 
     #[test]
     fn upsampler_long_kernels_match_fft_reference() {
-        // Polyphase branches longer than 65536 taps (the size where the
-        // convolver's tail schedule used to go wrong), up to a 1.1M-tap
-        // kernel at 16x. The upsampler is uniformly partitioned, so every
-        // partition must land exactly `p * block_in` input frames late.
+        // Polyphase branches longer than 65536 taps (where the convolver's
+        // tail schedule has to be right), up to a 1.1M-tap kernel at 16x. The
+        // upsampler is uniformly partitioned, so every partition must land
+        // exactly `p * block_in` input frames late.
         for (ratio, taps, max_block, frames) in [
             (2usize, 140_001usize, 1000usize, 75_000usize),
             (16, 1_100_000, 512, 72_000),
@@ -2661,6 +3348,10 @@ mod tests {
                 phase: FilterPhase::Linear,
                 kaiser_beta: 12.0,
                 cutoff: 0.95,
+                phase_mix: 1.0,
+                preserve_samples: false,
+                window: audivane_protocol::WindowKind::Kaiser,
+                taper: 0.25,
             };
             let kernel = design_kernel(&d);
             assert!(kernel.len().div_ceil(ratio) > 65_536);
@@ -2712,13 +3403,21 @@ mod tests {
                 phase,
                 kaiser_beta: 12.0,
                 cutoff: 0.95,
+                phase_mix: 1.0,
+                preserve_samples: false,
+                window: audivane_protocol::WindowKind::Kaiser,
+                taper: 0.25,
             };
             let kernel = design_kernel(&d);
             let mut up = Upsampler::new(&d, 2, max_block);
             let block_lat = up.block_latency_out_frames();
+            let peak = kernel
+                .iter()
+                .enumerate()
+                .fold(0, |b, (i, v)| if v.abs() > kernel[b].abs() { i } else { b });
             let expected_lat = match phase {
                 FilterPhase::Linear => block_lat + (taps - 1) / 2,
-                FilterPhase::Minimum => block_lat,
+                FilterPhase::Minimum | FilterPhase::Intermediate => block_lat + peak,
             };
             assert_eq!(up.latency_out_frames(), expected_lat);
 
@@ -2795,6 +3494,10 @@ mod tests {
             phase: FilterPhase::Linear,
             kaiser_beta: 14.0,
             cutoff: 1.0,
+            phase_mix: 1.0,
+            preserve_samples: false,
+            window: audivane_protocol::WindowKind::Kaiser,
+            taper: 0.25,
         };
         let mut up = Upsampler::new(&d, 1, 512);
         let fs_in = 44_100.0;
@@ -2836,14 +3539,15 @@ mod tests {
         );
     }
 
-    fn response_config(ratio: u32, taps: usize, phase: FilterPhase) -> UpsamplerConfig {
-        UpsamplerConfig {
+    fn response_config(ratio: u32, taps: usize, phase: FilterPhase) -> ManualConfig {
+        ManualConfig {
             target: audivane_protocol::RateTarget::Ratio(ratio),
             taps,
             phase,
             kaiser_beta: 14.0,
             cutoff: 1.0,
             cutoff_mode: CutoffMode::Fraction,
+            ..Default::default()
         }
     }
 
@@ -2946,13 +3650,14 @@ mod tests {
             (4, 16_385, FilterPhase::Linear, 14.0),
             (2, 4_097, FilterPhase::Minimum, 8.0),
         ] {
-            let cfg = UpsamplerConfig {
+            let cfg = ManualConfig {
                 target: audivane_protocol::RateTarget::Ratio(ratio),
                 taps,
                 phase,
                 kaiser_beta: beta,
                 cutoff: 1.0,
                 cutoff_mode: CutoffMode::NyquistStop,
+                ..Default::default()
             };
             let m = measure_upsampler(&cfg, 48_000).expect("measure");
             let rate = f64::from(m.output_rate());
@@ -2972,7 +3677,7 @@ mod tests {
     /// dense search from the reported start: never optimistic, and at most
     /// `slack_db` pessimistic. Returns (reported, dense) peak in dB.
     fn assert_stopband_summary_bounds(
-        cfg: &UpsamplerConfig,
+        cfg: &ManualConfig,
         source: u32,
         slack_db: f64,
     ) -> (f64, f64) {
@@ -2998,18 +3703,19 @@ mod tests {
 
     #[test]
     fn stopband_summary_finds_the_lobe_between_bins() {
-        // docs/research/scientific-review-2: at 48 kHz, x3, the first lobe
-        // after the transition (peak -92.748 dB at 24134.27 Hz, above the
-        // -92.920 dB target) fell between two FFT bins that were not local
-        // maxima. The summary started at 24117.19 Hz and reported -93.708 dB.
+        // At 48 kHz, x3, the first lobe after the transition (peak
+        // -92.748 dB at 24134.27 Hz, above the -92.920 dB target) falls
+        // between two FFT bins that are not local maxima: a sampled maximum
+        // would report the transition as over.
         for phase in [FilterPhase::Linear, FilterPhase::Minimum] {
-            let cfg = UpsamplerConfig {
+            let cfg = ManualConfig {
                 target: audivane_protocol::RateTarget::Ratio(3),
                 taps: 1084,
                 phase,
                 kaiser_beta: 9.281_026_226_494_81,
                 cutoff: 0.988_318_032_981_387,
                 cutoff_mode: CutoffMode::Fraction,
+                ..Default::default()
             };
             let m = measure_upsampler(&cfg, 48_000).expect("measure");
             let lobe = m.magnitude_db_at(&[24_134.269_86])[0];
@@ -3042,13 +3748,14 @@ mod tests {
             let beta = 2.0 + 18.0 * lcg(&mut seed).abs();
             let taps = 32 + (lcg(&mut seed).abs() * 3000.0) as usize;
             let cutoff = 0.5 + 0.5 * lcg(&mut seed).abs();
-            let cfg = UpsamplerConfig {
+            let cfg = ManualConfig {
                 target: audivane_protocol::RateTarget::Ratio(ratio),
                 taps,
                 phase,
                 kaiser_beta: beta,
                 cutoff,
                 cutoff_mode: CutoffMode::Fraction,
+                ..Default::default()
             };
             assert_stopband_summary_bounds(&cfg, [44_100, 48_000][i % 2], 0.02);
         }
@@ -3089,7 +3796,7 @@ mod tests {
     }
 
     fn verify_crossings_with_dense_scan(
-        cfg: &UpsamplerConfig,
+        cfg: &ManualConfig,
         source: u32,
         dense_margin_hz: f64,
         dense_step_hz: f64,
@@ -3219,7 +3926,7 @@ mod tests {
                 "2k x2 linear",
             ),
             (
-                UpsamplerConfig {
+                ManualConfig {
                     cutoff: 0.95,
                     ..response_config(4, 4096, FilterPhase::Minimum)
                 },
@@ -3227,7 +3934,7 @@ mod tests {
                 "4k x4 min",
             ),
             (
-                UpsamplerConfig {
+                ManualConfig {
                     kaiser_beta: 8.0,
                     ..response_config(2, 16_384, FilterPhase::Linear)
                 },
@@ -3235,7 +3942,7 @@ mod tests {
                 "16k beta 8 x2 linear",
             ),
             (
-                UpsamplerConfig {
+                ManualConfig {
                     kaiser_beta: 8.0,
                     ..response_config(2, 16_384, FilterPhase::Minimum)
                 },
@@ -3253,7 +3960,10 @@ mod tests {
             (1_000_000usize, FilterPhase::Linear, 4usize, "1M x2 linear"),
             (1_000_000, FilterPhase::Minimum, 4, "1M x2 minimum"),
             (4_000_000, FilterPhase::Linear, 4, "4M x2 linear"),
-            (4_000_000, FilterPhase::Minimum, 4, "4M x2 minimum"),
+            // The longest reflected minimum phase within the 1.5 GiB design
+            // workspace limit (a 4M one needs about 2 GB to design; the
+            // cepstral cap is the presets' transform, not this one).
+            (2_097_152, FilterPhase::Minimum, 4, "2M x2 minimum"),
         ] {
             let cfg = response_config(2, taps, phase);
             let lobe_hz = 96_000.0 / taps as f64;
@@ -3266,6 +3976,10 @@ mod tests {
                 label,
             );
         }
+        let e = measure_upsampler(&response_config(2, 4_000_000, FilterPhase::Minimum), 48_000)
+            .err()
+            .unwrap();
+        assert!(e.contains("GB design limit"), "{e}");
     }
 
     #[test]
@@ -3350,15 +4064,21 @@ mod tests {
         0.0
     }
 
-    /// Prints wall time and peak RSS for the response measurement. Run with
-    /// `cargo test -p audivane-dsp-core bench_upsampler_response -- --ignored
-    /// --nocapture`.
+    /// Prints wall time and peak RSS for the response measurement of the
+    /// longest designs: 4M linear taps, and the longest minimum phase, 2^21
+    /// taps (a Custom minimum phase is reflected: a 4M one needs about 2 GB
+    /// to design, over the 1.5 GiB design workspace limit; the cepstral cap
+    /// does not apply to it). Run with `cargo test -p audivane-dsp-core
+    /// bench_upsampler_response -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn bench_upsampler_response_long_kernel() {
         use std::time::Instant;
-        for phase in [FilterPhase::Linear, FilterPhase::Minimum] {
-            let cfg = response_config(2, 4_000_000, phase);
+        for (phase, taps) in [
+            (FilterPhase::Linear, 4_000_000),
+            (FilterPhase::Minimum, 2_097_152),
+        ] {
+            let cfg = response_config(2, taps, phase);
             let started = Instant::now();
             let measured = measure_upsampler(&cfg, 48_000).expect("response");
             let elapsed = started.elapsed().as_secs_f64();
@@ -3375,7 +4095,7 @@ mod tests {
             );
             let response = measured.response;
             eprintln!(
-                "upsampler_response 4M taps x2 {:?}: {elapsed:.2} s, peak RSS {:.1} MiB, \
+                "upsampler_response {taps} taps x2 {:?}: {elapsed:.2} s, peak RSS {:.1} MiB, \
                  stopband {:.1} dB from {:.0} Hz",
                 phase,
                 peak_rss_mib(),
@@ -3383,6 +4103,49 @@ mod tests {
                 response.stopband_start_hz
             );
             assert!(response.stopband_atten_db > 100.0);
+        }
+    }
+
+    /// Wall time of the response measurement at x32 against x64 for the
+    /// longest designs of each kind. Run with `cargo test --release -p
+    /// audivane-dsp-core bench_upsampler_response_x64 -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_upsampler_response_x64() {
+        use audivane_protocol::FilterPreset::*;
+        use std::time::Instant;
+        let manual = |taps, phase| response_config(1, taps, phase);
+        let preset = |p| ManualConfig {
+            preset: Some(p),
+            ..response_config(1, 4096, FilterPhase::Linear)
+        };
+        let cases = [
+            ("manual 65536 linear", manual(65_536, FilterPhase::Linear)),
+            ("manual 4M linear", manual(4_194_304, FilterPhase::Linear)),
+            ("manual 1M minimum", manual(1_048_576, FilterPhase::Minimum)),
+            ("lanczos32767", preset(Lanczos32767)),
+            ("flattop_huge", preset(FlattopHuge)),
+            ("kaiser_steep_mp", preset(KaiserSteepMp)),
+            ("cascade_fir_mp", preset(CascadeFirMp)),
+            ("block_fft_large", preset(BlockFftLarge)),
+            ("table_sinc", preset(TableSinc)),
+        ];
+        for (name, cfg) in cases {
+            for ratio in [32, 64] {
+                let cfg = ManualConfig {
+                    target: audivane_protocol::RateTarget::Ratio(ratio),
+                    ..cfg.clone()
+                };
+                let started = Instant::now();
+                let measured = measure_upsampler(&cfg, 44_100).expect("response");
+                eprintln!(
+                    "{name} x{ratio}: {:.2} s, peak RSS {:.0} MiB, stopband {:.1} dB",
+                    started.elapsed().as_secs_f64(),
+                    peak_rss_mib(),
+                    measured.response.stopband_atten_db
+                );
+            }
         }
     }
 
@@ -3428,12 +4191,31 @@ mod tests {
         );
     }
 
+    /// `upsampler_response` reports a Custom minimum-phase design's peak in
+    /// `latency_samples`: at x4 the measurement block's latency plus the
+    /// peak; at 160/147 the grid peak / M rounded (823 / 147 = 5.6 -> 6).
+    #[test]
+    fn upsampler_response_latency_of_custom_minimum_phase_is_its_peak() {
+        let cfg = |target| ManualConfig {
+            target,
+            taps: 4096,
+            phase: FilterPhase::Minimum,
+            ..ManualConfig::default()
+        };
+        let x4 = upsampler_response(&cfg(audivane_protocol::RateTarget::Ratio(4)), 48_000).unwrap();
+        // Block latency 256 + peak 19.
+        assert_eq!(x4.latency_samples, 275);
+        let r =
+            upsampler_response(&cfg(audivane_protocol::RateTarget::Rate(48_000)), 44_100).unwrap();
+        assert_eq!(r.latency_samples, 6);
+    }
+
     #[test]
     fn upsampler_response_ratio_one_is_flat() {
-        let cfg = UpsamplerConfig {
+        let cfg = ManualConfig {
             target: audivane_protocol::RateTarget::Off,
             taps: 4096,
-            ..UpsamplerConfig::default()
+            ..ManualConfig::default()
         };
         let response = upsampler_response(&cfg, 44_100).expect("response");
         assert_eq!(response.ratio, 1);
@@ -3526,6 +4308,10 @@ mod tests {
                 phase: FilterPhase::Linear,
                 kaiser_beta: 14.0,
                 cutoff: 1.0,
+                phase_mix: 1.0,
+                preserve_samples: false,
+                window: audivane_protocol::WindowKind::Kaiser,
+                taper: 0.25,
             };
             let block_in = 1024usize;
             let mut up = Upsampler::new(&d, 2, block_in);
@@ -3594,7 +4380,9 @@ mod tests {
         for k in cands {
             let mut lo = ((k as f64 - 1.0) / nfft as f64).max(f_lo);
             let mut hi = ((k as f64 + 1.0) / nfft as f64).min(0.5);
-            for _ in 0..40 {
+            // 16 iterations narrow the bin to 8.5e-4 of it, far under the
+            // 0.02 dB tolerances.
+            for _ in 0..16 {
                 let a = lo + (hi - lo) * 0.381_966_011_250_105_1;
                 let b = lo + (hi - lo) * 0.618_033_988_749_894_9;
                 let v = dft_magnitudes(h, 1.0, &[a, b]);
@@ -3623,13 +4411,14 @@ mod tests {
         beta: f64,
         source_rate: u32,
     ) -> (f64, f64) {
-        let cfg = UpsamplerConfig {
+        let cfg = ManualConfig {
             target: audivane_protocol::RateTarget::Ratio(ratio),
             taps,
             phase,
             kaiser_beta: beta,
             cutoff: 1.0,
             cutoff_mode: CutoffMode::NyquistStop,
+            ..Default::default()
         };
         let measured = measure_upsampler(&cfg, source_rate).expect("measure");
         let expected = nyquist_stop_check(taps, ratio as usize, beta).expect("feasible");
@@ -3648,8 +4437,8 @@ mod tests {
     fn nyquist_stop_feasibility_and_shift() {
         assert_eq!(nyquist_stop_cutoff(16_384, 1, 14.0), 1.0);
         assert_eq!(nyquist_stop_check(16_384, 1, 14.0), Ok(1.0));
-        // The review's clamp example: 64 taps x16 beta 20 cannot stop by
-        // Nyquist; it used to return 0.5 silently (-6.96 dB at Nyquist).
+        // A clamp example: 64 taps x16 beta 20 cannot stop at Nyquist
+        // (cutoff 0.5 would leave -6.96 dB there).
         let err = nyquist_stop_check(64, 16, 20.0).unwrap_err();
         let min = nyquist_stop_min_taps(16, 20.0).unwrap();
         assert_eq!(
@@ -3795,5 +4584,792 @@ mod tests {
             }
         }
         eprintln!("ALL {count} CASES PASSED (worst {worst:+.3} dB re -A)");
+    }
+
+    // ------------------------------------------------------------ band mode
+
+    fn band(pe: f64, se: f64, a: f64) -> BandSpec {
+        BandSpec {
+            passband_end: pe,
+            stopband_start: se,
+            attenuation_db: a,
+        }
+    }
+
+    /// Largest |dB| deviation from 0 over `[0, f_hi]` (cycles per output
+    /// sample): a 16x FFT grid plus golden-section refinement of its worst
+    /// bins and the edge itself.
+    fn passband_deviation_db(h: &[f64], gain: f64, f_hi: f64) -> f64 {
+        let nfft = (h.len() * 16).next_power_of_two().max(4096);
+        let mag = magnitude_spectrum(h, nfft);
+        let last = ((f_hi * nfft as f64).floor() as usize).min(mag.len() - 1);
+        let dev = |m: f64| lin_to_db(m / gain).abs();
+        let mut worst = dev(dft_magnitudes(h, 1.0, &[f_hi])[0]);
+        let mut cands: Vec<usize> = (0..=last).collect();
+        cands.sort_by(|a, b| dev(mag[*b]).total_cmp(&dev(mag[*a])));
+        // The worst eight bins of the grid, and the edge itself.
+        cands.truncate(8);
+        for k in cands {
+            let lo0 = ((k as f64 - 1.0) / nfft as f64).max(0.0);
+            let hi0 = ((k as f64 + 1.0) / nfft as f64).min(f_hi);
+            for sign in [1.0, -1.0] {
+                // Maximise sign * (|H| - gain) on [lo, hi].
+                let (mut lo, mut hi) = (lo0, hi0);
+                // 16 iterations: 8.5e-4 of a bin, far under the tolerances.
+                for _ in 0..16 {
+                    let a = lo + (hi - lo) * 0.381_966_011_250_105_1;
+                    let b = lo + (hi - lo) * 0.618_033_988_749_894_9;
+                    let v = dft_magnitudes(h, 1.0, &[a, b]);
+                    if sign * v[0] > sign * v[1] {
+                        hi = b;
+                    } else {
+                        lo = a;
+                    }
+                }
+                let f = 0.5 * (lo + hi);
+                worst = worst.max(dev(dft_magnitudes(h, 1.0, &[f])[0]));
+            }
+            worst = worst.max(dev(mag[k]));
+        }
+        worst
+    }
+
+    #[test]
+    fn band_design_meets_both_edges() {
+        let specs = [
+            band(0.9, 1.0, 100.0),
+            band(0.95, 1.0, 150.0),
+            band(0.8, 1.2, 60.0),
+            band(0.9, 1.05, 200.0),
+            band(0.5, 0.7, 120.0),
+            band(0.99, 1.0, 140.0),
+            band(1.0, 1.5, 225.0),
+            band(0.9, 0.95, 55.0),
+        ];
+        for spec in specs {
+            for ratio in [2usize, 3, 4, 8, 16] {
+                let b = band_design(&spec, ratio).unwrap();
+                let d = UpsamplerDesign {
+                    taps: b.taps,
+                    ..UpsamplerDesign::linear(ratio, b.taps, b.kaiser_beta, b.cutoff)
+                };
+                let h = design_kernel(&d);
+                let gain = ratio as f64;
+                let r2 = 2.0 * ratio as f64;
+                let (_, stop_db) = dense_peak_above(&h, gain, spec.stopband_start / r2);
+                assert!(
+                    stop_db <= -spec.attenuation_db + 0.02,
+                    "{spec:?} x{ratio} ({} taps): stopband peak {stop_db:.3} dB",
+                    b.taps
+                );
+                let pass_db = passband_deviation_db(&h, gain, spec.passband_end / r2);
+                // A Kaiser design ripples by the stopband's relative error
+                // in the passband: 20 log10(1 + delta) ~ 8.69 delta dB.
+                let bound = 8.69 * 10.0_f64.powf(-spec.attenuation_db / 20.0) * 1.25;
+                assert!(
+                    pass_db <= bound.max(1.0e-9),
+                    "{spec:?} x{ratio} ({} taps): passband deviation {pass_db:.3e} dB > {bound:.3e}",
+                    b.taps
+                );
+                // The shortest: one tap fewer must break the calibrated fit.
+                let y = |taps: usize| {
+                    let y = nyquist_stop_k(b.kaiser_beta)
+                        * kaiser_half_width(taps, ratio, b.kaiser_beta);
+                    y * (1.0 + NYQUIST_STOP_SHORT_GAIN * y)
+                };
+                let w = 0.5 * (spec.stopband_start - spec.passband_end);
+                assert!(y(b.taps) <= w && (b.taps <= 2 || y(b.taps - 1) > w));
+            }
+        }
+    }
+
+    #[test]
+    fn band_design_scales_with_the_ratio_and_rejects_bad_specs() {
+        let spec = band(0.9, 1.0, 140.0);
+        let t2 = band_design(&spec, 2).unwrap().taps as f64;
+        let t16 = band_design(&spec, 16).unwrap().taps as f64;
+        // Same duration at every ratio: 8x the taps for 8x the rate.
+        assert!((t16 / t2 - 8.0).abs() < 0.05, "{t2} {t16}");
+        assert!(band_design(&band(0.9, 0.9, 140.0), 4).is_err());
+        assert!(band_design(&band(0.4, 0.9, 140.0), 4).is_err());
+        assert!(band_design(&band(1.01, 1.2, 140.0), 4).is_err());
+        assert!(band_design(&band(0.9, 1.6, 140.0), 4).is_err());
+        assert!(band_design(&band(0.9, 1.0, 40.0), 4).is_err());
+        assert!(band_design(&band(0.9, 1.0, 230.0), 4).is_err());
+        assert!(band_design(&band(f64::NAN, 1.0, 140.0), 4).is_err());
+        let cfg = ManualConfig {
+            target: audivane_protocol::RateTarget::Ratio(4),
+            cutoff_mode: CutoffMode::Band,
+            band: spec,
+            ..Default::default()
+        };
+        let d = UpsamplerDesign::try_from_config(&cfg, 4).unwrap();
+        let b = band_design(&spec, 4).unwrap();
+        assert_eq!(
+            (d.taps, d.kaiser_beta, d.cutoff),
+            (b.taps, b.kaiser_beta, b.cutoff)
+        );
+    }
+
+    #[test]
+    fn taps_per_input_sample_scale_with_the_ratio() {
+        let cfg = ManualConfig {
+            taps: 1000,
+            taps_unit: audivane_protocol::TapsUnit::Input,
+            ..Default::default()
+        };
+        assert_eq!(UpsamplerDesign::from_config(&cfg, 8).taps, 8000);
+        assert_eq!(UpsamplerDesign::from_config(&cfg, 16).taps, 16_000);
+        let out = ManualConfig {
+            taps_unit: audivane_protocol::TapsUnit::Output,
+            ..cfg
+        };
+        assert_eq!(UpsamplerDesign::from_config(&out, 16).taps, 1000);
+    }
+
+    #[test]
+    fn scale_output_is_an_exact_gain() {
+        let d = UpsamplerDesign::linear(4, 1024, 12.0, 1.0);
+        let mut plain = Upsampler::new(&d, 1, 256);
+        let mut quiet = Upsampler::new(&d, 1, 256);
+        quiet.scale_output(0.5);
+        let mut seed = 7u64;
+        let x: Vec<f64> = (0..256).map(|_| lcg(&mut seed)).collect();
+        let (mut a, mut b) = (vec![0.0; 1024], vec![0.0; 1024]);
+        for _ in 0..8 {
+            plain.process(&[&x], &mut [&mut a]);
+            quiet.process(&[&x], &mut [&mut b]);
+            for (p, q) in a.iter().zip(&b) {
+                assert!((0.5 * p - q).abs() <= 1e-15 * p.abs().max(1.0));
+            }
+        }
+    }
+
+    // ---------------------------------------------------- intermediate phase
+
+    /// Pre-ringing duration: samples from the first one above -60 dB of the
+    /// impulse peak to the peak.
+    fn pre_ringing(h: &[f64]) -> usize {
+        let (peak, top) = h
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i, v.abs()))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap();
+        let first = h.iter().position(|v| v.abs() > top * 1.0e-3).unwrap();
+        peak - first
+    }
+
+    fn assert_intermediate(ratio: usize, taps: usize, beta: f64, cutoff: f64) {
+        let lin_d = UpsamplerDesign::linear(ratio, taps, beta, cutoff);
+        let lin = design_kernel(&lin_d);
+        let min = design_kernel(&UpsamplerDesign {
+            phase: FilterPhase::Minimum,
+            ..lin_d
+        });
+        let min_pre = pre_ringing(&min);
+        let lin_pre = pre_ringing(&lin);
+        let slack = (lin_pre / 10).max(3);
+        let mut pres = Vec::new();
+        for mix in [0.25, 0.5, 0.75, 0.9] {
+            let d = UpsamplerDesign {
+                phase: FilterPhase::Intermediate,
+                phase_mix: mix,
+                ..lin_d
+            };
+            let report =
+                crate::minphase::intermediate_phase(&lin, &minimum_phase_contract(&d), mix)
+                    .unwrap_or_else(|e| panic!("x{ratio} {taps} taps beta {beta} mix {mix}: {e}"));
+            let check = report.check.expect("checked");
+            assert!(check.passband_db <= crate::minphase::PASSBAND_TOLERANCE_DB);
+            let h = design_kernel(&d);
+            assert!(h.len() <= 4 * taps, "mix {mix}: {} taps", h.len());
+            let sum: f64 = h.iter().sum();
+            assert!((sum - ratio as f64).abs() < 1e-9 * ratio as f64);
+            pres.push(pre_ringing(&h));
+        }
+        // Audible pre-ringing stays between the two twins and grows with the
+        // mix (mostly over 0.75..1: below that it stays near minimum phase).
+        let what = format!(
+            "x{ratio} {taps} taps beta {beta}: pre-ringing {pres:?}, minimum {min_pre}, linear {lin_pre}"
+        );
+        assert!(
+            pres.iter()
+                .all(|&p| p + slack >= min_pre && p <= lin_pre + slack),
+            "{what}"
+        );
+        assert!(pres.windows(2).all(|w| w[1] + slack >= w[0]), "{what}");
+        assert!(pres[3] > pres[1], "{what}");
+        // The ends are the two twins exactly.
+        let at = |mix: f64| {
+            design_kernel(&UpsamplerDesign {
+                phase: FilterPhase::Intermediate,
+                phase_mix: mix,
+                ..lin_d
+            })
+        };
+        assert_eq!(at(1.0), lin);
+        assert_eq!(at(0.0), min);
+    }
+
+    #[test]
+    fn intermediate_phase_short_kernels_by_roots() {
+        for (ratio, taps, beta) in [
+            (2, 63, 8.0),
+            (4, 255, 12.0),
+            (8, 1023, 14.0),
+            (16, 512, 20.0),
+        ] {
+            assert_intermediate(ratio, taps, beta, 1.0);
+        }
+        assert_intermediate(4, 400, 10.0, 0.9);
+    }
+
+    #[test]
+    fn intermediate_phase_long_kernels_by_cepstrum() {
+        for (ratio, taps, beta) in [(2, 4096, 8.0), (8, 16_384, 14.0), (16, 16_383, 20.0)] {
+            assert_intermediate(ratio, taps, beta, 1.0);
+        }
+        assert_intermediate(4, 8192, 5.0, 0.95);
+    }
+
+    #[test]
+    fn intermediate_upsampler_reports_its_length_and_peak_delay() {
+        let d = UpsamplerDesign {
+            phase: FilterPhase::Intermediate,
+            phase_mix: 0.5,
+            ..UpsamplerDesign::linear(8, 4096, 12.0, 1.0)
+        };
+        let kernel = design_kernel(&d);
+        let up = Upsampler::new(&d, 2, 256);
+        assert_eq!(up.kernel_taps(), kernel.len());
+        let peak = kernel
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .unwrap()
+            .0;
+        assert_eq!(
+            up.latency_out_frames(),
+            up.block_latency_out_frames() + peak
+        );
+        // Between minimum (0) and linear ((N - 1) / 2) phase.
+        assert!(peak > 0 && peak < kernel.len() / 2, "peak {peak}");
+    }
+
+    /// Pre-ringing (samples above -60 and -100 dB before the peak), latency
+    /// and length against the mix. A research printout:
+    /// `cargo nextest run --release -E 'test(intermediate_phase_profile)' --run-ignored all --no-capture`.
+    #[test]
+    #[ignore = "research printout"]
+    fn intermediate_phase_profile() {
+        let pre_at = |h: &[f64], level: f64| {
+            let (peak, top) = h
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i, v.abs()))
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap();
+            peak - h.iter().position(|v| v.abs() > top * level).unwrap()
+        };
+        for (ratio, taps, beta) in [(2, 4096, 8.0), (8, 65_536, 14.0), (16, 65_536, 20.0)] {
+            let lin_d = UpsamplerDesign::linear(ratio, taps, beta, 1.0);
+            eprintln!("x{ratio} {taps} taps beta {beta}");
+            for mix in [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 1.0] {
+                let h = design_kernel(&UpsamplerDesign {
+                    phase: FilterPhase::Intermediate,
+                    phase_mix: mix,
+                    ..lin_d
+                });
+                let peak = h
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+                    .unwrap()
+                    .0;
+                eprintln!(
+                    "  mix {mix:4}: {:>7} taps ({:.2}x), peak at {peak:>6}, pre-ringing {:>6} (-60 dB) {:>6} (-100 dB)",
+                    h.len(),
+                    h.len() as f64 / taps as f64,
+                    pre_at(&h, 1e-3),
+                    pre_at(&h, 1e-5)
+                );
+            }
+        }
+    }
+
+    /// The largest intermediate-phase design the daemon accepts.
+    #[test]
+    #[ignore = "heavy: 1M-tap intermediate design"]
+    fn intermediate_phase_1m() {
+        for (ratio, beta, mix) in [(8, 14.0, 0.75), (16, 20.0, 0.5), (2, 5.0, 0.9)] {
+            let d = UpsamplerDesign {
+                phase: FilterPhase::Intermediate,
+                phase_mix: mix,
+                ..UpsamplerDesign::linear(ratio, 1 << 20, beta, 1.0)
+            };
+            let t = std::time::Instant::now();
+            let h = try_design_kernel(&d).unwrap_or_else(|e| panic!("x{ratio} beta {beta}: {e}"));
+            eprintln!(
+                "x{ratio} beta {beta} mix {mix}: {} taps ({:.2}x) in {:.1} s, peak RSS {:.0} MiB",
+                h.len(),
+                h.len() as f64 / (1 << 20) as f64,
+                t.elapsed().as_secs_f64(),
+                peak_rss_mib()
+            );
+        }
+    }
+
+    // ---------------------------------------------------- keep the samples
+
+    #[test]
+    fn preserve_samples_passes_the_input_through() {
+        for (ratio, taps) in [(2usize, 4096usize), (8, 65_536), (16, 8191), (3, 1000)] {
+            let d = UpsamplerDesign {
+                preserve_samples: true,
+                ..UpsamplerDesign::linear(ratio, taps, 14.0, 1.0)
+            };
+            let h = design_kernel(&d);
+            assert_eq!(h.len() % 2, 1, "odd length");
+            assert_eq!(h.len(), if taps % 2 == 0 { taps - 1 } else { taps });
+            let c = (h.len() - 1) / 2;
+            assert_eq!(h[c], 1.0);
+            for k in (ratio..=c).step_by(ratio) {
+                assert_eq!((h[c - k], h[c + k]), (0.0, 0.0));
+            }
+            // Through the real (FFT) upsampler, the input samples come back.
+            let mut up = Upsampler::new(&d, 1, 512);
+            let delay = up.latency_out_frames();
+            let mut seed = 11u64;
+            let n_in = 512 * 8 + delay / ratio + 2;
+            let x: Vec<f64> = (0..n_in).map(|_| lcg(&mut seed)).collect();
+            let mut y = vec![0.0; n_in * ratio];
+            for (xi, yi) in x.chunks(512).zip(y.chunks_mut(512 * ratio)) {
+                up.process(&[xi], &mut [yi]);
+            }
+            let mut worst = 0.0_f64;
+            for (n, &xn) in x.iter().enumerate() {
+                if let Some(&yn) = y.get(n * ratio + delay) {
+                    worst = worst.max((yn - xn).abs());
+                }
+            }
+            assert!(worst < 1e-12, "x{ratio} {taps} taps: worst {worst:e}");
+        }
+    }
+
+    #[test]
+    fn sample_leak_separates_nyquist_filters_from_the_rest() {
+        let leak = |preserve: bool, cutoff: f64, phase: FilterPhase| {
+            let cfg = ManualConfig {
+                target: audivane_protocol::RateTarget::Ratio(8),
+                taps: 16_384,
+                phase,
+                cutoff,
+                preserve_samples: preserve,
+                ..Default::default()
+            };
+            measure_upsampler(&cfg, 44_100)
+                .unwrap()
+                .response
+                .sample_leak_db
+        };
+        assert!(leak(true, 1.0, FilterPhase::Linear) < -250.0);
+        assert!(leak(false, 0.95, FilterPhase::Linear) > -80.0);
+        assert!(leak(false, 1.0, FilterPhase::Minimum) > -80.0);
+    }
+
+    // ------------------------------------------------------ Gaussian window
+
+    fn gaussian_design(ratio: usize, taps: usize, beta: f64, cutoff: f64) -> UpsamplerDesign {
+        UpsamplerDesign {
+            window: WindowKind::Gaussian,
+            ..UpsamplerDesign::linear(ratio, taps, beta, cutoff)
+        }
+    }
+
+    #[test]
+    fn gaussian_band_designs_meet_both_edges() {
+        let specs = [
+            band(0.9, 1.0, 100.0),
+            band(0.95, 1.0, 150.0),
+            band(0.8, 1.2, 60.0),
+            band(0.9, 1.05, 200.0),
+            band(0.5, 0.7, 120.0),
+            band(1.0, 1.5, 225.0),
+        ];
+        for spec in specs {
+            for ratio in [2usize, 4, 8, 16] {
+                let b = band_design_for(WindowKind::Gaussian, &spec, ratio).unwrap();
+                let h = design_kernel(&gaussian_design(ratio, b.taps, b.kaiser_beta, b.cutoff));
+                let gain = ratio as f64;
+                let r2 = 2.0 * ratio as f64;
+                let (_, stop_db) = dense_peak_above(&h, gain, spec.stopband_start / r2);
+                assert!(
+                    stop_db <= -spec.attenuation_db + 0.02,
+                    "{spec:?} x{ratio} ({} taps): stopband peak {stop_db:.3} dB",
+                    b.taps
+                );
+                let pass_db = passband_deviation_db(&h, gain, spec.passband_end / r2);
+                let bound = 8.69 * 10.0_f64.powf(-spec.attenuation_db / 20.0) * 1.25;
+                assert!(
+                    pass_db <= bound.max(1.0e-9),
+                    "{spec:?} x{ratio} ({} taps): passband {pass_db:.3e} dB > {bound:.3e}",
+                    b.taps
+                );
+                let w = 0.5 * (spec.stopband_start - spec.passband_end);
+                let ht = |t| half_transition(WindowKind::Gaussian, t, ratio, b.kaiser_beta);
+                assert!(ht(b.taps) <= w && (b.taps <= 2 || ht(b.taps - 1) > w));
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_nyquist_stop_holds() {
+        for ratio in [2usize, 4, 8, 16, 32] {
+            for beta in [5.0, 10.0, 14.0, 20.0, 24.0] {
+                let min = nyquist_stop_min_taps_for(WindowKind::Gaussian, ratio, beta).unwrap();
+                for taps in [min, 2 * min + 1, 8 * min] {
+                    if taps > 300_000 {
+                        continue;
+                    }
+                    let cutoff =
+                        nyquist_stop_check_for(WindowKind::Gaussian, taps, ratio, beta).unwrap();
+                    let h = design_kernel(&gaussian_design(ratio, taps, beta, cutoff));
+                    let (_, peak) = dense_peak_above(&h, ratio as f64, 0.5 / ratio as f64);
+                    let a = kaiser_attenuation_db(beta);
+                    assert!(
+                        peak <= -a + 0.02,
+                        "x{ratio} beta {beta} {taps} taps (cutoff {cutoff:.4}): {peak:.3} dB vs -{a:.1}"
+                    );
+                }
+                assert!(
+                    nyquist_stop_check_for(WindowKind::Gaussian, min - 1, ratio, beta).is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_rings_shorter_but_wider_than_kaiser() {
+        let (ratio, taps, beta) = (8usize, 16_383usize, 14.0);
+        let kaiser_h = design_kernel(&UpsamplerDesign::linear(ratio, taps, beta, 1.0));
+        let gauss_h = design_kernel(&gaussian_design(ratio, taps, beta, 1.0));
+        // Ringing level three quarters of the way from the centre to the end.
+        let at = |h: &[f64]| {
+            let c = (h.len() - 1) / 2;
+            let i = c + 3 * c / 4;
+            let top = h[c].abs();
+            lin_to_db(
+                h[i - 64..i + 64]
+                    .iter()
+                    .fold(0.0_f64, |m, v| m.max(v.abs()))
+                    / top,
+            )
+        };
+        let (k, g) = (at(&kaiser_h), at(&gauss_h));
+        assert!(g < k - 25.0, "Gaussian {g:.1} dB vs Kaiser {k:.1} dB");
+        // The price: about twice the transition at the same length.
+        let ratio_w = half_transition(WindowKind::Gaussian, taps, ratio, beta)
+            / half_transition(WindowKind::Kaiser, taps, ratio, beta);
+        assert!((1.6..2.4).contains(&ratio_w), "{ratio_w}");
+    }
+
+    #[test]
+    fn tukey_keeps_the_sinc_over_its_flat_middle() {
+        let (ratio, taps) = (8usize, 65_535usize);
+        let d = UpsamplerDesign {
+            window: WindowKind::Tukey,
+            taper: 0.25,
+            preserve_samples: true,
+            ..UpsamplerDesign::linear(ratio, taps, 14.0, 1.0)
+        };
+        let h = design_kernel(&d);
+        let c = (h.len() - 1) / 2;
+        assert_eq!(h[c], 1.0);
+        // The middle 75% of each half is the ideal sinc.
+        let mut worst = 0.0_f64;
+        for k in 1..(3 * c / 4) {
+            let x = PI * k as f64 / ratio as f64;
+            let ideal = x.sin() / x;
+            worst = worst
+                .max((h[c + k] - ideal).abs())
+                .max((h[c - k] - ideal).abs());
+        }
+        // (Up to the sum-to-ratio normalisation, ~1e-11.)
+        assert!(worst < 1e-9, "worst {worst:e}");
+        // A Kaiser of the same length keeps the sinc nowhere near that far
+        // out: its window is under 0.99 past ~4% of the half.
+        let kaiser_h = design_kernel(&UpsamplerDesign {
+            preserve_samples: true,
+            ..UpsamplerDesign::linear(ratio, taps, 14.0, 1.0)
+        });
+        let k = c / 2;
+        let x = PI * k as f64 / ratio as f64;
+        assert!((kaiser_h[c + k] / (x.sin() / x)) < 0.5);
+
+        // The stopband slopes down instead of sitting at a floor: about
+        // -111 dB from 2% past the source Nyquist, -150 dB from 10%.
+        let nfft = (h.len() * 16).next_power_of_two();
+        let mag = magnitude_spectrum(&h, nfft);
+        let peak_from = |edge: f64| {
+            let from = (0.5 / ratio as f64 * edge * nfft as f64).ceil() as usize;
+            lin_to_db(mag[from..].iter().fold(0.0_f64, |m, &v| m.max(v)) / ratio as f64)
+        };
+        let (near, far) = (peak_from(1.02), peak_from(1.1));
+        assert!((-116.0..-106.0).contains(&near), "from 1.02: {near:.1} dB");
+        assert!(far < -147.0, "from 1.1: {far:.1} dB");
+        let pass = passband_deviation_db(&h, ratio as f64, 0.5 / ratio as f64 * 0.99);
+        assert!(pass < 1e-3, "passband {pass:e} dB");
+    }
+
+    #[test]
+    fn gaussian_minimum_and_intermediate_phase() {
+        for (ratio, taps, beta) in [
+            (4usize, 512usize, 10.0),
+            (8, 16_384, 14.0),
+            (16, 65_536, 20.0),
+        ] {
+            for (phase, mix) in [
+                (FilterPhase::Minimum, 0.0),
+                (FilterPhase::Intermediate, 0.75),
+            ] {
+                let d = UpsamplerDesign {
+                    phase,
+                    phase_mix: mix,
+                    ..gaussian_design(ratio, taps, beta, 1.0)
+                };
+                let h = try_design_kernel(&d)
+                    .unwrap_or_else(|e| panic!("x{ratio} {taps} beta {beta} {phase:?}: {e}"));
+                let sum: f64 = h.iter().sum();
+                assert!((sum - ratio as f64).abs() < 1e-9 * ratio as f64);
+            }
+        }
+    }
+
+    #[test]
+    fn measure_upsampler_preset_ratio_one() {
+        let off = ManualConfig {
+            target: audivane_protocol::RateTarget::Off,
+            preset: Some(FilterPreset::GaussianShort),
+            ..Default::default()
+        };
+        let flat = measure_upsampler(&off, 44_100).expect("ratio 1 preset");
+        assert_eq!(flat.response.ratio, 1);
+        assert_eq!(flat.response.preset, Some(FilterPreset::GaussianShort));
+        assert_eq!(flat.response.impulse, vec![1.0]);
+    }
+
+    /// The response is measured at the source rate asked for, which need
+    /// not be one validation saw: the design is prepared at that ratio
+    /// first, so its limits hold (here 8 kHz resolves to x64, a kernel one
+    /// branch over the 8 Mi-tap limit, refused before it is designed), and
+    /// what builds is the engine's kernel.
+    #[test]
+    fn measure_upsampler_prepares_the_ratio_it_measures() {
+        let long = ManualConfig {
+            target: audivane_protocol::RateTarget::MaxRate(768_000),
+            taps: 131_073,
+            taps_unit: audivane_protocol::TapsUnit::Input,
+            ..ManualConfig::default()
+        };
+        let e = measure_upsampler(&long, 8_000).err().unwrap();
+        assert!(e.contains("8388672") && e.contains("8388608"), "{e}");
+        // Rational: the budget at the ratio measured.
+        let rational = ManualConfig {
+            target: audivane_protocol::RateTarget::Rate(705_600),
+            taps: 8_192,
+            taps_unit: audivane_protocol::TapsUnit::Input,
+            ..ManualConfig::default()
+        };
+        let e = measure_upsampler(&rational, 8_000).err().unwrap();
+        assert!(
+            e.contains("use a shorter filter or a lower output rate"),
+            "{e}"
+        );
+        // A design that builds measures the kernel the engine prepares.
+        let cfg = ManualConfig {
+            target: audivane_protocol::RateTarget::Ratio(4),
+            taps: 4_096,
+            phase: FilterPhase::Intermediate,
+            phase_mix: 0.5,
+            ..ManualConfig::default()
+        };
+        let m = measure_upsampler(&cfg, 44_100).unwrap();
+        let d = UpsamplerDesign::try_from_config(&cfg, 4).unwrap();
+        let k = try_design_kernel(&d).unwrap();
+        assert_eq!(m.response.taps, k.len());
+        assert_eq!(
+            m.response.latency_samples,
+            Upsampler::try_new(&d, 1, measurement_block(d.taps, 4))
+                .unwrap()
+                .latency_out_frames()
+        );
+    }
+
+    #[test]
+    fn measure_upsampler_fir_preset() {
+        let cfg = ManualConfig {
+            target: audivane_protocol::RateTarget::Ratio(4),
+            preset: Some(FilterPreset::GaussianShort),
+            ..Default::default()
+        };
+        let measured = measure_upsampler(&cfg, 44_100).expect("measure preset");
+        assert_eq!(measured.response.preset, Some(FilterPreset::GaussianShort));
+        assert_eq!(measured.response.ratio, 4);
+        assert_eq!(measured.response.phase, FilterPhase::Linear);
+        assert!(measured.response.taps > 0);
+        assert!(measured.response.stopband_atten_db > 40.0);
+    }
+
+    #[test]
+    fn measure_block_fft_preset_reports_its_edges() {
+        // Its stopband stays far above the fixed preset target, which must
+        // not hide the -0.1 and -3 dB points.
+        let cfg = ManualConfig {
+            target: audivane_protocol::RateTarget::Ratio(4),
+            preset: Some(FilterPreset::BlockFft),
+            ..Default::default()
+        };
+        let r = measure_upsampler(&cfg, 44_100)
+            .expect("measure preset")
+            .response;
+        assert!(
+            (20_000.0..22_050.0).contains(&r.minus_0_1_db_hz),
+            "-0.1 dB at {}",
+            r.minus_0_1_db_hz
+        );
+        assert!(
+            (22_000.0..22_200.0).contains(&r.minus_3_db_hz),
+            "-3 dB at {}",
+            r.minus_3_db_hz
+        );
+    }
+
+    use audivane_protocol::RateTarget;
+
+    fn rational_cfg(target: RateTarget, taps: usize, mode: CutoffMode) -> ManualConfig {
+        ManualConfig {
+            target,
+            taps,
+            taps_unit: audivane_protocol::TapsUnit::Input,
+            kaiser_beta: 14.0,
+            cutoff: 0.95,
+            cutoff_mode: mode,
+            ..ManualConfig::default()
+        }
+    }
+
+    #[test]
+    fn rational_budget_caps_kernel_bytes_and_counts_pipelines() {
+        use crate::design::budget::{MAX_RATIONAL_GRID_TAPS, MAX_RATIONAL_KERNEL_BYTES};
+        let r = RateRatio::from_rates(44_100, 768_000);
+        let check = |n, cap, pipelines| {
+            crate::design::budget::check_rational(n, r, 44_100, cap, pipelines)
+                .map_err(|e| e.to_string())
+        };
+        let cap = MAX_RATIONAL_GRID_TAPS;
+        assert_eq!(cap * 8, MAX_RATIONAL_KERNEL_BYTES);
+        // 260 taps per branch at 768 kHz: 200 M per pipeline.
+        let n = 2560 * 260;
+        check(n, cap, 2).unwrap();
+        check(n, cap, 4).unwrap();
+        // 409 taps per branch: 314 M; a swap is fine, A/B is not.
+        let n = 2560 * 409;
+        check(n, cap, 2).unwrap();
+        let e = check(n, cap, 4).unwrap_err();
+        assert!(e.contains("4 pipelines"), "{e}");
+        // The 21 MB kernel is over the byte cap whatever its cost.
+        let e = check(2560 * 1041, usize::MAX, 1).unwrap_err();
+        assert!(e.contains("MB"), "{e}");
+    }
+
+    #[test]
+    fn rational_designs_put_the_band_edge_at_the_lower_nyquist() {
+        // Upsampling 44.1k -> 48k: the edge is the source Nyquist.
+        let up = UpsamplerDesign::try_for_ratio(
+            &rational_cfg(RateTarget::Rate(48_000), 100, CutoffMode::Fraction),
+            RateRatio::new(160, 147),
+        )
+        .unwrap();
+        assert_eq!((up.ratio, up.taps), (160, 16_000));
+        // Decimation 96k -> 48k: the same shape as x2 from 48k, `taps`
+        // input frames long.
+        let cfg = rational_cfg(RateTarget::Rate(48_000), 100, CutoffMode::NyquistStop);
+        let down = UpsamplerDesign::try_for_ratio(&cfg, RateRatio::new(1, 2)).unwrap();
+        let x2 = UpsamplerDesign::try_from_config(
+            &ManualConfig {
+                taps: 100,
+                taps_unit: audivane_protocol::TapsUnit::Output,
+                ..cfg.clone()
+            },
+            2,
+        )
+        .unwrap();
+        assert_eq!((down.ratio, down.taps), (2, 100));
+        assert_eq!(down.cutoff, x2.cutoff);
+        // The decimation kernel is the x2 kernel at half the gain (one
+        // branch).
+        let k = try_design_kernel_for(&down, RateRatio::new(1, 2)).unwrap();
+        let k2 = try_design_kernel(&x2).unwrap();
+        for (a, b) in k.iter().zip(&k2) {
+            assert!((a - 0.5 * b).abs() < 1e-15);
+        }
+        assert!((k.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        // Integer ratios are untouched.
+        let cfg = rational_cfg(RateTarget::Ratio(4), 100, CutoffMode::Fraction);
+        assert_eq!(
+            UpsamplerDesign::try_for_ratio(&cfg, RateRatio::integer(4)).unwrap(),
+            UpsamplerDesign::try_from_config(&cfg, 4).unwrap()
+        );
+    }
+
+    #[test]
+    fn rational_response_is_measured_on_the_grid() {
+        let cfg = rational_cfg(RateTarget::Rate(48_000), 512, CutoffMode::NyquistStop);
+        let m = measure_upsampler(&cfg, 44_100).unwrap();
+        let r = &m.response;
+        assert_eq!((r.source_rate, r.output_rate, r.ratio), (44_100, 48_000, 0));
+        assert_eq!(r.rate_ratio, RateRatio::new(160, 147));
+        assert_eq!(m.impulse_rate(), 44_100 * 160);
+        assert!(r.passband_ripple_db < 1e-3, "{}", r.passband_ripple_db);
+        assert!(
+            r.stopband_start_hz <= 22_050.0 * 1.001,
+            "{}",
+            r.stopband_start_hz
+        );
+        assert!(r.stopband_atten_db > 130.0, "{}", r.stopband_atten_db);
+        // Linear phase: half of 512 input frames, in output frames.
+        let want = (160.0 * 512.0 - 1.0) / 2.0 / 147.0;
+        assert!((r.latency_samples as f64 - want).abs() <= 0.5);
+
+        // The protected-band error is measured on the grid too (it read 0,
+        // a perfect filter, when it divided by the integer ratio field).
+        let err = m.protected_band_error(0.9, 1.0);
+        let h = try_design_kernel_for(
+            &UpsamplerDesign::try_for_ratio(&cfg, RateRatio::new(160, 147)).unwrap(),
+            RateRatio::new(160, 147),
+        )
+        .unwrap();
+        let direct = crate::design::auto::protected_error(&h, 160.0, 0.9 / 320.0, 1.0 / 320.0);
+        assert!(err > 0.0 && err.is_finite(), "{err}");
+        assert!((err / direct - 1.0).abs() < 1e-6, "{err} vs {direct}");
+
+        let cfg = rational_cfg(RateTarget::Rate(48_000), 128, CutoffMode::NyquistStop);
+        let m = measure_upsampler(&cfg, 96_000).unwrap();
+        let r = &m.response;
+        assert_eq!(r.rate_ratio, RateRatio::new(1, 2));
+        let err = m.protected_band_error(0.9, 1.0);
+        assert!(err > 0.0 && err.is_finite(), "{err}");
+        assert!(
+            r.stopband_start_hz <= 24_000.0 * 1.001,
+            "{}",
+            r.stopband_start_hz
+        );
+        assert!(
+            r.minus_3_db_hz < 24_000.0 && r.minus_3_db_hz > 19_000.0,
+            "{}",
+            r.minus_3_db_hz
+        );
+        assert!(r.stopband_atten_db > 130.0);
     }
 }

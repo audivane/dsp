@@ -4,10 +4,10 @@
 //! Output is always a left-justified i32 (a 24-bit value occupies the top 24
 //! bits). The I/O layer packs it into S16/S24_3 etc.
 //!
-//! Dither is TPDF (triangular PDF) of ±1 LSB, made from two independent
-//! uniform draws in [0, 1): `d = u1 + u2 - 1`.  Its variance is
-//! `2 * (1/12) = 1/6 LSB²`; after rounding to the grid, the quantization error
-//! of a zero signal has variance 1/4 LSB² and no DC.
+//! Dither is TPDF of ±1 LSB from two independent uniform draws in [0, 1):
+//! `d = u1 + u2 - 1`. Its variance is `2 * (1/12) = 1/6 LSB²`; after rounding
+//! to the grid, the quantization error of a zero signal has variance 1/4 LSB²
+//! and no DC.
 //!
 //! # Noise shaping (`DitherKind::Shaped`)
 //!
@@ -25,21 +25,18 @@
 //!
 //! | design rate | filter | in-band F-weighted noise vs TPDF | total noise |
 //! |---|---|---|---|
-//! | 44.1 kHz | Wannamaker's published 9-tap F-weighted filter [1] | -11.4 dB | +18.4 dB |
+//! | 44.1 kHz | Wannamaker's published 9-tap F-weighted filter \[1\] | -11.4 dB | +18.4 dB |
 //! | 48 kHz | the same perceptual target re-derived at 48 kHz | -13.7 dB | +18.1 dB |
 //! | 88.2 / 96 kHz | target to 20 kHz, flat above (ultrasonic, gentle) | -25 dB | +10.8 / +10.0 dB |
 //! | 176.4 / 192 kHz | same | -32 / -34 dB | +6.0 / +5.9 dB |
 //! | below 44.1 kHz | none: plain TPDF | 0 dB | 0 dB |
 //!
-//! [1] R. A. Wannamaker, "Psychoacoustically Optimal Noise Shaping",
+//! \[1\] R. A. Wannamaker, "Psychoacoustically Optimal Noise Shaping",
 //! J. Audio Eng. Soc. 40(7/8), 1992. The other tables come from
-//! `tools/design_noise_shapers.py`: the weighting implied by [1]
-//! (`1 / |NTF₄₄(f)|²`, which an order-9 linear predictor reproduces exactly)
-//! is re-fitted at each rate by Levinson-Durbin. At 88.2 kHz and above the
-//! goal is to move noise out of the audible band into the ultrasonic one,
-//! not to maximise in-band gain, so total noise stays within +11 dB.
-//! "F-weighted" figures use the inverse of the threshold of hearing
-//! (Terhardt's approximation) over 20 Hz..20 kHz; plain A-weighting
+//! `tools/design_noise_shapers.py`: the weighting implied by \[1\] (an order-9
+//! linear predictor reproduces it exactly) is re-fitted at each rate by
+//! Levinson-Durbin. "F-weighted" figures use the inverse of the threshold of
+//! hearing (Terhardt's approximation) over 20 Hz..20 kHz; plain A-weighting
 //! under-penalises 12–20 kHz, where the audio-band shapers put their noise.
 //!
 //! The loop is bounded by construction: without clipping `|e| < 1.5 LSB`, so
@@ -47,8 +44,14 @@
 //! output saturates, the stored error is limited to that same range, so
 //! clipping can neither poison nor destabilise the shaper. `None` and `Tpdf`
 //! are unchanged; `Tpdf` stays the default.
+//!
+//! The fixed-coefficient modes (including `HeadroomTpdf`) use per-channel KISS
+//! generators and reserve headroom before adding dither. `HighpassTpdf`
+//! colours the dither alone; it has no error loop.
 
 use audivane_protocol::{DitherKind, OutputConfig};
+
+mod pcm;
 
 /// Highest channel index tracked individually by [`ClipStats`]. The meter
 /// bank reports up to this many channels; further channels are folded into
@@ -57,7 +60,8 @@ pub const MAX_CLIP_CHANNELS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ClipStats {
-    /// Samples that exceeded full scale and were saturated.
+    pub limiter: audivane_protocol::LimiterStatus,
+    /// Samples clamped at input/output, or overflowing a fixed mode's output.
     pub clipped: u64,
     /// Largest |x| seen before quantization (linear).
     pub peak: f64,
@@ -72,6 +76,9 @@ pub struct ClipStats {
     /// True when the peaks above were measured (a float signal went through
     /// the quantizer); false on paths that copy bytes.
     pub measured: bool,
+    /// A/B overs that started in this block, counted to A and B (see
+    /// [`crate::chain::AbChain::overs`]). Zero outside A/B.
+    pub ab_overs: [f64; 2],
 }
 
 impl ClipStats {
@@ -88,6 +95,16 @@ impl ClipStats {
             *dst = dst.max(src);
         }
         self.measured |= other.measured;
+        self.ab_overs[0] += other.ab_overs[0];
+        self.ab_overs[1] += other.ab_overs[1];
+        let events = self.limiter.events.saturating_add(other.limiter.events);
+        let reduction = self
+            .limiter
+            .gain_reduction_db
+            .max(other.limiter.gain_reduction_db);
+        self.limiter = other.limiter;
+        self.limiter.events = events;
+        self.limiter.gain_reduction_db = reduction;
     }
 }
 
@@ -235,6 +252,55 @@ impl Rng {
     }
 }
 
+/// TPDF dither noise of ±1 LSB (two uniform draws), for a path that has no
+/// [`Quantizer`]: Direct / bypass when the digital volume is not unity.
+/// Allocation-free; a fixed seed makes it reproducible.
+pub struct TpdfDither {
+    rng: Rng,
+    /// Per channel, output frames of dither left since the last non-zero
+    /// input sample (see [`Self::keep_dithering`]).
+    hold: [u32; TPDF_HOLD_CHANNELS],
+}
+
+/// Channels with their own dither hold: as many as the engine runs
+/// ([`crate::chain::MAX_CHANNELS`], 512 bytes of counters). A wider stream
+/// (bypass does not build a chain to refuse it) shares the last counter.
+pub const TPDF_HOLD_CHANNELS: usize = crate::chain::MAX_CHANNELS;
+
+impl TpdfDither {
+    pub fn new(seed: u64) -> Self {
+        Self {
+            rng: Rng::new(seed),
+            hold: [0; TPDF_HOLD_CHANNELS],
+        }
+    }
+
+    /// Whether channel `ch` is dithered this output frame: from a non-zero
+    /// input sample on, and for `hold_frames` frames after the last one, so
+    /// a sparse signal does not switch the noise on and off at the block
+    /// rate; after that the channel is digital silence again (a DAC's
+    /// auto-mute sees exact zeros). Call once per channel per frame.
+    #[inline]
+    pub fn keep_dithering(&mut self, ch: usize, nonzero: bool, hold_frames: u32) -> bool {
+        let h = &mut self.hold[ch.min(TPDF_HOLD_CHANNELS - 1)];
+        if nonzero {
+            *h = hold_frames;
+            true
+        } else if *h > 0 {
+            *h -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// One sample of noise in LSBs, in (-1, 1).
+    #[inline]
+    pub fn next_lsb(&mut self) -> f64 {
+        self.rng.uniform() + self.rng.uniform() - 1.0
+    }
+}
+
 pub struct Quantizer {
     bits: u32,
     kind: DitherKind,
@@ -245,6 +311,7 @@ pub struct Quantizer {
     shaper: Option<&'static [f64; SHAPER_ORDER]>,
     /// Per channel, the most recent total errors (`[e[n-1], e[n-2], ...]`).
     error: Vec<[f64; SHAPER_ORDER]>,
+    pcm: Vec<pcm::Channel>,
 }
 
 /// Output rate assumed by [`Quantizer::new`]. The 44.1 kHz shaper keeps its
@@ -281,6 +348,9 @@ impl Quantizer {
             rng: Rng::new(seed),
             shaper,
             error: vec![[0.0; SHAPER_ORDER]; channels],
+            pcm: (0..channels)
+                .map(|ch| pcm::Channel::new(seed, ch))
+                .collect(),
         }
     }
 
@@ -301,6 +371,17 @@ impl Quantizer {
 
     /// `out.len()` must equal `frames * channels`.
     pub fn process(&mut self, input: &[&[f64]], out: &mut [i32]) -> ClipStats {
+        self.process_with(input, out, |_| {})
+    }
+
+    /// [`Self::process`], calling `on_clip(frame)` for every clipped sample
+    /// (once per clipped channel). Allocation-free.
+    pub fn process_with(
+        &mut self,
+        input: &[&[f64]],
+        out: &mut [i32],
+        mut on_clip: impl FnMut(usize),
+    ) -> ClipStats {
         let channels = self.channels.min(input.len());
         let frames = if channels == 0 { 0 } else { input[0].len() };
         debug_assert_eq!(
@@ -330,6 +411,31 @@ impl Quantizer {
                     *slot = slot.max(a);
                 }
 
+                if !matches!(
+                    self.kind,
+                    DitherKind::None | DitherKind::Tpdf | DitherKind::Shaped
+                ) {
+                    if x.is_nan() {
+                        self.pcm[ch].clear_filter();
+                        out[frame * self.channels + ch] = 0;
+                        continue;
+                    }
+                    let v = x.clamp(-1.0, 1.0) * (scale - 1.0 - pcm::headroom(self.kind));
+                    let q = self.pcm[ch].sample(self.kind, v);
+                    if x.abs() > 1.0 || q > max_q as f64 || q < min_q as f64 {
+                        stats.clipped += 1;
+                        stats.clipped_ch[ch.min(MAX_CLIP_CHANNELS - 1)] += 1;
+                        on_clip(frame);
+                    }
+                    // Headroom alone cannot prevent every overflow. Saturate
+                    // only the packed output: sample() has already stored the
+                    // clean-input error using the UNCLAMPED q, so the loop's
+                    // recurrence and non-overloaded statistics stay unchanged.
+                    let packed_q = (q as i64).clamp(min_q, max_q);
+                    out[frame * self.channels + ch] = (packed_q * (1i64 << shift)) as i32;
+                    continue;
+                }
+
                 // v = x - H(e): the value the quantizer is asked to produce.
                 let mut v = x * scale;
                 if let Some(h) = self.shaper {
@@ -355,12 +461,14 @@ impl Quantizer {
                     continue;
                 }
 
-                let q = u.round() as i64;
+                // Ties to even: unbiased, and what other S32 paths do.
+                let q = u.round_ties_even() as i64;
                 let clipped = q > max_q || q < min_q;
                 let saturated = q.clamp(min_q, max_q);
                 if clipped {
                     stats.clipped += 1;
                     stats.clipped_ch[ch.min(MAX_CLIP_CHANNELS - 1)] += 1;
+                    on_clip(frame);
                 }
                 if self.shaper.is_some() {
                     // Total error e = y - v (dither included). A saturated
@@ -386,6 +494,9 @@ impl Quantizer {
     pub fn reset(&mut self) {
         self.rng = Rng::new(self.seed);
         self.error.fill([0.0; SHAPER_ORDER]);
+        for (ch, state) in self.pcm.iter_mut().enumerate() {
+            *state = pcm::Channel::new(self.seed, ch);
+        }
     }
 }
 
@@ -394,8 +505,27 @@ mod tests {
     use super::*;
     use audivane_protocol::{DitherKind, OutputConfig};
 
+    /// Every channel the engine runs has its own hold: a busy channel
+    /// does not keep a silent one dithering, up to the last channel.
+    #[test]
+    fn every_engine_channel_has_its_own_dither_hold() {
+        let last = crate::chain::MAX_CHANNELS - 1;
+        for (busy, quiet) in [(8, 9), (last - 1, last), (last, last - 1)] {
+            let mut d = TpdfDither::new(1);
+            assert!(d.keep_dithering(busy, true, 4));
+            assert!(
+                !d.keep_dithering(quiet, false, 4),
+                "channel {quiet} shares channel {busy}'s hold"
+            );
+        }
+    }
+
     fn cfg(bits: u32, dither: DitherKind) -> OutputConfig {
-        OutputConfig { bits, dither }
+        OutputConfig {
+            bits,
+            dither,
+            headroom_db: 0.0,
+        }
     }
 
     fn lcg(seed: u64) -> impl FnMut() -> f64 {
@@ -562,6 +692,72 @@ mod tests {
         let mut oa2 = vec![0; n];
         a.process(&[&zeros], &mut oa2);
         assert_eq!(oa, oa2);
+    }
+
+    #[test]
+    fn legacy_tpdf_preserves_original_samples_gain_and_clipping() {
+        // Independent integer PRNG / f64 quantizer calculation, including
+        // interleaved channel draw order, off-grid values, rails and NaN/Inf.
+        for (bits, expected) in [
+            (16, [0xf76d2df9045d6194, 0x174f5755d952e2d7]),
+            (24, [0x7cb90a22a9ce1d21, 0xe16f2396d398a910]),
+            (32, [0xdb3e32a3e55a9a1c, 0x1ab62f9de585e86f]),
+        ] {
+            let scale = 2f64.powi(bits as i32 - 1);
+            let x = [
+                -1.25,
+                -1.0,
+                -0.5,
+                -0.5 / scale,
+                0.5 / scale,
+                1.5 / scale,
+                0.25 / scale,
+                1.0 - 1.0 / scale,
+                1.0,
+                1.25,
+                0.12345,
+                f64::INFINITY,
+                f64::NAN,
+            ];
+            let right = x.map(|x| -x);
+            for (seed, hash) in [42, crate::chain::DEFAULT_SEED].into_iter().zip(expected) {
+                let mut q = Quantizer::new(&cfg(bits, DitherKind::Tpdf), 2, seed);
+                let mut out = [0; 26];
+                for _ in 0..2 {
+                    let stats = q.process(&[&x, &right], &mut out);
+                    assert_eq!(
+                        crate::bypass::hash_i32(&out),
+                        hash,
+                        "bits {bits}, seed {seed}"
+                    );
+                    assert_eq!(stats.clipped, 8);
+                    q.reset();
+                }
+                let mut fallback =
+                    Quantizer::with_sample_rate(&cfg(bits, DitherKind::Shaped), 2, seed, 32_000);
+                let mut shaped = [0; 26];
+                assert_eq!(fallback.process(&[&x, &right], &mut shaped).clipped, 8);
+                assert_eq!(shaped, out);
+            }
+        }
+    }
+
+    #[test]
+    fn feedback5_positive_rail_never_packs_as_negative() {
+        let input = vec![1.0; 65_536];
+        for bits in [16, 24, 32] {
+            for seed in [42, crate::chain::DEFAULT_SEED] {
+                let mut q = Quantizer::new(&cfg(bits, DitherKind::Feedback5), 1, seed);
+                let mut out = vec![0; input.len()];
+                q.process(&[&input], &mut out);
+                for (i, &packed) in out.iter().enumerate() {
+                    assert!(
+                        packed >= 0,
+                        "bits {bits}, seed {seed}, sample {i}: {packed}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -855,6 +1051,7 @@ mod tests {
                 DitherKind::None => 0,
                 DitherKind::Tpdf => 256,
                 DitherKind::Shaped => 34 * 256,
+                _ => unreachable!("only original modes in this test"),
             };
             assert!(
                 (out[1] - expected).abs() <= tolerance,
@@ -905,6 +1102,8 @@ mod tests {
             peak_ch: [0.5, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             chain_peak_ch: [0.7, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             measured: true,
+            limiter: Default::default(),
+            ab_overs: [0.25, 1.0],
         });
         assert_eq!(
             a,
@@ -915,8 +1114,28 @@ mod tests {
                 peak_ch: [0.5, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                 chain_peak_ch: [0.7, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                 measured: true,
+                limiter: Default::default(),
+                ab_overs: [0.25, 1.0],
             }
         );
+    }
+
+    #[test]
+    fn merge_keeps_the_largest_limiter_reduction() {
+        use audivane_protocol::LimiterStatus;
+        let status = |reduction, events, headroom| ClipStats {
+            limiter: LimiterStatus {
+                active: true,
+                headroom_db: headroom,
+                gain_reduction_db: reduction,
+                events,
+            },
+            ..ClipStats::default()
+        };
+        let mut a = ClipStats::default();
+        a.merge(status(6.0, 1, 1.0));
+        a.merge(status(0.5, 2, 1.5));
+        assert_eq!(a.limiter, status(6.0, 3, 1.5).limiter);
     }
 
     #[test]

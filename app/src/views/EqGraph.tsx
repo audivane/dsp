@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { Band } from "../api/types";
 import { hasSection, sectionEnabled, sectionSet } from "../lib/chain";
 import { channelShapeDb, design, isGainless, isIdentity, magSq, sectionShapeDb } from "../lib/eqmath";
+import { tiltStageDb, tiltStageOn } from "../lib/tilt";
 import { clamp, fmtDb, fmtFreq, minus } from "../lib/format";
 import { store, useApp } from "../store/store";
 import { cssVar, useSkin } from "../theme";
@@ -50,23 +51,23 @@ function editorPos(g: Geo, b: Band): React.CSSProperties {
 export function EqGraph() {
   const canvas = useRef<HTMLCanvasElement>(null);
   const geo = useRef<Geo>({ w: 0, h: 0 });
-  const dirty = useRef(true);
+  // Asks for one repaint; the frame loop only runs while there is something
+  // new to draw (a store change, a spectrum frame, its decay), then sleeps.
+  const kick = useRef<() => void>(() => {});
   const drag = useRef<{ i: number; pointer: number } | null>(null);
   const wheelTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [size, setSize] = useState<Geo>({ w: 0, h: 0 });
   const skin = useSkin();
   useOverlayRedraw();
-  useSpectrumLayer(() => {
-    dirty.current = true;
-  });
-  // Re-render on the inputs the painter reads (also marks the canvas dirty).
+  useSpectrumLayer(() => kick.current());
+  // Re-render on the inputs the painter reads; every render repaints once.
   const eqDraft = useApp((s) => s.eqDraft);
   const eqCfg = useApp((s) => s.config?.chain.eq);
+  useApp((s) => s.eqOff);
   const mode = useApp((s) => s.eqMode);
   const sel = useApp((s) => s.selectedBand);
   const dsp = useApp((s) => s.config?.dsp_enabled ?? true);
   const rate = useApp((s) => s.status?.graph_rate ?? 48000);
-  dirty.current = true;
   void eqDraft;
   void eqCfg;
   void skin;
@@ -87,7 +88,6 @@ export function EqGraph() {
       cv.width = Math.max(1, Math.round(r.width * d));
       cv.height = Math.max(1, Math.round(r.height * d));
       ctx.setTransform(d, 0, 0, d, 0, 0);
-      dirty.current = false;
       paint(ctx, geo.current);
       setSize((prev) => (prev.w === r.width && prev.h === r.height ? prev : { w: r.width, h: r.height }));
     };
@@ -95,17 +95,20 @@ export function EqGraph() {
     ro.observe(cv);
     resize();
     const loop = () => {
-      raf = requestAnimationFrame(loop);
-      if (!dirty.current && !spectrumAnimating()) return;
-      dirty.current = false;
       paint(ctx, geo.current);
+      raf = spectrumAnimating() ? requestAnimationFrame(loop) : 0;
     };
-    raf = requestAnimationFrame(loop);
+    kick.current = () => {
+      if (!raf) raf = requestAnimationFrame(loop);
+    };
     return () => {
       cancelAnimationFrame(raf);
+      raf = 0;
+      kick.current = () => {};
       ro.disconnect();
     };
   }, []);
+  useEffect(() => kick.current());
 
   function paint(ctx: CanvasRenderingContext2D, g: Geo) {
     if (!g.w || !g.h) return;
@@ -220,6 +223,8 @@ export function EqGraph() {
       drawDb(lDb, chL, 2.25, [], curveAlpha);
       drawDb(rDb, chR, 2.25, [], curveAlpha);
     }
+    // The tilt on its own, thin and dotted, under the combined curve that includes it.
+    if (tiltStageOn(eqNow)) drawDb(tiltStageDb(eqNow, fs, fsAt), muted, 1.25, [2, 3], active ? 0.8 : 0.35);
     if (hasSection(eqNow, m) && (m !== "linked" || !same || !secOn)) {
       const secColor = m === "left" ? chL : m === "right" ? chR : same ? accent : fg;
       drawDb(sectionShapeDb(eqNow, m, fs, fsAt), secColor, 1.75, [5, 4], active ? (secOn ? 0.85 : 0.45) : 0.3);
@@ -282,6 +287,8 @@ export function EqGraph() {
     const i = hit(p.x, p.y);
     if (i < 0) return;
     e.preventDefault();
+    // A selection left by an earlier double-click would follow the drag.
+    window.getSelection()?.removeAllRanges();
     canvas.current!.focus();
     st.selectBand(i);
     st.beginEqDrag();
@@ -384,6 +391,8 @@ export function EqGraph() {
         onPointerCancel={endDrag}
         onLostPointerCapture={endDrag}
         onDoubleClick={onDoubleClick}
+        onMouseDown={(e) => e.detail > 1 && e.preventDefault()}
+        onDragStart={(e) => e.preventDefault()}
         onKeyDown={onKeyDown}
         data-rate={rate}
       />

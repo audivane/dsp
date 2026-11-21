@@ -9,43 +9,76 @@
 // split L/R EQ; `?overlays=demo` adds the built-in Harman target next to the
 // simulated measurement the mock otherwise always has, and `?overlays=none`
 // starts with no overlays at all (clean screenshots); `?digital` simulates a
-// DAC without a hardware mixer (digital volume).
+// DAC without a hardware mixer (digital volume); `?measure=silent` makes
+// "Match to this track" hear side B as silent (its no-match path).
 
+import { DEFAULT_UI_SETTINGS, STEP_MAX_DB, STEP_MIN_DB, type KeysState, type MainViewMemory, type OsdPayload, type ShellEvent, type ShellView, type UiSettings, type WindowLabel } from "./shell";
 import { autoPreampDb, profileAutoPreampDb, profileChannelResponseDb } from "../lib/eqmath";
-import { kaiserAttenuationDb, minimumPhaseBlockReason, nyquistStopBlockReason, nyquistStopCutoff } from "../lib/upsamplerLimits";
+import { bandRationalProblem, kaiserAttenuationDb, manualRationalProblem, minimumPhaseBlockReason, nyquistStopBlockReason, nyquistStopCutoff } from "../lib/upsamplerLimits";
 import { parseApo } from "../lib/apo";
 import { normalizeRatePolicy } from "../lib/rates";
+import { cpuRefusal } from "../lib/cpuBudget";
+import { DEFAULT_CUSTOM_FIELDS, fromUpsamplerConfig, legacyToDesign, RECOMMENDED_PRESET, type LegacyUpsampler } from "../lib/upsamplerAdapter";
+import { presetCutoffFraction, presetEntry, presetRationalCost, presetRationalTaps, presetRatioNeed, presetTapsPerInput, rationalPipelines } from "../lib/filterPresets";
+import { ALLOWED_SOURCE_RATES } from "../lib/upsamplerLimits";
+import { HIGH_OUTPUT_RATES, MAX_INTEGER_RATIO, MAX_OUTPUT_RATE, rateRatioOf, resolveRateRatio } from "../lib/upsamplerRate";
 import { BUILTIN_TARGETS, DRAW_FREQS, OVERLAY_COLOURS, type OverlayData } from "../lib/overlays";
 import { bandCount, convList, deepEqual, emptyEq, eqIsActive, normalizeEq } from "../lib/chain";
+import { chainB as rawChainB, FLAT_PATCH, materializeB, patchError } from "../lib/abPatch";
+import { effectiveEndHz, normalizeTilt, tiltConfigError, tiltPairProblem, tiltProblem } from "../lib/tilt";
+import { limiterDelay, pitchActive as stagePitchActive, pitchCents } from "../lib/effects";
 import { DaemonError, ErrorCode, type IrInfo, type Transport, type TransportHandlers } from "./transport";
+import { catalogueDesign } from "./mockCatalogue";
+import { checkDesign as mockCheckDesign, type MockCheckContext } from "./mockDesignCheck";
+import { sameDesign } from "../lib/filterDesign";
 import type {
+  TiltConfig,
+  AbB,
   AbConfig,
+  AbStatus,
   AbSide,
   Band,
   ChainConfig,
   DaemonEvent,
+  DcBlockConfig,
   DeviceCapabilities,
   DeviceInfo,
   EngineConfig,
+  EngineLimits,
+  FilterPhase,
+  FilterPreset,
   Meters,
   NowPlaying,
+  OverloadReport,
   PassthroughBreak,
   Preset,
   PresetInfo,
+  RateRatio,
+  RateTarget,
+  FilterDesign,
+  DesignPlan,
   ResponseWindowRequest,
   SampleFormat,
   SelfTestResult,
+  SetStreamVolumeParams,
+  SetVolumeGuardedParams,
+  SetVarispeedParams,
+  VarispeedStatus,
   SetVolumeParams,
   SinkChoice,
+  FollowerState,
+  FollowerStatus,
+  OutputsStatus,
   Spectrum,
   Status,
   StreamInfo,
+  StreamVolume,
   Topic,
   UpsamplerConfig,
   UpsamplerResponse,
   VolumeStatus,
 } from "./types";
-import { BALANCE_MAX_DB, VOLUME_MAX_DB, VOLUME_MIN_DB } from "./types";
+import { BALANCE_MAX_DB, DC_BLOCK_CUTOFF_MAX_HZ, DC_BLOCK_CUTOFF_MIN_HZ, VOLUME_MAX_DB, VOLUME_MIN_DB } from "./types";
 
 /** The mock app's own version (and the mock engine's, unless `?engine_version=`). */
 export const MOCK_APP_VERSION = "0.1.0";
@@ -77,15 +110,32 @@ function eqProfile(name: string, bands: Band[]) {
   return { name, version: 2, preamp_db: Math.floor(autoPreampDb(bands, 48000) * 10) / 10 || 0, linked_enabled: true, bands: clone(bands) };
 }
 
+/** The preset a design is the expansion of (runtime kinds, unchanged copies), for the mock's model. */
+function modelPreset(d: FilterDesign | null): string | null {
+  if (!d) return null;
+  if (d.kind === "cascade") return ({ fir: "cascade_fir", fir_minimum: "cascade_fir_mp", fir_asymmetric: "cascade_fir_asym", frequency_sampled: "cascade_fft", elliptic: "cascade_elliptic", inverse_chebyshev: "cascade_inverse_chebyshev" } as const)[d.stage];
+  if (d.kind === "interpolator") return d.method;
+  if (d.kind === "block_fft") return "input" in d.block ? (d.overlap === "half" ? "block_fft_fast" : "block_fft") : "block_fft_large";
+  if (!d.based_on || d.based_on === RECOMMENDED_PRESET) return null;
+  const base = catalogueDesign(d.based_on);
+  return base && sameDesign(base, d) ? d.based_on : null;
+}
+
 function baseChain(): ChainConfig {
   return {
     eq: eqProfile("HD650 AutoEQ", HD650),
+    limiter: { mode: "off", ceiling_dbfs: -0.5, lookahead_ms: 5, release_ms: 100 },
     convolution: [
       { enabled: true, ir_path: IR_DIR + "Living room correction.wav", gain_db: 0, name: null },
       { enabled: true, ir_path: IR_DIR + "HD650 crossfeed.wav", gain_db: -1, name: null },
     ],
-    upsampler: { target: { ratio: 4 }, taps: 65536, phase: "linear", kaiser_beta: 14, cutoff: 1, cutoff_mode: "fraction" },
-    output: { bits: 24, dither: "tpdf" },
+    pitch: { enabled: true, cents: 0, quality: "high" },
+    upsampler: {
+      target: { ratio: 4 },
+      preset: null,
+      design: legacyToDesign(DEFAULT_CUSTOM_FIELDS),
+    },
+    output: { bits: 24, dither: "tpdf", headroom_db: 3 },
   };
 }
 
@@ -93,9 +143,15 @@ function baseChain(): ChainConfig {
 function defaultChain(eq: ChainConfig["eq"]): ChainConfig {
   return {
     eq,
+    limiter: { mode: "auto_headroom", ceiling_dbfs: -0.5, lookahead_ms: 5, release_ms: 100 },
     convolution: [],
-    upsampler: { target: "off", taps: 65536, phase: "linear", kaiser_beta: 14, cutoff: 1, cutoff_mode: "fraction" },
-    output: { bits: 24, dither: "tpdf" },
+    pitch: { enabled: true, cents: 0, quality: "high" },
+    upsampler: {
+      target: "off",
+      preset: null,
+      design: legacyToDesign(DEFAULT_CUSTOM_FIELDS),
+    },
+    output: { bits: 24, dither: "tpdf", headroom_db: 3 },
   };
 }
 
@@ -109,18 +165,37 @@ const DEVICES: DeviceInfo[] = [
   { id: "hw:CARD=PCH,DEV=0", card: "PCH", name: "Built-in Audio", hdmi: false, loopback: false, active: false },
   { id: "hw:CARD=HDMI,DEV=3", card: "HDMI", name: "HDMI 0 (monitor)", hdmi: true, loopback: false, active: false },
   { id: "hw:CARD=Loopback,DEV=0", card: "Loopback", name: "Loopback", hdmi: false, loopback: true, active: false },
-  { id: "hw:CARD=V3,DEV=0", card: "V3", name: "Creative Pebble V3", hdmi: false, loopback: false, active: false },
+  { id: "hw:CARD=SPK,DEV=0", card: "SPK", name: "USB speaker (48 kHz, 16-bit)", hdmi: false, loopback: false, active: false },
+  { id: "hw:CARD=USB,DEV=0", card: "USB", name: "Hi-res USB DAC", hdmi: false, loopback: false, active: false },
+  { id: "hw:CARD=USB48,DEV=0", card: "USB48", name: "USB DAC (48 kHz only)", hdmi: false, loopback: false, active: false },
 ];
 
 const RATES_44 = [44100, 88200, 176400, 352800, 705600];
 const RATES_48 = [48000, 96000, 192000, 384000, 768000];
+/** ×32 and ×64 of 44.1 and 48 kHz, like the protocol's `HIGH_OUTPUT_RATES`. */
+const RATES_HIGH = [...HIGH_OUTPUT_RATES];
+/** Largest term of a rational ratio the engine opens (`MAX_RATIONAL_TERM`). */
+const MAX_RATIONAL_TERM = 4096;
+
+/** The engine's limits on the mock "machine": 32 GB of RAM, so the 4 GiB
+ * design workspace ceiling (a quarter of the RAM, 1.5 to 4 GiB). */
+export const MOCK_LIMITS: EngineLimits = {
+  max_kernel_taps: 8_388_608,
+  intermediate_max_taps: 2_097_152,
+  design_workspace_bytes: 4 * 2 ** 30,
+  cpu_share: 0.9,
+};
 
 /**
  * What each mock card accepts, like the engine's probe (`status.device_caps`):
  * - DAC: a typical USB DAC: S16/S24/S32 (24 significant bits) up to 768k,
  *   S24 3-byte only up to 192k.
- * - V3: Creative Pebble V3, the 48 kHz / S16-only USB speaker from the bug
- *   report (`?device=V3` in the browser).
+ * - SPK: a USB speaker that plays 48 kHz S16 only (`?device=SPK` in the
+ *   browser).
+ * - USB: a hi-res DAC that also takes 1.4112 / 1.536 / 2.8224 / 3.072 MHz
+ *   (×32 and ×64) in S32 (`?device=USB`).
+ * - USB48: a USB DAC that plays 48 kHz only, S16/S24/S32 (24 significant
+ *   bits), for the engine bypass resampler (`?device=USB48`).
  */
 function capsFor(device: string): DeviceCapabilities | null {
   const card = DEVICES.find((d) => sameDevice(d, device))?.card ?? "";
@@ -149,8 +224,14 @@ function capsFor(device: string): DeviceCapabilities | null {
       return caps([44100, 48000, 96000, 192000].map((r) => row(r, [["s16", 16], ["s24", 24], ["s32", 24]])));
     case "Loopback":
       return caps(sorted([...RATES_44, ...RATES_48]).map((r) => row(r, [["s16", 16], ["s24", 24], ["s24_3", 24], ["s32", 32]])));
-    case "V3":
+    case "SPK":
       return caps([row(48000, [["s16", 16]])]);
+    case "USB48":
+      return caps([row(48000, [["s16", 16], ["s24", 24], ["s32", 24]])]);
+    case "USB":
+      return caps(
+        sorted([...RATES_44, ...RATES_48, ...RATES_HIGH]).map((r) => row(r, [...(r <= 768000 ? ([["s16", 16], ["s24", 24]] as [SampleFormat, number][]) : []), ["s32", 32]])),
+      );
     default:
       return null;
   }
@@ -167,12 +248,86 @@ function ladder(desired: number): number[] {
   }
 }
 
-/** Like io-alsa `plan_open`: first ratio on the ladder with a usable format. */
-function planOpen(caps: DeviceCapabilities, rate: number, desired: number, formats: SampleFormat[]): { ratio: number; format: SampleFormat } | null {
-  for (const k of ladder(desired)) {
-    const at = caps.rates.find((r) => r.rate === rate * k);
-    const f = formats.find((x) => at?.formats.some((c) => c.format === x));
-    if (f) return { ratio: k, format: f };
+const ONE: RateRatio = { up: 1, down: 1 };
+
+/** A design as the mock pictures it (see `MockDaemon.design`). */
+interface MockDesign {
+  ratio: RateRatio;
+  taps: number;
+  phase: FilterPhase;
+  cutoff: number;
+  atten: number;
+  beta: number;
+  tw: number;
+  /** Output frames. */
+  latency: number;
+  /** A band design's edges, as fractions of the lower Nyquist. */
+  band?: { pass: number; stop: number };
+}
+
+/** Rough stopband depth of each preset family, dB (README), for the mock's plots. */
+const PRESET_ATTEN_DB: Record<string, number> = {
+  gaussian: 142,
+  flattop: 210,
+  chebyshev: 190,
+  kaiser: 200,
+  halfband: 145,
+  lanczos: 90,
+  nuttall: 110,
+  hann: 120,
+  leaky: 112,
+  cascade: 100,
+  interp: 60,
+  block: 70,
+};
+const outRate = (rate: number, r: RateRatio) => Math.round((rate * r.up) / r.down);
+const ratioStr = (r: RateRatio) => (r.down === 1 ? `x${r.up}` : `${r.up}/${r.down}`);
+
+/** Whether the device plays `rate` in one of `formats` (empty: any). */
+function devicePlaysAt(caps: DeviceCapabilities, rate: number, formats: SampleFormat[]): SampleFormat | null {
+  const at = caps.rates.find((r) => r.rate === rate);
+  if (!at) return null;
+  if (formats.length === 0) return at.formats[0]?.format ?? null;
+  return formats.find((x) => at.formats.some((c) => c.format === x)) ?? null;
+}
+
+/**
+ * The ratios an open tries for a target at `rate`, like io-alsa's ladders:
+ * integer targets halve (powers of two) or step down to 1, a fractional or
+ * decimating ratio is tried then 1, and `max_rate_any` follows its family
+ * rule (README "Rate policy"), skipping what the chain cannot be built for.
+ */
+function ratioCandidates(chain: ChainConfig, rate: number, caps: DeviceCapabilities | null, formats: SampleFormat[]): RateRatio[] {
+  const t = chain.upsampler.target;
+  const want = resolveRateRatio(t, rate);
+  const pName = chain.upsampler.preset;
+  const buildable = (r: RateRatio) => !pName || pName === RECOMMENDED_PRESET || presetRatioNeed(pName as FilterPreset, r, MOCK_LIMITS.max_kernel_taps) === null;
+  if (want.down !== 1) return [want, ONE].filter(buildable);
+  if (t !== "off" && "max_rate_any" in t && caps) {
+    const cap = t.max_rate_any;
+    const plays = (r: number) => devicePlaysAt(caps, r, formats) !== null;
+    const same: RateRatio[] = [];
+    for (let k = MAX_INTEGER_RATIO; k >= 2; k--) if (rate * k <= cap && plays(rate * k)) same.push({ up: k, down: 1 });
+    const fam = (r: number) => (r % 11025 === 0 ? 44100 : 48000);
+    const other = [...RATES_44, ...RATES_48, ...RATES_HIGH]
+      .filter((r) => fam(r) !== fam(rate) && r > rate && r <= cap && plays(r))
+      .sort((a, b) => b - a)
+      .map((r) => rateRatioOf(rate, r))
+      .filter((r) => r.up <= MAX_RATIONAL_TERM && r.down <= MAX_RATIONAL_TERM)
+      .filter(buildable);
+    const sameBest = same.length ? rate * same[0].up : rate;
+    const otherBest = other.length ? outRate(rate, other[0]) : 0;
+    const cross = other.length > 0 && (same.length === 0 || otherBest >= 2 * sameBest);
+    return cross ? [other[0], ...same, ...other.slice(1), ONE] : [...same, ...other, ONE];
+  }
+  return ladder(want.up).map((k) => ({ up: k, down: 1 }));
+}
+
+/** Like io-alsa `plan_open`: the first ratio on the ladder with a usable format. */
+function planOpen(caps: DeviceCapabilities, rate: number, candidates: RateRatio[], formats: SampleFormat[]): { ratio: RateRatio; format: SampleFormat } | null {
+  for (const r of candidates.length ? candidates : [ONE]) {
+    const f = devicePlaysAt(caps, outRate(rate, r), formats);
+    if (f) return { ratio: r, format: f };
   }
   return null;
 }
@@ -183,19 +338,148 @@ function sameDevice(d: DeviceInfo, configured: string): boolean {
   return !!m && m[1].toLowerCase() === d.card.toLowerCase() && d.id.endsWith(`DEV=${m[2] ?? "0"}`);
 }
 
-function ratioOf(chain: ChainConfig, rate: number): number {
-  const t = chain.upsampler.target;
-  if (t === "off") return 1;
-  if ("ratio" in t) return Math.max(1, t.ratio);
-  let r = 1;
-  while (rate * r * 2 <= t.max_rate) r *= 2;
-  return r;
+function pitchIsActive(p: ChainConfig["pitch"]): boolean {
+  if (!p || !p.enabled) return false;
+  if (p.reference_hz != null && p.target_hz != null && p.reference_hz > 0 && p.target_hz > 0) {
+    return p.reference_hz !== p.target_hz;
+  }
+  if (p.semitones != null) return p.semitones !== 0;
+  return p.cents !== 0;
 }
 
+/** Explicit fixed-coefficient dither modes run the quantizer on their own. */
+function ditherEnablesProcessing(d: ChainConfig["output"]["dither"]): boolean {
+  return d !== "none" && d !== "tpdf" && d !== "shaped";
+}
+
+/** Mirrors `DcBlockConfig` serde decoding (object, sequence/array, or null/omitted). */
+function normalizeDcBlock(raw: unknown): DcBlockConfig | null {
+  if (raw === null || raw === undefined) return null;
+  if (Array.isArray(raw)) {
+    if (raw.length > 2) {
+      throw new DaemonError(ErrorCode.INVALID_PARAMS, "dc_block array must have at most 2 elements");
+    }
+    let enabled = true;
+    if (raw.length >= 1) {
+      if (typeof raw[0] !== "boolean") {
+        throw new DaemonError(ErrorCode.INVALID_PARAMS, "dc_block.enabled must be a boolean");
+      }
+      enabled = raw[0];
+    }
+    let cutoff_hz = 5.0;
+    if (raw.length >= 2) {
+      if (typeof raw[1] !== "number") {
+        throw new DaemonError(ErrorCode.INVALID_PARAMS, "dc_block.cutoff_hz must be a number");
+      }
+      cutoff_hz = raw[1];
+    }
+    return { enabled, cutoff_hz };
+  }
+  if (typeof raw !== "object") {
+    throw new DaemonError(ErrorCode.INVALID_PARAMS, "dc_block must be an object or null");
+  }
+  const r = raw as Record<string, unknown>;
+  let enabled = true;
+  if (r.enabled !== undefined) {
+    if (typeof r.enabled !== "boolean") {
+      throw new DaemonError(ErrorCode.INVALID_PARAMS, "dc_block.enabled must be a boolean");
+    }
+    enabled = r.enabled;
+  }
+  let cutoff_hz = 5.0;
+  if (r.cutoff_hz !== undefined) {
+    if (typeof r.cutoff_hz !== "number") {
+      throw new DaemonError(ErrorCode.INVALID_PARAMS, "dc_block.cutoff_hz must be a number");
+    }
+    cutoff_hz = r.cutoff_hz;
+  }
+  return { enabled, cutoff_hz };
+}
+
+/** Serde defaults and the daemon's `normalize` of one stored chain. */
+function normalizeChainFields(raw: Partial<ChainConfig>): ChainConfig {
+  const chain: ChainConfig = { ...defaultChain(null), ...raw };
+  if (chain.dc_block !== undefined) chain.dc_block = normalizeDcBlock(chain.dc_block);
+  // Serde field defaults: a patch like `{"crossfeed": {"enabled": true}}` on a
+  // chain without the stage fills the rest in.
+  if (chain.crossfeed) chain.crossfeed = { enabled: true, mode: "bs2b_default", cutoff_hz: 700, feed_db: 4.5, level: "matched", ...(chain.crossfeed as Partial<NonNullable<ChainConfig["crossfeed"]>>) };
+  if (chain.harmonics) chain.harmonics = { enabled: true, character: "triode", h2_db: -40, h3_db: -58, h4_db: null, h5_db: null, dc_block: true, ...(chain.harmonics as Partial<NonNullable<ChainConfig["harmonics"]>>) };
+  // A removed `Option` field (`{"design": null}` in a merge patch) reads back as None.
+  if (chain.upsampler) chain.upsampler = { ...chain.upsampler, preset: chain.upsampler.preset ?? null, design: chain.upsampler.design ?? null };
+  if (chain.pitch) chain.pitch = { enabled: true, cents: 0, quality: "high", ...(chain.pitch as Partial<NonNullable<ChainConfig["pitch"]>>) };
+  if (chain.eq) chain.eq = normalizeEq(chain.eq);
+  if (chain.eq?.tilt) chain.eq.tilt = normalizeTilt(chain.eq.tilt);
+  if (chain.eq?.tilt_high) chain.eq.tilt_high = normalizeTilt(chain.eq.tilt_high);
+  return chain;
+}
+
+/**
+ * Mirrors Serde field defaults + the daemon's `set_ab` check and
+ * `normalize_ab`: B is materialised from `b` and chain A. A full chain B
+ * keeps its filter; its target, limiter and output follow chain A (`notes`
+ * says so). A patch on a shared field is refused.
+ */
+function normalizeAbWithChainA(raw: unknown, chainA: ChainConfig): { ab: AbConfig; notes: string[] } {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new DaemonError(ErrorCode.INVALID_PARAMS, "ab must be an object or null");
+  }
+  const rawAb = raw as Partial<AbConfig>;
+  const rawB = rawAb.b as unknown;
+  if (typeof rawB !== "object" || rawB === null || Array.isArray(rawB) || (!("patch" in rawB) && !("chain" in rawB))) {
+    throw new DaemonError(ErrorCode.INVALID_PARAMS, "ab.b must be {patch} or {chain}");
+  }
+  const notes: string[] = [];
+  let b: AbB;
+  if ("chain" in rawB) {
+    const chain = normalizeChainFields(clone((rawB as { chain: Partial<ChainConfig> }).chain));
+    const changed = [
+      !deepEqual(chain.upsampler.target, chainA.upsampler.target) && "upsampler.target",
+      !deepEqual(chain.limiter, chainA.limiter) && "limiter",
+      !deepEqual(chain.output, chainA.output) && "output",
+    ].filter(Boolean);
+    if (changed.length) notes.push(`side B's ${changed.join(" and ")} now follow chain A`);
+    b = { chain: materializeB(chainA, { chain }) };
+  } else {
+    const patch = (rawB as { patch: unknown }).patch;
+    const err = patchError(patch);
+    if (err) throw new DaemonError(ErrorCode.INVALID_PARAMS, err);
+    b = { patch: clone(patch) as AbB extends { patch: infer P } ? P : never };
+  }
+  const chain_b = normalizeChainFields(materializeB(chainA, b));
+  const level: AbConfig["level"] =
+    rawAb.level === undefined
+      ? { mode: "analytic", weighting: "k" }
+      : rawAb.level.mode === "analytic"
+        ? { mode: "analytic", weighting: rawAb.level.weighting ?? "k" }
+        : clone(rawAb.level);
+  const headroom: AbConfig["headroom"] = rawAb.headroom === undefined ? { mode: "auto" } : clone(rawAb.headroom);
+  const ab: AbConfig = { b, chain_b, level, headroom };
+  if (typeof rawAb.label === "string") ab.label = rawAb.label;
+  return { ab, notes };
+}
+
+/** Chain B as the daemon deserialises it: materialised, then Serde's field defaults. */
+function chainB(ab: AbConfig, a: ChainConfig): ChainConfig {
+  return normalizeChainFields(rawChainB(ab, a));
+}
+
+/** Mirrors `ChainConfig::is_passthrough` in the daemon. */
 function chainIsPassthrough(chain: ChainConfig): boolean {
   const eqActive = eqIsActive(chain.eq);
   const conv = convList(chain).some((c) => c.enabled);
-  return !eqActive && !conv && chain.upsampler.target === "off";
+  const dcBlockActive = chain.dc_block != null && (chain.dc_block.enabled ?? true);
+  return (
+    !dcBlockActive &&
+    !(chain.crossfeed?.enabled ?? false) &&
+    !eqActive &&
+    !conv &&
+    !pitchIsActive(chain.pitch) &&
+    !(chain.harmonics?.enabled ?? false) &&
+    (chain.limiter?.mode ?? "off") === "off" &&
+    chain.upsampler.target === "off" &&
+    !ditherEnablesProcessing(chain.output.dither) &&
+    chain.output.headroom_db === 0
+  );
 }
 
 function bandsCountOfChain(chain: ChainConfig): number {
@@ -223,15 +507,42 @@ function mockMeasurement(): OverlayData {
 
 type Listener = (e: DaemonEvent) => void;
 
+/** A daemon instance id like the daemon's: 128 random bits in hex. */
+function newInstance(): string {
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+}
+
 export class MockDaemon {
   config: EngineConfig;
   presets = new Map<string, Preset & { modified_unix: number }>();
-  streams: StreamInfo[];
+  /** When each stream started playing (a counter), for the arbiter's
+   * first-started rule. Kept while it plays, across sink moves. */
+  private startedAt = new Map<number, number>();
+  private startSeq = 0;
+  private streamList: StreamInfo[] = [];
   nowPlaying: NowPlaying | null;
-  volume: VolumeStatus = { volume_db: -12, balance_db: 0, muted: false, hardware: true, min_db: -80, max_db: 0 };
+  volume: VolumeStatus = {
+    volume_db: -12, balance_db: 0, muted: false, hardware: true, min_db: VOLUME_MIN_DB, max_db: 0,
+    mode: "auto", hardware_db: -12, software_db: 0, hardware_unavailable: false, ceiling_db: null,
+    sink_volume: "ignore", guard: "off", blocked: 0, last_blocked: null,
+  };
   abSide: AbSide = "a";
   released = false;
   running: boolean;
+  /** `Status.overload`: the fallback in effect after a simulated overload. */
+  overload: OverloadReport | null = null;
+  private overloadEpisodes = 0;
+  /** `VolumeStatus.instance`: new on every (re)start. */
+  instance = newInstance();
+  /** `VolumeStatus.revision`: bumped on every change of the level state. */
+  revision = 1;
+  /** Leave out `instance`/`revision`, like a daemon that predates them. */
+  legacyVolume = false;
+  /** No `set_stream_volume` and no `StreamInfo.volume_db`, like a daemon
+   *  that predates them. */
+  legacyStreamVolume = false;
   /** `status.version`; the mock app is MOCK_APP_VERSION (`?engine_version=` to differ). */
   engineVersion: string;
   /** Overlay files, as the app process would keep them on disk. */
@@ -246,11 +557,61 @@ export class MockDaemon {
   private clippedCh = [0, 0];
   private lastStatusJson = "";
   private latency = 40;
+  /** The card has a hardware mixer (`?digital`: no). */
+  private hasMixer = true;
+  /** Limiter telemetry: running event total, held automatic headroom, in reduction. */
+  private limEvents = 0;
+  private limHeadroom = 0;
+  /** `Status.limiter_held_db`: the held headroom while the limiter is in the path. */
+  private limHeld = 0;
+  private limReducing = false;
+  /** Followers: when each one (re)started, for its opening → locking → locked walk. */
+  private followerSince = new Map<string, number>();
+  /** Follower devices reported `lost` (tests, `?follower_lost=`). */
+  lostFollowers = new Set<string>();
+  /** The clock the follower walk reads (tests replace it). */
+  followerClock: () => number = () => Date.now();
+  /** `Status.error`: a recoverable engine error while the streams keep playing. */
+  engineError: string | null = null;
+  /** `Status.xruns`: dropouts since the engine started. */
+  xruns = 0;
 
-  constructor(opts: { running?: boolean; apps?: boolean; split?: boolean; overlays?: boolean | "none"; digitalVolume?: boolean; device?: string; engineVersion?: string; playRate?: number } = {}) {
+  /** Behave like an engine before fractional rates (0.9.4): no `rate_ratio`, integer targets only. */
+  legacyRatio = false;
+  /** Behave like an engine before the crossfeed level policy: `level` is dropped (serde ignores it) and the stage is peak-safe. */
+  legacyCrossfeedLevel = false;
+
+  /** A crossfeed config as the engine keeps it: serde fills a missing `level` with `matched`; an older engine drops it. */
+  private crossfeedAsStored(xf: NonNullable<ChainConfig["crossfeed"]>): NonNullable<ChainConfig["crossfeed"]> {
+    if (this.legacyCrossfeedLevel) {
+      const { level: _level, ...rest } = xf;
+      return rest as NonNullable<ChainConfig["crossfeed"]>;
+    }
+    return { ...xf, level: xf.level ?? "matched" };
+  }
+
+  /** An engine error to report, pushed at once like the daemon's (`null` clears it). */
+  setEngineError(error: string | null) {
+    this.engineError = error;
+    this.emitStatus(true);
+  }
+
+  /** xruns so far, pushed at once like the daemon's. */
+  setXruns(n: number) {
+    this.xruns = Math.max(0, Math.round(n));
+    this.emitStatus(true);
+  }
+
+  constructor(opts: { running?: boolean; apps?: boolean; split?: boolean; overlays?: boolean | "none"; digitalVolume?: boolean; device?: string; engineVersion?: string; playRate?: number; legacyRatio?: boolean; legacyStreamVolume?: boolean; legacyCrossfeedLevel?: boolean; followers?: string[] } = {}) {
+    this.legacyRatio = opts.legacyRatio ?? false;
+    this.legacyCrossfeedLevel = opts.legacyCrossfeedLevel ?? false;
+    this.legacyStreamVolume = opts.legacyStreamVolume ?? false;
     this.running = opts.running ?? true;
     this.engineVersion = opts.engineVersion ?? MOCK_APP_VERSION;
-    if (opts.digitalVolume) this.volume = { ...this.volume, hardware: false };
+    if (opts.digitalVolume) {
+      this.volume = { ...this.volume, hardware: false };
+      this.hasMixer = false;
+    }
     if (opts.overlays !== "none") {
       const measured = mockMeasurement();
       this.overlays.set(measured.name, measured);
@@ -269,13 +630,28 @@ export class MockDaemon {
       formats: ["s32", "s24", "s24_3", "s16"],
       dsp_enabled: true,
       chain,
-      ab: { chain_b: flatChain(), level: { mode: "analytic" } },
-      rate: { follow_source: true, allowed_rates: [44100, 48000, 88200, 96000, 176400, 192000], default_rate: 48000, conflict: "keep_current" },
+      ab: { b: { patch: FLAT_PATCH }, label: "Flat", chain_b: flatChain(), level: { mode: "analytic", weighting: "k" }, headroom: { mode: "auto" } },
+      rate: { follow_source: true, allowed_rates: [44100, 48000, 88200, 96000, 176400, 192000], default_rate: 48000, conflict: "keep_current", bypass_resampler: "engine" },
       quantum: 1024,
       routing: opts.apps ? { mode: "apps", rules: [{ app: "Strawberry", sink: "dsp" }] } : { mode: "system" },
-      volume: { volume_db: -12, balance_db: 0, muted: false },
+      volume: {
+        volume_db: -12, balance_db: 0, muted: false, mode: "auto", hardware_db: null, max_volume_db: null,
+        sink_volume: "ignore", guard: { mode: "off", max_rise_db_per_s: 6, stream_max_db: null },
+      },
+      varispeed: { enabled: false, speed: 1, ramp_ms: 200, keep_pitch: false },
+      device_lost: "pause",
+      outputs: { followers: [] },
       active_preset: "HD650 AutoEQ",
     };
+    // Preloaded followers (`?followers=USB,SPK`): cards other than the main one.
+    for (const card of opts.followers ?? []) {
+      const d = DEVICES.find((x) => x.card === card || x.id === card);
+      if (d && d.id !== this.config.device && !this.config.outputs.followers.some((f) => f.device === d.id) && this.config.outputs.followers.length < 3) {
+        this.config.outputs.followers.push({ device: d.id, enabled: true, trim_ms: 0, volume_db: 0 });
+      }
+    }
+    // Already playing (and locked) when the preview opens.
+    for (const f of this.config.outputs.followers) this.followerSince.set(f.device, Date.now() - 60_000);
     const now = Math.floor(Date.now() / 1000);
     this.presets.set("HD650 AutoEQ", { version: 1, name: "HD650 AutoEQ", chain: clone(chain), modified_unix: now - 86400 * 3 });
     const room = baseChain();
@@ -283,11 +659,12 @@ export class MockDaemon {
     this.presets.set("Room + bass shelf", { version: 1, name: "Room + bass shelf", chain: room, modified_unix: now - 86400 * 12 });
     this.presets.set("Flat", { version: 1, name: "Flat", chain: flatChain(), modified_unix: now - 86400 * 40 });
     this.streams = [
-      { node: 81, app_name: "Strawberry", binary: "strawberry", media_name: "Nils Frahm · Says", rate: opts.playRate ?? 44100, channels: 2, format: "S24LE", sink: "dsp", volume: 1, muted: false },
-      { node: 94, app_name: "Firefox", binary: "firefox", media_name: "YouTube", rate: 48000, channels: 2, format: "F32LE", sink: null, volume: 1, muted: false },
-      { node: 102, app_name: "Discord", binary: "Discord", media_name: "Voice", rate: 48000, channels: 2, format: "F32LE", sink: null, volume: 0.8, muted: false },
+      { node: 81, app_name: "Strawberry", binary: "strawberry", media_name: "Nils Frahm · Says", rate: opts.playRate ?? 44100, channels: 2, format: "S24LE", sink: "dsp", volume: 1, muted: false, volume_db: 0 },
+      { node: 94, app_name: "Firefox", binary: "firefox", media_name: "YouTube", rate: 48000, channels: 2, format: "F32LE", sink: null, volume: 1, muted: false, volume_db: 0 },
+      { node: 102, app_name: "Discord", binary: "Discord", media_name: "Voice", rate: 48000, channels: 2, format: "F32LE", sink: null, volume: 0.8, muted: false, volume_db: -1.94 },
     ];
     this.nowPlaying = { player: "org.mpris.MediaPlayer2.strawberry", title: "Says", artist: "Nils Frahm", album: "Spaces", status: "Playing", native_rate: 44100, native_bits: 24 };
+    this.applyGain();
   }
 
   // ------------------------------------------------------------ events
@@ -326,10 +703,71 @@ export class MockDaemon {
   }
   snapshot(topics: Topic[]) {
     if (topics.includes("status")) this.emit({ event: "status", data: this.status() });
-    if (topics.includes("streams")) this.emit({ event: "streams", data: this.streams });
+    if (topics.includes("streams")) this.emit({ event: "streams", data: this.visibleStreams() });
     if (topics.includes("now_playing")) this.emit({ event: "now_playing", data: this.nowPlaying });
     if (topics.includes("config")) this.emit({ event: "config", data: this.config });
     if (topics.includes("presets")) this.emit({ event: "presets", data: this.listPresets() });
+    if (topics.includes("devices")) this.emit({ event: "devices", data: this.listDevices() });
+  }
+
+  /** The volume status as reported: with this instance and revision. */
+  volumeStatus(): VolumeStatus {
+    if (this.legacyVolume) {
+      const { instance: _i, revision: _r, ...legacy } = clone(this.volume);
+      return legacy as VolumeStatus;
+    }
+    return { ...clone(this.volume), instance: this.instance, revision: this.revision };
+  }
+
+  /** Run `change`, then work out what is applied; bump the revision when
+   *  the level state or the applied split moved. */
+  private levelChange(change: () => void) {
+    const key = () => JSON.stringify([this.volume.volume_db, this.volume.balance_db, this.volume.muted, this.volume.software_db, this.volume.hardware_db]);
+    const before = key();
+    change();
+    this.applyGain();
+    if (key() !== before) this.revision++;
+  }
+
+  /**
+   * The split between the card and the digital part, like the engine's
+   * `volume::resolve` (a mock mixer reaching down to −100 dB): `auto` and
+   * `hardware` put the volume on the card, `software` is all digital,
+   * `hybrid` keeps the card at `hardware_db` and attenuates the rest
+   * digitally; without a mixer everything is digital.
+   */
+  private applyGain() {
+    const v = this.volume;
+    const target = v.volume_db;
+    const residue = (hw: number) => {
+      const r = Math.min(0, target - hw);
+      return r > -0.02 ? 0 : r;
+    };
+    const cfgHw = this.config?.volume?.hardware_db ?? null;
+    if (!this.hasMixer || v.mode === "software") {
+      this.volume = { ...v, hardware: false, software_db: target, hardware_db: this.hasMixer ? cfgHw : null };
+    } else if (v.mode === "hybrid") {
+      const hw = Math.max(cfgHw ?? target, target);
+      this.volume = { ...v, hardware: true, hardware_db: hw, software_db: residue(hw) };
+    } else {
+      const hw = Math.max(-100, target);
+      this.volume = { ...v, hardware: true, hardware_db: hw, software_db: residue(hw) };
+    }
+  }
+
+  /** Replace the config as another client or an older engine would (tests). */
+  snapshotConfig(config: EngineConfig) {
+    this.config = clone(config);
+    this.emitConfig();
+  }
+
+  /** A level change from outside the app (the CLI, the desktop). */
+  setLevel(patch: Partial<Pick<VolumeStatus, "volume_db" | "balance_db" | "muted">>) {
+    this.levelChange(() => {
+      this.volume = { ...this.volume, ...patch };
+      if (this.config.volume) this.config.volume = { ...this.config.volume, ...patch };
+    });
+    this.emitConfig();
   }
 
   startEngine() {
@@ -339,10 +777,15 @@ export class MockDaemon {
 
   /** Like a service restart after an upgrade: down, then up on the app's version. */
   restartEngine() {
+    // Calls on the old connection fail while it is down, as with a real
+    // daemon whose socket went away.
+    this.running = false;
     for (const l of this.connListeners) l(false);
     this.engineVersion = MOCK_APP_VERSION;
-    this.running = true;
     setTimeout(() => {
+      this.instance = newInstance();
+      this.revision = 1;
+      this.running = true;
       for (const l of this.connListeners) l(true);
     }, 300);
   }
@@ -353,6 +796,8 @@ export class MockDaemon {
       if (!this.running || this.listeners.size === 0) return;
       this.tickCount++;
       this.emit({ event: "meters", data: this.meters() });
+      // Followers lock over a few seconds: push their status as it moves.
+      if (this.config.outputs.followers.length && this.tickCount % 15 === 0) this.emitStatus();
       if (this.spectrumEnabled && this.tickCount % 2 === 0 && this.feeding().length > 0 && !this.released && !this.volume.muted) {
         this.emit({ event: "spectrum", data: this.spectrum() });
       }
@@ -362,13 +807,31 @@ export class MockDaemon {
   stop() {
     if (this.meterTimer) clearInterval(this.meterTimer);
     this.meterTimer = null;
+    if (this.abMeasure) clearInterval(this.abMeasure.timer);
   }
 
   // ------------------------------------------------------------ derived state
 
+  /** The active sink's clients, oldest first (as the arbiter sorts them:
+   * the first started wins a conflict it cannot keep). */
   private feeding(): StreamInfo[] {
     const sink = this.activeSink();
-    return this.streams.filter((s) => s.sink !== null && s.sink === sink);
+    const since = (s: StreamInfo) => this.startedAt.get(s.node) ?? 0;
+    return this.streams.filter((s) => s.sink !== null && s.sink === sink).sort((a, b) => since(a) - since(b) || a.node - b.node);
+  }
+
+  get streams(): StreamInfo[] {
+    return this.streamList;
+  }
+
+  /** Replace the streams. A stream new to the list starts playing (its age
+   * counts from now); one gone from it stopped. Moving sinks, or any other
+   * change, keeps a stream's age, as the arbiter keeps a running client's. */
+  set streams(next: StreamInfo[]) {
+    const playing = new Set(next.map((s) => s.node));
+    for (const node of [...this.startedAt.keys()]) if (!playing.has(node)) this.startedAt.delete(node);
+    for (const s of next) if (!this.startedAt.has(s.node)) this.startedAt.set(s.node, ++this.startSeq);
+    this.streamList = next;
   }
 
   private activeSink(): SinkChoice | null {
@@ -380,119 +843,222 @@ export class MockDaemon {
 
   private chainOn(): ChainConfig {
     const ab = this.config.ab;
-    return this.abSide === "b" && ab ? ab.chain_b : this.config.chain;
+    return this.abSide === "b" && ab ? chainB(ab, this.config.chain) : this.config.chain;
   }
 
   /** Rate the graph last ran at while something played (for `keep_current`). */
   private lastRate = 0;
 
   /**
-   * Like the engine's rate arbiter, without its timers: one app (or several
-   * that agree) is followed; when they disagree `rate.conflict` decides.
-   * Streams are listed in start order, so the first one started first.
-   */
-  /**
    * Like the engine's io-pw `rate_caps`: the configured rates the device can
-   * play (directly or upsampled, with some format), and the default rate
-   * moved to the nearest of them (same family first, then 48k).
+   * play without the engine bypass resampler (natively, or upsampled with
+   * DSP on, with some format), widened to every such engine rate when none
+   * is, and the default rate moved to the nearest of them (same family
+   * first, then 48k): the DSP sink's native base (`native`). With DSP off,
+   * the configured rates the engine converts are added on top, never in
+   * its place.
    */
-  effectivePolicy(): { allowed: number[]; defaultRate: number } {
+  effectivePolicy(): { allowed: number[]; defaultRate: number; native: number[] } {
     const policy = this.config.rate;
     const caps = capsFor(this.config.device);
-    if (!caps) return { allowed: policy.allowed_rates, defaultRate: policy.default_rate };
+    if (!caps) return { allowed: policy.allowed_rates, defaultRate: policy.default_rate, native: policy.allowed_rates };
     const chain = this.chainOn();
-    const playable = (r: number) => planOpen(caps, r, this.config.dsp_enabled ? ratioOf(chain, r) : 1, this.config.formats) !== null;
-    let allowed = policy.allowed_rates.filter(playable);
-    if (allowed.length === 0) allowed = [...RATES_44, ...RATES_48].filter(playable);
-    allowed = [...allowed].sort((a, b) => a - b);
+    const playable = (r: number) => planOpen(caps, r, this.config.dsp_enabled ? ratioCandidates(chain, r, caps, this.config.formats) : [ONE], this.config.formats) !== null;
+    let native = policy.allowed_rates.filter(playable);
+    if (native.length === 0) native = [...RATES_44, ...RATES_48].filter(playable);
+    native = [...native].sort((a, b) => a - b);
     const fam = (r: number) => (r % 11025 === 0 ? 44100 : 48000);
-    const defaultRate = allowed.includes(policy.default_rate)
+    const defaultRate = native.includes(policy.default_rate)
       ? policy.default_rate
-      : ([...allowed].sort(
+      : ([...native].sort(
           (a, b) =>
             Number(fam(a) !== fam(policy.default_rate)) - Number(fam(b) !== fam(policy.default_rate)) ||
             Math.abs(a - policy.default_rate) - Math.abs(b - policy.default_rate) ||
             Number(a !== 48000) - Number(b !== 48000),
         )[0] ?? policy.default_rate);
-    return { allowed, defaultRate };
+    const converted = this.config.dsp_enabled ? [] : policy.allowed_rates.filter((r) => !native.includes(r) && this.bypassLanding(r) !== null);
+    const allowed = [...native, ...converted].sort((a, b) => a - b);
+    return { allowed, defaultRate, native };
   }
 
-  /** Like io-pw `direct_rate_policy`: effective rates the device plays natively. */
-  directRates(): number[] {
+  /** The formats the open plan tries (empty: the driver's preference). */
+  private openFormats(): SampleFormat[] {
+    return this.config.formats.length ? this.config.formats : (["s32", "s24", "s24_3", "s16"] as SampleFormat[]);
+  }
+
+  /**
+   * Like io-pw `DesiredDspConfig::bypass_landing`: the native rate the engine
+   * bypass resampler converts `rate` to for Direct and DSP off (the allowed
+   * rate the device plays at or above it, else the closest; any native
+   * engine rate when no allowed one is native). Null when the device plays
+   * `rate` natively, with `bypass_resampler: "pipewire"`, or without a
+   * probe. The mock builds every pair within the rational term limit.
+   */
+  bypassLanding(rate: number): number | null {
+    if ((this.config.rate.bypass_resampler ?? "engine") !== "engine") return null;
+    const caps = capsFor(this.config.device);
+    if (!caps) return null;
+    const formats = this.openFormats();
+    const native = (r: number) => devicePlaysAt(caps, r, formats) !== null;
+    if (native(rate)) return null;
+    const engineRates = [...RATES_44, ...RATES_48].sort((a, b) => a - b);
+    const pick = (list: number[]) => {
+      if (list.length === 0) return null;
+      return list.find((r) => r >= rate) ?? [...list].sort((a, b) => Math.abs(a - rate) - Math.abs(b - rate))[0];
+    };
+    const out = pick(engineRates.filter((r) => native(r) && this.config.rate.allowed_rates.includes(r))) ?? pick(engineRates.filter(native));
+    if (out === null) return null;
+    const r = rateRatioOf(rate, out);
+    return r.up <= MAX_RATIONAL_TERM && r.down <= MAX_RATIONAL_TERM ? out : null;
+  }
+
+  /** Like io-pw's ladder for Direct and DSP off: the bypass resampler's ratio, then x1. */
+  private bypassLadder(rate: number): RateRatio[] {
+    const out = this.bypassLanding(rate);
+    return out === null ? [ONE] : [rateRatioOf(rate, out), ONE];
+  }
+
+  /**
+   * Like io-pw `direct_rate_policy`: effective rates the device plays
+   * natively (`native`; every native engine rate when none is, with the
+   * engine bypass resampler), and the configured or effective ones the
+   * engine converts on top.
+   */
+  directPolicy(): { allowed: number[]; native: number[] } {
     const caps = capsFor(this.config.device);
     const allowed = this.effectivePolicy().allowed;
-    if (!caps) return allowed;
-    const formats = this.config.formats.length ? this.config.formats : (["s32", "s24", "s24_3", "s16"] as SampleFormat[]);
-    return allowed.filter((r) => formats.some((f) => caps.rates.some((c) => c.rate === r && c.formats.some((x) => x.format === f))));
+    if (!caps) return { allowed, native: allowed };
+    const formats = this.openFormats();
+    const plays = (r: number) => formats.some((f) => caps.rates.some((c) => c.rate === r && c.formats.some((x) => x.format === f)));
+    let native = allowed.filter(plays);
+    if (native.length === 0 && (this.config.rate.bypass_resampler ?? "engine") === "engine") native = [...RATES_44, ...RATES_48].filter(plays).sort((a, b) => a - b);
+    const converted = [...new Set([...this.config.rate.allowed_rates, ...allowed])].filter((r) => !native.includes(r) && this.bypassLanding(r) !== null);
+    return { allowed: [...native, ...converted].sort((a, b) => a - b), native };
   }
 
+  directRates(): number[] {
+    return this.directPolicy().allowed;
+  }
+
+  /**
+   * Like io-pw `rate_arbiter::sink_rate`: a client's rate when the sink
+   * plays it, else the next higher (or closest) of the sink's native rates.
+   * A converted rate is only chosen for a client at exactly that rate, so
+   * nothing is converted twice and a native rate never.
+   */
+  private sinkRate(r: number, allowed: number[], native: number[]): number {
+    if (allowed.includes(r)) return r;
+    const base = native.length ? native : allowed;
+    if (base.length === 0) return r;
+    return base.find((a) => a >= r) ?? [...base].sort((a, b) => Math.abs(a - r) - Math.abs(b - r))[0];
+  }
+
+  /**
+   * The graph rate: like the engine's rate arbiter, without its timers. One
+   * app (or several that agree) is followed; when they disagree
+   * `rate.conflict` decides. Streams are listed in start order.
+   */
   private graphRate(): number {
     const policy = this.config.rate;
     const eff = this.effectivePolicy();
     if (!policy.follow_source) return eff.defaultRate;
     // A stream at a rate the device cannot play maps onto the next allowed
-    // rate (PipeWire resamples it), like `choose_allowed_rate`.
-    const toAllowed = (r: number) => (eff.allowed.includes(r) ? r : (eff.allowed.find((a) => a >= r) ?? eff.allowed[eff.allowed.length - 1]));
+    // rate (PipeWire resamples it), like `choose_allowed_rate`. Direct's
+    // clients map through Direct's rates (the engine bypass resampler's
+    // included), the DSP sink's through its own, like the arbiter.
+    const onDirect = this.activeSink() === "direct";
+    const direct = onDirect ? this.directPolicy() : { allowed: [], native: [] };
+    const [allowed, native] = direct.allowed.length ? [direct.allowed, direct.native] : [eff.allowed, eff.native];
+    // Like the arbiter: every client's rate maps onto the sink's rates.
     const wanted = this.feeding()
       .map((s) => s.rate)
-      .filter((r): r is number => !!r && policy.allowed_rates.includes(r))
-      .map(toAllowed);
+      .filter((r): r is number => !!r)
+      .map((r) => this.sinkRate(r, allowed, native));
+    // Direct keeps the current rate while a client still plays at it
+    // (`keep_current`, whatever `rate.conflict` says), as the arbiter does.
+    const conflict = onDirect ? "keep_current" : policy.conflict;
     let rate: number;
     if (wanted.length === 0) rate = eff.allowed.includes(this.lastRate) ? this.lastRate : eff.defaultRate;
     else if (wanted.every((r) => r === wanted[0])) rate = wanted[0];
-    else if (policy.conflict === "highest") rate = Math.max(...wanted);
-    else if (policy.conflict === "default_rate") rate = eff.defaultRate;
+    else if (conflict === "highest") rate = Math.max(...wanted);
+    else if (conflict === "default_rate") rate = eff.defaultRate;
     else rate = wanted.includes(this.lastRate) ? this.lastRate : wanted[0];
     this.lastRate = rate;
     return rate;
   }
 
   status(): Status {
-    const chain = this.chainOn();
+    const st = this.currentStatus();
+    if (!this.legacyRatio) return st;
+    // A daemon that predates `rate_ratio`: none (and an integer `ratio`).
+    const { rate_ratio: _gone, ...old } = st;
+    void _gone;
+    return old as Status;
+  }
+
+  private currentStatus(): Status {
+    // The engine runs the overload fallback, not the saved upsampler.
+    const saved = this.chainOn();
+    const chain = this.overload?.action === "upsampler_off" ? { ...saved, upsampler: { ...saved.upsampler, target: "off" as const } } : saved;
     const sink = this.activeSink();
     // Direct never upsamples: it moves the graph to a native rate.
-    const directRates = this.directRates();
+    const direct = this.directPolicy();
+    const directRates = direct.allowed;
     let rate = this.graphRate();
-    if (sink === "direct" && directRates.length && !directRates.includes(rate)) {
-      rate = directRates.find((r) => r >= rate) ?? directRates[directRates.length - 1];
-    }
-    const dspPath = this.config.dsp_enabled && sink !== "direct";
+    if (sink === "direct" && directRates.length && !directRates.includes(rate)) rate = this.sinkRate(rate, directRates, direct.native);
+    const dspPath = this.config.dsp_enabled && this.overload?.action !== "bypass" && sink !== "direct";
     const caps = capsFor(this.config.device);
-    const wantedRatio = dspPath ? ratioOf(chain, rate) : 1;
-    const plan = caps ? planOpen(caps, rate, wantedRatio, this.config.formats) : { ratio: wantedRatio, format: this.config.formats[0] ?? null };
-    const ratio = plan?.ratio ?? 1;
+    const candidates = dspPath ? ratioCandidates(chain, rate, caps, this.config.formats) : this.bypassLadder(rate);
+    const plan = caps ? planOpen(caps, rate, candidates, this.config.formats) : { ratio: candidates[0] ?? ONE, format: this.config.formats[0] ?? null };
+    const rateRatio = plan?.ratio ?? ONE;
+    const outputRate = outRate(rate, rateRatio);
+    const ratio = rateRatio.down === 1 ? rateRatio.up : 0;
     const format = this.released ? null : (plan?.format ?? null);
     const eff = this.effectivePolicy();
     const feeding = this.feeding();
     const breaks: PassthroughBreak[] = [];
     if (feeding.length === 0) breaks.push({ reason: "not_playing" });
-    const dspActive = dspPath && !chainIsPassthrough(chain);
+    // The engine bypass resampler's conversion processes the samples too
+    // (it resamples and dithers, at unity volume included).
+    const converting = !dspPath && rateRatio.up !== rateRatio.down && feeding.length > 0;
+    const varispeed = this.varispeedStatus(dspPath && !this.released);
+    const dspActive = (dspPath && !chainIsPassthrough(chain)) || converting || varispeed.active;
     if (dspActive) breaks.push({ reason: "dsp_active" });
     if (ratio > 1) breaks.push({ reason: "upsampling", ratio });
-    if (!this.volume.hardware && dspPath && this.volume.volume_db !== 0) breaks.push({ reason: "volume", node: 40, volume: Math.pow(10, this.volume.volume_db / 20) });
+    else if (rateRatio.up !== rateRatio.down) breaks.push({ reason: "rate_conversion", graph_rate: rate, output_rate: outputRate });
+    if (varispeed.active) breaks.push({ reason: "varispeed", speed: varispeed.speed });
+    // A non-unity digital part marks the engine DSP-active on every path:
+    // DSP, Direct and bypass (control-plane.md, "Digital volume & balance").
+    const digitalPart = Math.abs(this.volume.software_db) >= 0.02 || (!this.volume.hardware && this.volume.muted);
+    if (!dspActive && digitalPart) breaks.push({ reason: "dsp_active" });
     for (const s of feeding) if ((s.volume ?? 1) !== 1 || s.muted) breaks.push({ reason: "volume", node: s.node, volume: s.muted ? 0 : (s.volume ?? 1) });
     if (feeding.length > 1) breaks.push({ reason: "mixing", streams: feeding.length });
     for (const s of feeding) if (s.rate && s.rate !== rate) breaks.push({ reason: "resampled", stream_rate: s.rate, graph_rate: rate });
-    const upTaps = chain.upsampler.target === "off" ? 0 : chain.upsampler.taps;
-    const upLat = dspPath && ratio > 1 ? (chain.upsampler.phase === "linear" ? upTaps / 2 / (rate * ratio) * 1000 : 0.4) : 0;
+    const resampling = rateRatio.up !== rateRatio.down;
+    const design = dspPath && resampling ? this.design(chain.upsampler, rate, rateRatio) : null;
+    const upTaps = design ? design.taps : 0;
+    const upLat = design ? (design.latency / outputRate) * 1000 : 0;
     const convLat = dspPath && convList(chain).some((c) => c.enabled) ? 2.7 : 0;
-    this.latency = (this.config.quantum / 48000) * 1000 * 2 + upLat + convLat;
-    const loadBase = !dspPath ? 0.004 : 0.012 + convList(chain).filter((c) => c.enabled).length * 0.02 + (ratio > 1 ? (upTaps / 65536) * 0.03 * (ratio / 4) : 0);
+    const pitchLat = dspPath && stagePitchActive(chain.pitch) ? (chain.pitch.quality === "max" && rate <= 96000 ? 240 : 120) : 0;
+    const limLat = dspPath && chain.limiter && chain.limiter.mode !== "off" ? limiterDelay(chain.limiter.lookahead_ms, outputRate).ms : 0;
+    this.latency = (this.config.quantum / 48000) * 1000 * 2 + upLat + convLat + pitchLat + limLat;
+    const loadBase = !dspPath ? 0.004 : 0.012 + convList(chain).filter((c) => c.enabled).length * 0.02 + (resampling ? (upTaps / 65536) * 0.03 * (Math.max(1, rateRatio.up / rateRatio.down) / 4) : 0);
     const presetName = this.config.active_preset ?? null;
     const preset = presetName ? this.presets.get(presetName) : undefined;
     return {
       version: this.engineVersion,
       state: !this.running ? "error" : this.released ? "idle" : feeding.length ? "playing" : "ready",
       device: this.config.device,
-      error: null,
+      error: this.engineError,
       format,
       graph_rate: rate,
-      output_rate: rate * ratio,
+      output_rate: outputRate,
+      rate_ratio: rateRatio,
       ratio,
       quantum: this.config.quantum,
       latency_ms: Math.round(this.latency * 10) / 10,
-      filter_latency_ms: Math.round((upLat + convLat) * 10) / 10,
-      xruns: 0,
+      filter_latency_ms: Math.round((upLat + convLat + limLat) * 10) / 10,
+      xruns: this.xruns,
       dsp_load: Math.round(loadBase * 1000) / 1000,
       dsp_enabled: this.config.dsp_enabled,
       active_sink: sink,
@@ -501,17 +1067,359 @@ export class MockDaemon {
         broken_because: breaks,
         caveats: [],
       },
-      ab: this.config.ab ? { enabled: true, current: this.abSide, offset_db: this.abOffset() } : null,
-      volume: clone(this.volume),
+      ab: this.config.ab ? this.abStatus() : null,
+      volume: this.volumeStatus(),
       preset: preset ? { name: preset.name, modified: !deepEqual(preset.chain, this.config.chain) } : null,
       device_caps: this.released ? null : caps,
-      effective_rates: this.released ? [] : eff.allowed,
+      effective_rates: this.released ? [] : [...new Set([...eff.allowed, ...directRates])].sort((a, b) => a - b),
       direct_rates: this.released ? [] : directRates,
+      bypass_resampler: this.released ? null : this.bypassStatus(sink, rate, rateRatio, feeding),
       effective_default_rate: this.released ? null : eff.defaultRate,
       dither_bits: format ? Math.min(this.config.chain.output.bits, format === "s16" ? 16 : format === "s32" ? 32 : 24) : null,
+      limiter_held_db: this.config.chain.limiter?.mode !== "off" ? this.limHeld : 0,
       // System-wide routing makes Audivane DSP the default, so there is no
       // other "normal" output to name.
       normal_output: this.config.routing.mode === "apps" ? "Built-in Audio Analog Stereo" : null,
+      eq_tilt: this.tiltStatus(this.config.chain, rate),
+      eq_tilt_b: this.config.ab ? this.tiltStatus(chainB(this.config.ab, this.config.chain), rate) : null,
+      overload: this.overload ? clone(this.overload) : null,
+      rt_load_max: 0,
+      varispeed,
+      limits: { ...MOCK_LIMITS },
+      waiting_for_device: false,
+      outputs: this.outputsStatus(sink, outputRate),
+    };
+  }
+
+  /**
+   * `status.outputs`, like the engine's: each follower opens, locks over
+   * a few seconds (muted), then plays in sync. The SPK card's large periods
+   * leave it unaligned (late by 42 ms) once the master's alignment settles
+   * at 60 ms; a device missing from the list, or in `lostFollowers`, is lost.
+   */
+  private outputsStatus(sink: SinkChoice | null, masterRate: number): OutputsStatus {
+    const list = this.config.outputs.followers;
+    const now = this.followerClock();
+    const heard = sink !== "direct" && this.config.dsp_enabled;
+    const followers = list.map((f): FollowerStatus => {
+      const listed = DEVICES.find((d) => d.id === f.device);
+      const card = listed?.card ?? "";
+      const lost = !listed || this.lostFollowers.has(f.device);
+      const age = now - (this.followerSince.get(f.device) ?? now);
+      const running = this.running && !this.released;
+      const state: FollowerState = !running ? "off" : lost ? "lost" : age < 400 ? "opening" : age < 3000 ? "locking" : !f.enabled || !heard ? "muted" : card === "SPK" ? "unaligned" : "locked";
+      const open = state !== "off" && state !== "lost" && state !== "opening";
+      // A steady clock offset per card, settling while it locks.
+      const seed = [...f.device].reduce((a, c) => (a * 31 + c.charCodeAt(0)) % 997, 7);
+      const ppm = ((seed % 120) - 60) / 1.7;
+      const settle = state === "locking" ? 1 + (3000 - age) / 600 : 1;
+      const caps = capsFor(f.device);
+      const rate = caps?.rates.some((r) => r.rate === masterRate) ? masterRate : (caps?.rates[caps.rates.length - 1]?.rate ?? masterRate);
+      const period = card === "SPK" ? 4096 : 1024;
+      return {
+        device: f.device,
+        enabled: f.enabled,
+        trim_ms: f.trim_ms,
+        volume_db: f.volume_db,
+        state,
+        offset_ms: state === "unaligned" || (state === "muted" && card === "SPK") ? 42 : 0,
+        ppm: open ? Math.round(ppm * settle * 10) / 10 : 0,
+        phase_error_frames: open ? (state === "locking" ? 3.2 : 0.1) : 0,
+        bandwidth_hz: open ? (state === "locking" ? 2 : 0.05) : 0,
+        skips: open && state !== "locking" ? 1 : 0,
+        xruns: 0,
+        latency_ms: open ? Math.round(((period * 3) / rate) * 1000 * 10) / 10 : 0,
+        device_rate: open ? rate : 0,
+        period: open ? period : 0,
+        error: state === "lost" ? "the device is not connected" : null,
+      };
+    });
+    const alignment = followers.length === 0 ? 0 : followers.some((f) => f.offset_ms > 0) ? 60 : 6;
+    return { alignment_ms: alignment, followers };
+  }
+
+  /** Like the daemon's `validate_outputs`. */
+  private validateOutputs(c: EngineConfig) {
+    const list = c.outputs?.followers ?? [];
+    if (list.length > 3) this.bad(`outputs.followers: at most 3 followers (got ${list.length})`);
+    list.forEach((f, i) => {
+      const at = `outputs.followers[${i}]`;
+      if (!f.device.startsWith("hw:") || f.device.trim() !== f.device) this.bad(`${at}.device "${f.device}" must be an ALSA \`hw:\` device such as "hw:CARD=USB,DEV=0"`);
+      if (f.device === c.device) this.bad(`${at}.device ${f.device} is the main output device; a follower plays another one`);
+      if (list.slice(0, i).some((g) => g.device === f.device)) this.bad(`${at}.device ${f.device} is listed twice`);
+      if (!Number.isFinite(f.trim_ms) || Math.abs(f.trim_ms) > 50) this.bad(`${at}.trim_ms must be between -50 and 50 ms (got ${f.trim_ms})`);
+      if (!Number.isFinite(f.volume_db) || f.volume_db < -120 || f.volume_db > 0) this.bad(`${at}.volume_db must be between -120 and 0 dB (got ${f.volume_db})`);
+    });
+    if (list.length && c.varispeed.enabled && c.varispeed.speed > 1.996) {
+      this.bad(`varispeed.speed is at most 1.996 while followers play (got ${c.varispeed.speed}): each follower corrects its clock on top of it`);
+    }
+  }
+
+  /** Start the walk of followers new to the list; forget removed ones. */
+  private syncFollowers() {
+    const now = this.followerClock();
+    const list = this.config.outputs.followers.map((f) => f.device);
+    for (const d of [...this.followerSince.keys()]) if (!list.includes(d)) this.followerSince.delete(d);
+    for (const d of list) if (!this.followerSince.has(d)) this.followerSince.set(d, now);
+  }
+
+  /**
+   * Like the engine's budget: the time stretch alone is over it at
+   * 176.4 kHz graph rates and above (it fits up to 96 kHz).
+   */
+  private checkKeepPitch(rate: number) {
+    if (rate >= 176_400) {
+      const macs = Math.round((1200 * rate) / 192_000);
+      this.bad(
+        `Keep pitch is not available at ${rate} Hz: the time stretch alone needs ${macs} M multiply-adds per second per channel at its slowest speed, more than the 800 M budget; play at a lower rate or turn Keep pitch off`,
+      );
+    }
+  }
+
+  /**
+   * The varispeed stage, applied at once (no ramp). A quantum below 256 caps
+   * the speed at 1.25× (`quantum_too_small`), so the cap note can be seen in
+   * the preview.
+   */
+  private varispeedStatus(dspPath: boolean): VarispeedStatus {
+    const v = this.config.varispeed;
+    const rate = this.graphRate();
+    // Keep pitch at a rate over the budget: the request stays, the stage
+    // is off (as the engine after a renegotiation).
+    const keepPitchOver = v.enabled && v.keep_pitch && rate >= 176_400;
+    const active = v.enabled && dspPath && !keepPitchOver;
+    const capped = this.config.quantum < 256;
+    const speedLimit = capped ? 1.25 : 2;
+    const target = active ? Math.min(v.speed, speedLimit) : 1;
+    // The stretch's delay is about 135 ms (6 691 frames at 48 kHz).
+    const latency = v.keep_pitch ? Math.round(0.1394 * rate) : 507.5;
+    return {
+      enabled: v.enabled,
+      keep_pitch: v.keep_pitch,
+      active,
+      speed: target,
+      target,
+      requested: v.speed,
+      speed_limit: speedLimit,
+      cap_reason: capped ? "quantum_too_small" : null,
+      ramping: false,
+      fading: false,
+      latency_frames: active ? latency : 0,
+      latency_exact: true,
+      held: null,
+      overload_hold: "none",
+      underfeed_events: 0,
+      underfeed_frames: 0,
+      short_cycles: 0,
+      gap_fades: 0,
+      error: keepPitchOver ? `Keep pitch is not available at ${rate} Hz: the time stretch is over the CPU budget at this rate` : null,
+    };
+  }
+
+  /**
+   * Like the daemon after a second over real time: the upsampler is
+   * switched off in the engine (the saved config is kept) and an
+   * `overload` event goes to status subscribers. Mock only (tests, demo).
+   */
+  simulateOverload(load = 1.4) {
+    const upsampling = this.config.chain.upsampler.target !== "off";
+    const pct = `${Math.round(load * 100)}%`;
+    this.overloadEpisodes += 1;
+    this.overload = {
+      stage: upsampling ? "upsampler" : "chain",
+      output_rate: this.status().output_rate,
+      load,
+      action: upsampling ? "upsampler_off" : "bypass",
+      message: upsampling
+        ? `The engine switched the upsampler off: it needed more CPU than real time allows (load ${pct}). Your setting is kept; lower the taps or the output rate.`
+        : `The engine switched DSP off: the chain needed more CPU than real time allows (load ${pct}). Your settings are kept; make the chain lighter.`,
+      episode: this.overloadEpisodes,
+      applied: true,
+    };
+    this.emit({ event: "overload", data: clone(this.overload) as OverloadReport });
+    this.emitStatus();
+  }
+
+  /**
+   * The fallback's first step while A/B is on: A/B off, chain A kept (the
+   * config keeps side B). Mock only (tests, demo).
+   */
+  simulateAbOverload(load = 1.4) {
+    if (!this.config.ab) return this.simulateOverload(load);
+    this.overloadEpisodes += 1;
+    this.overload = {
+      stage: "ab",
+      output_rate: this.status().output_rate,
+      load,
+      action: "ab_off",
+      message: `The engine turned A/B off and kept chain A: both sides together needed more CPU than real time allows (load ${Math.round(load * 100)}%). Your settings are kept; a new side B (a lighter filter, say) tries again.`,
+      episode: this.overloadEpisodes,
+      applied: true,
+    };
+    this.abSide = "a";
+    this.emit({ event: "overload", data: clone(this.overload) as OverloadReport });
+    this.emitStatus();
+  }
+
+  /** Overs counted to each side, as after limiter events (until the next `set_ab` or `ab_select`). Mock only. */
+  simulateAbOvers(a: number, b: number) {
+    this.abOvers = { a, b };
+    this.emitStatus();
+  }
+
+  private abOvers = { a: 0, b: 0 };
+
+  /**
+   * A running `ab_measure`. No audio in the mock: it hears about 8 s of
+   * music per real second, its running offset wobbling into the estimate,
+   * and follows the engine's lock rule (20 s, then within 0.1 dB over the
+   * last 10 s, or `max_seconds`).
+   */
+  private abMeasure: { seconds: number; max: number; target: number; offset: number | null; stable: boolean; history: [number, number][]; pair: string; timer: ReturnType<typeof setInterval> } | null = null;
+  private abMeasureError: string | null = null;
+  /** Mock only: the next measurement hears side B as silent (its no-match path; also `?measure=silent`). */
+  measureSilentB = false;
+
+  private abPair(): string | null {
+    const ab = this.config.ab;
+    return ab ? JSON.stringify([this.config.chain, ab.b, ab.headroom]) : null;
+  }
+
+  private abMeasureStart(max: number) {
+    this.abMeasureEnd(null);
+    const silent = this.measureSilentB || (typeof location !== "undefined" && new URLSearchParams(location.search).get("measure") === "silent");
+    const timer = setInterval(() => this.abMeasureTick(), 250);
+    this.abMeasure = { seconds: 0, max, target: this.abOffset(), offset: null, stable: false, history: [], pair: this.abPair() ?? "", timer };
+    if (silent) this.abMeasure.target = Number.NaN;
+  }
+
+  private abMeasureEnd(error: string | null) {
+    if (this.abMeasure) clearInterval(this.abMeasure.timer);
+    this.abMeasure = null;
+    this.abMeasureError = error;
+  }
+
+  private abMeasureLock(offset: number, seconds: number) {
+    this.abMeasureEnd(null);
+    if (this.config.ab) this.config.ab.level = { mode: "measured", offset_db: Math.round(offset * 100) / 100, seconds: Math.round(seconds * 10) / 10 };
+    this.emitConfig();
+  }
+
+  /** One control-plane tick: 2 s more of contributing audio. */
+  private abMeasureTick() {
+    const m = this.abMeasure;
+    if (!m || !this.running) return;
+    if (m.stable && m.offset !== null) return this.abMeasureLock(m.offset, m.seconds);
+    m.seconds = Math.min(m.max, m.seconds + 2);
+    if (!Number.isNaN(m.target)) {
+      m.offset = m.target + 0.9 * Math.exp(-m.seconds / 5) * Math.cos(m.seconds * 0.8);
+      m.history.push([m.seconds, m.offset]);
+      const recent = m.history.filter(([t]) => t >= m.seconds - 10).map(([, o]) => o);
+      m.stable = m.seconds >= 20 && Math.max(...recent) - Math.min(...recent) < 0.1;
+    }
+    if (m.seconds >= m.max) {
+      if (m.offset === null) {
+        this.abMeasureEnd(`no match: B stayed silent over ${m.seconds.toFixed(0)} s of A`);
+        this.emitStatus();
+      } else this.abMeasureLock(m.offset, m.seconds);
+      return;
+    }
+    this.emitStatus();
+  }
+
+  /** Mock only: the player moves to another track (a running measurement is cancelled). */
+  simulateTrackChange(title = "Hammers") {
+    if (this.nowPlaying) this.nowPlaying = { ...this.nowPlaying, title };
+    this.emit({ event: "now_playing", data: this.nowPlaying });
+    if (this.abMeasure) this.abMeasureEnd("cancelled: the track changed");
+    this.emitStatus();
+  }
+
+  /** The daemon's CPU admission of `next`, and the end of a fallback it replaces. */
+  private admitCpu(next: EngineConfig) {
+    const refusal = cpuRefusal(this.config, next);
+    if (refusal) throw new DaemonError(ErrorCode.INVALID_PARAMS, refusal);
+    const o = this.overload;
+    if (!o) return;
+    const part = (c: EngineConfig) => JSON.stringify([c.chain.upsampler, c.chain.output, c.ab !== null]);
+    // A/B off ends with a new side B (not B following an edit of A).
+    if (o.action === "ab_off") {
+      if (JSON.stringify(next.ab?.b ?? null) !== JSON.stringify(this.config.ab?.b ?? null)) this.overload = null;
+      return;
+    }
+    const ends = o.action === "bypass" ? JSON.stringify([next.dsp_enabled, next.chain, next.ab]) !== JSON.stringify([this.config.dsp_enabled, this.config.chain, this.config.ab]) : part(next) !== part(this.config);
+    if (ends) this.overload = null;
+  }
+
+  /**
+   * `Status.bypass_resampler`, like the engine's: active while Direct or DSP
+   * off converts, else why PipeWire still resamples a stream there.
+   */
+  private bypassStatus(sink: SinkChoice | null, rate: number, ratio: RateRatio, feeding: { rate?: number | null }[]): Status["bypass_resampler"] {
+    const mode = this.config.rate.bypass_resampler ?? "engine";
+    const bypassPath = sink === "direct" || !this.config.dsp_enabled;
+    const active = bypassPath && ratio.up !== ratio.down && feeding.length > 0;
+    let reason: string | null = null;
+    const other = feeding.map((s) => s.rate).find((r): r is number => !!r && r !== rate);
+    if (mode === "engine" && bypassPath && !active && other) {
+      const why = !this.config.rate.follow_source
+        ? "rate following is off"
+        : !this.config.rate.allowed_rates.includes(other)
+          ? `${other} Hz is not in the allowed rates`
+          : feeding.some((s) => s.rate === rate)
+            ? `another stream plays at ${rate} Hz`
+            : this.bypassLanding(other) === null
+              ? `the engine cannot convert ${other} Hz to a rate the DAC plays`
+              : "the graph has not moved yet";
+      reason = `PipeWire resamples the ${other} Hz stream: ${why}`;
+    }
+    return { mode, active, reason };
+  }
+
+  /** `Status.eq_tilt`: the tilt stage's effective band at the graph rate (both sections), like the engine's. */
+  private tiltStatus(chain: ChainConfig, rate: number): Status["eq_tilt"] {
+    const eq = chain.eq;
+    const on = (
+      [
+        ["tilt", eq?.tilt],
+        ["tilt_high", eq?.tilt_high],
+      ] as const
+    ).filter((e): e is readonly ["tilt" | "tilt_high", TiltConfig] => !!e[1]?.enabled);
+    if (on.length === 0) return null;
+    const first = on[0][1];
+    const last = on[on.length - 1][1];
+    const notes = on
+      .filter(([, t]) => effectiveEndHz(t, rate) < t.end_hz)
+      .map(([k, t]) => `${k} end_hz clamped from ${t.end_hz.toFixed(3)} to ${effectiveEndHz(t, rate).toFixed(3)} Hz at ${rate} Hz (0.45 * fs)`);
+    const pair = eq?.tilt && eq.tilt_high ? tiltPairProblem(eq.tilt, eq.tilt_high) : null;
+    const why = pair ? `tilt: ${pair}` : on.map(([k, t]) => (tiltProblem(t, rate) ? `${k}: ${tiltProblem(t, rate)}` : null)).find((e) => e) ?? null;
+    return {
+      sample_rate: rate,
+      effective_start_hz: first.start_hz,
+      effective_end_hz: effectiveEndHz(last, rate),
+      clamp_note: notes.length ? notes.join("; ") : null,
+      error: why,
+    };
+  }
+
+  /** Never boost: the louder side is cut (no shared headroom in the mock). */
+  private abStatus(): AbStatus {
+    const o = this.abOffset();
+    const gain_a_db = Math.min(0, -o);
+    return {
+      enabled: true,
+      current: this.abSide,
+      offset_db: o,
+      gain_a_db,
+      gain_b_db: Math.min(0, gain_a_db + o),
+      headroom_db: 0,
+      overs: { ...this.abOvers },
+      level: this.config.ab?.level ?? { mode: "analytic", weighting: "k" },
+      measuring: this.abMeasure
+        ? { seconds: this.abMeasure.seconds, offset_db: this.abMeasure.offset === null ? null : Math.round(this.abMeasure.offset * 1000) / 1000, stable: this.abMeasure.stable, max_seconds: this.abMeasure.max }
+        : null,
+      measure_error: this.abMeasureError,
+      error: null,
     };
   }
 
@@ -519,7 +1427,7 @@ export class MockDaemon {
     const ab = this.config.ab;
     if (!ab) return 0;
     if (ab.level.mode === "off") return 0;
-    if (ab.level.mode === "manual") return ab.level.offset_db;
+    if (ab.level.mode === "manual" || ab.level.mode === "measured") return ab.level.offset_db;
     const loud = (c: ChainConfig) => {
       const eq = c.eq;
       if (!eq) return 0;
@@ -528,7 +1436,7 @@ export class MockDaemon {
       const r = profileChannelResponseDb(eq, 1, 48000, freqs);
       return (l.reduce((a, b) => a + b, 0) + r.reduce((a, b) => a + b, 0)) / (2 * freqs.length);
     };
-    return Math.round((loud(this.config.chain) - loud(ab.chain_b)) * 10) / 10;
+    return Math.round((loud(this.config.chain) - loud(chainB(ab, this.config.chain))) * 10) / 10;
   }
 
   private meters(): Meters {
@@ -550,6 +1458,34 @@ export class MockDaemon {
     };
     const l = ch(0);
     const r = ch(1);
+    const lim = chain.limiter;
+    const dspPath = playing && this.config.dsp_enabled && this.activeSink() !== "direct";
+    let limiter: Meters["limiter"];
+    if (lim && lim.mode !== "off") {
+      // Simulated with a hotter crest than the bars, so the stage has work to do.
+      const peak = Math.max(l.p, r.p) + 12;
+      let gr = 0;
+      if (dspPath) {
+        if (lim.mode === "auto_headroom") {
+          while (peak - this.limHeadroom > lim.ceiling_dbfs && this.limHeadroom < 12) {
+            this.limHeadroom += 0.5;
+            this.limEvents++;
+          }
+          gr = Math.max(this.limHeadroom, peak - lim.ceiling_dbfs);
+        } else {
+          gr = Math.max(0, peak - lim.ceiling_dbfs);
+          if (gr > 0.01 && !this.limReducing) this.limEvents++;
+          this.limReducing = gr > 0.01;
+        }
+        for (const c of [l, r]) c.p = Math.min(c.p, lim.ceiling_dbfs);
+      }
+      limiter = { active: dspPath, headroom_db: dspPath ? this.limHeadroom : 0, gain_reduction_db: Math.round(gr * 100) / 100, events: this.limEvents };
+    }
+    const held = limiter?.active ? limiter.headroom_db : 0;
+    if (held !== this.limHeld) {
+      this.limHeld = held;
+      this.emitStatus();
+    }
     if (l.p >= 0) this.clippedCh[0]++;
     if (r.p >= 0) this.clippedCh[1]++;
     this.clipped = this.clippedCh[0] + this.clippedCh[1];
@@ -562,6 +1498,7 @@ export class MockDaemon {
       chain_peak_db: playing && this.config.dsp_enabled && this.activeSink() !== "direct" ? [l.chain, r.chain] : [],
       xruns: 0,
       dsp_load: this.status().dsp_load,
+      ...(limiter ? { limiter } : {}),
     };
   }
 
@@ -598,45 +1535,87 @@ export class MockDaemon {
     return { f_min_hz: fMin, bins_per_octave: bpo, pre, post, rate };
   }
 
-  private mockRatio(cfg: UpsamplerConfig, sourceRate: number): number {
-    const t = cfg.target;
-    let ratio = 1;
-    if (t !== "off") {
-      if ("ratio" in t) ratio = Math.max(1, t.ratio);
-      else while (sourceRate * ratio * 2 <= t.max_rate) ratio *= 2;
+  /** The error budget an automatic design aims at, dB (`match_output` from chain A's output, like the daemon). */
+  private autoBudgetDb(cfg: LegacyUpsampler): number {
+    const b = cfg.auto_taps;
+    if (!b) return kaiserAttenuationDb(cfg.kaiser_beta);
+    if (b !== "match_output") return b.db;
+    const bits = Math.min(24, this.config.chain.output.bits);
+    const dithered = this.config.chain.output.dither !== "none";
+    return Math.min(6.02 * bits + 1.76 - (dithered ? 4.7712 : 0), dithered ? 141.47 : 146.24);
+  }
+
+  /**
+   * Roughly what the engine builds for `cfg` from `sourceRate` at `ratio`:
+   * enough for plausible plots, latency and load, not the real design.
+   * `taps` is on the intermediate grid (the output rate for integer ratios),
+   * `cutoff` a fraction of the lower of the two Nyquists, `tw` in Hz.
+   */
+  private design(cfg: UpsamplerConfig, sourceRate: number, ratio: RateRatio = resolveRateRatio(cfg.target, sourceRate)): MockDesign {
+    const out = outRate(sourceRate, ratio);
+    const edge = Math.min(sourceRate, out) / 2;
+    const perOut = out / sourceRate;
+    const block = Math.round(1024 * perOut);
+    const latencyFor = (taps: number, phase: FilterPhase) =>
+      (phase === "linear" ? Math.floor((taps - 1) / 2 / ratio.down) : phase === "intermediate" ? Math.floor((0.375 * taps) / ratio.down) : 0) + block;
+    const modelled = cfg.preset ?? modelPreset(cfg.design);
+    if (modelled && modelled !== RECOMMENDED_PRESET) {
+      const preset = modelled as FilterPreset;
+      const p = presetEntry(preset);
+      const t = ratio.down === 1 ? presetTapsPerInput(preset, sourceRate, ratio.up, out) : presetRationalTaps(preset, sourceRate, ratio);
+      const taps = t * ratio.up * (p?.phase === "intermediate" && ratio.down !== 1 ? 4 : 1);
+      const phase = p?.phase ?? "linear";
+      const atten = PRESET_ATTEN_DB[p?.family ?? "gaussian"] ?? 140;
+      const tw = Math.max(0.5, Math.min(0.24 * edge, (9 * 2 * edge) / Math.max(2, t)));
+      return { ratio, taps, phase, cutoff: presetCutoffFraction(preset, sourceRate), atten, beta: 0, tw, latency: latencyFor(taps, phase) };
     }
-    return ratio;
-  }
-
-  private nyquistStopCutoff(taps: number, ratio: number, kaiserBeta: number): number {
-    return nyquistStopCutoff(taps, ratio, kaiserBeta);
-  }
-
-  private effectiveCutoff(cfg: UpsamplerConfig, ratio: number): number {
-    if (ratio <= 1) return 1;
-    if (cfg.cutoff_mode === "nyquist_stop") {
-      return this.nyquistStopCutoff(cfg.taps, ratio, cfg.kaiser_beta);
+    const lu = fromUpsamplerConfig(cfg);
+    const scale = Math.max(ratio.up, ratio.down);
+    const window = lu.window === "gaussian" ? 2 : 1;
+    const mixed = lu.phase === "intermediate" && lu.phase_mix > 0 && lu.phase_mix < 1;
+    if (lu.auto_taps || lu.cutoff_mode === "band") {
+      const atten = lu.auto_taps ? this.autoBudgetDb(lu) : lu.band.attenuation_db;
+      const delta = Math.max(0.005, lu.band.stopband_start - lu.band.passband_end);
+      const k = Math.ceil(((atten - 7.95) / (14.36 * delta)) * window);
+      let taps = Math.min(4_194_304, 2 * k * scale + 1);
+      if (mixed) taps = Math.round(taps * 1.45);
+      const beta = atten > 50 ? 0.1102 * (atten - 8.7) : 0.5842 * Math.pow(atten - 21, 0.4) + 0.07886 * (atten - 21);
+      const tw = Math.max(0.5, delta * edge);
+      const cutoff = (lu.band.passband_end + lu.band.stopband_start) / 2;
+      const band = { pass: lu.band.passband_end, stop: lu.band.passband_end + delta };
+      return { ratio, taps, phase: lu.phase, cutoff, atten, beta, tw, latency: latencyFor(taps, lu.phase), band };
     }
-    return Math.max(0.5, Math.min(1, cfg.cutoff));
-  }
-
-  private mockTransitionWidth(cfg: UpsamplerConfig, sourceRate: number, ratio: number): number {
-    const nyquistIn = sourceRate / 2;
-    return Math.max(0.5, Math.min(0.24 * nyquistIn, ((cfg.kaiser_beta + 2) / (Math.PI * Math.max(256, cfg.taps))) * sourceRate * ratio * 2.5));
+    const base = lu.taps_unit === "input" ? lu.taps * ratio.up : ratio.down > 1 ? lu.taps * ratio.down : lu.taps;
+    const taps = mixed ? Math.round(base * 1.45) : base;
+    const cutoff = lu.cutoff_mode === "nyquist_stop" ? nyquistStopCutoff(base, ratio.up, lu.kaiser_beta) : Math.max(0.5, Math.min(1, lu.cutoff));
+    const tw = Math.max(0.5, Math.min(0.24 * edge, ((lu.kaiser_beta + 2) / (Math.PI * Math.max(256, base / window))) * sourceRate * ratio.up * 2.5));
+    return { ratio, taps, phase: lu.phase, cutoff, atten: kaiserAttenuationDb(lu.kaiser_beta), beta: lu.kaiser_beta, tw, latency: latencyFor(taps, lu.phase) };
   }
 
   /** Smooth analytic stand-in for the measured magnitude (dB) of a design. */
   private mockMagnitude(cfg: UpsamplerConfig, sourceRate: number): (f: number) => number {
-    const ratio = this.mockRatio(cfg, Math.max(1, Math.round(sourceRate)));
-    if (ratio <= 1) return () => 0;
-    const nyquistIn = sourceRate / 2;
-    const fc = this.effectiveCutoff(cfg, ratio) * nyquistIn;
-    const atten = Math.min(230, Math.max(40, kaiserAttenuationDb(cfg.kaiser_beta)));
-    const tw = this.mockTransitionWidth(cfg, sourceRate, ratio);
+    const src = Math.max(1, Math.round(sourceRate));
+    const ratio = resolveRateRatio(cfg.target, src);
+    if (ratio.up === ratio.down) return () => 0;
+    const d = this.design(cfg, src, ratio);
+    const edge = Math.min(src, outRate(src, ratio)) / 2;
+    const fc = d.cutoff * edge;
+    const atten = Math.min(230, Math.max(40, d.atten));
+    const tw = d.tw;
     const stopFloor = Math.pow(10, -atten / 20);
+    // A band design is symmetric about the band's middle, like a windowed
+    // sinc: the stopband depth at the stop edge and the same tiny deviation
+    // at the pass edge.
+    let centre = fc;
+    let scale = tw * 0.14;
+    if (d.band) {
+      const xStop = Math.log(Math.pow(10, atten / 20) - 1);
+      centre = ((d.band.pass + d.band.stop) / 2) * edge;
+      scale = Math.max(1e-3, ((d.band.stop - d.band.pass) * edge) / 2 / xStop);
+    }
     return (f: number): number => {
       if (f <= 0) return 0;
-      const trans = 1 / (1 + Math.exp((f - fc) / (tw * 0.14)));
+      const trans = 1 / (1 + Math.exp((f - centre) / scale));
       const passRipple = 1 + 0.000002 * Math.sin(f / 320);
       const stopLobe = stopFloor * (0.45 + 0.55 * Math.abs(Math.sin((f - fc) / Math.max(0.2, tw * 0.4))));
       const lin = Math.max(1e-12, trans * passRipple + (1 - trans) * stopLobe);
@@ -673,15 +1652,17 @@ export class MockDaemon {
 
   private buildUpsamplerResponse(cfg: UpsamplerConfig, sourceRate: number): UpsamplerResponse {
     const source_rate = Math.max(1, Math.round(sourceRate));
-    const t = cfg.target;
-    let ratio = 1;
-    if (t !== "off") {
-      if ("ratio" in t) ratio = Math.max(1, t.ratio);
-      else while (source_rate * ratio * 2 <= t.max_rate) ratio *= 2;
-    }
-    const output_rate = source_rate * ratio;
-    const nyquistIn = source_rate / 2;
-    const nyquistOut = output_rate / 2;
+    const rate_ratio = resolveRateRatio(cfg.target, source_rate);
+    const output_rate = outRate(source_rate, rate_ratio);
+    const ratio = rate_ratio.down === 1 ? rate_ratio.up : 0;
+    // The band edge is the lower Nyquist; the plot runs, like the daemon's,
+    // to the Nyquist of the grid it measures on: source x up (the output's
+    // for an integer ratio, the intermediate grid's for a fractional one).
+    const nyquistIn = Math.min(source_rate, output_rate) / 2;
+    const nyquistOut = (source_rate * rate_ratio.up) / 2;
+    // The statistics scan to the higher of the two Nyquists (fine enough
+    // steps; above it a fractional grid's response is stopband anyway).
+    const statTop = Math.max(source_rate, output_rate) / 2;
 
     const rawFreqs: number[] = [0];
     const lo = Math.max(1, Math.min(20, nyquistOut / 2));
@@ -703,14 +1684,19 @@ export class MockDaemon {
       }
     }
 
-    if (ratio === 1) {
+    const lu = fromUpsamplerConfig(cfg);
+    if (rate_ratio.up === rate_ratio.down) {
       return {
         source_rate,
         output_rate,
         ratio: 1,
-        taps: cfg.taps,
-        phase: cfg.phase,
+        rate_ratio: { up: 1, down: 1 },
+        taps: lu.taps,
+        phase: lu.phase,
+        filter_window: lu.window,
         effective_cutoff: 1,
+        effective_kaiser_beta: lu.kaiser_beta,
+        sample_leak_db: -400,
         freqs_hz,
         magnitude_db: freqs_hz.map(() => 0),
         impulse: [1],
@@ -725,10 +1711,12 @@ export class MockDaemon {
       };
     }
 
-    const cutoff = this.effectiveCutoff(cfg, ratio);
+    const d = this.design(cfg, source_rate, rate_ratio);
+    const cutoff = d.cutoff;
     const fc = cutoff * nyquistIn;
-    const tw = this.mockTransitionWidth(cfg, source_rate, ratio);
+    const tw = d.tw;
     const magDbAt = this.mockMagnitude(cfg, source_rate);
+    const perOut = output_rate / source_rate;
 
     const magnitude_db = freqs_hz.map(magDbAt);
     const STAT_N = 16384;
@@ -743,7 +1731,7 @@ export class MockDaemon {
     const statFreq: number[] = [];
     const statDb: number[] = [];
     for (let i = 1; i <= STAT_N; i++) {
-      const f = (nyquistOut * i) / STAT_N;
+      const f = (statTop * i) / STAT_N;
       const db = magDbAt(f);
       statFreq.push(f);
       statDb.push(db);
@@ -763,7 +1751,7 @@ export class MockDaemon {
     }
     const stopband_atten_db = Math.max(0, -worstStopDb);
     const threshold = -stopband_atten_db;
-    let stopband_start_hz = Math.min(nyquistOut, fc + tw * 0.85);
+    let stopband_start_hz = Math.min(statTop, fc + tw * 0.85);
     for (let i = statDb.length - 1; i >= 0; i--) {
       if (statFreq[i] >= nyquistIn && statDb[i] > threshold) {
         stopband_start_hz = statFreq[Math.min(statFreq.length - 1, i + 1)];
@@ -771,34 +1759,41 @@ export class MockDaemon {
       }
     }
 
-    const crossings = this.mockCrossings(magDbAt, nyquistOut, stopband_atten_db);
+    const crossings = this.mockCrossings(magDbAt, statTop, stopband_atten_db);
     const crossingAt = (level: number) => crossings.find((c) => c.level_db === level)?.freq_hz;
     minus_0_1_db_hz = crossingAt(-0.1) ?? minus_0_1_db_hz;
     minus_3_db_hz = crossingAt(-3) ?? minus_3_db_hz;
 
     const impulseLen = 256;
     const impulse: number[] = [];
-    const impulse_peak = cfg.phase === "linear" ? 128 : 24;
+    const impulse_peak = d.phase === "linear" ? 128 : d.phase === "intermediate" ? 96 : 24;
     for (let i = 0; i < impulseLen; i++) {
       const n = i - impulse_peak;
-      if (cfg.phase === "minimum" && n < -6) {
+      if (d.phase === "minimum" && n < -6) {
         impulse.push(0);
         continue;
       }
       const w = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (impulseLen - 1));
-      const arg = (Math.PI * cutoff * n) / ratio;
+      const arg = (Math.PI * cutoff * n) / Math.max(perOut, 1);
       const sinc = arg === 0 ? 1 : Math.sin(arg) / arg;
-      const decay = cfg.phase === "minimum" && n > 0 ? Math.exp(-n / 90) : 1;
+      const decay = d.phase !== "linear" && n > 0 ? Math.exp(-n / (d.phase === "minimum" ? 90 : 140)) : d.phase === "intermediate" && n < 0 ? Math.exp(n / 40) : 1;
       impulse.push(sinc * w * decay);
     }
 
+    const isNamedPreset = cfg.preset !== null && cfg.preset !== RECOMMENDED_PRESET;
+    const namedPreset = isNamedPreset ? (cfg.preset as FilterPreset) : null;
     return {
       source_rate,
       output_rate,
       ratio,
-      taps: cfg.taps,
-      phase: cfg.phase,
-      effective_cutoff: cutoff,
+      rate_ratio,
+      taps: d.taps,
+      phase: d.phase,
+      // Presets report neutral placeholders here, like the daemon.
+      filter_window: namedPreset ? "kaiser" : lu.window,
+      effective_cutoff: namedPreset ? 1 : cutoff,
+      effective_kaiser_beta: namedPreset ? 0 : d.beta,
+      sample_leak_db: rate_ratio.up < rate_ratio.down ? 0 : namedPreset ? (presetEntry(namedPreset)?.cutoff === "nyquist" ? -300 : -40) : lu.preserve_samples ? -300 : -40,
       freqs_hz,
       magnitude_db,
       impulse,
@@ -808,9 +1803,39 @@ export class MockDaemon {
       minus_3_db_hz,
       stopband_start_hz,
       stopband_atten_db,
-      latency_samples: cfg.phase === "linear" ? Math.floor((cfg.taps - 1) / 2) + 1024 * ratio : 1024 * ratio,
+      latency_samples: d.latency,
       crossings,
+      preset: namedPreset,
+      ...this.responseDesign(cfg, source_rate),
     };
+  }
+
+  /** The `design` a response measured and its `plan` (with the bounded-input peak). */
+  private responseDesign(cfg: UpsamplerConfig, rate: number): { design?: FilterDesign; plan?: DesignPlan } {
+    const design = cfg.design ?? catalogueDesign(cfg.preset ?? RECOMMENDED_PRESET);
+    if (!design) return {};
+    const plan = mockCheckDesign(design, this.checkContext({ ...cfg, design, preset: null }, [rate])).plans[0]?.plan;
+    if (!plan) return { design };
+    const kernel = design.kind === "windowed_sinc" || design.kind === "lanczos";
+    return { design, plan: { ...plan, grid_taps_exact: true, ...(kernel ? { bounded_peak_db: design.phase.type === "linear" ? 2.1 : 2.6 } : {}) } };
+  }
+
+  /** What `check_design` checks against: chain A's target and output, the given rates. */
+  private checkContext(u: UpsamplerConfig, rates: readonly number[]): MockCheckContext {
+    const bits = Math.min(24, this.config.chain.output.bits);
+    const dithered = this.config.chain.output.dither !== "none";
+    return {
+      rates,
+      ratioAt: (rate) => resolveRateRatio(u.target, rate),
+      maxKernelTaps: MOCK_LIMITS.max_kernel_taps,
+      autoDb: Math.min(6.02 * bits + 1.76 - (dithered ? 4.7712 : 0), dithered ? 141.47 : 146.24),
+      pipelines: rationalPipelines(!!this.config.ab),
+      block: (rate) => Math.min(1024, Math.max(512, 2 ** Math.floor(Math.log2(Math.max(32, Math.floor((this.config.quantum * rate) / 48000)))))),
+    };
+  }
+
+  private listDevices(): DeviceInfo[] {
+    return DEVICES.map((d) => ({ ...d, active: sameDevice(d, this.config.device) }));
   }
 
   private listPresets(): PresetInfo[] {
@@ -824,6 +1849,51 @@ export class MockDaemon {
   }
 
   // ------------------------------------------------------------ calls
+
+  /** Streams as the engine reports them (an older one has no `volume_db`). */
+  private visibleStreams(): StreamInfo[] {
+    if (!this.legacyStreamVolume) return this.streams;
+    return this.streams.map(({ volume_db: _, ...s }) => s);
+  }
+
+  /** `set_stream_volume`, as the daemon does it for streams whose app
+   *  volume is 100 % (the mock's): capped by the stream maximum. */
+  private setStreamVolume(p: SetStreamVolumeParams): StreamVolume {
+    const node = Number(p?.node);
+    const db = p?.volume_db;
+    if (db !== undefined && db !== null && !(typeof db === "number" && Number.isFinite(db) && db >= VOLUME_MIN_DB && db <= VOLUME_MAX_DB)) {
+      this.bad(`volume_db must be between ${VOLUME_MIN_DB} and ${VOLUME_MAX_DB} dB (got ${db})`);
+    }
+    const s = this.streams.find((x) => x.node === node);
+    if (!s) this.bad(`no stream with node id ${node} (see \`avdsp ctl streams\`)`);
+    if (s.sink === null) {
+      this.conflict(
+        `stream ${node} (${s.app_name ?? s.binary ?? "unknown app"}) is not playing on an Audivane sink; only streams on Audivane DSP or Audivane Direct can be set here (move it with \`avdsp ctl route\`)`,
+      );
+    }
+    const cap = Math.min(this.config.volume.guard?.stream_max_db ?? 0, 0);
+    let volume_db = s.volume_db ?? 0;
+    let limited: StreamVolume["limited_by"];
+    if (typeof db === "number") {
+      volume_db = Math.round(Math.max(VOLUME_MIN_DB, Math.min(db, cap)) * 100) / 100;
+      if (db > cap + 0.002) {
+        limited = "stream_max";
+        this.volume = {
+          ...this.volume,
+          blocked: this.volume.blocked + 1,
+          last_blocked: { source: { kind: "stream", node, app: s.app_name ?? null }, requested_db: db, applied_db: volume_db, reason: "capped", at_ms: Date.now() },
+        };
+      }
+    }
+    const muted = typeof p.muted === "boolean" ? p.muted : s.muted;
+    const next = { ...s, volume_db, volume: Math.round(10 ** (volume_db / 20) * 1e6) / 1e6, muted };
+    if (typeof db === "number" || typeof p.muted === "boolean") {
+      this.streams = this.streams.map((x) => (x.node === node ? next : x));
+      this.emit({ event: "streams", data: this.visibleStreams() });
+      this.emitStatus();
+    }
+    return { node, volume_db, muted, max_db: cap, ...(limited ? { limited_by: limited } : {}) };
+  }
 
   private bad(msg: string): never {
     throw new DaemonError(ErrorCode.INVALID_PARAMS, msg);
@@ -845,33 +1915,242 @@ export class MockDaemon {
     }
   }
 
-  private validateChain(chain: ChainConfig) {
+  private validateChain(chain: ChainConfig, allowedRates: readonly number[] = this.config.rate.allowed_rates) {
+    if (chain.dc_block) {
+      if (
+        !Number.isFinite(chain.dc_block.cutoff_hz) ||
+        chain.dc_block.cutoff_hz < DC_BLOCK_CUTOFF_MIN_HZ ||
+        chain.dc_block.cutoff_hz > DC_BLOCK_CUTOFF_MAX_HZ
+      ) {
+        this.bad(`dc_block.cutoff_hz must be between ${DC_BLOCK_CUTOFF_MIN_HZ} and ${DC_BLOCK_CUTOFF_MAX_HZ} Hz (got ${chain.dc_block.cutoff_hz})`);
+      }
+    }
+    const xf = chain.crossfeed;
+    if (xf && !this.legacyCrossfeedLevel && xf.level !== "matched" && xf.level !== "peak_safe") this.bad(`unknown variant \`${String(xf.level)}\`, expected \`matched\` or \`peak_safe\``);
+    if (xf && xf.mode === "bs2b_custom") {
+      if (!(xf.cutoff_hz >= 300 && xf.cutoff_hz <= 2000)) this.bad(`crossfeed cutoff_hz must be within 300..=2000 Hz (got ${xf.cutoff_hz})`);
+      if (!(xf.feed_db >= 1 && xf.feed_db <= 15)) this.bad(`crossfeed feed_db must be within 1..=15 dB (got ${xf.feed_db})`);
+    }
+    const h = chain.harmonics;
+    if (h && h.character === "custom") {
+      for (const [k, v] of [["h2_db", h.h2_db], ["h3_db", h.h3_db], ["h4_db", h.h4_db], ["h5_db", h.h5_db]] as const) {
+        if (v === null || v === undefined) {
+          if (k === "h2_db" || k === "h3_db") this.bad(`harmonics ${k} is required`);
+          continue;
+        }
+        if (!(v >= -120 && v <= -20)) this.bad(`harmonics ${k} must be within -120..=-20 dB (got ${v})`);
+      }
+    }
+    const pc = chain.pitch;
+    if (pc) {
+      const ways = [pc.cents !== 0, pc.semitones != null, pc.reference_hz != null || pc.target_hz != null].filter(Boolean).length;
+      if (ways > 1) this.bad("pitch: set at most one of cents, semitones, or reference_hz/target_hz");
+      if (!(Math.abs(pc.cents) <= 1200)) this.bad(`pitch cents must be within -1200..=1200 (got ${pc.cents})`);
+      if (pc.semitones != null && !(Math.abs(pc.semitones) <= 12)) this.bad(`pitch semitones must be within -12..=12 (got ${pc.semitones})`);
+      if (pc.reference_hz != null || pc.target_hz != null) {
+        if (!(pc.reference_hz != null && pc.target_hz != null && pc.reference_hz > 0 && pc.target_hz > 0)) this.bad("pitch reference_hz and target_hz must both be > 0");
+        const c = pitchCents(pc);
+        if (!(Math.abs(c) <= 1200)) this.bad(`pitch shift from reference/target must be within -1200..=1200 cents (got ${c.toFixed(1)})`);
+      }
+    }
+    const lim = chain.limiter;
+    if (lim) {
+      if (!(lim.ceiling_dbfs >= -6 && lim.ceiling_dbfs <= 0)) this.bad(`limiter ceiling_dbfs must be within -6..=0 (got ${lim.ceiling_dbfs})`);
+      if (!(lim.lookahead_ms >= 5 && lim.lookahead_ms <= 20)) this.bad(`limiter lookahead_ms must be within 5..=20 (got ${lim.lookahead_ms})`);
+      if (!(lim.release_ms >= 10 && lim.release_ms <= 2000)) this.bad(`limiter release_ms must be within 10..=2000 (got ${lim.release_ms})`);
+    }
+    for (const key of ["tilt", "tilt_high"] as const) {
+      const tilt = chain.eq?.[key];
+      if (!tilt) continue;
+      // Config validation checks every stored tilt, on or off (`validate_eq_tilt`).
+      const err = tiltConfigError(tilt);
+      if (err) this.bad(`chain.eq.${err.replace(/^tilt/, key)}`);
+      // The design at the stream rate only matters for one that runs.
+      const why = tilt.enabled ? tiltProblem(tilt, this.graphRate()) : null;
+      if (why) this.bad(`${key}: ${why}`);
+    }
+    if (chain.eq?.tilt && chain.eq.tilt_high) {
+      const pair = tiltPairProblem(chain.eq.tilt, chain.eq.tilt_high);
+      if (pair) this.bad(`chain.eq: ${pair}`);
+    }
     if (chain.eq) {
       this.validateBands(chain.eq.bands);
       if (chain.eq.left) this.validateBands(chain.eq.left.bands);
       if (chain.eq.right) this.validateBands(chain.eq.right.bands);
     }
-    if (chain.upsampler.taps < 1 || chain.upsampler.taps > 4_194_304) this.bad("taps must be 1..=4194304");
-    if (!Number.isFinite(chain.upsampler.kaiser_beta) || chain.upsampler.kaiser_beta < 0 || chain.upsampler.kaiser_beta > 40) {
-      this.bad(`kaiser_beta must be between 0 and 40 (got ${chain.upsampler.kaiser_beta})`);
+    this.validateUpsampler(chain.upsampler, allowedRates);
+  }
+
+  /**
+   * The daemon's `validate_upsampler`, in the parts the app can reach:
+   * target ranges, presets and their ratio rules, automatic and band
+   * designs, the phase and window rules, and the rational grid limit.
+   */
+  private validateUpsampler(u: UpsamplerConfig, allowedRates: readonly number[]) {
+    const f = "chain.upsampler";
+    const t = u.target;
+    if (this.legacyRatio && t !== "off" && ("rate" in t || "max_rate_any" in t)) {
+      this.bad(`unknown variant \`${"rate" in t ? "rate" : "max_rate_any"}\`, expected one of \`ratio\`, \`max_rate\`, \`off\``);
     }
-    // Same rules as the daemon's validate_upsampler.
-    if (chain.upsampler.phase === "minimum") {
-      const why = minimumPhaseBlockReason(chain.upsampler.kaiser_beta);
-      if (why) this.bad(why);
+    if (t !== "off") {
+      if ("ratio" in t && !(t.ratio >= 1 && t.ratio <= 64)) this.bad(`${f}.target ratio must be between 1 and 64 (got ${t.ratio})`);
+      if ("rate" in t && !([...ALLOWED_SOURCE_RATES, ...RATES_HIGH] as number[]).includes(t.rate)) {
+        this.bad(`${f}.target rate must be one of [${ALLOWED_SOURCE_RATES.join(", ")}] or [${RATES_HIGH.join(", ")}] Hz (got ${t.rate})`);
+      }
+      const max = "max_rate" in t ? t.max_rate : "max_rate_any" in t ? t.max_rate_any : null;
+      if (max !== null && !(max >= 8000 && max <= MAX_OUTPUT_RATE)) this.bad(`${f}.target max rate must be between 8000 and ${MAX_OUTPUT_RATE} Hz (got ${max})`);
+      if (max !== null && max < 44100) this.bad(`${f}.target max rate ${max} Hz is below the lowest source rate`);
     }
-    if (chain.upsampler.cutoff_mode === "nyquist_stop") {
-      const why = nyquistStopBlockReason(chain.upsampler);
-      if (why) this.bad(why);
+    // Integer ratios at every engine rate; rational ones at the allowed rates.
+    const rational = ALLOWED_SOURCE_RATES.map((rate) => ({ rate, r: resolveRateRatio(t, rate) })).filter(({ r }) => r.up !== r.down);
+    const checked = rational.filter(({ rate, r }) => r.down === 1 || allowedRates.includes(rate));
+    for (const { rate, r } of checked) {
+      if (r.up > MAX_RATIONAL_TERM || r.down > MAX_RATIONAL_TERM) this.bad(`${f}.target: at ${rate} Hz the ratio ${r.up}/${r.down} has a term above ${MAX_RATIONAL_TERM}`);
+    }
+    const hint = (rate: number) => `(or remove ${rate} Hz from rate.allowed_rates)`;
+    const MAX_GRID = 1_048_576;
+    const pipelines = rationalPipelines(!!this.config.ab);
+    if (u.preset !== null && u.design !== null) {
+      this.bad(`${f}: preset and design cannot both be set`);
+    }
+    if (u.preset === RECOMMENDED_PRESET) {
+      return;
+    }
+    if (u.design) {
+      const { errors } = mockCheckDesign(u.design, this.checkContext(u, allowedRates));
+      if (errors.length > 0) this.bad(`${f}.${errors[0].path}: ${errors[0].message}`);
+      // The legacy model below only knows the standard path's windowed sinc.
+      const d = u.design;
+      if (d.kind !== "windowed_sinc" || d.numerics.path !== "standard") return;
+    }
+    if (u.preset) {
+      const preset = u.preset as FilterPreset;
+      if (!presetEntry(preset)) this.bad(`${f}.preset: unknown filter preset ${u.preset}`);
+      for (const { rate, r } of checked) {
+        const need = presetRatioNeed(preset, r, MOCK_LIMITS.max_kernel_taps);
+        if (need) this.bad(`${f}.preset: at ${rate} Hz, filter preset ${u.preset} does not run at ${ratioStr(r)}: it needs ${need}`);
+        if (r.down === 1) continue;
+        const { gridTaps, macs } = presetRationalCost(preset, rate, r, pipelines);
+        if (gridTaps > MAX_GRID || macs > 800e6) {
+          this.bad(`${f}.preset: at ${rate} Hz, ${u.preset} needs ${gridTaps} taps on the ${r.up}x grid: use a shorter preset or a lower output rate ${hint(rate)}`);
+        }
+      }
+      return;
+    }
+    const lu = fromUpsamplerConfig(u);
+    if (!(lu.phase_mix >= 0 && lu.phase_mix <= 1)) this.bad(`${f}.phase_mix must be between 0 and 1 (got ${lu.phase_mix})`);
+    const bandEdges = () => {
+      const b = lu.band;
+      if (!(b.passband_end >= 0.5 && b.passband_end <= 1)) this.bad(`${f}.band: passband end must be between 0.5 and 1 (got ${b.passband_end})`);
+      if (!(b.stopband_start > b.passband_end && b.stopband_start <= 1.5)) this.bad(`${f}.band: stopband start must be above the passband end and at most 1.5 (got ${b.stopband_start})`);
+    };
+    if (lu.auto_taps) {
+      const a = this.autoBudgetDb(lu);
+      if (!(a >= 55 && a <= 200)) this.bad(`${f}.auto_taps: error budget must be between 55 and 200 dB (got ${a})`);
+      if (lu.window === "tukey" || lu.preserve_samples) this.bad(`${f}.auto_taps: automatic taps needs Kaiser or Gaussian without preserve_samples`);
+      bandEdges();
+      return;
+    }
+    if (lu.cutoff_mode === "band") {
+      bandEdges();
+      const a = lu.band.attenuation_db;
+      if (!(a >= 55 && a <= 225)) this.bad(`${f}.band: attenuation must be between 55 and 225 dB (got ${a})`);
+      if (lu.phase !== "linear" && a > 190.2) this.bad(`${f}: ${lu.phase} phase supports a band attenuation up to 190.2 dB (got ${a})`);
+      // Like the daemon's `check_rational_at` for band designs (config.rs).
+      const bp = bandRationalProblem(lu, allowedRates, pipelines);
+      if (bp) {
+        const { rate, ratio: r, gridTaps } = bp;
+        const fix = `widen the band's transition or lower its attenuation, or use a preset ${hint(rate)}`;
+        if (gridTaps > MAX_GRID) this.bad(`${f}: at ${rate} Hz (${ratioStr(r)}) the design needs ${gridTaps} taps on the ${r.up}x grid, more than ${MAX_GRID}: ${fix}`);
+        const out = (rate * r.up) / r.down;
+        const one = out * Math.ceil(gridTaps / r.up);
+        this.bad(
+          `${f}: at ${rate} Hz, the ${ratioStr(r)} kernel (${Math.ceil(gridTaps / r.up)} taps per output frame at ${out} Hz) needs ${Math.round(one / 1e6)} M multiply-adds per second per channel, ${Math.round((one * pipelines) / 1e6)} M with the ${pipelines} pipelines that can run at once (a swap or crossfade runs two, A/B doubles it), more than the 800 M budget: ${fix}`,
+        );
+      }
+    } else {
+      const maxTaps = MOCK_LIMITS.max_kernel_taps;
+      if (!(lu.taps >= 1 && lu.taps <= maxTaps)) this.bad(`${f}.taps must be between 1 and ${maxTaps} (got ${lu.taps})`);
+      if (!Number.isFinite(lu.kaiser_beta) || lu.kaiser_beta < 0 || lu.kaiser_beta > 40) this.bad(`${f}.kaiser_beta must be between 0 and 40 (got ${lu.kaiser_beta})`);
+      if (!(lu.cutoff > 0 && lu.cutoff <= 1)) this.bad(`${f}.cutoff must be in (0, 1] (got ${lu.cutoff})`);
+      if (lu.phase === "minimum") {
+        const why = minimumPhaseBlockReason(lu.kaiser_beta);
+        if (why) this.bad(why);
+      }
+      if (lu.phase === "intermediate" && (lu.kaiser_beta < 2 || lu.kaiser_beta > 20)) this.bad(`${f}: intermediate phase needs a Kaiser beta between 2 and 20 (got ${lu.kaiser_beta})`);
+      if (lu.cutoff_mode === "nyquist_stop") {
+        const why = nyquistStopBlockReason(lu, allowedRates);
+        if (why) this.bad(why);
+      }
+    }
+    if (lu.window === "tukey") {
+      if (lu.phase !== "linear" || lu.cutoff_mode !== "fraction") this.bad(`${f}: the Tukey window needs linear phase with cutoff_mode fraction (its stopband has no calibrated formula)`);
+      if (!(lu.taper > 0 && lu.taper <= 1)) this.bad(`${f}.taper must be in (0, 1] (got ${lu.taper})`);
+    }
+    if (lu.preserve_samples) {
+      if (lu.phase !== "linear" || lu.cutoff_mode !== "fraction" || lu.cutoff !== 1) {
+        this.bad(`${f}.preserve_samples needs linear phase with cutoff_mode fraction and cutoff 1.0 (a filter that passes the input samples through is -6 dB at the source Nyquist)`);
+      }
+      const dec = checked.find(({ r }) => r.up < r.down);
+      if (dec) this.bad(`${f}.preserve_samples needs an output rate at or above the input rate (at ${dec.rate} Hz the target resamples by ${ratioStr(dec.r)})`);
+    }
+    // Rational ratios: the manual design lives on the intermediate grid.
+    const problem = manualRationalProblem(lu, allowedRates, pipelines);
+    if (problem) {
+      const { rate, ratio: r, gridTaps, maxPerInput: n } = problem;
+      const fix = n === 0 ? `use a preset ${hint(rate)}` : `use taps_unit "input" with at most ${n} taps per input sample, or a preset ${hint(rate)}`;
+      if (gridTaps > MAX_GRID) this.bad(`${f}: at ${rate} Hz (${ratioStr(r)}) the design needs ${gridTaps} taps on the ${r.up}x grid, more than ${MAX_GRID}: ${fix}`);
+      // Like the daemon's `check_rational_budget`: within the size, over the cost.
+      const out = (rate * r.up) / r.down;
+      const one = out * Math.ceil(gridTaps / r.up);
+      this.bad(
+        `${f}: at ${rate} Hz, the ${ratioStr(r)} kernel (${Math.ceil(gridTaps / r.up)} taps per output frame at ${out} Hz) needs ${Math.round(one / 1e6)} M multiply-adds per second per channel, ${Math.round((one * pipelines) / 1e6)} M with the ${pipelines} pipelines that can run at once (a swap or crossfade runs two, A/B doubles it), more than the 800 M budget: ${fix}`,
+      );
     }
   }
 
-  /** Chain B follows chain A's upsampler and output, like the daemon. */
+  /** `VolumeConfig` validation (control-plane.md, "Volume, balance, and mute"). */
+  private validateVolume(v: EngineConfig["volume"]) {
+    const inRange = (x: number | null, lo: number, hi: number) => x === null || (Number.isFinite(x) && x >= lo && x <= hi);
+    if (!inRange(v.hardware_db, -120, 0)) this.bad(`volume.hardware_db must be within -120..=0 dB (got ${v.hardware_db})`);
+    if (!inRange(v.max_volume_db, -120, 0)) this.bad(`volume.max_volume_db must be within -120..=0 dB (got ${v.max_volume_db})`);
+    if (!inRange(v.guard.stream_max_db, -120, 0)) this.bad(`volume.guard.stream_max_db must be within -120..=0 dB (got ${v.guard.stream_max_db})`);
+    if (!inRange(v.guard.max_rise_db_per_s, 0, 1000)) this.bad(`volume.guard.max_rise_db_per_s must be within 0..=1000 (got ${v.guard.max_rise_db_per_s})`);
+    if (v.mode === "hybrid" && v.hardware_db === null) this.bad("volume.mode hybrid requires volume.hardware_db");
+  }
+
+  /** What the engine reports after a settings change: mode, mixer use, ceiling. */
+  private applyVolumeSettings(v: EngineConfig["volume"]) {
+    this.levelChange(() => {
+      const wantsHw = v.mode === "hardware" || v.mode === "hybrid";
+      const hardware = this.hasMixer && v.mode !== "software";
+      const ceiling = v.max_volume_db;
+      const level = ceiling !== null ? Math.min(this.volume.volume_db, ceiling) : this.volume.volume_db;
+      this.volume = {
+        ...this.volume,
+        mode: v.mode,
+        hardware,
+        hardware_unavailable: wantsHw && !this.hasMixer,
+        max_db: ceiling ?? 0,
+        ceiling_db: ceiling,
+        sink_volume: v.sink_volume,
+        guard: v.guard.mode,
+        volume_db: level,
+      };
+    });
+    this.config.volume = { ...this.config.volume, volume_db: this.volume.volume_db };
+  }
+
+  /** Chain B is re-materialised from `b` after every edit, like the daemon. */
   private normalizeB() {
     const ab = this.config.ab;
     if (!ab) return;
-    ab.chain_b.upsampler = clone(this.config.chain.upsampler);
-    ab.chain_b.output = clone(this.config.chain.output);
+    try {
+      this.config.ab = normalizeAbWithChainA(ab, this.config.chain).ab;
+    } catch {
+      this.config.ab = null;
+      this.abSide = "a";
+    }
   }
 
   handle(method: string, params: unknown): unknown {
@@ -881,6 +2160,8 @@ export class MockDaemon {
     const mutate = (fn: () => void) => {
       fn();
       this.normalizeB();
+      // A measurement is of one pair: a change to either side ends it (a level or label change does not).
+      if (this.abMeasure && this.abMeasure.pair !== this.abPair()) this.abMeasureEnd("cancelled: the compared chains changed");
       this.emitConfig();
       return null;
     };
@@ -892,23 +2173,37 @@ export class MockDaemon {
       case "set_config":
         return mutate(() => {
           const next = clone(params as EngineConfig);
+          if (next.chain.dc_block !== undefined) next.chain.dc_block = normalizeDcBlock(next.chain.dc_block);
           if (next.chain.eq) next.chain.eq = normalizeEq(next.chain.eq);
+          if (next.chain.eq?.tilt) next.chain.eq.tilt = normalizeTilt(next.chain.eq.tilt);
+          if (next.chain.eq?.tilt_high) next.chain.eq.tilt_high = normalizeTilt(next.chain.eq.tilt_high);
+          if (next.ab) {
+            next.ab = normalizeAbWithChainA(next.ab, next.chain).ab;
+          }
           // Like the daemon's `normalize_rates` + `validate`.
           if (!next.rate.allowed_rates.length) throw new DaemonError(ErrorCode.INVALID_PARAMS, "rate.allowed_rates must not be empty");
           next.rate = normalizeRatePolicy(next.rate);
-          this.validateChain(next.chain);
-          // Like the daemon, the whole config is applied, volume included.
+          this.validateChain(next.chain, next.rate.allowed_rates);
+          if (next.ab) this.validateChain(chainB(next.ab, next.chain), next.rate.allowed_rates);
+          this.admitCpu(next);
+          next.outputs ??= { followers: [] };
+          this.validateOutputs(next);
+          // Like the daemon: the level belongs to `set_volume`, so the
+          // incoming volume, balance and mute are ignored.
           if (next.volume) {
-            const db = Math.max(this.volume.min_db, Math.min(this.volume.max_db, next.volume.volume_db));
-            this.volume = { ...this.volume, volume_db: db, balance_db: next.volume.balance_db, muted: next.volume.muted };
-            next.volume = { ...next.volume, volume_db: db };
+            next.volume = { ...next.volume, volume_db: this.volume.volume_db, balance_db: this.volume.balance_db, muted: this.volume.muted };
+            this.validateVolume(next.volume);
           }
           this.config = next;
+          this.syncFollowers();
+          if (next.volume) this.applyVolumeSettings(next.volume);
         });
       case "set_eq":
         return mutate(() => {
           const rawEq = params === null ? null : clone(params as NonNullable<ChainConfig["eq"]>);
           const eq = rawEq ? normalizeEq(rawEq) : null;
+          if (eq?.tilt) eq.tilt = normalizeTilt(eq.tilt);
+          if (eq?.tilt_high) eq.tilt_high = normalizeTilt(eq.tilt_high);
           const chain = { ...cfg.chain, eq };
           this.validateChain(chain);
           cfg.chain = chain;
@@ -922,8 +2217,120 @@ export class MockDaemon {
         return mutate(() => {
           const next = { ...cfg.chain, upsampler: clone(params as ChainConfig["upsampler"]) };
           this.validateChain(next);
+          this.admitCpu({ ...cfg, chain: next, ab: cfg.ab ? normalizeAbWithChainA(cfg.ab, next).ab : null });
           cfg.chain = next;
         });
+      case "set_dc_block":
+        return mutate(() => {
+          const next = normalizeDcBlock(params);
+          const chain = { ...cfg.chain, dc_block: next };
+          this.validateChain(chain);
+          cfg.chain = chain;
+        });
+      case "set_crossfeed":
+        return mutate(() => {
+          const chain = { ...cfg.chain, crossfeed: params === null ? null : this.crossfeedAsStored(clone(params as NonNullable<ChainConfig["crossfeed"]>)) };
+          this.validateChain(chain);
+          cfg.chain = chain;
+        });
+      case "set_varispeed": {
+        const given = (params ?? {}) as SetVarispeedParams;
+        for (const k of ["enabled", "speed", "ramp_ms", "keep_pitch"] as const) {
+          if (k in given && given[k] === null) this.bad(`invalid type: null, expected ${k === "enabled" || k === "keep_pitch" ? "a boolean" : "f64"}`);
+        }
+        const next = { ...cfg.varispeed, ...given };
+        if (next.enabled && next.keep_pitch) this.checkKeepPitch(this.graphRate());
+        if (!(Number.isFinite(next.speed) && next.speed >= 0.5 && next.speed <= 2)) this.bad(`varispeed.speed must be between 0.5 and 2 (got ${next.speed})`);
+        if (!(Number.isFinite(next.ramp_ms) && next.ramp_ms >= 0 && next.ramp_ms <= 10000)) this.bad(`varispeed.ramp_ms must be between 0 and 10000 ms (got ${next.ramp_ms})`);
+        this.validateOutputs({ ...cfg, varispeed: next });
+        cfg.varispeed = next;
+        this.emitConfig();
+        return this.currentStatus().varispeed;
+      }
+      case "set_pitch":
+        return mutate(() => {
+          const chain = { ...cfg.chain, pitch: { ...{ enabled: true, cents: 0, quality: "high" as const }, ...clone(params as ChainConfig["pitch"]) } };
+          this.validateChain(chain);
+          cfg.chain = chain;
+        });
+      case "set_harmonics":
+        return mutate(() => {
+          const chain = { ...cfg.chain, harmonics: params === null ? null : clone(params as NonNullable<ChainConfig["harmonics"]>) };
+          this.validateChain(chain);
+          cfg.chain = chain;
+        });
+      case "set_limiter":
+        return mutate(() => {
+          // Shared with chain B (normalizeB), like the upsampler and output.
+          const chain = { ...cfg.chain, limiter: clone(params as ChainConfig["limiter"]) };
+          this.validateChain(chain);
+          if (chain.limiter?.mode !== cfg.chain.limiter?.mode) this.limHeadroom = 0;
+          cfg.chain = chain;
+        });
+      case "meters":
+        return this.meters();
+      case "set_output":
+        return mutate(() => {
+          const chain = { ...cfg.chain, output: clone(params as ChainConfig["output"]) };
+          if (![16, 20, 24, 32].includes(chain.output.bits)) this.bad(`output.bits must be 16, 20, 24 or 32 (got ${chain.output.bits})`);
+          const h = chain.output.headroom_db;
+          if (!(h >= 0 && h <= 12)) this.bad(`chain.output.headroom_db must be between 0 and 12 dB (got ${h})`);
+          this.validateChain(chain);
+          cfg.chain = chain;
+        });
+      case "set_formats":
+        return mutate(() => {
+          const formats = clone(params as EngineConfig["formats"]);
+          if (!Array.isArray(formats) || formats.length === 0) this.bad("formats must not be empty");
+          cfg.formats = formats;
+        });
+      case "set_rate":
+        return mutate(() => {
+          const rate = clone(params as EngineConfig["rate"]);
+          if (!rate.allowed_rates.length) this.bad("rate.allowed_rates must not be empty");
+          // Like serde: a missing field is the default, an unknown one an error.
+          rate.bypass_resampler ??= "engine";
+          if (rate.bypass_resampler !== "engine" && rate.bypass_resampler !== "pipewire") {
+            this.bad(`unknown variant \`${String(rate.bypass_resampler)}\`, expected \`engine\` or \`pipewire\``);
+          }
+            const next = normalizeRatePolicy(rate);
+          // Like the daemon's `edit`: the whole config is validated, and the
+          // upsampler's fractional limits depend on the allowed rates.
+          this.validateChain(cfg.chain, next.allowed_rates);
+          if (cfg.ab) this.validateChain(chainB(cfg.ab, cfg.chain), next.allowed_rates);
+          cfg.rate = next;
+        });
+      case "set_device":
+        return mutate(() => {
+          const device = String((params as { device?: unknown })?.device ?? "");
+          if (device !== "" && !device.startsWith("hw:")) this.bad(`device must be an ALSA hw: device (got "${device}")`);
+          this.validateOutputs({ ...cfg, device: device || DEVICES[0].id });
+          cfg.device = device || DEVICES[0].id;
+        });
+      case "set_follower": {
+        const given = (params ?? {}) as { device?: unknown; remove?: unknown; enabled?: unknown; trim_ms?: unknown; volume_db?: unknown };
+        for (const k of ["remove", "enabled", "trim_ms", "volume_db"] as const) {
+          if (k in given && given[k] === null) this.bad(`invalid type: null, expected ${k === "remove" || k === "enabled" ? "a boolean" : "f64"}`);
+        }
+        const device = String(given.device ?? "");
+        const followers = clone(cfg.outputs.followers);
+        const at = followers.findIndex((f) => f.device === device);
+        if (given.remove === true) {
+          if (at < 0) this.bad(`${device} is not a follower`);
+          followers.splice(at, 1);
+        } else {
+          const i = at >= 0 ? at : followers.push({ device, enabled: true, trim_ms: 0, volume_db: 0 }) - 1;
+          const f = followers[i];
+          if (typeof given.enabled === "boolean") f.enabled = given.enabled;
+          if (typeof given.trim_ms === "number") f.trim_ms = given.trim_ms;
+          if (typeof given.volume_db === "number") f.volume_db = given.volume_db;
+        }
+        this.validateOutputs({ ...cfg, outputs: { followers } });
+        cfg.outputs = { followers };
+        this.syncFollowers();
+        this.emitConfig();
+        return this.currentStatus().outputs;
+      }
       case "set_dsp_enabled":
         return mutate(() => {
           cfg.dsp_enabled = !!p.enabled;
@@ -931,20 +2338,53 @@ export class MockDaemon {
       case "set_ab": {
         const notes: string[] = [];
         mutate(() => {
-          cfg.ab = params === null ? null : clone(params as AbConfig);
-          if (cfg.ab && !deepEqual(cfg.ab.chain_b.upsampler, cfg.chain.upsampler)) notes.push("Side B uses side A's upsampling.");
-          if (!cfg.ab) this.abSide = "a";
+          if (params === undefined || params === null) {
+            cfg.ab = null;
+            this.abSide = "a";
+            return;
+          }
+          this.abOvers = { a: 0, b: 0 };
+          const { ab: next, notes: abNotes } = normalizeAbWithChainA(params, cfg.chain);
+          this.validateChain(chainB(next, cfg.chain));
+          this.admitCpu({ ...cfg, ab: next });
+          notes.push(...abNotes);
+          cfg.ab = next;
         });
-        return { ...(this.status().ab ?? { enabled: false, current: "a", offset_db: 0 }), ...(notes.length ? { notes } : {}) };
+        return { ...(this.status().ab ?? { enabled: false, current: "a", offset_db: 0, error: null }), ...(notes.length ? { notes } : {}) };
+      }
+      case "ab_measure": {
+        if (!cfg.ab) throw new DaemonError(ErrorCode.INVALID_PARAMS, "A/B is not configured");
+        if (p.cancel && p.accept) throw new DaemonError(ErrorCode.INVALID_PARAMS, "ab_measure: cancel and accept exclude each other");
+        if (p.cancel) {
+          if (this.abMeasure) this.abMeasureEnd(null);
+          this.emitStatus();
+          return this.status().ab;
+        }
+        if (p.accept) {
+          const m = this.abMeasure;
+          if (!m) throw new DaemonError(ErrorCode.BAD_STATE, "no A/B level measurement is running");
+          if (m.offset === null) throw new DaemonError(ErrorCode.BAD_STATE, "nothing measured yet: play some music first");
+          this.abMeasureLock(m.offset, m.seconds);
+          return this.status().ab;
+        }
+        const max = p.max_seconds === undefined ? 60 : Number(p.max_seconds);
+        if (!Number.isFinite(max) || max < 10 || max > 300) throw new DaemonError(ErrorCode.INVALID_PARAMS, "ab_measure: max_seconds must be 10 to 300");
+        this.abMeasureStart(max);
+        this.emitStatus();
+        return this.status().ab;
       }
       case "ab_select": {
         if (!cfg.ab) throw new DaemonError(ErrorCode.INVALID_PARAMS, "A/B is not configured");
         this.abSide = p.side === "b" ? "b" : "a";
+        this.abOvers = { a: 0, b: 0 };
         this.emitStatus();
         return this.status().ab;
       }
       case "list_streams":
-        return clone(this.streams);
+        return clone(this.visibleStreams());
+      case "set_stream_volume":
+        if (this.legacyStreamVolume) throw new DaemonError(ErrorCode.INVALID_REQUEST, `unknown method "${method}"`);
+        return this.setStreamVolume(params as SetStreamVolumeParams);
       case "route": {
         const target = p.target as { node: number } | { app: string };
         const sink = p.sink as SinkChoice;
@@ -952,7 +2392,7 @@ export class MockDaemon {
           const hit = "node" in target ? s.node === target.node : s.app_name?.toLowerCase() === target.app.toLowerCase();
           return hit ? { ...s, sink: sink === "default" ? (cfg.routing.mode === "system" ? "dsp" : null) : sink } : s;
         });
-        this.emit({ event: "streams", data: this.streams });
+        this.emit({ event: "streams", data: this.visibleStreams() });
         this.emitStatus();
         return null;
       }
@@ -964,7 +2404,7 @@ export class MockDaemon {
             const rule = cfg.routing.rules.find((r) => r.app.toLowerCase() === (s.app_name ?? "").toLowerCase());
             return { ...s, sink: rule ? (rule.sink === "default" ? null : rule.sink) : s.sink === "direct" ? "direct" : null };
           });
-          this.emit({ event: "streams", data: this.streams });
+          this.emit({ event: "streams", data: this.visibleStreams() });
         });
       case "now_playing":
         return clone(this.nowPlaying);
@@ -987,6 +2427,8 @@ export class MockDaemon {
         return null;
       case "acquire_device":
         this.released = false;
+        // The followers reopen and lock again.
+        for (const d of this.followerSince.keys()) this.followerSince.set(d, this.followerClock());
         this.emitStatus();
         return null;
       case "subscribe":
@@ -995,14 +2437,34 @@ export class MockDaemon {
         this.running = false;
         for (const l of this.connListeners) l(false);
         return null;
+      case "set_volume_guarded":
       case "set_volume": {
-        const v = params as SetVolumeParams;
+        const given = params as SetVolumeParams | SetVolumeGuardedParams;
+        // A guarded write changes only the fields it carries.
+        const v = {
+          volume_db: given.volume_db ?? this.volume.volume_db,
+          balance_db: given.balance_db ?? this.volume.balance_db,
+          muted: given.muted ?? this.volume.muted,
+        };
+        if (method === "set_volume_guarded") {
+          // A daemon that predates guarded writes does not know the method.
+          if (this.legacyVolume) throw new DaemonError(ErrorCode.INVALID_REQUEST, `unknown method "${method}"`);
+          const g = given as SetVolumeGuardedParams;
+          if (g.if_instance !== this.instance) {
+            throw new DaemonError(ErrorCode.STALE_INSTANCE, `this volume change was made for engine instance "${g.if_instance}", which has since restarted`);
+          }
+          if (g.if_revision !== this.revision) {
+            throw new DaemonError(ErrorCode.STALE_REVISION, `the volume changed since revision ${g.if_revision} (now ${this.revision})`);
+          }
+        }
         if (!(v.volume_db >= VOLUME_MIN_DB && v.volume_db <= VOLUME_MAX_DB)) this.bad(`volume_db must be within ${VOLUME_MIN_DB}..=${VOLUME_MAX_DB} dB`);
         if (!(Math.abs(v.balance_db) <= BALANCE_MAX_DB)) this.bad(`balance_db must be within ±${BALANCE_MAX_DB} dB`);
-        this.volume = { ...this.volume, volume_db: Math.max(this.volume.min_db, Math.min(this.volume.max_db, v.volume_db)), balance_db: v.balance_db, muted: v.muted };
-        cfg.volume = { volume_db: this.volume.volume_db, balance_db: v.balance_db, muted: v.muted };
+        this.levelChange(() => {
+          this.volume = { ...this.volume, volume_db: Math.max(this.volume.min_db, Math.min(this.volume.max_db, v.volume_db)), balance_db: v.balance_db, muted: v.muted };
+        });
+        cfg.volume = { ...cfg.volume, volume_db: this.volume.volume_db, balance_db: v.balance_db, muted: v.muted };
         this.emitConfig();
-        return clone(this.volume);
+        return this.volumeStatus();
       }
       case "list_presets":
         return this.listPresets();
@@ -1069,15 +2531,34 @@ export class MockDaemon {
         return this.info(pr);
       }
       case "list_devices":
-        return DEVICES.map((d) => ({ ...d, active: sameDevice(d, cfg.device) }));
+        return this.listDevices();
+      case "resolve_design": {
+        const name = (p ?? {}).preset;
+        const design = typeof name === "string" ? catalogueDesign(name) : null;
+        if (!design) this.bad(`unknown filter preset ${String(name)}`);
+        return design;
+      }
+      case "check_design": {
+        const req = (p ?? {}) as { design?: FilterDesign; target?: RateTarget; source_rate?: number };
+        if (!req.design) this.bad("check_design needs a design");
+        const a = this.config.chain.upsampler;
+        const target = req.target ?? a.target;
+        if (target !== "off" && "ratio" in target && !(target.ratio >= 1 && target.ratio <= 64)) {
+          return { errors: [{ path: "target", message: `ratio must be between 1 and 64 (got ${target.ratio})` }], plans: [] };
+        }
+        const rates = req.source_rate !== undefined ? [req.source_rate] : this.config.rate.allowed_rates;
+        return mockCheckDesign(req.design, this.checkContext({ ...a, target }, rates));
+      }
       case "upsampler_response": {
         const req = (params ?? {}) as { config?: UpsamplerConfig | null; source_rate?: number | null; window?: ResponseWindowRequest | null };
         const upCfg = req.config ?? this.chainOn().upsampler;
         const srcRate = req.source_rate ?? this.graphRate();
         const res = this.buildUpsamplerResponse(upCfg, srcRate);
+        if (this.legacyRatio) delete (res as Partial<UpsamplerResponse>).rate_ratio;
         const w = req.window;
         if (w) {
-          const nyqOut = res.output_rate / 2;
+          // Like the daemon: up to the grid's Nyquist (source x up).
+          const nyqOut = (res.source_rate * (res.rate_ratio?.up ?? res.ratio)) / 2;
           if (!Number.isFinite(w.f_lo_hz) || !Number.isFinite(w.f_hi_hz)) this.bad("window frequencies must be finite");
           if (w.f_lo_hz < 0 || w.f_hi_hz > nyqOut) this.bad(`window must lie within 0 .. ${nyqOut} Hz`);
           if (w.f_lo_hz >= w.f_hi_hz) this.bad("window needs f_lo_hz < f_hi_hz");
@@ -1131,7 +2612,7 @@ export class MockTransport implements Transport {
   start(h: TransportHandlers): () => void {
     let unsub: (() => void) | null = null;
     let live = true;
-    const topics: Topic[] = ["meters", "status", "streams", "now_playing", "config", "presets"];
+    const topics: Topic[] = ["meters", "status", "streams", "now_playing", "config", "presets", "devices"];
     const delay = this.latency.event;
     const onEvent =
       delay > 0
@@ -1218,6 +2699,16 @@ export class MockTransport implements Transport {
     this.daemon.startEngine();
   }
 
+  atLogin = false;
+
+  async engineAtLogin(): Promise<boolean | null> {
+    return this.atLogin;
+  }
+
+  async setEngineAtLogin(on: boolean): Promise<void> {
+    this.atLogin = on;
+  }
+
   async engineLastError(): Promise<string | null> {
     return null;
   }
@@ -1269,4 +2760,133 @@ export class MockTransport implements Transport {
     await new Promise((r) => setTimeout(r, this.latency.request));
     this.daemon.overlays.delete(name);
   }
+
+  // ---------------------------------------------------------------- shell
+  // The desktop shell in memory: settings, start at login, the volume keys'
+  // state. URL switches: `?window=popup|osd` picks the window,
+  // `?keys=none|declined|x11` what turning the keys on leads to, `?notray`
+  // a desktop without a tray host, `?kde` a KDE Plasma session.
+
+  shell: ShellView = { settings: { ...DEFAULT_UI_SETTINGS }, autostart: false, keys: { state: "off" }, tray: true, kde: false };
+  /** Calls a test can look at: "show-main", "hide-popup", "osd:<source>". */
+  shellCalls: string[] = [];
+  lastOsd: OsdPayload | null = null;
+  private shellHandlers = new Set<(e: ShellEvent) => void>();
+
+  private query(): URLSearchParams {
+    return new URLSearchParams(typeof location !== "undefined" ? location.search : "");
+  }
+
+  windowLabel(): WindowLabel {
+    const w = this.query().get("window");
+    return w === "popup" || w === "osd" ? w : "main";
+  }
+
+  /** Send a shell message to this page (tests: a volume key, an OSD payload). */
+  emitShell(e: ShellEvent): void {
+    for (const h of this.shellHandlers) h(clone(e));
+  }
+
+  async shellView(): Promise<ShellView> {
+    if (this.query().has("notray")) this.shell.tray = false;
+    if (this.query().has("kde")) this.shell.kde = true;
+    return clone(this.shell);
+  }
+
+  async setUiSettings(s: UiSettings): Promise<ShellView> {
+    await new Promise((r) => setTimeout(r, this.latency.request));
+    const step = Number.isFinite(s.volume_step_db) ? Math.round(Math.min(STEP_MAX_DB, Math.max(STEP_MIN_DB, s.volume_step_db)) * 2) / 2 : 1;
+    const was = this.shell.settings.volume_keys;
+    this.shell.settings = { ...s, volume_step_db: step };
+    if (s.volume_keys !== was) this.setKeys(s.volume_keys);
+    const view = clone(this.shell);
+    this.emitShell({ kind: "ui-settings", view });
+    return view;
+  }
+
+  private setKeys(on: boolean) {
+    const send = (keys: KeysState) => {
+      this.shell.keys = keys;
+      this.emitShell({ kind: "keys-state", keys: clone(keys) });
+    };
+    if (!on) return send({ state: "off" });
+    send({ state: "starting" });
+    const mode = this.query().get("keys");
+    setTimeout(() => {
+      if (!this.shell.settings.volume_keys) return;
+      if (mode === "none") send({ state: "unavailable", reason: "No desktop portal is running: on Wayland the volume keys need the desktop's global shortcuts portal (KDE Plasma has it)." });
+      else if (mode === "declined") send({ state: "declined" });
+      else
+        send({
+          state: "active",
+          via: mode === "x11" ? "x11" : "portal",
+          bound: [
+            { action: "up", trigger: "Volume Up" },
+            { action: "down", trigger: "Volume Down" },
+            { action: "mute", trigger: "Volume Mute" },
+          ],
+        });
+    }, 300);
+  }
+
+  async setAutostart(on: boolean): Promise<ShellView> {
+    await new Promise((r) => setTimeout(r, this.latency.request));
+    this.shell.autostart = on;
+    const view = clone(this.shell);
+    this.emitShell({ kind: "ui-settings", view });
+    return view;
+  }
+
+  onShell(handler: (e: ShellEvent) => void): () => void {
+    this.shellHandlers.add(handler);
+    return () => this.shellHandlers.delete(handler);
+  }
+
+  showMainWindow(): void {
+    this.shellCalls.push("show-main");
+  }
+
+  hidePopup(): void {
+    this.shellCalls.push("hide-popup");
+  }
+
+  osdShow(p: OsdPayload, source: "keys" | "scroll"): void {
+    this.shellCalls.push(`osd:${source}`);
+    this.lastOsd = clone(p);
+  }
+
+  async osdReady(): Promise<OsdPayload | null> {
+    // A standalone OSD page in the browser shows a sample level, or the
+    // one in the URL (`?window=osd&db=-12.5&muted`).
+    const q = this.query();
+    const db = q.get("db");
+    return this.lastOsd ?? { volume_db: db === null ? -23.5 : Number(db), muted: q.has("muted"), min_db: -80, max_db: q.has("ceiling") ? Number(q.get("ceiling")) : 0, note: q.get("note") };
+  }
+
+  // The app process keeps the main view's place while its window is closed
+  // to the tray; here the tab's session storage stands in for it, so a
+  // reload plays the part of the window being made again.
+  saveMainView(m: MainViewMemory): void {
+    try {
+      sessionStorage.setItem(MAIN_VIEW_KEY, JSON.stringify(m));
+    } catch {
+      /* no storage: nothing is kept */
+    }
+  }
+
+  mainCloseReady(m: MainViewMemory | null): void {
+    if (m) this.saveMainView(m);
+    this.shellCalls.push("main-close-ready");
+  }
+
+  async loadMainView(): Promise<MainViewMemory | null> {
+    try {
+      const raw = sessionStorage.getItem(MAIN_VIEW_KEY);
+      return raw ? (JSON.parse(raw) as MainViewMemory) : null;
+    } catch {
+      return null;
+    }
+  }
 }
+
+const MAIN_VIEW_KEY = "avdsp-mock-main-view";

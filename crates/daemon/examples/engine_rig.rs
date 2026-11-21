@@ -13,6 +13,8 @@
 //!   snapshot
 //!   release
 //!   acquire
+//!   varispeed <on|off> [speed] [ramp_ms]
+//!   varispeed_status
 //!   quit
 
 use anyhow::{Context, Result};
@@ -39,7 +41,7 @@ struct SnapshotLine {
     format: Option<SampleFormat>,
     graph_rate: u32,
     output_rate: u32,
-    ratio: u32,
+    ratio: audivane_protocol::RateRatio,
     quantum: u32,
     latency_ms: f64,
     xruns: u64,
@@ -156,6 +158,34 @@ fn main() -> Result<()> {
                     break;
                 } else if trimmed == "snapshot" {
                     emit_json(&out_in, &SnapshotLine::from(engine_in.snapshot()));
+                } else if trimmed == "varispeed_status" {
+                    let st = engine_in.varispeed_status();
+                    emit_json(
+                        &out_in,
+                        &serde_json::json!({"type": "reply", "cmd": "varispeed_status", "ok": true,
+                            "status": format!("{st:?}")}),
+                    );
+                } else if let Some(rest) = trimmed.strip_prefix("varispeed ") {
+                    let mut parts = rest.split_whitespace();
+                    let on = parts.next() == Some("on");
+                    let speed: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+                    let ramp: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                    let keep_pitch = parts.next() == Some("keep_pitch");
+                    match engine_in.set_varispeed(audivane_protocol::ipc::VarispeedConfig {
+                        enabled: on,
+                        speed,
+                        ramp_ms: ramp,
+                        keep_pitch,
+                    }) {
+                        Ok(()) => emit_json(
+                            &out_in,
+                            &serde_json::json!({"type": "reply", "cmd": "varispeed", "ok": true}),
+                        ),
+                        Err(e) => emit_json(
+                            &out_in,
+                            &serde_json::json!({"type": "reply", "cmd": "varispeed", "ok": false, "error": e.to_string()}),
+                        ),
+                    }
                 } else if trimmed == "meters" {
                     let m = engine_in.meters();
                     emit_json(

@@ -1,5 +1,0 @@
-   Compiling scientific-review v0.0.0 (<repo>/docs/research/scientific-review)
-    Finished `release` profile [optimized] target(s) in 0.50s
-     Running `docs/research/scientific-review/target/release/scientific-review dense 64 20`
-DENSE N=64 beta=20 ratio=16 lin worst=-6.962774 at_offset_widths=0.000000000 target=-190.188203
-DENSE N=64 beta=20 ratio=16 min worst=-6.963943 at_offset_widths=0.000000000 target=-190.188203

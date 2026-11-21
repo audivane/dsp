@@ -23,8 +23,9 @@ Security problems: see [SECURITY.md](SECURITY.md) instead of opening an issue.
 3. Run the checks before you push:
 
    ```sh
-   cargo test                 # or cargo nextest run
+   cargo fmt --check
    cargo clippy --all-targets
+   cargo test                 # or cargo nextest run
    (cd app && npm ci && npm run typecheck && npm test)
    ```
 

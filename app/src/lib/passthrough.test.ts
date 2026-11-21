@@ -34,6 +34,11 @@ describe("passthrough badge", () => {
     expect(v.reasons).toEqual(["Firefox volume is at 80%, not 100%", "PipeWire resamples 44.1 kHz to 48 kHz"]);
   });
 
+  it("is never green without an open output", () => {
+    const v = verdict(p([{ reason: "no_output" }]));
+    expect(v).toMatchObject({ kind: "warn", label: "Not bit-perfect" });
+  });
+
   it("is neutral when nothing plays", () => {
     expect(verdict(p([{ reason: "not_playing" }]))).toMatchObject({ kind: "idle", label: "Nothing playing" });
     expect(verdict(null).kind).toBe("idle");
@@ -50,6 +55,7 @@ describe("passthrough badge", () => {
       { reason: "channel_mix", stream_channels: 6, sink_channels: 2 },
       { reason: "source_over24_bit" },
       { reason: "truncated", source_bits: 24, output_bits: 16 },
+      { reason: "no_output" },
     ];
     const texts = all.map((b) => breakText(b));
     expect(texts).toEqual([
@@ -62,6 +68,7 @@ describe("passthrough badge", () => {
       "6-channel audio is remixed to 2 channels",
       "The source has more than 24 bits",
       "24-bit audio is cut to 16 bits for the DAC",
+      "The output is not playing: nothing reaches the DAC",
     ]);
     for (const t of texts) expect(t).not.toMatch(/_/);
     expect(caveatText({ reason: "unknown_source_precision", format: "F32LE" })).toContain("F32LE");

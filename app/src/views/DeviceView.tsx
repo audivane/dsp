@@ -1,11 +1,15 @@
 import { useEffect, useRef, useState } from "react";
-import type { RateConflict } from "../api/types";
-import { directRateNote, formatBits, rateSupportNote, usedBits } from "../lib/deviceCaps";
+import type { BypassResampler, DeviceLostAction, RateConflict } from "../api/types";
+import { formatBits, rateSupportNote, usedBits } from "../lib/deviceCaps";
 import { rateChips, type RateChip } from "../lib/rates";
 import { fmtRate, fmtRateShort, fmtSampleFormat } from "../lib/format";
 import { store, useApp } from "../store/store";
 import { DevicePicker } from "../components/TopBar";
 import { Seg } from "../components/Seg";
+import { Refresh } from "../components/Icons";
+import { VolumeSettings } from "./VolumeSettings";
+import { TraySettings } from "./TraySettings";
+import { FollowersPanel } from "./FollowersPanel";
 
 /** "Use as default" for one chip; Escape, a click elsewhere or Tab closes it. */
 function RateMenu({ chip, x, y, onClose }: { chip: RateChip; x: number; y: number; onClose: () => void }) {
@@ -111,15 +115,25 @@ export function DeviceView() {
   const status = useApp((s) => s.status);
   const devices = useApp((s) => s.devices);
   const test = useApp((s) => s.selfTest);
+  const devicesKnown = useApp((s) => s.caps.devices);
+  const conflict = useApp((s) => s.deviceConflict);
+  // Cards come and go (a DAC plugged in or out): read the list when the page opens.
+  useEffect(() => {
+    void store().refreshDevices();
+  }, []);
   if (!cfg) return null;
   const dev = devices.length ? st.currentDevice() : undefined;
   const released = status?.state === "idle";
   const hw = status?.volume ? (status.volume.hardware ? "Yes" : "No (digital)") : "—";
   const effectiveRates = status?.effective_rates ?? [];
   const rateNote = rateSupportNote(cfg.rate.allowed_rates, effectiveRates);
-  const directNote = directRateNote(effectiveRates, status?.direct_rates);
+  // An engine without the setting sends no field (older than this option).
+  const bypassKnown = cfg.rate.bypass_resampler !== undefined;
+  const bypass = status?.bypass_resampler;
   const defaultRate = status?.effective_default_rate ?? cfg.rate.default_rate;
   const bits = usedBits(status?.device_caps, status?.output_rate, status?.format);
+  const probed = (status?.device_caps?.rates ?? []).filter((c) => c.formats.length > 0).map((c) => c.rate);
+  const dacPlays = probed.length ? probed.map((r) => fmtRateShort(r)).join(", ") : "—";
   const bitsTitle =
     bits !== null && status?.format
       ? `The DAC takes ${fmtSampleFormat(status.format)} samples and converts ${bits} bits of each` +
@@ -134,6 +148,46 @@ export function DeviceView() {
         <div className="row">
           <span className="k">Output device</span>
           <DevicePicker className="chip" id="device-page" />
+          <button
+            className="icon-btn"
+            aria-label="Refresh the device list"
+            title="Refresh the device list"
+            disabled={devicesKnown !== true}
+            onClick={() => void st.refreshDevices()}
+          >
+            <Refresh />
+          </button>
+        </div>
+        {conflict && (
+          <div className="device-conflict" role="alert">
+            <span>
+              {devices.find((d) => d.id === conflict)?.name ?? conflict} already plays under "Also play on". A device plays one role at a time: remove it there to make it the main device.
+            </span>
+            <button className="btn small" onClick={() => void st.moveDeviceToFollower(conflict)}>
+              Remove it and switch
+            </button>
+            <button className="btn small" onClick={() => st.clearDeviceConflict()}>
+              Keep as is
+            </button>
+          </div>
+        )}
+        <div className="row">
+          <span
+            className="k"
+            title="Audivane's outputs stay up while the DAC is unplugged, so apps never move to the speakers. This picks what the music does meanwhile. Playback goes back to the DAC, faded in, once it is plugged in again."
+          >
+            When the DAC is unplugged
+          </span>
+          <Seg<DeviceLostAction>
+            label="What the music does while the DAC is unplugged"
+            value={cfg.device_lost ?? "pause"}
+            onChange={(action) => st.setDeviceLost(action)}
+            disabled={cfg.device_lost === undefined}
+            options={[
+              ["pause", "Pause", "Pause the player (players that support media controls). It is not resumed when the DAC is back."],
+              ["keep_playing", "Keep playing", "Players keep playing into silence, so their position moves on as usual."],
+            ]}
+          />
         </div>
         <div className="facts">
           <div className="fact">
@@ -165,15 +219,20 @@ export function DeviceView() {
           </div>
         </div>
         <div className="row">
-          <span className="k" title="Sample rates the graph may run at (before upsampling); click one to allow or block it. An app at a blocked rate is resampled by PipeWire. 352.8 kHz and up are off by default.">
-            Sample rates
+          <span className="k" title="The rates this device itself plays, as the engine probed it when it opened the device. Other rates are converted to one of these.">
+            Hardware rates
+          </span>
+          <span className="hw-rates">{dacPlays}</span>
+        </div>
+        <div className="row">
+          <span className="k" title="Rates the Audivane engine accepts from apps (before upsampling), not what the device plays; click one to allow or block it. An app at a blocked rate is resampled by PipeWire. 352.8 kHz and up are off by default.">
+            Engine accepts
           </span>
           <RateChips />
           <span className="hint rate-legend">
             <span className="def-dot" aria-hidden="true" /> default · right-click a rate to make it the default
           </span>
           {rateNote && <span className="hint">{rateNote.text}</span>}
-          {directNote && <span className="hint">{directNote}</span>}
         </div>
         <div className="row">
           <span className="k" title="When apps play into Audivane DSP at different sample rates, the DAC can run at only one of them; PipeWire resamples the others. Apps on the Direct (bit-perfect) path always set the rate themselves.">
@@ -191,6 +250,39 @@ export function DeviceView() {
             ]}
           />
           {!cfg.rate.follow_source && <span className="hint">Rate following is off: always {fmtRate(defaultRate)}</span>}
+        </div>
+        <div className="row">
+          <span
+            className="k"
+            title="Who converts the rate for Audivane Direct and DSP off when the DAC does not play the source's rate (for example 44.1 kHz on a DAC that only takes 48 kHz). A rate the DAC plays is always sent unchanged (bit-perfect), whichever you pick."
+          >
+            When the DAC lacks the rate
+          </span>
+          <Seg<BypassResampler>
+            label="Who converts the rate for Direct and DSP off when the DAC lacks it"
+            value={cfg.rate.bypass_resampler ?? "pipewire"}
+            onChange={(mode) => st.setBypassResampler(mode)}
+            disabled={!bypassKnown}
+            options={[
+              [
+                "engine",
+                "Engine",
+                "Audivane keeps the source rate and converts it to the nearest rate the DAC plays, with its recommended filter (linear phase, sized to the output's resolution; it adds the filter's delay and a little CPU). Not bit-perfect, but the converter is ours. Falls back to PipeWire for a rate it cannot convert.",
+              ],
+              [
+                "pipewire",
+                "PipeWire",
+                "PipeWire moves the playback to a rate the DAC plays and resamples the app with its own resampler. Not bit-perfect either.",
+              ],
+            ]}
+          />
+          {!bypassKnown && <span className="hint">This engine always lets PipeWire convert; update the engine for this option.</span>}
+          {bypass?.active && status && (
+            <span className="hint" role="status">
+              The engine converts {fmtRate(status.graph_rate)} to {fmtRate(status.output_rate)} now (not bit-perfect).
+            </span>
+          )}
+          {bypass && !bypass.active && bypass.reason && <span className="hint">{bypass.reason[0].toUpperCase() + bypass.reason.slice(1)}.</span>}
         </div>
         <div className="row">
           {released ? (
@@ -221,6 +313,9 @@ export function DeviceView() {
           </div>
         )}
       </div>
+      <FollowersPanel />
+      <VolumeSettings />
+      <TraySettings />
     </section>
   );
 }

@@ -41,6 +41,8 @@ export function normalizeEq(eq: EqProfile): EqProfile {
         preamp_db: raw.right.preamp_db,
         bands: cloneBands(raw.right.bands),
       },
+      ...(raw.tilt ? { tilt: { ...raw.tilt } } : {}),
+      ...(raw.tilt_high ? { tilt_high: { ...raw.tilt_high } } : {}),
     };
   }
   const out: EqProfile = {
@@ -56,6 +58,8 @@ export function normalizeEq(eq: EqProfile): EqProfile {
   if (raw.right) {
     out.right = { enabled: raw.right.enabled ?? true, preamp_db: raw.right.preamp_db, bands: cloneBands(raw.right.bands) };
   }
+  if (raw.tilt) out.tilt = { ...raw.tilt };
+  if (raw.tilt_high) out.tilt_high = { ...raw.tilt_high };
   return out;
 }
 
@@ -135,7 +139,7 @@ export function eqIsActive(eq: EqProfile | null | undefined): boolean {
   const linkedOn = (eq.linked_enabled ?? true) && eq.bands.some((b) => b.enabled);
   const leftOn = !!eq.left?.enabled && (eq.left.preamp_db !== 0 || eq.left.bands.some((b) => b.enabled));
   const rightOn = !!eq.right?.enabled && (eq.right.preamp_db !== 0 || eq.right.bands.some((b) => b.enabled));
-  return eq.preamp_db !== 0 || linkedOn || leftOn || rightOn;
+  return eq.preamp_db !== 0 || linkedOn || leftOn || rightOn || !!eq.tilt?.enabled || !!eq.tilt_high?.enabled;
 }
 
 export function cloneBands(bands: readonly Band[]): Band[] {

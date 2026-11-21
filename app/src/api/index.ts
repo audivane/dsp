@@ -16,6 +16,9 @@ export function createTransport(): Transport {
       device: q.get("device") ?? undefined,
       engineVersion: q.get("engine_version") ?? undefined,
       playRate: q.has("playing") ? Number(q.get("playing")) || undefined : undefined,
+      legacyRatio: q.has("legacy_ratio"),
+      legacyStreamVolume: q.has("legacy_streams"),
+      followers: q.get("followers")?.split(",").filter(Boolean),
     }),
   );
 }

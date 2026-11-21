@@ -14,7 +14,7 @@ When configured with `media.class = "Audio/Sink"`, `node.driver = "true"`, `prio
 
 | Approach | Driver Scheduling & Clock Control | Language / Deployment | Verdict |
 | --- | --- | --- | --- |
-| **`pw_stream` (`DRIVER \| RT_PROCESS`)** | Exposes server-mapped `SPA_IO_Position` (`clock`) via `io_changed`; calls `pw_stream_trigger_process()` from ALSA wakeup loop; negotiates `F32LE` port format cleanly. | Pure Rust (`pipewire` 0.10 crate), out-of-process daemon. | **Chosen.** Meets every Phase-2/3 requirement cleanly. |
+| **`pw_stream` (`DRIVER \| RT_PROCESS`)** | Exposes server-mapped `SPA_IO_Position` (`clock`) via `io_changed`; calls `pw_stream_trigger_process()` from ALSA wakeup loop; negotiates `F32LE` port format cleanly. | Pure Rust (`pipewire` crate), out-of-process daemon. | **Chosen.** Meets every requirement cleanly. |
 | `pw_filter` (`DRIVER \| RT_PROCESS`) | Lower-level multi-port DSP wrapper without built-in format negotiation / `audioadapter`; better suited for internal filter nodes. | Pure Rust, out-of-process. | Unnecessary complexity for a sink endpoint; keeps `audioadapter` format conversion on upstream client edge if needed. |
 | C SPA node / PipeWire module | Direct SPA node callbacks inside server RT loop. | Requires C plugin packaged in `/usr/lib/pipewire-0.3/` and restarting/loading into PipeWire server. | **Not needed** (kept only as a contingency if future zero-copy/custom-protocol requirements ever arise). |
 
@@ -31,7 +31,7 @@ When configured with `media.class = "Audio/Sink"`, `node.driver = "true"`, `prio
    - **Solution implemented in [`driver.rs`](../crates/io-pw/src/driver.rs)**:
      - During prefill (`!alsa_running`), each trigger waits synchronously on an `eventfd` (`data_efd`) + `cycles_completed` atomic counter before issuing the next trigger, keeping prefill strictly sequential.
      - Once running (`alsa_running`), the ALSA thread maintains 1 in-flight PipeWire cycle per ALSA `POLLOUT` period wakeup: wakeup -> write 1 `period_in * ratio` block -> advance clock & trigger next cycle. This yields `pw-top ERR=0` and constant `drift_frames = -quantum` (bounded to 1 period).
-     - `period_in` is opened equal to the quantum PipeWire actually runs: `scaled_quantum` mirrors PipeWire's `node.latency` scaling, which rounds `q48 * rate / 48000` *down* to a power of two (`clock.power-of-two-quantum`, default on) and caps it at the quantum limit (8192). A 1024 quantum runs 512 at 44.1 kHz, 1024 at 88.2 kHz, 2048 at 176.4 kHz, 4096 at 352.8 kHz. (Up to 0.9.0 the engine opened 1881/3763/7526-frame periods at 88.2/176.4/352.8 kHz and fired the second cycle each period owed back to back; the source client could not follow, PipeWire filled ~45% of the output with silence while status said `playing, xruns 0`.)
+     - `period_in` is opened equal to the quantum PipeWire actually runs: `scaled_quantum` mirrors PipeWire's `node.latency` scaling, which rounds `q48 * rate / 48000` *down* to a power of two (`clock.power-of-two-quantum`, default on) and caps it at the quantum limit (8192). A 1024 quantum runs 512 at 44.1 kHz, 1024 at 88.2 kHz, 2048 at 176.4 kHz, 4096 at 352.8 kHz. Matching `period_in` to the scaled quantum avoids firing two cycles back-to-back per period.
      - When the quantum still differs from the period (`clock.force-quantum`, a client asking for a lower latency, non-default PipeWire settings), cycles are counted per quantum consumed and the extra ones are fired from the poll timeout, at least half a quantum apart (`CyclePacer`), never back to back; the start cushion holds one period plus two quanta so the ring never zero-fills across graph cycles.
 
 3. **Stream Pause Tail Drain**:
@@ -57,43 +57,19 @@ When configured with `media.class = "Audio/Sink"`, `node.driver = "true"`, `prio
    - Fix in [`pcm.rs`](../crates/io-alsa/src/pcm.rs): `swp.set_start_threshold(swp.get_boundary()?)`, plus guarding `AlsaOutput::start()` on `self.pcm.state() != State::Running`.
 
 3. **Real-Time Priority via `rtkit`**:
-   - Calling `org.freedesktop.RealtimeKit1.MakeThreadRealtime` requires setting `RLIMIT_RTTIME` to `RTTimeUSecMax` first. On this host, `audivane-alsa-rt` cleanly promotes to `SCHED_FIFO` priority 20 and falls back gracefully if rtkit denies promotion.
+   - Calling `org.freedesktop.RealtimeKit1.MakeThreadRealtime` requires setting `RLIMIT_RTTIME` to `RTTimeUSecMax` first. `audivane-alsa-rt` promotes to real-time priority 20 (`SCHED_RR`, what rtkit grants) and falls back gracefully if rtkit denies promotion.
 
 ---
 
 ## Spike measurements
 
-All tests were executed unattended against ALSA loopback card 10 (`hw:Loopback,0,0` playback -> `hw:Loopback,1,0` capture) with PipeWire 1.6.8 + WirePlumber running as user services.
+Verified unattended against ALSA loopback (`hw:Loopback,0,0` playback -> `hw:Loopback,1,0` capture) with PipeWire 1.6.8 + WirePlumber (`tests/spike/`):
 
-### 1. Unit Tests & Lints (`audivane-io-alsa` & `audivane-io-pw`)
-- `cargo test -p audivane-io-alsa -p audivane-io-pw`: **7/7 passed** (6 in `io-alsa` covering `S32`, `S24_LE`, `S24_3LE`, `S16_LE` packing and card parsing; 1 in `io-pw` verifying `f32 -> left-justified i32` bit-exactness across 24-bit boundaries and strided full-range sweep).
-- `cargo clippy -p audivane-io-alsa -p audivane-io-pw --all-targets -- -D warnings`: **0 warnings / 0 errors**.
-
-### 2. 60-Second Driver-Mode Upsampling Stability (`tests/spike/test_driver.sh`)
-- **Command**: `driver_spike --device hw:Loopback,0,0 --rate 48000 --ratio 4 --format s32 --period 1024 --seconds 64`
-- **Source**: 60s 48 kHz 24-bit stereo 1 kHz sine (`-6 dBFS`) played via `pw-play --target audivane_dsp --volume=1.0`, upsampled 4× (`SpikeUpsampler`, 16-tap Blackman-windowed polyphase sinc) to `192 kHz` `S32_LE`, captured via `arecord -D hw:Loopback,1,0 -f S32_LE -r 192000`.
-- **Measured Results**:
-  - Telemetry: `rx_frames=2880512`, `tx_frames=11521024`, `quantum=256`, `graph_rate=48000`
-  - Errors/Underruns: `alsa_xruns=0`, `ring_underruns=0`, `pw-top ERR=0`
-  - Drift bound: `max_abs_drift=256.00 frames` (exactly 1 PipeWire quantum = 1 ALSA `period_in`, `period_out/ratio = 1024/4`)
-  - Captured L channel: `duration=59.60s`, `rms_med=0.35438` (`0.35438..0.35438`), `max_residual=-92.9dB`, `max_phase_jump=0.00000rad`
-  - Captured R channel: `duration=59.60s`, `rms_med=0.35438` (`0.35438..0.35438`), `max_residual=-92.9dB`, `max_phase_jump=0.00000rad`
-
-### 3. 24-Bit Bit-Perfect 1:1 Passthrough (`tests/spike/test_bitperfect.sh`)
-- **Command**: `driver_spike --device hw:Loopback,0,0 --rate 48000 --ratio 1 --format s32 --period 1024 --seconds 7`
-- **Source**: 3s 48 kHz 24-bit deterministic white-noise WAV (`144,000` stereo frames) played via `pw-play --target audivane_dsp --volume=1.0` with sink volume `1.0` and unmuted.
-- **Measured Result**:
-  - `144000 consecutive stereo frames (288000 samples) 100% bit-identical in top 24 bits of S32_LE (offset=26800 frames, low_byte_nonzero=0)`
-
-### 4. Sample-Rate Switching & Resampling (`tests/spike/test_rate.sh`)
-- **Case 1 (Fixed 48 kHz driver + 44.1 kHz stream)**:
-  - `pw-top`: `audivane_dsp` `QUANT=256 RATE=48000 ERR=0`, `pw-play` resampled by PipeWire (`44100 -> 48000`, `ERR=0`), `xruns=0`, `ring_underruns=0`, `drift_frames=-256.00`.
-- **Case 2 (`--follow-rate` + `clock.allowed-rates = [44100 48000 88200 96000 176400 192000]`, no `clock.force-rate`)**:
-  - Pinning `node.rate = "1/48000"` on a sink keeps PipeWire's graph rate at `48000` when `48000` is already in `clock.allowed-rates` (`pw-play` resamples `44100 -> 48000`, `ERR=0`, `xruns=0`, `drift_frames=-256.00`).
-- **Case 3 (`--follow-rate` + `clock.force-rate = 44100`)**:
-  - PipeWire switched `audivane_dsp` to `RATE=44100 QUANT=128` (`F32LE 2 44100`).
-  - `audivane-io-pw` detected `target_rate=44100`, dropped and reopened `hw:Loopback,0,0` at `176400 Hz` (`44100 * 4`) with `period=512 buffer=1536` (matching `target_quantum * ratio = 128 * 4`), achieving `xruns=0` and `drift_frames=-128.00` locked across playback.
-  - Note: a single startup `ring_underruns=1` and `pw-top ERR=2` occurred during the initial reopen transition before settling cleanly.
+| Test | Setup | Result |
+| --- | --- | --- |
+| 60 s 4× upsampling (`test_driver.sh`) | 48 kHz 24-bit 1 kHz sine (`-6 dBFS`) → 192 kHz `S32_LE`, `period=1024`, `quantum=256` | `alsa_xruns=0`, `ring_underruns=0`, `pw-top ERR=0`, `max_abs_drift=256.00 frames` (1 quantum), residual `−92.9 dB`, `0.00000 rad` phase jumps |
+| 24-bit bit-perfect (`test_bitperfect.sh`) | 3 s 48 kHz 24-bit deterministic white noise, 1:1 `S32_LE` | 144,000 consecutive stereo frames 100 % bit-identical in top 24 bits (`low_byte_nonzero=0`) |
+| Rate switching (`test_rate.sh`) | Fixed 48 kHz, `--follow-rate` with `node.rate = "1/48000"`, and `--follow-rate` + `clock.force-rate = 44100` | Fixed/pinned cases stayed at 48 kHz (`ERR=0`, `xruns=0`); forced 44.1 kHz reopened ALSA at 176.4 kHz (`period=512`, `buffer=1536`, `quantum=128`) and locked with `xruns=0`, `drift_frames=-128.00` |
 
 ---
 
@@ -102,10 +78,14 @@ All tests were executed unattended against ALSA loopback card 10 (`hw:Loopback,0
 1. **Dual-Generation `DesiredDspConfig` & Dynamic `RateTarget` Negotiation ([`lifecycle.rs`](../crates/io-pw/src/lifecycle.rs), [`engine_driver.rs`](../crates/io-pw/src/engine_driver.rs))**:
    - Runtime `apply` propagates `(dsp_enabled, rate_target, max_ratio)` with a monotonic `generation` counter (`RtControlCmd::UpdateDesiredDsp`) to the RT ALSA thread so `Direct -> DSP` transitions always recompute against the latest config rather than startup defaults.
    - `RateTarget` (`Off` / `Ratio` / `MaxRate`) is resolved dynamically against the live PipeWire graph rate on every open/reopen/acquire, e.g. `MaxRate(192000)` picks `4x` at `44.1k`/`48k` and `2x` at `96k`.
+   - The engine bypass resampler (`rate.bypass_resampler: engine`) rides on the same snapshot: `DesiredDspConfig::bypass` (`BypassLeg`: on/off, the bypass mask of pairs its chain builds, the configured allowed rates as bits) and `DesiredDspConfig::bypass_landing(G, rates)`, a pure, allocation-free function of the device's native rates. The Direct and DSP-off ladder is `[O/G, ×1]` when it lands, so `open_landing` and `decide_rt_reopen` handle it unchanged.
+   - Policies per device (`rate_caps::RatePolicies`): the DSP sink's (`effective_rate_policy`: its native base, what plays without the engine leg, widened as before, plus with DSP off the configured rates the engine converts), Direct's (its native rates plus the converted ones), each sink's native base (`dsp_native`, `direct_native`), and the published union (`clock.allowed-rates`, both sinks' `audio.allowed-rates` and format pods, `Status.effective_rates`). The arbiter maps each sink's clients through that sink's rates (`RateInputs::dsp_policy`/`direct_policy`, shared as one `sink_policies` snapshot) with `rate_arbiter::sink_rate`: a client at a converted rate runs the graph there, any other rate maps through the native base. `plan_graph_rate` and the follow rate do the same, so a native rate is never converted and nothing is converted twice. The control loop resends the policies (`SentRatePolicies`) when either sink's policy changes, even when the published union does not.
+   - A negotiation whose resample-only chain does not build (`NegotiatedChain::bypass_unbuildable`), or whose chain the engine is still building (`bypass_pending`), goes through `lifecycle::open_with_bypass_fallback`, shared by start-up, reacquire and reopen: the pair is held back (`BypassHeld`: a failed pair until the device changes, a pending one until `BypassNotifier::designed`, either until the engine's design epoch moves on), the policies are republished without it, and the device is opened again, at a native rate (the PipeWire path), before anything resumes. Every entry point keeps the config the open ran with (`lifecycle::open_and_keep`) before it resumes: it carries a newer generation than the one the control loop held, so later updates build on it and the RT thread takes them (`lifecycle::rt_takes`). `CtrlReq::Bypass` carries the engine's `BypassNote`s (`lifecycle::bypass_note`), and republishes when a hold changes. `Designed` brings a pending pair back (or keeps a failed one out); the engine sends it only for a design the driver waits for, asked for in the current design epoch. `Epoch` says an edit of what the designs depend on (the device, the output section as the negotiated format caps it, the quantum, the bypass mode) dropped the old ones: holds from older epochs are retired (`BypassHeld::retire`; each miss carries the epoch its negotiation ran in, `NegotiatedChain::bypass_epoch`), so the policies offer the pair again and the next open asks for its new design.
 
 2. **Serialized Release/Acquire, Device Handoff & Card Reservations ([`lifecycle.rs`](../crates/io-pw/src/lifecycle.rs))**:
    - `release_device()` only resolves and publishes `EngineState::Idle` after RT ALSA close, PipeWire teardown (`core.sync`), and `ReserveDevice1` release complete. `acquire_device()` serializes behind any pending release teardown and waits for `RtEvent::Resumed`; timeouts return errors instead of succeeding optimistically.
    - Cross-card device switches close A and release A's D-Bus reservation before reserving B; same-card substream changes (e.g. `hw:Loopback,0,0` ↔ `hw:Loopback,0,1`) keep the per-card reservation intact. Any open/reserve failure clears old device state into `EngineState::Error` without silently retaining the previous device.
+   - The negotiation callback (`RatioNegotiator`) and the release hook (`ReleaseHook`) both carry the device they concern. An open the engine reports as `NegotiatedChain::superseded` (its config moved to another device while the open ran; that change is queued behind it) is closed without `Resume`: a reopen ends with `ReopenAborted` and the queued `UpdateConfig` (a device change always forces a reopen) reopens on the new device; an acquire goes back to `Idle` and is redone when that `UpdateConfig` arrives, its waiters still pending.
 
 3. **PipeWire `settings` Metadata Ownership & Crash Recovery ([`metadata.rs`](../crates/io-pw/src/metadata.rs))**:
    - Startup waits for initial `metadata::property` events + a `core.sync(0)` barrier before writing `clock.allowed-rates` / `clock.force-rate` / `clock.force-quantum`. Originals are atomically persisted (`tmp` + `fsync` + `rename`) to `$XDG_RUNTIME_DIR/audivane-dsp/settings-restore.json` before overwriting, recovered on startup after any crash (`SIGKILL`), and only restored on teardown for keys still owned (externally edited keys are left untouched).
@@ -119,13 +99,30 @@ All tests were executed unattended against ALSA loopback card 10 (`hw:Loopback,0
    - **RT CPU budget**: Because `SwapPhase` permits at most one swap in flight, RT DSP load temporarily doubles (~2× active-chain CPU) during that warm-up window (e.g., ~2× ~12% = ~24% of one core / cycle budget for dual 65,536-tap ×4 upsampler + EQ) and drops back to 1× immediately afterward with zero heap allocation or deallocation.
 
 
+## Without a device: the engine's own clock
+
+When the DAC is gone (unplugged, or missing at start-up) the driver keeps
+both sink nodes and stays the graph's driver, but nothing paces it. While
+its node streams with a client, the RT thread then fires one cycle per
+quantum on a monotonic deadline (`DriverClockState::next_time_ns`, the
+same `advance_and_trigger` as with a DAC: `clock.rate = 1/G`, `duration =
+Q`, `rate_diff = 1.0`, `delay = 0`) and drains what the sinks receive.
+Clients therefore keep running at real time instead of stalling, and
+nothing gives WirePlumber a reason to move them: our nodes never go away.
+When the device returns, the reopen primes it as after any reopen
+(`clock_state.reset()`, paced priming, fade-in), so the free-running
+position does not carry over. A start-up without the device publishes the
+configured rates (nothing was probed) and starts the graph at the default
+rate; the first open probes and publishes the device's rates.
+
 ## Startup Priming: Why the Driver Must Not Consume Faster Than Real Time
 
 A rare "bit-perfect mismatch after the first ~1024 frames" flake in the Direct
 rig was traced to the ALSA prefill loop, not to the ring or the sink policy.
 
 The ALSA RT thread primes the DAC buffer by triggering `n_prefill_periods`
-PipeWire graph cycles, then starts ALSA DMA. Because the graph is triggered from
+PipeWire graph cycles (as many whole periods as the negotiated buffer holds,
+at least one: `prefill_periods`), then starts ALSA DMA. Because the graph is triggered from
 the RT thread's own loop, those cycles complete as fast as the graph can run
 (observed: three 512-frame cycles in ~130 us). The source client (e.g.
 `pw-play`) is a *follower* with its own converter and a larger latency (its node

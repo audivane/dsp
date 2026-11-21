@@ -1,12 +1,15 @@
 //! "Is what reaches the DAC bit-identical to the source?"
 //!
 //! This module is pure: it turns an engine snapshot plus the PipeWire facts
-//! about the streams feeding the active sink into an [`ipc::Passthrough`].
-//! Anything that changes the samples on the way to the DAC becomes one
+//! about the streams feeding the active sink into a `Passthrough`. Anything
+//! that changes the samples on the way to the DAC becomes one
 //! [`PassthroughBreak`]; an empty list means the path is intact.
 
 use crate::api::EngineSnapshot;
-use audivane_protocol::ipc::{Passthrough, PassthroughBreak, PassthroughCaveat};
+use audivane_protocol::ipc::{
+    BypassResampler, BypassResamplerStatus, EngineConfig, EngineState, Passthrough,
+    PassthroughBreak, PassthroughCaveat, SinkChoice,
+};
 
 /// What the graph watcher knows about one playing stream.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -76,12 +79,11 @@ fn is_int_format(format: &str) -> bool {
 /// The source precision we can actually prove for one stream, if any.
 ///
 /// A negotiated *container* is not the source precision: `pw-play` opens a
-/// 24-bit WAV as `S32LE`, and a float bus says nothing about the file behind
-/// it. So only two things count as knowledge:
+/// 24-bit WAV as `S32LE`, and a float bus says nothing about the file behind it.
+/// Only two things count as knowledge:
 ///
-/// * `hint` — the player's own metadata (MPRIS `native_bits`), passed in only
-///   when one stream fills the sink and it is therefore the file that player
-///   is playing;
+/// * `hint`: the player's own metadata (MPRIS `native_bits`), passed in only
+///   when one stream fills the sink and is therefore the file that player plays;
 /// * an integer format of at most 24 bits, whose first number *is* the
 ///   significant depth (`S16LE`, `S24_3LE`, ...).
 fn known_source_bits(stream: &StreamView, hint: Option<u32>) -> Option<u32> {
@@ -110,12 +112,26 @@ pub fn compute(
 
     if streams.is_empty() {
         broken.push(PassthroughBreak::NotPlaying);
+    } else if snap.format.is_none() || snap.state != EngineState::Playing {
+        // Streams are linked, but the output is not writing them (no
+        // format negotiated, a reopen in flight, an error): nothing reaches
+        // the DAC, so nothing is bit-perfect.
+        broken.push(PassthroughBreak::NoOutput);
     }
-    if snap.dsp_active {
+    let varispeed_active = snap.varispeed.as_ref().filter(|v| v.active);
+    if snap.dsp_active || varispeed_active.is_some() {
         broken.push(PassthroughBreak::DspActive);
     }
-    if snap.ratio > 1 {
-        broken.push(PassthroughBreak::Upsampling { ratio: snap.ratio });
+    match snap.ratio.as_integer() {
+        Some(1) => {}
+        Some(ratio) => broken.push(PassthroughBreak::Upsampling { ratio }),
+        None => broken.push(PassthroughBreak::RateConversion {
+            graph_rate: snap.graph_rate,
+            output_rate: snap.output_rate,
+        }),
+    }
+    if let Some(vs) = varispeed_active {
+        broken.push(PassthroughBreak::Varispeed { speed: vs.speed });
     }
 
     if !streams.is_empty() {
@@ -217,6 +233,53 @@ pub fn compute(
     }
 }
 
+/// The engine bypass resampler's status (`engine`, from the engine
+/// snapshot) with the reason filled in when it is on but PipeWire still
+/// resamples a stream feeding Direct or DSP off (passthrough reports it as
+/// `resampled`): rate following off, a rate outside `rate.allowed_rates`,
+/// another stream deciding the graph rate, or a rate the engine cannot
+/// convert to one the DAC plays (`landing`: where the engine would take a
+/// stream rate, [`audivane_io_pw::DesiredDspConfig::bypass_landing`]).
+pub fn bypass_resampler_status(
+    engine: Option<BypassResamplerStatus>,
+    cfg: &EngineConfig,
+    snap: &EngineSnapshot,
+    streams: &[StreamView],
+    active_sink: Option<SinkChoice>,
+    landing: impl Fn(u32) -> Option<u32>,
+) -> Option<BypassResamplerStatus> {
+    let mut status = engine?;
+    let bypass_path = active_sink == Some(SinkChoice::Direct) || !cfg.dsp_enabled;
+    if status.mode != BypassResampler::Engine
+        || status.active
+        || status.reason.is_some()
+        || !bypass_path
+        || snap.graph_rate == 0
+    {
+        return Some(status);
+    }
+    let Some(rate) = streams
+        .iter()
+        .filter_map(|s| s.rate)
+        .find(|&r| r != snap.graph_rate)
+    else {
+        return Some(status);
+    };
+    let why = if !cfg.rate.follow_source {
+        "rate following is off".to_string()
+    } else if !cfg.rate.allowed_rates.contains(&rate) {
+        format!("{rate} Hz is not in the allowed rates")
+    } else if streams.iter().any(|s| s.rate == Some(snap.graph_rate)) {
+        format!("another stream plays at {} Hz", snap.graph_rate)
+    } else if landing(rate).is_none() {
+        format!("the engine cannot convert {rate} Hz to a rate the DAC plays")
+    } else {
+        "the graph has not moved yet".to_string()
+    };
+    status.reason = Some(format!("PipeWire resamples the {rate} Hz stream: {why}"));
+    Some(status)
+}
+
 /// The volume a break reports: 0 when muted (what is heard, and what
 /// clients show as "muted"), else the linear slider volume.
 fn effective_volume(muted: bool, volume: Option<f64>) -> f64 {
@@ -237,7 +300,7 @@ mod tests {
             format: Some(SampleFormat::S24),
             graph_rate: 44_100,
             output_rate: 44_100,
-            ratio: 1,
+            ratio: audivane_protocol::RateRatio::ONE,
             quantum: 1024,
             latency_ms: 5.0,
             filter_latency_ms: 0.0,
@@ -257,6 +320,10 @@ mod tests {
             direct_rates: Vec::new(),
             effective_default_rate: None,
             dither_bits: None,
+            bypass_resampler: None,
+            rt_load_max: 0.0,
+            varispeed: None,
+            waiting_for_device: false,
         }
     }
 
@@ -298,7 +365,7 @@ mod tests {
     fn dsp_and_upsampling() {
         let mut snap = snapshot();
         snap.dsp_active = true;
-        snap.ratio = 4;
+        snap.ratio = audivane_protocol::RateRatio::integer(4);
         snap.output_rate = 176_400;
         let status = compute(&snap, &[stream()], Some(&sink()), None);
         assert_eq!(
@@ -308,6 +375,59 @@ mod tests {
                 PassthroughBreak::Upsampling { ratio: 4 }
             ]
         );
+    }
+
+    #[test]
+    fn rate_conversion_is_reported() {
+        let mut snap = snapshot();
+        snap.ratio = audivane_protocol::RateRatio::new(160, 147);
+        snap.output_rate = 48_000;
+        let status = compute(&snap, &[stream()], Some(&sink()), None);
+        assert_eq!(
+            status.broken_because,
+            vec![PassthroughBreak::RateConversion {
+                graph_rate: 44_100,
+                output_rate: 48_000,
+            }]
+        );
+    }
+
+    #[test]
+    fn nothing_open_is_never_intact() {
+        // A reopen from x1 failed: the stream is still linked, but no
+        // format is negotiated and nothing reaches the DAC.
+        let mut snap = snapshot();
+        snap.format = None;
+        let status = compute(&snap, &[stream()], Some(&sink()), None);
+        assert!(!status.intact);
+        assert_eq!(status.broken_because, vec![PassthroughBreak::NoOutput]);
+        // The format is still known, but the output is not writing: a
+        // reopen in flight, waiting for a chain, or an error.
+        let mut snap = snapshot();
+        for state in [
+            EngineState::Switching,
+            EngineState::Ready,
+            EngineState::Error,
+        ] {
+            snap.state = state;
+            let status = compute(&snap, &[stream()], Some(&sink()), None);
+            assert!(!status.intact, "{state:?}");
+            assert_eq!(
+                status.broken_because,
+                vec![PassthroughBreak::NoOutput],
+                "{state:?}"
+            );
+        }
+        // Reported before the DSP break, as documented.
+        snap.dsp_active = true;
+        assert_eq!(
+            compute(&snap, &[stream()], Some(&sink()), None).broken_because[..2],
+            [PassthroughBreak::NoOutput, PassthroughBreak::DspActive]
+        );
+        // Nothing playing: that, not NoOutput.
+        let status = compute(&snap, &[], Some(&sink()), None);
+        assert_eq!(status.broken_because[0], PassthroughBreak::NotPlaying);
+        assert!(!status.broken_because.contains(&PassthroughBreak::NoOutput));
     }
 
     #[test]
@@ -498,8 +618,9 @@ mod tests {
 
     #[test]
     fn unknown_pieces_do_not_crash() {
+        // Unknown stream details and graph rate (the output is open; with
+        // no output at all see `nothing_open_is_never_intact`).
         let mut snap = snapshot();
-        snap.format = None;
         snap.graph_rate = 0;
         let mut stream = stream();
         stream.format = None;
@@ -526,5 +647,186 @@ mod tests {
         assert!(is_int_le_24("S24LE"));
         assert!(!is_int_le_24("S32LE"));
         assert!(!is_int_le_24("F32LE"));
+    }
+
+    /// Test 18 (status): the engine leg converting reports the existing
+    /// rate breaks; a stream PipeWire still resamples keeps `Resampled`,
+    /// and the bypass resampler's status says why.
+    #[test]
+    fn the_engine_leg_reports_its_conversion_and_why_pipewire_resamples() {
+        // Direct, 44.1 kHz converted to 48 kHz by the engine.
+        let mut snap = snapshot();
+        snap.active_sink = Some(SinkChoice::Direct);
+        snap.ratio = audivane_protocol::RateRatio::from_rates(44_100, 48_000);
+        snap.output_rate = 48_000;
+        let p = compute(&snap, &[stream()], Some(&sink()), None);
+        assert!(!p.intact);
+        assert_eq!(
+            p.broken_because,
+            vec![PassthroughBreak::RateConversion {
+                graph_rate: 44_100,
+                output_rate: 48_000
+            }]
+        );
+        // A second client at another rate: still `Resampled` for it.
+        let mut other = stream();
+        other.node = 11;
+        other.rate = Some(96_000);
+        let p = compute(&snap, &[stream(), other.clone()], Some(&sink()), None);
+        assert!(p.broken_because.contains(&PassthroughBreak::Resampled {
+            stream_rate: 96_000,
+            graph_rate: 44_100
+        }));
+
+        let cfg = EngineConfig::default();
+        let idle = BypassResamplerStatus {
+            mode: BypassResampler::Engine,
+            active: false,
+            reason: None,
+        };
+        let direct = Some(SinkChoice::Direct);
+        let lands = |_| Some(48_000);
+        // Converting: nothing to explain.
+        let active = BypassResamplerStatus {
+            active: true,
+            ..idle.clone()
+        };
+        let st = bypass_resampler_status(Some(active), &cfg, &snap, &[stream()], direct, lands);
+        assert!(st.unwrap().reason.is_none());
+        // A native graph rate with every stream at it: nothing either.
+        let mut native = snapshot();
+        native.active_sink = direct;
+        let st = bypass_resampler_status(
+            Some(idle.clone()),
+            &cfg,
+            &native,
+            &[stream()],
+            direct,
+            lands,
+        );
+        assert!(st.unwrap().reason.is_none());
+        // Another stream decides the graph rate.
+        let st = bypass_resampler_status(
+            Some(idle.clone()),
+            &cfg,
+            &native,
+            &[stream(), other.clone()],
+            direct,
+            lands,
+        );
+        assert!(
+            st.unwrap()
+                .reason
+                .unwrap()
+                .contains("another stream plays at 44100 Hz")
+        );
+        // The engine cannot convert the stream's rate.
+        let st = bypass_resampler_status(
+            Some(idle.clone()),
+            &cfg,
+            &native,
+            &[other.clone()],
+            direct,
+            |_| None,
+        );
+        let reason = st.unwrap().reason.unwrap();
+        assert!(
+            reason.starts_with("PipeWire resamples the 96000 Hz stream"),
+            "{reason}"
+        );
+        assert!(reason.contains("cannot convert"), "{reason}");
+        // A rate outside the allowed rates.
+        let mut narrow = cfg.clone();
+        narrow.rate.allowed_rates = vec![44_100, 48_000];
+        let st = bypass_resampler_status(
+            Some(idle.clone()),
+            &narrow,
+            &native,
+            &[other.clone()],
+            direct,
+            lands,
+        );
+        assert!(
+            st.unwrap()
+                .reason
+                .unwrap()
+                .contains("not in the allowed rates")
+        );
+        // DSP on, DSP sink: not the bypass path, no reason.
+        let st = bypass_resampler_status(
+            Some(idle.clone()),
+            &cfg,
+            &native,
+            &[other.clone()],
+            Some(SinkChoice::Dsp),
+            |_| None,
+        );
+        assert!(st.unwrap().reason.is_none());
+        // PipeWire mode: no reason.
+        let pw = BypassResamplerStatus {
+            mode: BypassResampler::Pipewire,
+            ..idle
+        };
+        let st = bypass_resampler_status(Some(pw), &cfg, &native, &[other], direct, |_| None);
+        assert!(st.unwrap().reason.is_none());
+        assert!(bypass_resampler_status(None, &cfg, &native, &[], direct, lands).is_none());
+    }
+
+    #[test]
+    fn active_varispeed_breaks_passthrough_even_at_unity_and_inactive_stays_intact() {
+        use audivane_protocol::ipc::{VarispeedConfig, VarispeedStatus};
+
+        // Enabled in config, not running (Direct / DSP off / idle): bit-perfect.
+        let mut snap = snapshot();
+        snap.varispeed = Some(VarispeedStatus::from_config(&VarispeedConfig {
+            enabled: true,
+            speed: 1.05,
+            ramp_ms: 200.0,
+            keep_pitch: false,
+        }));
+        let p = compute(&snap, &[stream()], Some(&sink()), None);
+        assert!(p.intact, "{:?}", p.broken_because);
+
+        // Active at unity with a flat chain: DspActive + Varispeed { speed: 1.0 }.
+        let mut active_unity = VarispeedStatus::from_config(&VarispeedConfig {
+            enabled: true,
+            speed: 1.0,
+            ramp_ms: 200.0,
+            keep_pitch: false,
+        });
+        active_unity.active = true;
+        active_unity.speed = 1.0;
+        snap.varispeed = Some(active_unity);
+        let p = compute(&snap, &[stream()], Some(&sink()), None);
+        assert!(!p.intact);
+        assert_eq!(
+            p.broken_because,
+            vec![
+                PassthroughBreak::DspActive,
+                PassthroughBreak::Varispeed { speed: 1.0 },
+            ]
+        );
+
+        // Active during a ramp: reports applied speed, never target/requested.
+        let mut ramping = VarispeedStatus::from_config(&VarispeedConfig {
+            enabled: true,
+            speed: 1.5,
+            ramp_ms: 500.0,
+            keep_pitch: false,
+        });
+        ramping.active = true;
+        ramping.speed = 1.08;
+        ramping.target = 1.5;
+        ramping.ramping = true;
+        snap.dsp_active = true;
+        snap.varispeed = Some(ramping);
+        let p = compute(&snap, &[stream()], Some(&sink()), None);
+        assert_eq!(
+            p.broken_because,
+            vec![
+                PassthroughBreak::DspActive,
+                PassthroughBreak::Varispeed { speed: 1.08 },
+            ]
+        );
     }
 }

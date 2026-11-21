@@ -1,3 +1,4 @@
+import type { CutoffMode } from "../api/generated/CutoffMode";
 // Pure axis-mapping and data-slicing helpers for the Upsampling response plots.
 
 export const ZOOM_MIN_FACTOR = 0.73;
@@ -123,16 +124,19 @@ export function cutoffTips(
   sourceRate: number,
   r: {
     ratio: number;
+    /** The running ratio; `ratio` is 0 for a fractional one. */
+    rate_ratio?: { up: number; down: number };
     source_rate: number;
     effective_cutoff?: number;
     crossings: { level_db: number; freq_hz: number }[];
     minus_3_db_hz: number;
   } | null,
-  cutoffMode?: "fraction" | "nyquist_stop",
+  cutoffMode?: CutoffMode,
 ): { full: string; nyquistStop: string; apod: string } {
   const nyq = sourceRate / 2;
   const at = (level: number) => r?.crossings.find((c) => c.level_db === level)?.freq_hz;
-  const measured = !!(r && r.ratio > 1 && r.source_rate === sourceRate);
+  const resampling = r ? (r.rate_ratio ? r.rate_ratio.up !== r.rate_ratio.down : r.ratio > 1) : false;
+  const measured = !!(r && resampling && r.source_rate === sourceRate);
   const eff = r?.effective_cutoff;
   const isApod = measured && (eff !== undefined ? eff <= 0.96 : (at(-6) ?? r.minus_3_db_hz) < nyq * 0.99);
   const isNyqStop =
@@ -173,4 +177,43 @@ export function cutoffTips(
     apod += measuredSummary();
   }
   return { full, nyquistStop, apod };
+}
+
+/**
+ * Top of the response plots: the Nyquist the engine measures to, the
+ * intermediate grid's (source × up) at a fractional ratio, which equals the
+ * output Nyquist for an integer one. Zoom windows may reach it too.
+ */
+export function responsePlotTop(r: { source_rate: number; output_rate: number; rate_ratio: { up: number; down: number } }): number {
+  return (r.source_rate * Math.max(1, r.rate_ratio.up)) / 2;
+}
+
+type WindowReq = { f_lo_hz: number; f_hi_hz: number; points: number };
+type WindowRecord = { key: string; req: WindowReq } | null;
+
+function sameWindow(a: WindowReq | null | undefined, b: WindowReq | null | undefined): boolean {
+  return !!a && !!b && a.f_lo_hz === b.f_lo_hz && a.f_hi_hz === b.f_hi_hz && a.points === b.points;
+}
+
+/**
+ * Which plot's zoom window to fetch next: one that is wanted, not in yet for
+ * this design (`baseKey`), and not refused for exactly this selection (a
+ * refused window is tried again only once the view or the design changes).
+ */
+export function nextWindowToFetch<K extends string>(
+  wanted: Record<K, WindowReq | null>,
+  have: Record<K, WindowRecord>,
+  failed: Record<K, WindowRecord>,
+  baseKey: string,
+): K | null {
+  for (const id of Object.keys(wanted) as K[]) {
+    const w = wanted[id];
+    if (w === null) continue;
+    const h = have[id];
+    if (h && h.key === baseKey && sameWindow(h.req, w)) continue;
+    const f = failed[id];
+    if (f && f.key === baseKey && sameWindow(f.req, w)) continue;
+    return id;
+  }
+  return null;
 }

@@ -452,3 +452,114 @@ fn newer_analysis_supersedes_pending_one() {
         first_started.elapsed()
     );
 }
+
+/// A real daemon (hardware-free waiting engine, no PipeWire/MPRIS) on `socket`.
+fn real_daemon(socket: &Path, volume_db: f64) -> audivane_dsp_daemon::control::daemon::Daemon {
+    use audivane_dsp_daemon::control::daemon::{Daemon, DaemonOptions};
+    use audivane_dsp_daemon::engine::waiting::WaitingEngine;
+    use audivane_protocol::ipc::{EngineConfig, RoutingMode};
+    let mut config = EngineConfig {
+        device: "hw:0,0".into(),
+        ..EngineConfig::default()
+    };
+    config.routing = RoutingMode::Apps { rules: Vec::new() };
+    config.volume.volume_db = volume_db;
+    let engine = Arc::new(WaitingEngine::new(config.clone(), "test".into()));
+    let mut opts = DaemonOptions::new(socket.to_path_buf());
+    opts.graph = false;
+    opts.mpris = false;
+    Daemon::start(engine, config, opts).expect("start daemon")
+}
+
+/// The native client keeps one request socket and reconnects it on its
+/// own: a `set_volume_guarded` the webview made against one daemon may be written
+/// to the daemon that replaced it (here through the client's retry after
+/// the old connection died). Bound to the old instance, it is refused and
+/// changes nothing.
+#[test]
+fn a_guarded_set_volume_for_a_restarted_daemon_is_refused_through_the_native_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("control.sock");
+    let first = real_daemon(&socket, -12.0);
+    let p = socket.clone();
+    let client = DaemonClient::new(Arc::new(move || p.clone()));
+    let old = client.call("status", None).unwrap();
+    let old_instance = old["volume"]["instance"].as_str().unwrap().to_string();
+    assert!(!old_instance.is_empty());
+    assert_eq!(old["volume"]["volume_db"], json!(-12.0));
+    first.shutdown();
+
+    let second = real_daemon(&socket, -30.0);
+    // The request made from the first daemon's level, delivered now.
+    let request = json!({
+        "method": "set_volume_guarded",
+        "params": {"volume_db": 0.0, "balance_db": -2.0, "muted": false,
+                   "if_instance": old_instance, "if_revision": old["volume"]["revision"]},
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let err = loop {
+        match client.call_request(request.clone()) {
+            Err(e) if e.code == CallError::DISCONNECTED && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            Err(e) => break e,
+            Ok(v) => panic!("the old daemon's volume change was applied: {v}"),
+        }
+    };
+    assert_eq!(
+        err.code,
+        audivane_protocol::ipc::RpcError::STALE_INSTANCE,
+        "{err}"
+    );
+    let now = client.call("status", None).unwrap();
+    assert_ne!(now["volume"]["instance"].as_str().unwrap(), old_instance);
+    assert_eq!(now["volume"]["volume_db"], json!(-30.0));
+    assert_eq!(now["volume"]["balance_db"], json!(0.0));
+
+    // Bound to the daemon that answers: applied.
+    let ok = client
+        .call(
+            "set_volume_guarded",
+            Some(json!({"volume_db": -30.5, "balance_db": 0.0, "muted": false,
+                        "if_instance": now["volume"]["instance"], "if_revision": now["volume"]["revision"]})),
+        )
+        .unwrap();
+    assert_eq!(ok["volume_db"], json!(-30.5));
+    second.shutdown();
+}
+
+#[test]
+fn subscription_toggles_meters_topic() {
+    let fake = Fake::start(false);
+    let (mut sub, got) = collect(fake.path_fn());
+    wait_for(&got, |m| m.contains(&SubMsg::Up));
+    assert!(fake.topics.lock().unwrap()[0].contains(&"meters".to_string()));
+
+    // Off: one silent reconnect, its topics without `meters`.
+    let before_conns = fake.conns.load(Ordering::SeqCst);
+    sub.set_meters(false);
+    wait_for(&got, |_| fake.conns.load(Ordering::SeqCst) > before_conns);
+    wait_for(&got, |_| fake.topics.lock().unwrap().len() >= 2);
+    let topics = fake.topics.lock().unwrap().last().cloned().unwrap();
+    assert!(!topics.contains(&"meters".to_string()));
+    assert!(topics.contains(&"status".to_string()));
+    // Off again changes nothing.
+    let conns = fake.conns.load(Ordering::SeqCst);
+    sub.set_meters(false);
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(fake.conns.load(Ordering::SeqCst), conns);
+
+    // On: added on the live connection, no reconnect.
+    sub.set_meters(true);
+    wait_for(&got, |_| {
+        fake.topics
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|t| t == &vec!["meters".to_string()])
+    });
+    assert_eq!(fake.conns.load(Ordering::SeqCst), conns);
+    let msgs = got.lock().unwrap().clone();
+    assert!(!msgs.iter().any(|m| matches!(m, SubMsg::Down(_))));
+    sub.stop();
+}

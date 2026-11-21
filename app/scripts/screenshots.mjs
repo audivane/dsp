@@ -30,6 +30,25 @@ try {
           localStorage.setItem("avdsp-skin", s);
           localStorage.setItem("avdsp-ui", JSON.stringify({ view: v, autoPreamp: true }));
         }, [skin, view]);
+        // The tray popup and the on-screen display are windows of their own,
+        // at their own sizes (src-tauri/src/app.rs).
+        const own = { popup: [320, 184], osd: [264, 76] }[view];
+        if (own) {
+          const c2 = await browser.newContext({ viewport: { width: own[0], height: own[1] }, deviceScaleFactor: 2 });
+          await c2.addInitScript((s) => localStorage.setItem("avdsp-skin", s), skin);
+          const p2 = await c2.newPage();
+          p2.on("pageerror", (e) => errors.push(`${skin} ${view}: ${e.message}`));
+          p2.on("console", (m) => m.type() === "error" && errors.push(`${skin} ${view}: ${m.text()}`));
+          await p2.goto(url + "?window=" + view + (query ? "&" + query : ""));
+          await p2.waitForSelector(view === "popup" ? ".popup" : ".osd-line");
+          await p2.waitForTimeout(600);
+          const file = resolve(outDir, `${view}-${skin}${query ? "-" + query.replace(/[^a-z0-9]+/gi, "_") : ""}.png`);
+          await p2.screenshot({ path: file });
+          console.log(file);
+          await c2.close();
+          await ctx.close();
+          continue;
+        }
         const page = await ctx.newPage();
         page.on("pageerror", (e) => errors.push(`${skin} ${view}: ${e.message}`));
         page.on("console", (m) => m.type() === "error" && errors.push(`${skin} ${view}: ${m.text()}`));

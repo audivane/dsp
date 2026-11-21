@@ -6,4 +6,12 @@ export type OutputConfig = {
  * Effective bit depth that dither targets (<= format bits). Many
  * "32-bit" DACs resolve ~24 bits, so 24 is a sane default.
  */
-bits: number, dither: DitherKind, };
+bits: number, dither: DitherKind, 
+/**
+ * Fixed headroom in dB (0..=12) taken off at the end of the f64 chain,
+ * after harmonics and before the A/B mix, volume, limiter and quantizer,
+ * at every ratio: it keeps the peaks the upsampler (or the DAC's own
+ * filter) reconstructs between samples, up to about +3 dB on loud
+ * masters, from clipping. Default [`DEFAULT_OUTPUT_HEADROOM_DB`].
+ */
+headroom_db: number, };

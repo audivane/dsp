@@ -77,6 +77,14 @@ pub struct MockEngine {
     pub fail_apply: Mutex<Option<EngineError>>,
     pub fail_selftest: Mutex<Option<EngineError>>,
     pub on_apply: Mutex<Option<ApplyHook>>,
+    /// Reported by [`Engine::cpu_rates`] (CPU admission off when `None`).
+    pub cpu_rates: Mutex<Option<&'static audivane_dsp_core::cpu_bench::KernelRates>>,
+    /// Varispeed as [`Engine::varispeed_request`] reports it, and every
+    /// hold the overload fallback set (a retired stage stops running).
+    pub varispeed: Mutex<audivane_dsp_daemon::api::VarispeedRequest>,
+    pub varispeed_holds: Mutex<Vec<audivane_dsp_daemon::api::VarispeedHold>>,
+    /// Every live `set_varispeed(enabled, speed, ramp_ms)` call received.
+    pub varispeed_calls: Mutex<Vec<(bool, f64, f64)>>,
 }
 
 impl MockEngine {
@@ -88,7 +96,7 @@ impl MockEngine {
             format: None,
             graph_rate: 48_000,
             output_rate: 48_000,
-            ratio: 1,
+            ratio: audivane_protocol::RateRatio::ONE,
             quantum: config.quantum,
             latency_ms: 7.5,
             filter_latency_ms: 0.0,
@@ -108,11 +116,16 @@ impl MockEngine {
             direct_rates: Vec::new(),
             effective_default_rate: None,
             dither_bits: None,
+            bypass_resampler: None,
+            rt_load_max: 0.0,
+            varispeed: None,
+            waiting_for_device: false,
         };
         Arc::new(Self {
             config: Mutex::new(config),
             snapshot: Mutex::new(snapshot),
             meters: Mutex::new(Meters {
+                limiter: None,
                 peak_db: vec![-23.0, -24.0],
                 rms_db: vec![-30.0, -31.0],
                 clipped: 0,
@@ -133,6 +146,10 @@ impl MockEngine {
             fail_apply: Mutex::new(None),
             fail_selftest: Mutex::new(None),
             on_apply: Mutex::new(None),
+            cpu_rates: Mutex::new(None),
+            varispeed: Mutex::new(Default::default()),
+            varispeed_holds: Mutex::new(Vec::new()),
+            varispeed_calls: Mutex::new(Vec::new()),
         })
     }
 
@@ -161,6 +178,54 @@ impl MockEngine {
 }
 
 impl Engine for MockEngine {
+    fn set_varispeed_hold(&self, hold: audivane_dsp_daemon::api::VarispeedHold) -> u64 {
+        use audivane_dsp_daemon::api::VarispeedHold;
+        let mut holds = self.varispeed_holds.lock().unwrap();
+        if holds.last().copied().unwrap_or(VarispeedHold::None) == hold {
+            return holds.len() as u64;
+        }
+        holds.push(hold);
+        // Each change is the next sequence, applied at once.
+        let seq = holds.len() as u64;
+        let mut vs = self.varispeed.lock().unwrap();
+        vs.hold_ack = seq;
+        match hold {
+            VarispeedHold::None => vs.running = vs.wanted,
+            VarispeedHold::Budget | VarispeedHold::Unity => vs.budget = 0.5,
+            VarispeedHold::Off => vs.running = false,
+        }
+        seq
+    }
+    fn varispeed_request(&self) -> audivane_dsp_daemon::api::VarispeedRequest {
+        *self.varispeed.lock().unwrap()
+    }
+    fn set_varispeed(
+        &self,
+        cfg: audivane_protocol::ipc::VarispeedConfig,
+    ) -> Result<(), EngineError> {
+        let audivane_protocol::ipc::VarispeedConfig {
+            enabled,
+            speed,
+            ramp_ms,
+            ..
+        } = cfg;
+        self.varispeed_calls
+            .lock()
+            .unwrap()
+            .push((enabled, speed, ramp_ms));
+        self.config.lock().unwrap().varispeed = cfg;
+        {
+            let mut vs = self.varispeed.lock().unwrap();
+            vs.wanted = enabled;
+            vs.running = enabled;
+            vs.speed = speed;
+            vs.requests += 1;
+        }
+        Ok(())
+    }
+    fn cpu_rates(&self) -> Option<&'static audivane_dsp_core::cpu_bench::KernelRates> {
+        *self.cpu_rates.lock().unwrap()
+    }
     fn apply(&self, cfg: &EngineConfig) -> Result<(), EngineError> {
         let hook = self.on_apply.lock().unwrap().clone();
         if let Some(hook) = hook {
@@ -185,6 +250,8 @@ impl Engine for MockEngine {
             enabled: true,
             current: side,
             offset_db: -2.5,
+            error: None,
+            ..Default::default()
         };
         self.snapshot.lock().unwrap().ab = Some(status.clone());
         Ok(status)

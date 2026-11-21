@@ -6,10 +6,12 @@ import { EQ_MIN_HEIGHT, MAX_PLOT_HEIGHT, PLOT_HEIGHT_KEYS, usePersistentHeight }
 import { store, useApp } from "../store/store";
 import { Download, Power, Redo, Undo } from "../components/Icons";
 import { OverlayMenu } from "../components/OverlayMenu";
+import { CompareButton } from "../components/StageParts";
 import { ResizeHandle } from "../components/ResizeHandle";
 import { BandStrip } from "./BandStrip";
 import { EqGraph } from "./EqGraph";
 import { SpectrumControls } from "./SpectrumLayer";
+import { TiltPanel } from "./TiltPanel";
 
 const SECTIONS: { id: EqSection; label: string; title: string }[] = [
   { id: "linked", label: "L+R", title: "Shared EQ applied to both channels" },
@@ -66,7 +68,7 @@ function Preamp({ value }: { value: number }) {
       <button
         className="tag"
         aria-pressed={auto}
-        title={auto ? "Preamp follows the largest boost so the EQ cannot clip. Select to set it by hand." : "Set by hand. Select to follow the largest boost again."}
+        title={auto ? "Preamp follows the largest boost the curve shows (an estimate when a tilt is on, within about 0.2 dB), so the EQ should not clip. Select to set it by hand." : "Set by hand. Select to follow the largest boost again."}
         onClick={() => st.setAutoPreamp(!auto)}
       >
         auto
@@ -85,6 +87,8 @@ export function EqView() {
   const rate = useApp((s) => s.status?.graph_rate ?? s.config?.rate.default_rate ?? 48000);
   useApp((s) => s.eqDraft);
   useApp((s) => s.config?.chain.eq);
+  useApp((s) => s.eqOff);
+  const eqOn = useApp((s) => !!s.config?.chain.eq);
   const eq = st.eq();
   const set = sectionSet(eq, mode);
   const hasCur = hasSection(eq, mode);
@@ -123,7 +127,11 @@ export function EqView() {
   return (
     <section className="view eq-view" aria-labelledby="eq-title">
       <div className="view-head">
+        <button className="pwr stage-pwr" aria-pressed={eqOn} aria-label="Parametric EQ on" title={eqOn ? "Turn the EQ off (the bands are kept)" : "Turn the EQ on"} onClick={() => st.setEqEnabled(!eqOn)}>
+          <Power />
+        </button>
         <h1 id="eq-title">Parametric EQ</h1>
+        <span className={"tag" + (eqOn ? " on" : "")}>{eqOn ? "On" : "Off"}</span>
         <div className="sec-tabs" role="group" aria-label="EQ sections">
           {SECTIONS.map((sec) => {
             const present = hasSection(eq, sec.id);
@@ -175,7 +183,7 @@ export function EqView() {
         {eq && <Preamp value={eq.preamp_db} />}
         {eq && peakGainDb > 0.05 && (
           <div className="clip-warn" role="status">
-            <span>Max boost {fmtDb(peakGainDb, 1)} dB exceeds preamp</span>
+            <span>Max boost {eq.tilt?.enabled || eq.tilt_high?.enabled ? "about " : ""}{fmtDb(peakGainDb, 1)} dB exceeds preamp</span>
             <button className="tag" onClick={() => st.setAutoPreamp(true)}>
               Auto preamp
             </button>
@@ -201,6 +209,7 @@ export function EqView() {
           </button>
         )}
         <div className="spacer" />
+        <CompareButton stage="eq" />
         <SpectrumControls />
         <button className="icon-btn" aria-label="Undo" title="Undo (Ctrl+Z)" disabled={!canUndo} onClick={() => st.undo()}>
           <Undo />
@@ -264,13 +273,8 @@ export function EqView() {
           measure={() => eqStageRef.current?.getBoundingClientRect().height ?? measuredHeight}
         />
       </div>
-      {eq ? (
-        <BandStrip bands={set.bands} selected={sel} disabled={false} />
-      ) : (
-        <div className="notice">
-          The EQ is off. <button className="link-btn" onClick={() => st.setEqEnabled(true)}>Turn it on</button>
-        </div>
-      )}
+      {eq && <TiltPanel />}
+      {eq && <BandStrip bands={set.bands} selected={sel} disabled={false} />}
     </section>
   );
 }

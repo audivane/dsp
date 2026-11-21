@@ -45,16 +45,53 @@ pub fn a_weighting_db(f_hz: f64) -> f64 {
     }
 }
 
-/// Static level offset for an A/B comparison.
-///
-/// `power_a(f)` / `power_b(f)` return |H(f)|² of each chain. Both are
-/// integrated over 20 Hz..min(20 kHz, Nyquist) on a log grid, weighted by
-/// A-weighting power and a pink-noise (1/f) reference spectrum. Returns the
-/// dB gain to apply to **B** so its A-weighted loudness equals A's.
+/// Static level offset for an A/B comparison, A-weighted
+/// ([`weighted_offset_db`] with [`Weighting::A`]).
 pub fn analytic_offset_db(
     power_a: &dyn Fn(f64) -> f64,
     power_b: &dyn Fn(f64) -> f64,
     sample_rate: f64,
+) -> f64 {
+    weighted_offset_db(power_a, power_b, sample_rate, Weighting::A)
+}
+
+/// Frequency weighting for [`weighted_offset_db`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Weighting {
+    /// BS.1770 K-weighting as the [`LufsMeter`] runs it at the stream rate
+    /// (the digital shelf and high pass), so the integral predicts LUFS.
+    K,
+    /// IEC 61672 A-weighting, analytic.
+    A,
+}
+
+impl From<audivane_protocol::ipc::LevelWeighting> for Weighting {
+    fn from(w: audivane_protocol::ipc::LevelWeighting) -> Self {
+        match w {
+            audivane_protocol::ipc::LevelWeighting::K => Self::K,
+            audivane_protocol::ipc::LevelWeighting::A => Self::A,
+        }
+    }
+}
+
+/// Power (|W(f)|²) of BS.1770 K-weighting at `f_hz` for `sample_rate`.
+pub fn k_weighting_power(f_hz: f64, sample_rate: f64) -> f64 {
+    let z1 = Complex64::from_polar(1.0, -2.0 * PI * f_hz / sample_rate);
+    (section_response(&k_shelf(sample_rate), z1) * section_response(&k_high_pass(sample_rate), z1))
+        .norm_sqr()
+}
+
+/// Static level offset for an A/B comparison.
+///
+/// `power_a(f)` / `power_b(f)` return |H(f)|² of each chain. Both are
+/// integrated over 20 Hz..min(20 kHz, Nyquist) on a log grid, weighted by
+/// `weighting`'s power and a pink-noise (1/f) reference spectrum. Returns
+/// the dB gain to apply to **B** so its weighted loudness equals A's.
+pub fn weighted_offset_db(
+    power_a: &dyn Fn(f64) -> f64,
+    power_b: &dyn Fn(f64) -> f64,
+    sample_rate: f64,
+    weighting: Weighting,
 ) -> f64 {
     if !sample_rate.is_finite() || sample_rate <= 0.0 {
         return 0.0;
@@ -74,10 +111,13 @@ pub fn analytic_offset_db(
     for i in 0..POINTS {
         let u = u0 + (i as f64 + 0.5) * du;
         let f = u.exp();
-        // A-weighting power times pink 1/f, integrated over df = f du, so the
+        // Weighting power times pink 1/f, integrated over df = f du, so the
         // 1/f and the f from the substitution cancel; only du remains.
-        let a2 = crate::db_to_lin(a_weighting_db(f)).powi(2);
-        let weight = a2 * du;
+        let w2 = match weighting {
+            Weighting::A => crate::db_to_lin(a_weighting_db(f)).powi(2),
+            Weighting::K => k_weighting_power(f, sample_rate),
+        };
+        let weight = w2 * du;
         power_a_total += power_a(f) * weight;
         power_b_total += power_b(f) * weight;
     }
@@ -201,7 +241,7 @@ fn section_response(sec: &[f64; 5], z1: Complex64) -> Complex64 {
 }
 
 #[inline]
-fn biquad_step(coeff: &[f64; 5], state: &mut [f64; 2], x: f64) -> f64 {
+pub(crate) fn biquad_step(coeff: &[f64; 5], state: &mut [f64; 2], x: f64) -> f64 {
     let y = coeff[0] * x + state[0];
     state[0] = coeff[1] * x - coeff[3] * y + state[1];
     state[1] = coeff[2] * x - coeff[4] * y;
@@ -314,7 +354,7 @@ const RELATIVE_GATE_LU: f64 = 10.0;
 const BLOCK_SECONDS: f64 = 0.4;
 const HOP_SECONDS: f64 = 0.1;
 
-fn k_shelf(sample_rate: f64) -> [f64; 5] {
+pub(crate) fn k_shelf(sample_rate: f64) -> [f64; 5] {
     let fs = sample_rate;
     let f0 = K_SHELF_F0.min(0.45 * fs);
     let k = (PI * f0 / fs).tan();
@@ -330,7 +370,7 @@ fn k_shelf(sample_rate: f64) -> [f64; 5] {
     ]
 }
 
-fn k_high_pass(sample_rate: f64) -> [f64; 5] {
+pub(crate) fn k_high_pass(sample_rate: f64) -> [f64; 5] {
     let fs = sample_rate;
     let f0 = K_HP_F0.min(0.45 * fs);
     let k = (PI * f0 / fs).tan();

@@ -8,6 +8,9 @@
 // Rust: `cargo metadata --locked` with the release features, following normal
 // (non-dev, non-build) dependency edges from the three shipped crates; build
 // scripts and proc-macros, which do not end up in the binaries, are skipped.
+// `cargo metadata` also lists optional dependencies whose feature is off
+// (e.g. tauri's tray-icon/libappindicator), so only crates that `cargo tree`
+// reports for the same packages, features and target are kept.
 // npm: `npm ls --omit=dev` in app/. For each package the license expression
 // and every top-level LICENSE / COPYING / NOTICE / COPYRIGHT file are
 // included; identical texts are printed once and list every package using
@@ -89,7 +92,26 @@ function standardText(p) {
   return [];
 }
 
+/** "name version" of every crate `cargo tree` says the shipped binaries
+ *  build with (normal edges, the release features, the Linux target). */
+function builtCrates() {
+  const out = execFileSync("cargo", [
+    "tree", "--locked", "-e", "normal", "--target", "x86_64-unknown-linux-gnu",
+    ...SHIPPED.flatMap((p) => ["-p", p]),
+    "--features", "audivane-dsp-ui/custom-protocol",
+    "--prefix", "none", "-f", "{p}",
+  ], { cwd: ROOT, maxBuffer: 64 * 1024 * 1024, encoding: "utf8" });
+  const set = new Set();
+  for (const line of out.split("\n")) {
+    const m = line.trim().match(/^(\S+) v(\S+)/);
+    if (m) set.add(`${m[1]} ${m[2]}`);
+  }
+  if (set.size === 0) throw new Error("cargo tree listed no crates");
+  return set;
+}
+
 function rustPackages() {
+  const built = builtCrates();
   const meta = JSON.parse(execFileSync("cargo", [
     "metadata", "--format-version", "1", "--locked",
     "--filter-platform", "x86_64-unknown-linux-gnu",
@@ -108,6 +130,7 @@ function rustPackages() {
       if (!dep.dep_kinds.some((k) => k.kind === null)) continue;
       const pkg = byId.get(dep.pkg);
       if (pkg.targets.some((t) => t.kind.includes("proc-macro"))) continue;
+      if (!built.has(`${pkg.name} ${pkg.version}`)) continue;
       if (!seen.has(dep.pkg)) { seen.add(dep.pkg); queue.push(dep.pkg); }
     }
   }
@@ -143,7 +166,28 @@ function npmPackages() {
   return [...out.values()];
 }
 
-const packages = [...rustPackages(), ...npmPackages()]
+function vendoredPackages() {
+  return [
+    {
+      eco: "c++",
+      name: "signalsmith-stretch",
+      version: "1.3.1",
+      license: "MIT",
+      url: "https://github.com/Signalsmith-Audio/signalsmith-stretch",
+      files: licenseFiles(path.join(ROOT, "crates/dsp-core/third_party/signalsmith-stretch")),
+    },
+    {
+      eco: "c++",
+      name: "signalsmith-linear",
+      version: "vendored",
+      license: "MIT",
+      url: "https://github.com/Signalsmith-Audio/linear",
+      files: licenseFiles(path.join(ROOT, "crates/dsp-core/third_party/signalsmith-linear")),
+    },
+  ];
+}
+
+const packages = [...rustPackages(), ...npmPackages(), ...vendoredPackages()]
   .sort((a, b) => a.eco.localeCompare(b.eco) || a.name.localeCompare(b.name) || a.version.localeCompare(b.version, undefined, { numeric: true }));
 
 const missing = packages.filter((p) => p.files.length === 0);
@@ -178,7 +222,7 @@ ${rule}
 
 `;
 for (const p of packages) {
-  doc += `${p.eco === "crate" ? "crate" : "npm  "}  ${p.name} ${p.version}  —  ${p.license}${p.url ? `\n       ${p.url}` : ""}\n`;
+  doc += `${p.eco.padEnd(5)}  ${p.name} ${p.version}  —  ${p.license}${p.url ? `\n       ${p.url}` : ""}\n`;
 }
 if (missing.length > 0) {
   doc += `\nThese packages ship no license file of their own. They are distributed
@@ -186,6 +230,36 @@ under the license named above (for a choice of licenses, under Apache-2.0),
 whose full standard text appears among the texts below:
 ${missing.map((p) => `  ${p.name} ${p.version} (${p.license})`).join("\n")}\n`;
 }
+doc += `\n${rule}
+ALGORITHMS
+${rule}
+
+The headphone crossfeed's bs2b modes implement the filter design published
+by the bs2b project (Bauer stereophonic-to-binaural DSP,
+https://bs2b.sourceforge.net/). No bs2b code is included; the design is
+credited here. libbs2b is distributed under the MIT License:
+
+  Copyright (c) 2005 Boris Mikhaylov
+
+  Permission is hereby granted, free of charge, to any person obtaining a
+  copy of this software and associated documentation files (the
+  "Software"), to deal in the Software without restriction, including
+  without limitation the rights to use, copy, modify, merge, publish,
+  distribute, sublicense, and/or sell copies of the Software, and to permit
+  persons to whom the Software is furnished to do so, subject to the
+  following conditions:
+
+  The above copyright notice and this permission notice shall be included
+  in all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+  OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+  NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+  DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+  OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+  USE OR OTHER DEALINGS IN THE SOFTWARE.
+`;
 doc += `\n${rule}\nLICENSE TEXTS\n${rule}\n`;
 const ordered = [...texts.values()].sort((a, b) => a.users[0].localeCompare(b.users[0]));
 for (const t of ordered) {

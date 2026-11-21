@@ -9,8 +9,8 @@
 use crate::error::{AlsaError, Result};
 use alsa::PCM;
 use alsa::pcm::{Access, Format, HwParams};
-use audivane_protocol::SampleFormat;
 use audivane_protocol::ipc::{DeviceCapabilities, FormatCapability, RateCapability};
+use audivane_protocol::{RateRatio, SampleFormat};
 
 /// Formats the engine can pack, in the order the probe reports them.
 pub const PROBE_FORMATS: [SampleFormat; 4] = [
@@ -20,13 +20,17 @@ pub const PROBE_FORMATS: [SampleFormat; 4] = [
     SampleFormat::S32,
 ];
 
-/// Ratios tried when the device rejects `source_rate * desired`: halve powers
-/// of two, otherwise step down by one, ending at 1.
-pub fn ratio_ladder(desired: u32) -> Vec<u32> {
+/// Ratios tried when the device rejects `source_rate * desired`: integer
+/// ratios halve powers of two, otherwise step down by one, ending at 1; a
+/// rational ratio (or decimation) falls straight back to 1.
+pub fn ratio_ladder(desired: RateRatio) -> Vec<RateRatio> {
+    if !desired.is_integer() {
+        return vec![desired, RateRatio::ONE];
+    }
     let mut ratios = Vec::new();
-    let mut r = desired.max(1);
+    let mut r = desired.up.max(1);
     loop {
-        ratios.push(r);
+        ratios.push(RateRatio::integer(r));
         if r == 1 {
             break;
         }
@@ -52,32 +56,36 @@ pub fn probe_rates(graph_rates: &[u32], max_ratio: u32, max_rate: u32) -> Vec<u3
     out
 }
 
-/// Pick the DAC ratio and format for `source_rate`: the first ratio on
-/// [`ratio_ladder`] whose rate `source_rate * ratio` the device supports with
-/// one of `formats` (in preference order). Never a "nearest" rate: the graph
-/// rate times the ratio must be the device rate exactly, or the pitch is off.
+/// Pick the DAC ratio and format for `source_rate`: the first ratio of
+/// `ladder` (usually [`ratio_ladder`]) whose rate `source_rate * ratio` is a
+/// whole number of Hz the device supports with one of `formats` (in
+/// preference order). Never a "nearest" rate: the graph rate times the ratio
+/// must be the device rate exactly, or the pitch is off.
 pub fn plan_open(
     caps: &DeviceCapabilities,
     source_rate: u32,
-    desired_ratio: u32,
+    ladder: &[RateRatio],
     formats: &[SampleFormat],
-) -> Result<(u32, SampleFormat)> {
-    let ladder = ratio_ladder(desired_ratio);
-    for &ratio in &ladder {
-        let rate = source_rate.saturating_mul(ratio);
+) -> Result<(RateRatio, SampleFormat)> {
+    for &ratio in ladder {
+        let Some(rate) = ratio.output_rate(source_rate) else {
+            continue;
+        };
         if let Some(&f) = formats.iter().find(|&&f| caps.supports(rate, f)) {
             return Ok((ratio, f));
         }
     }
     let tried: Vec<String> = ladder
         .iter()
-        .map(|&k| format!("{} Hz", source_rate.saturating_mul(k)))
+        .filter_map(|k| k.output_rate(source_rate))
+        .map(|r| format!("{r} Hz"))
         .collect();
-    let rejected = if ladder.len() == 1 {
+    let rejected = if ladder.len() <= 1 {
         format!("rate {source_rate} Hz")
     } else {
         format!(
-            "graph rate {source_rate} Hz at any upsampling ratio from x{desired_ratio} down to x1 ({})",
+            "graph rate {source_rate} Hz at any output rate from {} down to x1 ({})",
+            ladder[0],
             tried.join(", ")
         )
     };
@@ -296,7 +304,7 @@ mod tests {
 
     #[test]
     fn hda_codec_bits_come_from_the_default_pcm_block() {
-        let codec = "Codec: Realtek ALC245\nAddress: 0\nDefault PCM:\n    rates [0x560]: 44100 48000 96000 192000\n    bits [0xe]: 16 20 24\n    formats [0x1]: PCM\nDefault Amp-In caps: N/A\nNode 0x02 [Audio Output] wcaps 0x41d: Stereo Amp-Out\n  PCM:\n    rates [0x40]: 48000\n    bits [0x1e]: 16 20 24 32\n";
+        let codec = "Codec: Generic HDA\nAddress: 0\nDefault PCM:\n    rates [0x560]: 44100 48000 96000 192000\n    bits [0xe]: 16 20 24\n    formats [0x1]: PCM\nDefault Amp-In caps: N/A\nNode 0x02 [Audio Output] wcaps 0x41d: Stereo Amp-Out\n  PCM:\n    rates [0x40]: 48000\n    bits [0x1e]: 16 20 24 32\n";
         assert_eq!(codec_default_pcm_bits(codec), Some(24));
         assert_eq!(
             codec_default_pcm_bits("Codec: HDMI\nDefault PCM:\n    N/A\n"),
@@ -322,11 +330,11 @@ mod tests {
         assert_eq!(sbits, [Some(16), Some(24)]);
     }
 
-    /// The real device behind the bug report: Creative Pebble V3, USB full
-    /// speed, one playback altset: S16_LE, 2 channels, 48000 Hz only.
-    pub(crate) fn pebble_v3() -> DeviceCapabilities {
+    /// A fixed-rate USB device: one playback altset, S16_LE, 2 channels,
+    /// 48000 Hz only.
+    pub(crate) fn usb_speaker_48k() -> DeviceCapabilities {
         DeviceCapabilities {
-            device: "hw:CARD=V3,DEV=0".into(),
+            device: "hw:CARD=SPK,DEV=0".into(),
             channels: 2,
             channels_min: 2,
             channels_max: 2,
@@ -352,10 +360,56 @@ mod tests {
 
     #[test]
     fn ladder_halves_powers_of_two_and_steps_others() {
-        assert_eq!(ratio_ladder(1), vec![1]);
-        assert_eq!(ratio_ladder(8), vec![8, 4, 2, 1]);
-        assert_eq!(ratio_ladder(6), vec![6, 5, 4, 2, 1]);
-        assert_eq!(ratio_ladder(0), vec![1]);
+        let ints = |d: u32| -> Vec<u32> {
+            ratio_ladder(RateRatio::integer(d))
+                .into_iter()
+                .map(|r| r.up)
+                .collect()
+        };
+        assert_eq!(ints(1), vec![1]);
+        assert_eq!(ints(8), vec![8, 4, 2, 1]);
+        assert_eq!(ints(6), vec![6, 5, 4, 2, 1]);
+        assert_eq!(ints(0), vec![1]);
+        let r = RateRatio::new(160, 147);
+        assert_eq!(ratio_ladder(r), vec![r, RateRatio::ONE]);
+    }
+
+    fn plan(
+        caps: &DeviceCapabilities,
+        rate: u32,
+        desired: u32,
+        formats: &[SampleFormat],
+    ) -> Result<(u32, SampleFormat)> {
+        plan_open(
+            caps,
+            rate,
+            &ratio_ladder(RateRatio::integer(desired)),
+            formats,
+        )
+        .map(|(r, f)| (r.up, f))
+    }
+
+    #[test]
+    fn plan_open_takes_rational_ratios_and_decimation() {
+        let caps = usb_speaker_48k();
+        // 44.1k into a 48k-only device: 160/147.
+        let r = RateRatio::from_rates(44_100, 48_000);
+        assert_eq!(
+            plan_open(&caps, 44_100, &ratio_ladder(r), &PREF).unwrap(),
+            (r, SampleFormat::S16)
+        );
+        // 96k down to 48k.
+        let r = RateRatio::from_rates(96_000, 48_000);
+        assert_eq!(
+            plan_open(&caps, 96_000, &ratio_ladder(r), &PREF).unwrap(),
+            (r, SampleFormat::S16)
+        );
+        // No whole output rate: skipped, falls back to x1 (48k plays).
+        let odd = RateRatio::new(3, 7);
+        assert_eq!(
+            plan_open(&caps, 48_000, &ratio_ladder(odd), &PREF).unwrap(),
+            (RateRatio::ONE, SampleFormat::S16)
+        );
     }
 
     #[test]
@@ -370,24 +424,79 @@ mod tests {
         let all = probe_rates(audivane_protocol::ALLOWED_RATES, 16, 768_000);
         assert!(all.contains(&768_000) && all.contains(&705_600));
         assert!(all.iter().all(|&r| r <= 768_000));
+        let top = probe_rates(
+            audivane_protocol::ALLOWED_RATES,
+            64,
+            audivane_protocol::MAX_OUTPUT_RATE,
+        );
+        for &r in audivane_protocol::HIGH_OUTPUT_RATES {
+            assert!(top.contains(&r), "{r}");
+        }
+        assert_eq!(top.last(), Some(&3_072_000));
+    }
+
+    /// A DAC that takes S32 up to 3.072 MHz: x64 opens at 2.8224 and
+    /// 3.072 MHz; one that stops at 768 kHz falls back to x16.
+    #[test]
+    fn plan_open_reaches_x64_and_falls_back_below_it() {
+        let dac = |top: u32| {
+            let rates: Vec<u32> = probe_rates(
+                audivane_protocol::ALLOWED_RATES,
+                64,
+                audivane_protocol::MAX_OUTPUT_RATE,
+            )
+            .into_iter()
+            .filter(|&r| {
+                r <= top && (r <= 768_000 || audivane_protocol::HIGH_OUTPUT_RATES.contains(&r))
+            })
+            .collect();
+            DeviceCapabilities {
+                device: "hw:CARD=USB,DEV=0".into(),
+                channels: 2,
+                channels_min: 2,
+                channels_max: 2,
+                rate_min: rates[0],
+                rate_max: *rates.last().unwrap(),
+                formats: vec![SampleFormat::S32],
+                rates: rates
+                    .iter()
+                    .map(|&rate| RateCapability {
+                        rate,
+                        formats: vec![FormatCapability {
+                            format: SampleFormat::S32,
+                            sbits: Some(32),
+                        }],
+                    })
+                    .collect(),
+            }
+        };
+        let high = dac(3_072_000);
+        assert_eq!(plan(&high, 44_100, 64, &PREF).unwrap().0, 64);
+        assert_eq!(plan(&high, 48_000, 64, &PREF).unwrap().0, 64);
+        assert_eq!(plan(&high, 96_000, 64, &PREF).unwrap().0, 32);
+        // x48 (2.1168 MHz) is no DAC rate: the ladder steps down to x32.
+        assert_eq!(plan(&high, 44_100, 48, &PREF).unwrap().0, 32);
+        let low = dac(768_000);
+        assert_eq!(plan(&low, 44_100, 64, &PREF).unwrap().0, 16);
+        assert_eq!(plan(&low, 48_000, 32, &PREF).unwrap().0, 16);
     }
 
     #[test]
-    fn pebble_v3_plays_48k_s16_at_ratio_one() {
-        let caps = pebble_v3();
+    fn usb_speaker_48k_plays_48k_s16_at_ratio_one() {
+        let caps = usb_speaker_48k();
         // S32 preferred, upsampling x4 wanted: falls back to x1 and S16.
         assert_eq!(
-            plan_open(&caps, 48_000, 4, &PREF).unwrap(),
+            plan(&caps, 48_000, 4, &PREF).unwrap(),
             (1, SampleFormat::S16)
         );
         // 44.1k can never be opened: no nearest-rate fallback.
-        let err = plan_open(&caps, 44_100, 1, &PREF).unwrap_err().to_string();
+        let err = plan(&caps, 44_100, 1, &PREF).unwrap_err().to_string();
         assert!(err.contains("rate 44100 Hz"), "{err}");
         assert!(
             err.contains("rates 48000 Hz; formats S16; channels 2"),
             "{err}"
         );
-        let err = plan_open(&caps, 44_100, 4, &PREF).unwrap_err().to_string();
+        let err = plan(&caps, 44_100, 4, &PREF).unwrap_err().to_string();
         assert!(err.contains("176400 Hz, 88200 Hz, 44100 Hz"), "{err}");
     }
 
@@ -419,16 +528,16 @@ mod tests {
             rates,
         };
         assert_eq!(
-            plan_open(&caps, 48_000, 4, &PREF).unwrap(),
+            plan(&caps, 48_000, 4, &PREF).unwrap(),
             (4, SampleFormat::S16)
         );
         assert_eq!(
-            plan_open(&caps, 48_000, 2, &PREF).unwrap(),
+            plan(&caps, 48_000, 2, &PREF).unwrap(),
             (2, SampleFormat::S32)
         );
         // Strict list without S16 skips 192k and drops to x2.
         assert_eq!(
-            plan_open(&caps, 48_000, 4, &[SampleFormat::S32]).unwrap(),
+            plan(&caps, 48_000, 4, &[SampleFormat::S32]).unwrap(),
             (2, SampleFormat::S32)
         );
     }
@@ -456,10 +565,11 @@ mod rig_tests {
             rate: 96_000,
             ..Default::default()
         };
+        let ladder = ratio_ladder(RateRatio::integer(2));
         let (out, ratio) = open
-            .configure_with_ratio_fallback(&cfg, 48_000, 2, 1024, &[], Some(&caps))
+            .configure_with_ratio_fallback(&cfg, 48_000, &ladder, 1024, &[], Some(&caps))
             .expect("configure");
-        assert_eq!(ratio, 2);
+        assert_eq!(ratio, RateRatio::integer(2));
         assert_eq!(out.params().rate, 96_000);
     }
 }

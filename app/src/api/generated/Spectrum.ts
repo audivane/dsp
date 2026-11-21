@@ -2,28 +2,22 @@
 
 /**
  * Live FFT spectrum of the pre (chain input at the graph rate) and post
- * (chain output at the output rate) taps. `post` is taken from the
- * quantizer's left-justified output scaled back to `f32`, which is within
- * half an LSB of the value just before quantization.
+ * (chain output at the output rate) taps; `post` is the quantizer's output
+ * scaled back to `f32`, within half an LSB of the value before quantization.
  *
  * Each tap runs two Hann FFTs: 8192 points (50% overlap) for every bin and
  * 32768 points (87.5% overlap) for the low band, where a 1/24-octave bin is
- * narrower than four 8192-point bins (below about 800 Hz at 48 kHz). Power
- * is averaged over the frames since the previous report. Each tap is mapped
- * onto its own fixed log grid: bin `k` is centred on
- * `f_min_hz * 2^(k / bins_per_octave)` (half a step either side), centres
- * from [`Self::f_min_hz`] to `min(20 kHz, Nyquist)`.
+ * narrower than four 8192-point bins. Power is averaged over the frames since
+ * the previous report. Bin `k` is centred on `f_min_hz * 2^(k /
+ * bins_per_octave)` (half a step either side), up to `min(20 kHz, Nyquist)`.
  *
  * Values are band power in dB, channel-mean, rounded to 0.1 dB: 0 dB = a
- * full-scale sine. A bin reads the signal power inside it (the interpolated
- * power density integrated over the bin), or a sine's interpolated peak
- * level where the bin holds a spectral peak, whichever is higher. A sine
- * therefore reads its level in one bin and noise reads its power per bin
- * (white noise rises 3 dB/octave, pink noise is flat), independent of FFT
- * size.
+ * full-scale sine. A bin reads the signal power inside it, or a sine's
+ * interpolated peak level where it holds a spectral peak, whichever is
+ * higher, independent of FFT size.
  *
- * There are no events while the engine is idle (fewer than one complete
- * 8192-sample frame has arrived), and the last frame is kept by clients.
+ * No events while the engine is idle (no complete 8192-sample frame yet);
+ * clients keep the last frame.
  */
 export type Spectrum = { f_min_hz: number, bins_per_octave: number, pre: Array<number>, post: Array<number>, 
 /**

@@ -4,15 +4,20 @@
 //! The engine (ALSA + PipeWire driver + DSP) is reached only through
 //! [`crate::api::Engine`], so everything here is testable with a mock.
 
+pub mod ab_measure;
+pub mod ab_side;
 pub mod config;
+pub mod cpu_budget;
 pub mod daemon;
 pub mod graph;
 pub mod ipc;
 pub mod mpris;
+pub mod overload;
 pub mod passthrough;
 pub mod persist;
 pub mod presets;
 pub mod service;
+pub mod volume_guard;
 
 pub use daemon::{Daemon, DaemonOptions};
 pub use service::{Dispatch, Service, ShutdownFlag};

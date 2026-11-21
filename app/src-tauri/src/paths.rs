@@ -18,15 +18,32 @@ pub fn config_dir_under(config_home: &Path, what: &str) -> PathBuf {
     config_home.join("audivane-dsp").join(what)
 }
 
+/// `$XDG_CONFIG_HOME`, else `$HOME/.config`; None when neither is set.
+pub fn config_home() -> Option<PathBuf> {
+    config_home_from(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn config_home_from(
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(x) = xdg.filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(x));
+    }
+    home.filter(|v| !v.is_empty())
+        .map(|h| Path::new(&h).join(".config"))
+}
+
 /// Where the app keeps overlay files (targets, bounds, measurements).
 pub fn overlays_dir() -> Result<PathBuf, String> {
-    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        return Ok(config_dir_under(Path::new(&x), "overlays"));
-    }
-    if let Some(h) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-        return Ok(config_dir_under(&Path::new(&h).join(".config"), "overlays"));
-    }
-    Err("neither XDG_CONFIG_HOME nor HOME is set, so there is nowhere to keep overlays".into())
+    config_home()
+        .map(|h| config_dir_under(&h, "overlays"))
+        .ok_or_else(|| {
+            "neither XDG_CONFIG_HOME nor HOME is set, so there is nowhere to keep overlays".into()
+        })
 }
 
 fn resolve(explicit: Option<PathBuf>, runtime: Option<PathBuf>, uid: u32) -> PathBuf {
@@ -49,6 +66,19 @@ mod tests {
             config_dir_under(Path::new("/home/you/.config"), "overlays"),
             PathBuf::from("/home/you/.config/audivane-dsp/overlays")
         );
+    }
+
+    #[test]
+    fn config_home_prefers_xdg_then_home() {
+        assert_eq!(
+            config_home_from(Some("/x".into()), Some("/h".into())),
+            Some(PathBuf::from("/x"))
+        );
+        assert_eq!(
+            config_home_from(Some("".into()), Some("/h".into())),
+            Some(PathBuf::from("/h/.config"))
+        );
+        assert_eq!(config_home_from(None, None), None);
     }
 
     #[test]

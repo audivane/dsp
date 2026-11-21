@@ -15,6 +15,7 @@ mod level;
 mod nulltest;
 mod process;
 mod profile;
+mod render;
 mod signal;
 mod upgrade;
 mod wavio;
@@ -43,6 +44,8 @@ struct Cli {
 enum Command {
     /// Process a WAV file through the DSP chain.
     Process(ProcessArgs),
+    /// Play a WAV file at another speed through the varispeed stage.
+    Render(RenderArgs),
     /// EQ profile utilities (import, export, response).
     Eq {
         #[command(subcommand)]
@@ -91,11 +94,15 @@ pub struct ProcessArgs {
     #[arg(long)]
     pub conv: Vec<PathBuf>,
     /// Integer upsampling ratio (e.g. 4).
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..), conflicts_with = "max_rate")]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..), conflicts_with_all = ["max_rate", "out_rate"])]
     pub upsample: Option<u32>,
     /// Highest output rate to reach with a power-of-two ratio.
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..), conflicts_with = "out_rate")]
     pub max_rate: Option<u32>,
+    /// Resample to exactly this output rate (rational ratios and
+    /// decimation included, e.g. 48000 from a 44100 Hz file).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub out_rate: Option<u32>,
     /// Upsampler kernel length at the output rate.
     #[arg(long)]
     pub taps: Option<usize>,
@@ -121,6 +128,28 @@ pub struct ProcessArgs {
     #[arg(long, default_value_t = 1024)]
     pub block: usize,
     /// Remove the reported chain latency from the output.
+    #[arg(long)]
+    pub trim_latency: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct RenderArgs {
+    /// Input WAV (16/24/32-bit integer or 32-bit float).
+    pub input: PathBuf,
+    /// Output WAV (32-bit float, the input's rate).
+    pub output: PathBuf,
+    /// Playback speed, 0.5 to 2 (1.02 = +2 %: tempo and pitch together).
+    #[arg(long, default_value_t = 1.0)]
+    pub speed: f64,
+    /// A speed change during the output: `TIME:SPEED:RAMP_MS` (the ramp
+    /// optional), the time in seconds of output. Repeatable. The ramp is never
+    /// shorter than the speed envelope allows (0 means as fast as it allows).
+    #[arg(long = "change", value_name = "TIME:SPEED[:RAMP_MS]")]
+    pub changes: Vec<String>,
+    /// Frames per call (1 to 8192).
+    #[arg(long, default_value_t = 1024)]
+    pub block: usize,
+    /// Remove the stage's delay at the start speed from the output.
     #[arg(long)]
     pub trim_latency: bool,
 }
@@ -357,11 +386,20 @@ impl From<PhaseArg> for FilterPhase {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-#[value(rename_all = "lower")]
+#[value(rename_all = "snake_case")]
 pub enum DitherArg {
     None,
     Tpdf,
     Shaped,
+    HeadroomTpdf,
+    Rectangular,
+    Gaussian,
+    HighpassTpdf,
+    Feedback1,
+    Feedback5,
+    Resonant5,
+    Resonant9,
+    Integrator15,
 }
 
 impl From<DitherArg> for DitherKind {
@@ -370,6 +408,15 @@ impl From<DitherArg> for DitherKind {
             DitherArg::None => Self::None,
             DitherArg::Tpdf => Self::Tpdf,
             DitherArg::Shaped => Self::Shaped,
+            DitherArg::HeadroomTpdf => Self::HeadroomTpdf,
+            DitherArg::Rectangular => Self::Rectangular,
+            DitherArg::Gaussian => Self::Gaussian,
+            DitherArg::HighpassTpdf => Self::HighpassTpdf,
+            DitherArg::Feedback1 => Self::Feedback1,
+            DitherArg::Feedback5 => Self::Feedback5,
+            DitherArg::Resonant5 => Self::Resonant5,
+            DitherArg::Resonant9 => Self::Resonant9,
+            DitherArg::Integrator15 => Self::Integrator15,
         }
     }
 }
@@ -391,6 +438,7 @@ fn main() {
 fn run(cli: Cli) -> Result<i32> {
     match cli.command {
         Command::Process(args) => process::run(args),
+        Command::Render(args) => render::run(args),
         Command::Eq { command } => eqcmd::run(command),
         Command::Levelmatch(args) => level::run(args),
         Command::Kernel(args) => kernel::run(args),
@@ -400,5 +448,39 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Bench(args) => bench::run(args),
         Command::Ctl(args) => ctl::run(args),
         Command::Upgrade(args) => upgrade::run(args),
+    }
+}
+
+#[cfg(test)]
+mod dither_arg_tests {
+    use super::*;
+
+    #[test]
+    fn process_dither_accepts_every_json_spelling() {
+        let names = [
+            "none",
+            "tpdf",
+            "shaped",
+            "headroom_tpdf",
+            "rectangular",
+            "gaussian",
+            "highpass_tpdf",
+            "feedback1",
+            "feedback5",
+            "resonant5",
+            "resonant9",
+            "integrator15",
+        ];
+        for name in names {
+            let cli =
+                Cli::try_parse_from(["avdsp", "process", "in.wav", "out.wav", "--dither", name])
+                    .unwrap_or_else(|err| panic!("{name}: {err}"));
+            let Command::Process(args) = cli.command else {
+                panic!("expected process");
+            };
+            let kind: DitherKind = args.dither.unwrap().into();
+            assert_eq!(serde_json::to_value(kind).unwrap(), name);
+        }
+        assert_eq!(DitherArg::value_variants().len(), names.len());
     }
 }

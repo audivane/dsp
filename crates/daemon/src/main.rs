@@ -9,8 +9,8 @@ use audivane_dsp_daemon::api::Engine;
 use audivane_dsp_daemon::control::config::{self, ConfigStore};
 use audivane_dsp_daemon::control::daemon::{Daemon, DaemonOptions};
 use audivane_dsp_daemon::control::ipc;
-use audivane_dsp_daemon::engine::RealEngine;
 use audivane_dsp_daemon::engine::waiting::{WaitingEngine, start_error_text};
+use audivane_dsp_daemon::engine::{RealEngine, leave_mixer_safe};
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,6 +41,12 @@ struct Args {
     /// both are set.
     #[arg(long, value_name = "LEVEL", default_value = "info")]
     log_level: String,
+    /// Do not start: bring the DAC's hardware volume down to the configured
+    /// level when the volume mode keeps it higher (software with a fixed
+    /// hardware level, hybrid), then exit. The systemd unit runs this as
+    /// `ExecStopPost=`, so a crash does not leave the card at full level.
+    #[arg(long)]
+    volume_failsafe: bool,
 }
 
 fn main() {
@@ -59,7 +65,17 @@ fn main() {
 }
 
 fn run(args: Args) -> anyhow::Result<()> {
+    // The `SIGXCPU` handler first, before the config is read and the
+    // filters are designed (an automatic-length design takes seconds): the
+    // signal's default action ends the process, and a PipeWire context can
+    // set a soft `RLIMIT_RTTIME` before the engine's audio thread exists.
+    if let Err(err) = audivane_io_alsa::install_overload_guard() {
+        log::warn!("could not install the SIGXCPU handler: {err}");
+    }
     let socket = ipc::socket_path(args.socket.as_deref()).map_err(anyhow::Error::msg)?;
+    if args.volume_failsafe {
+        return volume_failsafe(&args, &socket);
+    }
     // A second copy (e.g. started by hand while the service runs) would only
     // get "device reservation denied" from the first one: say what is going on
     // before touching the config or the device.
@@ -70,6 +86,8 @@ fn run(args: Args) -> anyhow::Result<()> {
             socket.display()
         );
     }
+    // The design workspace cap, before the config's designs are validated.
+    audivane_dsp_daemon::control::cpu_budget::init_design_workspace();
     let store = Arc::new(ConfigStore::new(
         args.config
             .clone()
@@ -106,9 +124,12 @@ fn run(args: Args) -> anyhow::Result<()> {
         }
     }
 
-    // Without its device the engine cannot run, but the daemon still starts:
-    // the app and `avdsp ctl` then show why and can pick another device,
-    // instead of systemd restarting a failing service until it gives up.
+    // A device that is not there (unplugged) does not stop the engine: its
+    // sinks come up on the engine's own clock and it opens the device when
+    // it appears. A device that is there but cannot be opened still leaves
+    // the daemon running: the app and `avdsp ctl` then show why and can pick
+    // another device, instead of systemd restarting a failing service until
+    // it gives up.
     let mut waiting = None;
     let engine: Arc<dyn Engine> = match RealEngine::start(&config) {
         Ok(engine) => engine,
@@ -156,6 +177,35 @@ fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `--volume-failsafe`. A running engine owns the mixer (and does this
+/// itself when it stops), so it is left alone. The probe uses the same
+/// socket the daemon would (`--socket`, `$AUDIVANE_DSP_SOCKET`, then the
+/// runtime directory); the unit passes none, like its `ExecStart=`.
+fn volume_failsafe(args: &Args, socket: &std::path::Path) -> anyhow::Result<()> {
+    if ipc::probe(socket) {
+        log::info!("volume failsafe: the engine is running, nothing to do");
+        return Ok(());
+    }
+    let store = ConfigStore::new(
+        args.config
+            .clone()
+            .unwrap_or_else(ConfigStore::default_path),
+    );
+    // Read-only: an invalid file stays where it is for the next start.
+    let Some(config) = store.read_only() else {
+        log::info!("volume failsafe: no usable config, nothing to do");
+        return Ok(());
+    };
+    match leave_mixer_safe(&config).map_err(anyhow::Error::msg)? {
+        Some(db) => log::info!(
+            "volume failsafe: hardware volume of {} left at {db:.2} dB",
+            config.device
+        ),
+        None => log::debug!("volume failsafe: the mixer already carries the volume"),
+    }
+    Ok(())
+}
+
 /// How often a waiting daemon looks for its device.
 const DEVICE_POLL: Duration = Duration::from_secs(1);
 
@@ -191,9 +241,10 @@ fn watch_for_device(
     Ok(())
 }
 
-/// Restart a running engine that can no longer play, usually because its
-/// device was unplugged. The fresh copy opens the device again, or waits for
-/// it like any start without its device (see `watch_for_device`).
+/// Restart a running engine that can no longer play: its audio thread
+/// ended. An unplugged device does not end it (the engine waits for the
+/// device with its sinks up); this covers the failures it cannot recover
+/// from by reopening.
 fn watch_engine(
     engine: Arc<dyn Engine>,
     shutdown: Arc<audivane_dsp_daemon::control::ShutdownFlag>,
@@ -214,9 +265,7 @@ fn watch_engine(
                     log::warn!("output device {device} stopped working; restarting the engine");
                     std::thread::sleep(RETRY_PRESENT_DEVICE);
                 } else {
-                    log::warn!(
-                        "output device {device} is gone; restarting the engine to wait for it"
-                    );
+                    log::warn!("output device {device} is gone; restarting the engine");
                 }
                 restart.store(true, Ordering::Release);
                 shutdown.request();

@@ -8,9 +8,91 @@
 //! at rates the device cannot play instead of switching the graph to them.
 
 use crate::lifecycle::DesiredDspConfig;
-use audivane_io_alsa::{FORMAT_PREFERENCE, ratio_ladder};
+use audivane_io_alsa::FORMAT_PREFERENCE;
 use audivane_protocol::SampleFormat;
 use audivane_protocol::ipc::{DeviceCapabilities, RatePolicy, SinkChoice};
+
+/// What an open does with the graph rate ([`plan_graph_rate`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphRate {
+    /// Open for the graph rate as it is.
+    Keep,
+    /// Ask PipeWire to move the graph to this rate, and open for it.
+    Move(u32),
+    /// Direct cannot play on the device at all (no native rate).
+    DirectCannotPlay,
+}
+
+/// Where an open of `sink` at `graph_rate` runs the graph under the
+/// device's [`RatePolicies`]. Direct runs at its own rates (native x1, or
+/// converted by the engine bypass resampler), so another rate moves the
+/// graph to one of them (PipeWire resamples the stream into it); for the DSP
+/// sink, a rate it cannot play at any ratio moves it too. A move goes to
+/// the sink's native base ([`crate::rate_arbiter::sink_rate`]): a rate the
+/// engine converts is never a move target, so nothing is converted twice.
+pub fn plan_graph_rate(p: &RatePolicies, graph_rate: u32, sink: SinkChoice) -> GraphRate {
+    use crate::rate_arbiter::sink_rate;
+    if sink == SinkChoice::Direct {
+        if p.direct.allowed_rates.is_empty() {
+            return GraphRate::DirectCannotPlay;
+        }
+        if !p.direct.allowed_rates.contains(&graph_rate) {
+            return GraphRate::Move(sink_rate(graph_rate, &p.direct, Some(&p.direct_native)));
+        }
+        // Direct's rates are its own: with the engine bypass resampler they
+        // include rates the DSP sink cannot play.
+        return GraphRate::Keep;
+    }
+    let eff = &p.dsp;
+    if eff.allowed_rates.is_empty() || eff.allowed_rates.contains(&graph_rate) {
+        return GraphRate::Keep;
+    }
+    GraphRate::Move(if eff.follow_source {
+        sink_rate(graph_rate, eff, Some(&p.dsp_native))
+    } else {
+        eff.default_rate
+    })
+}
+
+/// A graph that is not moving: opens keep asking PipeWire to move it off
+/// `from` (to `to`) and it stays (another driver or client fixes the
+/// rate). Each such open reopens the device for nothing, so one deadline
+/// runs per unresolved move: [`MOVE_GIVE_UP_NS`] after its first attempt
+/// the open fails with an error instead (the DSP path keeps working). Only
+/// an observed landing (the RT thread saw the graph at the rate it opened
+/// for: `landings` moved on) or another request starts a new one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoveAttempts {
+    pub from: u32,
+    pub to: u32,
+    first_ns: u64,
+    landings: u64,
+}
+
+/// How long an unresolved move may go on before the open gives up.
+pub const MOVE_GIVE_UP_NS: u64 = 3_000_000_000;
+
+impl MoveAttempts {
+    /// Note an attempt to move the graph from `from` to `to` at `now_ns`,
+    /// `landings` being the RT thread's count of observed landings; `true`
+    /// when this move has stayed unresolved for [`MOVE_GIVE_UP_NS`].
+    pub fn note(slot: &mut Option<Self>, from: u32, to: u32, now_ns: u64, landings: u64) -> bool {
+        match slot {
+            Some(a) if a.from == from && a.to == to && a.landings == landings => {
+                now_ns.saturating_sub(a.first_ns) >= MOVE_GIVE_UP_NS
+            }
+            _ => {
+                *slot = Some(Self {
+                    from,
+                    to,
+                    first_ns: now_ns,
+                    landings,
+                });
+                false
+            }
+        }
+    }
+}
 
 /// The rate policy the driver runs with, plus what was dropped and why.
 #[derive(Clone, Debug, PartialEq)]
@@ -27,7 +109,8 @@ pub struct EffectiveRates {
 
 /// Can the graph run at `rate` on this device: does it accept
 /// `rate * k` for some ratio `k` on the fallback ladder from the desired
-/// upsampling ratio down to 1, with one of `formats`?
+/// ratio down to 1 ([`DesiredDspConfig::ratio_ladder_for`], rational
+/// ratios and decimation included), with one of `formats`?
 pub fn graph_rate_playable(
     caps: &DeviceCapabilities,
     rate: u32,
@@ -39,11 +122,18 @@ pub fn graph_rate_playable(
     } else {
         formats
     };
-    let desired_ratio = desired.resolve_ratio_for(SinkChoice::Dsp, rate);
-    ratio_ladder(desired_ratio).into_iter().any(|k| {
-        let out = rate.saturating_mul(k);
-        formats.iter().any(|&f| caps.supports(out, f))
-    })
+    // DSP off opens x1 only: a rate the device lacks natively is not
+    // playable then, so the graph moves to a native one.
+    desired
+        .ladder(
+            SinkChoice::Dsp,
+            rate,
+            crate::lifecycle::DeviceRates::playable(Some(caps), formats),
+        )
+        .as_slice()
+        .iter()
+        .filter_map(|k| k.output_rate(rate))
+        .any(|out| formats.iter().any(|&f| caps.supports(out, f)))
 }
 
 fn family(rate: u32) -> u32 {
@@ -67,10 +157,14 @@ pub fn nearest_rate(want: u32, candidates: &[u32]) -> Option<u32> {
 
 /// Restrict `configured` to what the device can play.
 ///
-/// Allowed = configured ∩ playable. If that is empty, every playable rate in
-/// `engine_rates` (the engine's full list); if still empty, an error that
-/// says what the device supports. The default rate is kept when playable,
-/// else the [`nearest_rate`].
+/// Allowed = configured ∩ playable without the engine bypass resampler
+/// (natively, or through the DSP chain). If that is empty, every such rate
+/// in `engine_rates` (the engine's full list); if still empty, an error
+/// that says what the device supports. The default rate is kept when
+/// playable, else the [`nearest_rate`]. With DSP off, the configured rates
+/// the engine bypass resampler converts ([`DesiredDspConfig::bypass_landing`])
+/// are added on top of that native base, never in its place: a native rate
+/// the base widens to stays, so it is never converted.
 pub fn effective_rate_policy(
     configured: &RatePolicy,
     caps: &DeviceCapabilities,
@@ -83,8 +177,9 @@ pub fn effective_rate_policy(
     if let Some(reason) = caps.unusable_reason() {
         return Err(reason);
     }
-    let playable = |r: u32| graph_rate_playable(caps, r, desired, formats);
-    let (mut allowed, unsupported): (Vec<u32>, Vec<u32>) = configured
+    let native = desired.native_only();
+    let playable = |r: u32| graph_rate_playable(caps, r, native, formats);
+    let (mut allowed, mut unsupported): (Vec<u32>, Vec<u32>) = configured
         .allowed_rates
         .iter()
         .copied()
@@ -118,6 +213,17 @@ pub fn effective_rate_policy(
     } else {
         nearest_rate(configured.default_rate, &allowed).unwrap_or(allowed[0])
     };
+    if desired.is_bypass(SinkChoice::Dsp) {
+        let rates = crate::lifecycle::DeviceRates::playable(Some(caps), formats);
+        unsupported.retain(|&r| {
+            let converted = desired.bypass_landing(r, rates).is_some();
+            if converted && !allowed.contains(&r) {
+                allowed.push(r);
+            }
+            !converted
+        });
+        allowed.sort_unstable();
+    }
     Ok(EffectiveRates {
         policy: RatePolicy {
             allowed_rates: allowed,
@@ -129,48 +235,175 @@ pub fn effective_rate_policy(
     })
 }
 
-/// The rate policy of the Direct (bit-perfect) sink: Direct never
-/// upsamples, so it only runs at effective rates the device plays natively
-/// (x1) with one of `formats`. The default is the effective default when it
-/// is native, else the [`nearest_rate`] native one. Without a probe the
-/// effective policy is used as is. `allowed_rates` is empty when no effective
-/// rate is native: Direct cannot play on this device then.
+/// The rate policy of the Direct (bit-perfect) sink. Direct never runs the
+/// DSP chain: it runs at effective rates the device plays natively (x1)
+/// with one of `formats`, and, with the engine bypass resampler, at the
+/// configured or effective rates the engine converts to a native one
+/// ([`DesiredDspConfig::bypass_landing`]). The default is the effective
+/// default when Direct plays it natively, else the [`nearest_rate`] native
+/// one. Without a probe the effective policy is used as is.
+/// `allowed_rates` is empty when Direct runs at no effective rate: it
+/// cannot play on this device then.
 pub fn direct_rate_policy(
     effective: &RatePolicy,
     caps: Option<&DeviceCapabilities>,
     formats: &[SampleFormat],
+    desired: DesiredDspConfig,
 ) -> RatePolicy {
+    split_direct_policy(effective, caps, formats, desired).0
+}
+
+/// Direct's policy and its native base (the rates it plays at x1).
+fn split_direct_policy(
+    effective: &RatePolicy,
+    caps: Option<&DeviceCapabilities>,
+    formats: &[SampleFormat],
+    desired: DesiredDspConfig,
+) -> (RatePolicy, RatePolicy) {
     let Some(caps) = caps else {
-        return effective.clone();
+        return (effective.clone(), effective.clone());
     };
     let formats: &[SampleFormat] = if formats.is_empty() {
         &FORMAT_PREFERENCE
     } else {
         formats
     };
-    let allowed: Vec<u32> = effective
+    let native_at = |r: u32| formats.iter().any(|&f| caps.supports(r, f));
+    let mut native: Vec<u32> = effective
         .allowed_rates
         .iter()
         .copied()
-        .filter(|&r| formats.iter().any(|&f| caps.supports(r, f)))
+        .filter(|&r| native_at(r))
         .collect();
-    let default_rate = if allowed.contains(&effective.default_rate) {
+    if native.is_empty() && desired.bypass.engine {
+        // No effective rate is native (the DSP chain upsamples them all):
+        // Direct still has a native base, so a source the engine does not
+        // convert lands at a native rate (once), never at a converted one.
+        native = audivane_protocol::ALLOWED_RATES
+            .iter()
+            .copied()
+            .filter(|&r| native_at(r))
+            .collect();
+    }
+    let mut allowed = native.clone();
+    let rates = crate::lifecycle::DeviceRates::playable(Some(caps), formats);
+    let configured = audivane_protocol::ALLOWED_RATES
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| desired.bypass.allowed & (1 << i) != 0)
+        .map(|(_, &r)| r);
+    for r in configured.chain(effective.allowed_rates.iter().copied()) {
+        if !allowed.contains(&r) && desired.bypass_landing(r, rates).is_some() {
+            allowed.push(r);
+        }
+    }
+    allowed.sort_unstable();
+    let default_rate = if native.contains(&effective.default_rate) {
         effective.default_rate
     } else {
-        nearest_rate(effective.default_rate, &allowed).unwrap_or(effective.default_rate)
+        nearest_rate(effective.default_rate, &native)
+            .or_else(|| nearest_rate(effective.default_rate, &allowed))
+            .unwrap_or(effective.default_rate)
     };
-    RatePolicy {
-        allowed_rates: allowed,
-        default_rate,
-        ..effective.clone()
+    (
+        RatePolicy {
+            allowed_rates: allowed,
+            default_rate,
+            ..effective.clone()
+        },
+        RatePolicy {
+            allowed_rates: native,
+            default_rate,
+            ..effective.clone()
+        },
+    )
+}
+
+/// The rate policies the driver runs with on one device.
+///
+/// Each sink has its rates and a native base: the rates it plays without
+/// the engine bypass resampler. The engine's converted rates are added on
+/// top of the base, never in its place, and a client is only run at a
+/// converted rate when it plays at exactly that rate; any other rate maps
+/// through the base ([`crate::rate_arbiter::sink_rate`]). So a native rate
+/// is never converted, and no source is converted twice (PipeWire, then
+/// the engine).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RatePolicies {
+    /// What PipeWire is offered (`clock.allowed-rates`, the sinks' rates)
+    /// and status shows: the DSP sink's rates and Direct's together. The
+    /// default is the DSP sink's.
+    pub published: RatePolicy,
+    /// The rates the DSP sink plays ([`effective_rate_policy`]).
+    pub dsp: RatePolicy,
+    /// Direct's rates ([`direct_rate_policy`]).
+    pub direct: RatePolicy,
+    /// The DSP sink's native base: `dsp` without the converted rates.
+    pub dsp_native: RatePolicy,
+    /// Direct's native base: the rates it plays at x1.
+    pub direct_native: RatePolicy,
+}
+
+/// The [`RatePolicies`] for the DSP sink's effective policy `dsp` on a
+/// device with `caps`. The published rates only differ from `dsp` with the
+/// engine bypass resampler while DSP is on: Direct then runs at rates the
+/// DSP sink cannot play (the rate arbiter keeps the DSP sink's clients on
+/// `dsp`, [`crate::rate_arbiter::RateInputs::dsp_policy`]).
+pub fn rate_policies(
+    dsp: RatePolicy,
+    caps: Option<&DeviceCapabilities>,
+    formats: &[SampleFormat],
+    desired: DesiredDspConfig,
+) -> RatePolicies {
+    let dsp_native = match caps {
+        Some(caps) => {
+            let native = desired.native_only();
+            let base: Vec<u32> = dsp
+                .allowed_rates
+                .iter()
+                .copied()
+                .filter(|&r| graph_rate_playable(caps, r, native, formats))
+                .collect();
+            if base.is_empty() {
+                dsp.clone()
+            } else {
+                RatePolicy {
+                    allowed_rates: base,
+                    ..dsp.clone()
+                }
+            }
+        }
+        None => dsp.clone(),
+    };
+    // Direct's native base is the native part of `dsp` (a converted rate
+    // is never native); it converts the configured and effective rates.
+    let (direct, direct_native) = split_direct_policy(&dsp, caps, formats, desired);
+    let mut allowed = dsp.allowed_rates.clone();
+    allowed.extend(
+        direct
+            .allowed_rates
+            .iter()
+            .filter(|r| !dsp.allowed_rates.contains(r)),
+    );
+    allowed.sort_unstable();
+    RatePolicies {
+        published: RatePolicy {
+            allowed_rates: allowed,
+            ..dsp.clone()
+        },
+        dsp,
+        direct,
+        dsp_native,
+        direct_native,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle::RatePairMask;
     use audivane_protocol::ipc::{FormatCapability, RateCapability};
-    use audivane_protocol::{ALLOWED_RATES, RateTarget};
+    use audivane_protocol::{ALLOWED_RATES, RateRatio, RateTarget};
 
     fn caps(rows: &[(u32, &[SampleFormat])]) -> DeviceCapabilities {
         DeviceCapabilities {
@@ -201,10 +434,10 @@ mod tests {
         }
     }
 
-    /// Creative Pebble V3 (the bug report): S16_LE, 2 ch, 48000 Hz only.
-    fn pebble_v3() -> DeviceCapabilities {
+    /// A 48 kHz-only device (S16, 2 channels).
+    fn usb_speaker_48k() -> DeviceCapabilities {
         DeviceCapabilities {
-            device: "hw:CARD=V3,DEV=0".into(),
+            device: "hw:CARD=SPK,DEV=0".into(),
             ..caps(&[(48_000, &[SampleFormat::S16])])
         }
     }
@@ -215,16 +448,18 @@ mod tests {
             rate_target: target,
             max_ratio: 16,
             generation: 0,
+            buildable: RatePairMask::ALL,
+            bypass: crate::lifecycle::BypassLeg::OFF,
         }
     }
 
     const ALL: [SampleFormat; 4] = FORMAT_PREFERENCE;
 
     #[test]
-    fn pebble_v3_offers_48k_only() {
+    fn usb_speaker_48k_offers_48k_only() {
         let eff = effective_rate_policy(
             &RatePolicy::default(),
-            &pebble_v3(),
+            &usb_speaker_48k(),
             dsp(RateTarget::Off),
             &ALL,
             ALLOWED_RATES,
@@ -245,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn pebble_v3_with_upsampling_still_48k_and_ratio_one() {
+    fn usb_speaker_48k_with_upsampling_still_48k_and_ratio_one() {
         for target in [
             RateTarget::Ratio(2),
             RateTarget::Ratio(4),
@@ -253,7 +488,7 @@ mod tests {
         ] {
             let eff = effective_rate_policy(
                 &RatePolicy::default(),
-                &pebble_v3(),
+                &usb_speaker_48k(),
                 dsp(target),
                 &ALL,
                 ALLOWED_RATES,
@@ -261,8 +496,10 @@ mod tests {
             .unwrap();
             assert_eq!(eff.policy.allowed_rates, vec![48_000], "{target:?}");
             let ratio = dsp(target).resolve_ratio_for(SinkChoice::Dsp, 48_000);
-            let (k, f) = audivane_io_alsa::plan_open(&pebble_v3(), 48_000, ratio, &ALL).unwrap();
-            assert_eq!((k, f), (1, SampleFormat::S16), "{target:?}");
+            let ladder = audivane_io_alsa::ratio_ladder(ratio);
+            let (k, f) =
+                audivane_io_alsa::plan_open(&usb_speaker_48k(), 48_000, &ladder, &ALL).unwrap();
+            assert_eq!((k, f), (RateRatio::ONE, SampleFormat::S16), "{target:?}");
         }
     }
 
@@ -416,7 +653,7 @@ mod tests {
         .unwrap();
         assert_eq!(eff.policy.allowed_rates, vec![48_000, 96_000]);
         assert_eq!(eff.policy.default_rate, 48_000);
-        let direct = direct_rate_policy(&eff.policy, Some(&c), &ALL);
+        let direct = direct_rate_policy(&eff.policy, Some(&c), &ALL, DesiredDspConfig::default());
         assert_eq!(direct.allowed_rates, vec![96_000]);
         assert_eq!(direct.default_rate, 96_000);
         // A 48k Direct client maps onto the native 96k graph.
@@ -431,12 +668,15 @@ mod tests {
             ..RatePolicy::default()
         };
         assert!(
-            direct_rate_policy(&only48, Some(&c), &ALL)
+            direct_rate_policy(&only48, Some(&c), &ALL, DesiredDspConfig::default())
                 .allowed_rates
                 .is_empty()
         );
         // Without a probe, Direct takes the effective policy.
-        assert_eq!(direct_rate_policy(&only48, None, &ALL), only48);
+        assert_eq!(
+            direct_rate_policy(&only48, None, &ALL, DesiredDspConfig::default()),
+            only48
+        );
     }
 
     #[test]
@@ -454,5 +694,115 @@ mod tests {
         )
         .unwrap();
         assert_eq!(eff.policy.allowed_rates, vec![48_000]);
+    }
+
+    /// A 48k-family DAC with a fixed explicit output rate: 44.1k sources play
+    /// through a fractional ratio, 96k and 192k sources by decimation.
+    #[test]
+    fn explicit_rate_and_any_family_targets_reach_other_family_rates() {
+        let c = caps(&[(48_000, &[SampleFormat::S32])]);
+        for rate in [44_100, 48_000, 88_200, 96_000, 192_000] {
+            assert!(
+                graph_rate_playable(&c, rate, dsp(RateTarget::Rate(48_000)), &ALL),
+                "{rate} via an explicit 48 kHz output"
+            );
+        }
+        // An integer-only target cannot reach 48 kHz from 44.1 kHz.
+        assert!(!graph_rate_playable(
+            &c,
+            44_100,
+            dsp(RateTarget::MaxRate(48_000)),
+            &ALL
+        ));
+        // The any-family cap finds the 48 kHz rate on its own.
+        assert!(graph_rate_playable(
+            &c,
+            44_100,
+            dsp(RateTarget::MaxRateAny(192_000)),
+            &ALL
+        ));
+        let ladder = dsp(RateTarget::MaxRateAny(192_000)).ratio_ladder_for(
+            SinkChoice::Dsp,
+            44_100,
+            Some(&c),
+            &[],
+        );
+        assert_eq!(
+            ladder,
+            vec![RateRatio::from_rates(44_100, 48_000), RateRatio::ONE]
+        );
+    }
+
+    #[test]
+    fn dsp_off_and_direct_move_an_unfixed_graph_to_a_native_rate() {
+        // A 48 kHz-only DAC, any family up to 48 kHz: DSP on takes a 44.1k
+        // graph (160/147); DSP off and Direct play x1 only, so the graph
+        // moves to 48 kHz.
+        let c = caps(&[(48_000, &[SampleFormat::S32])]);
+        let on = dsp(RateTarget::MaxRateAny(48_000));
+        let off = DesiredDspConfig {
+            dsp_enabled: false,
+            ..on
+        };
+        assert!(graph_rate_playable(&c, 44_100, on, &ALL));
+        assert!(!graph_rate_playable(&c, 44_100, off, &ALL));
+        let policy = |desired| {
+            effective_rate_policy(&RatePolicy::default(), &c, desired, &ALL, ALLOWED_RATES)
+                .unwrap()
+                .policy
+        };
+        assert!(policy(on).allowed_rates.contains(&44_100));
+        let eff = policy(off);
+        assert_eq!(eff.allowed_rates, vec![48_000]);
+        assert_eq!(
+            crate::rate_arbiter::choose_allowed_rate(44_100, &eff),
+            48_000
+        );
+        // Direct runs only at native rates of the DSP-on policy.
+        let direct = direct_rate_policy(&policy(on), Some(&c), &ALL, DesiredDspConfig::default());
+        assert_eq!(direct.allowed_rates, vec![48_000]);
+        // Neither lands anywhere at 44.1 kHz itself: x1 is all they open.
+        let rates = crate::lifecycle::DeviceRates::playable(Some(&c), &ALL);
+        let none = crate::lifecycle::Rungs::EMPTY;
+        for (cfg, sink) in [(on, SinkChoice::Direct), (off, SinkChoice::Dsp)] {
+            assert_eq!(cfg.open_landing(sink, 44_100, rates, &none), None);
+        }
+        // Both plan a move to 48 kHz; DSP on keeps 44.1 kHz (160/147).
+        let policies = |desired| rate_policies(policy(desired), Some(&c), &ALL, desired);
+        assert_eq!(
+            plan_graph_rate(&policies(on), 44_100, SinkChoice::Direct),
+            GraphRate::Move(48_000)
+        );
+        assert_eq!(
+            plan_graph_rate(&policies(off), 44_100, SinkChoice::Dsp),
+            GraphRate::Move(48_000)
+        );
+        assert_eq!(
+            plan_graph_rate(&policies(on), 44_100, SinkChoice::Dsp),
+            GraphRate::Keep
+        );
+    }
+
+    #[test]
+    fn an_unresolved_move_has_one_deadline() {
+        let s = 1_000_000_000u64;
+        // Attempts every 50 ms or every second, the graph never landing:
+        // one deadline, 3 s after the first.
+        for step in [s / 20, s] {
+            let mut slot = None;
+            let mut t = 0;
+            while t < 3 * s {
+                assert!(!MoveAttempts::note(&mut slot, 44_100, 48_000, t, 7), "{t}");
+                t += step;
+            }
+            assert!(MoveAttempts::note(&mut slot, 44_100, 48_000, t, 7));
+        }
+        let mut slot = None;
+        assert!(!MoveAttempts::note(&mut slot, 44_100, 48_000, 0, 7));
+        // An observed landing, however long ago, starts over.
+        assert!(!MoveAttempts::note(&mut slot, 44_100, 48_000, 100 * s, 8));
+        // So does another request.
+        assert!(!MoveAttempts::note(&mut slot, 96_000, 48_000, 104 * s, 8));
+        assert!(MoveAttempts::note(&mut slot, 96_000, 48_000, 107 * s, 8));
     }
 }

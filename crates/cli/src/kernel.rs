@@ -20,6 +20,10 @@ pub fn run(args: KernelArgs) -> Result<i32> {
         phase: args.phase.into(),
         kaiser_beta: args.beta,
         cutoff: args.cutoff,
+        phase_mix: 1.0,
+        preserve_samples: false,
+        window: audivane_protocol::WindowKind::Kaiser,
+        taper: 0.25,
     };
     let kernel = try_design_kernel(&design).map_err(|e| anyhow::anyhow!("{e}"))?;
 

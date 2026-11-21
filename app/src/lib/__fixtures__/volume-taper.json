@@ -1,0 +1,36 @@
+[
+  { "min_db": -80, "max_db": 0, "db": -80, "pos": 0.0, "percent": 0 },
+  { "min_db": -80, "max_db": 0, "db": -60, "pos": 0.1, "percent": 10 },
+  { "min_db": -80, "max_db": 0, "db": -40, "pos": 0.2, "percent": 20 },
+  { "min_db": -80, "max_db": 0, "db": -30, "pos": 0.4, "percent": 40 },
+  { "min_db": -80, "max_db": 0, "db": -20, "pos": 0.6, "percent": 60 },
+  { "min_db": -80, "max_db": 0, "db": -12, "pos": 0.76, "percent": 76 },
+  { "min_db": -80, "max_db": 0, "db": -6, "pos": 0.88, "percent": 88 },
+  { "min_db": -80, "max_db": 0, "db": -3, "pos": 0.94, "percent": 94 },
+  { "min_db": -80, "max_db": 0, "db": -1, "pos": 0.98, "percent": 98 },
+  { "min_db": -80, "max_db": 0, "db": 0, "pos": 1.0, "percent": 100 },
+  { "min_db": -80, "max_db": 0, "db": -120, "pos": 0.0, "percent": 0 },
+  { "min_db": -80, "max_db": 0, "db": 6, "pos": 1.0, "percent": 100 },
+
+  { "min_db": -80, "max_db": -10, "db": -80, "pos": 0.0, "percent": 0 },
+  { "min_db": -80, "max_db": -10, "db": -60, "pos": 0.1, "percent": 10 },
+  { "min_db": -80, "max_db": -10, "db": -40, "pos": 0.2, "percent": 20 },
+  { "min_db": -80, "max_db": -10, "db": -25, "pos": 0.6, "percent": 60 },
+  { "min_db": -80, "max_db": -10, "db": -10, "pos": 1.0, "percent": 100 },
+  { "min_db": -80, "max_db": -10, "db": -3, "pos": 1.0, "percent": 100 },
+
+  { "min_db": -80, "max_db": -50, "db": -80, "pos": 0.0, "percent": 0 },
+  { "min_db": -80, "max_db": -50, "db": -65, "pos": 0.5, "percent": 50 },
+  { "min_db": -80, "max_db": -50, "db": -50, "pos": 1.0, "percent": 100 },
+
+  { "min_db": -120, "max_db": 0, "db": -120, "pos": 0.0, "percent": 0 },
+  { "min_db": -120, "max_db": 0, "db": -80, "pos": 0.1, "percent": 10 },
+  { "min_db": -120, "max_db": 0, "db": -40, "pos": 0.2, "percent": 20 },
+  { "min_db": -120, "max_db": 0, "db": -20, "pos": 0.6, "percent": 60 },
+  { "min_db": -120, "max_db": 0, "db": 0, "pos": 1.0, "percent": 100 },
+
+  { "min_db": -64, "max_db": 0, "db": -90, "pos": 0.0, "percent": 0 },
+  { "min_db": -64, "max_db": 0, "db": -40, "pos": 0.2, "percent": 20 },
+  { "min_db": -200, "max_db": 5, "db": -80, "pos": 0.1, "percent": 10 },
+  { "min_db": -200, "max_db": 5, "db": 0, "pos": 1.0, "percent": 100 }
+]

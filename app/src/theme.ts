@@ -21,7 +21,7 @@ function read(): Skin {
   } catch {
     /* ignore */
   }
-  return "system";
+  return "graphite";
 }
 
 function prefersDark(): boolean {
@@ -53,6 +53,17 @@ export function setSkin(s: Skin) {
 
 export function initTheme() {
   apply();
+  // The popup and the on-screen display are other windows of the same app:
+  // a skin picked in the main window reaches them through storage events.
+  try {
+    window.addEventListener("storage", (e) => {
+      if (e.key !== KEY) return;
+      current = read();
+      apply();
+    });
+  } catch {
+    /* ignore */
+  }
   try {
     window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
       if (current === "system") apply();

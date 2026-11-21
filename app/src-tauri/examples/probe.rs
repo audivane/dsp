@@ -573,12 +573,13 @@ fn exercise(ir1: &str, ir2: &str) -> usize {
     );
 
     println!("\n# A/B");
-    let mut chain_b = cfg["chain"].clone();
-    chain_b["eq"] = json!({"name": "Flat", "preamp_db": 0.0, "bands": []});
-    chain_b["convolution"] = json!([]);
     let r = call(
         "set_ab",
-        Some(json!({"chain_b": chain_b, "level": {"mode": "analytic"}})),
+        Some(json!({
+            "b": {"patch": {"eq": null, "convolution": []}},
+            "label": "Flat",
+            "level": {"mode": "analytic"}
+        })),
     );
     k.check(
         "set_ab flat",
@@ -590,7 +591,11 @@ fn exercise(ir1: &str, ir2: &str) -> usize {
     b2["eq"]["name"] = json!("Probe B");
     let r = call(
         "set_ab",
-        Some(json!({"chain_b": b2, "level": {"mode": "manual", "offset_db": -1.5}})),
+        Some(json!({
+            "b": {"chain": b2},
+            "label": "Probe B",
+            "level": {"mode": "manual", "offset_db": -1.5}
+        })),
     );
     k.check(
         "set_ab from a preset (other upsampler → notes, not refused)",

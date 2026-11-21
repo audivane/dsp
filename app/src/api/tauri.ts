@@ -2,6 +2,9 @@
 // (src-tauri/src/client.rs) and forwards daemon events over an ipc Channel.
 
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import type { KeysState, MainViewMemory, OsdPayload, ShellEvent, ShellView, UiSettings, WindowLabel } from "./shell";
 import { DaemonError, ErrorCode, type IrInfo, type Transport, type TransportHandlers } from "./transport";
 import type { DaemonEvent, ResponseWindowRequest, UpsamplerConfig, UpsamplerResponse } from "./types";
 
@@ -94,6 +97,18 @@ export class TauriTransport implements Transport {
     }
   }
 
+  async engineAtLogin(): Promise<boolean | null> {
+    return invoke<boolean | null>("engine_at_login").catch(() => null);
+  }
+
+  async setEngineAtLogin(on: boolean): Promise<void> {
+    try {
+      await invoke("set_engine_at_login", { enabled: on });
+    } catch (e) {
+      throw toError(e);
+    }
+  }
+
   async engineLastError(): Promise<string | null> {
     return invoke<string | null>("engine_last_error").catch(() => null);
   }
@@ -164,5 +179,79 @@ export class TauriTransport implements Transport {
     } catch (e) {
       throw toError(e);
     }
+  }
+
+  // ---------------------------------------------------------------- shell
+
+  windowLabel(): WindowLabel {
+    const l = getCurrentWindow().label;
+    return l === "popup" || l === "osd" ? l : "main";
+  }
+
+  async shellView(): Promise<ShellView> {
+    return invoke<ShellView>("ui_settings");
+  }
+
+  async setUiSettings(settings: UiSettings): Promise<ShellView> {
+    try {
+      return await invoke<ShellView>("set_ui_settings", { settings });
+    } catch (e) {
+      throw toError(e);
+    }
+  }
+
+  async setAutostart(enabled: boolean): Promise<ShellView> {
+    try {
+      return await invoke<ShellView>("set_autostart", { enabled });
+    } catch (e) {
+      throw toError(e);
+    }
+  }
+
+  onShell(handler: (e: ShellEvent) => void): () => void {
+    let live = true;
+    const offs: (() => void)[] = [];
+    const on = <P>(name: string, map: (p: P) => ShellEvent) => {
+      void listen<P>(name, (e) => {
+        if (live) handler(map(e.payload));
+      }).then((off) => (live ? offs.push(off) : off()));
+    };
+    on<ShellView>("ui-settings", (view) => ({ kind: "ui-settings", view }));
+    on<KeysState>("keys-state", (keys) => ({ kind: "keys-state", keys }));
+    on<null>("popup-shown", () => ({ kind: "popup-shown" }));
+    on<null>("main-closing", () => ({ kind: "main-closing" }));
+    on<OsdPayload>("osd", (payload) => ({ kind: "osd", payload }));
+    return () => {
+      live = false;
+      for (const off of offs) off();
+    };
+  }
+
+  showMainWindow(): void {
+    void invoke("show_main_window").catch(() => undefined);
+  }
+
+  hidePopup(): void {
+    void invoke("popup_hide").catch(() => undefined);
+  }
+
+  osdShow(payload: OsdPayload, source: "keys" | "scroll"): void {
+    void invoke("osd_show", { payload, source }).catch(() => undefined);
+  }
+
+  async osdReady(): Promise<OsdPayload | null> {
+    return invoke<OsdPayload | null>("osd_ready").catch(() => null);
+  }
+
+  saveMainView(view: MainViewMemory): void {
+    void invoke("main_view_save", { view }).catch(() => undefined);
+  }
+
+  mainCloseReady(view: MainViewMemory | null): void {
+    void invoke("main_close_ready", { view }).catch(() => undefined);
+  }
+
+  async loadMainView(): Promise<MainViewMemory | null> {
+    return invoke<MainViewMemory | null>("main_view_load").catch(() => null);
   }
 }

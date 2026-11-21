@@ -157,17 +157,33 @@ export function rateSupportNote(configured: number[], effective: number[] | null
 }
 
 /**
- * What Audivane Direct can do on this device: it never upsamples, so it is
- * bit-perfect only at rates the device plays natively (`status.direct_rates`).
- * Null when Direct plays every effective rate natively (or nothing is known).
+ * What Audivane Direct can do on this device (`status.direct_rates`): it is
+ * bit-perfect at the rates the device plays natively, and with the engine
+ * bypass resampler it also runs at rates the engine converts to a native
+ * one (not bit-perfect); `caps` tells them apart. Null when Direct plays
+ * every effective rate natively (or nothing is known).
  */
-export function directRateNote(effective: number[] | null | undefined, direct: number[] | null | undefined): string | null {
+export function directRateNote(
+  effective: number[] | null | undefined,
+  direct: number[] | null | undefined,
+  caps?: DeviceCapabilities | null,
+): string | null {
   if (!effective || effective.length === 0) return null;
-  const native = direct ?? [];
-  if (native.length === 0) return "Audivane Direct cannot play on this device: none of its sample rates is native (Direct never upsamples). Use Audivane DSP.";
-  if (effective.every((r) => native.includes(r))) return null;
-  const only = native.length === 1 ? `${fmtRate(native[0])} only` : joinRates(native);
-  return `Audivane Direct is bit-perfect at ${only} on this device; a Direct stream at another rate is resampled by PipeWire.`;
+  const all = direct ?? [];
+  if (all.length === 0) return "Audivane Direct cannot play on this device: none of its sample rates is native (Direct never upsamples). Use Audivane DSP.";
+  const plays = (r: number) => !caps || caps.rates.some((c) => c.rate === r);
+  const native = all.filter(plays);
+  const converted = all.filter((r) => !plays(r));
+  const everyRate = effective.every((r) => all.includes(r));
+  if (everyRate && converted.length === 0) return null;
+  const rest = everyRate ? "" : " A Direct stream at another rate is resampled by PipeWire.";
+  if (converted.length === 0) {
+    const only = native.length === 1 ? `${fmtRate(native[0])} only` : joinRates(native);
+    return `Audivane Direct is bit-perfect at ${only} on this device; a Direct stream at another rate is resampled by PipeWire.`;
+  }
+  const conv = `at ${joinRates(converted)} the engine converts to a rate the DAC plays (not bit-perfect).`;
+  if (native.length === 0) return `Audivane Direct is not bit-perfect on this device: ${conv}${rest}`;
+  return `Audivane Direct is bit-perfect at ${joinRates(native)} on this device; ${conv}${rest}`;
 }
 
 /** Whether a Direct stream at `rate` is resampled (not native on the device). */

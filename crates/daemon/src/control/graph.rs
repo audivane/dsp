@@ -11,16 +11,22 @@
 //!
 //! Routing:
 //!
-//! - [`RoutingMode::System`] makes "Audivane DSP" the default sink by writing
+//! - `RoutingMode::System` makes "Audivane DSP" the default sink by writing
 //!   `default.audio.sink` and `default.configured.audio.sink` in the `default`
 //!   metadata (WirePlumber honours the latter). The previous default is
 //!   remembered and restored when system mode is left or the daemon exits.
-//! - [`RoutingMode::Apps`] moves individual streams by writing
+//! - `RoutingMode::Apps` moves individual streams by writing
 //!   `target.object` (and `target.node`) on the stream's metadata subject.
 //!   `SinkChoice::Default` clears both keys.
 //! - App rules are applied to streams as they appear, and when they change.
 
-use audivane_protocol::ipc::{AppRule, SinkChoice};
+use crate::control::volume_guard::{
+    StreamGuards, StreamWrite, VolumeEventLog, stream_cap_db, user_stream_level,
+};
+use audivane_protocol::ipc::{
+    AppRule, BlockReason, GuardMode, RpcError, SinkChoice, StreamVolume, StreamVolumeLimit,
+    VOLUME_MIN_DB, VolumeGuard, VolumeSource,
+};
 use pipewire as pw;
 use pw::metadata::Metadata;
 use pw::node::Node;
@@ -40,11 +46,11 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const DSP_SINK_NAME: &str = "audivane_dsp";
 pub const DIRECT_SINK_NAME: &str = "audivane_direct";
@@ -192,7 +198,7 @@ impl<S: Copy + Eq> RestoreJournalTracker<S> {
     }
 }
 
-/// Crash-safety file for the session default (see [`Graph::enter_system_default`]).
+/// Crash-safety file for the session default (see `Graph::enter_system_default`).
 pub fn default_restore_path() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR").map(|dir| {
         PathBuf::from(dir)
@@ -209,6 +215,8 @@ pub struct StreamFact {
     pub node: u32,
     pub app_name: Option<String>,
     pub binary: Option<String>,
+    /// `application.process.id`: the process the stream comes from.
+    pub pid: Option<u32>,
     pub media_name: Option<String>,
     pub rate: Option<u32>,
     pub channels: Option<u32>,
@@ -216,6 +224,9 @@ pub struct StreamFact {
     pub format: Option<String>,
     pub volume: Option<f64>,
     pub muted: bool,
+    /// The level it plays at, dB (loudest channel times its master), once
+    /// it reported its volume.
+    pub volume_db: Option<f64>,
     /// One of our sinks, when the stream is linked to one.
     pub sink: Option<SinkChoice>,
     pub sink_node: Option<u32>,
@@ -296,12 +307,11 @@ impl Default for GraphOptions {
 
 /// The session default sink, as it was before this daemon took it over.
 ///
-/// Both `default` metadata keys are kept independently: WirePlumber's
-/// effective default (`default.audio.sink`) is *not* the user's configured
-/// preference (`default.configured.audio.sink`) — a preferred device that is
-/// currently unavailable makes them differ — and restoring one over the other
-/// destroys that preference. Raw JSON values are stored so an absent key
-/// (`None`) is restored as absent, not as an empty default.
+/// Both `default` metadata keys are kept independently: WirePlumber's effective
+/// default (`default.audio.sink`) is *not* the user's configured preference
+/// (`default.configured.audio.sink`), and restoring one over the other destroys
+/// that preference. Raw JSON values are stored so an absent key is restored
+/// absent, not as an empty default.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct DefaultSnapshot {
     /// Sink names this daemon wrote. A key is only restored while it still
@@ -507,6 +517,57 @@ impl GraphWatcher {
         self.send(Command::SetRules(rules));
     }
 
+    /// Guard the volume of app streams on our sinks; blocked changes go to
+    /// `log`. Sending the same guard again is a no-op.
+    pub fn set_volume_guard(&self, guard: VolumeGuard, log: Arc<VolumeEventLog>) {
+        self.send(Command::SetVolumeGuard(guard, log));
+    }
+
+    /// Set one app stream's level and/or mute (`set_stream_volume`) and
+    /// wait for the watcher's answer.
+    pub fn set_stream_volume(
+        &self,
+        node: u32,
+        volume_db: Option<f64>,
+        muted: Option<bool>,
+    ) -> Result<StreamVolume, RpcError> {
+        let stopped = || RpcError {
+            code: RpcError::BAD_STATE,
+            message: "the PipeWire graph watcher has stopped; cannot set stream volumes".into(),
+        };
+        if !self.is_running() {
+            return Err(stopped());
+        }
+        let (reply, answer) = mpsc::channel();
+        let ticket = Arc::new(Ticket::default());
+        if self
+            .tx
+            .send(Command::SetStreamVolume {
+                node,
+                volume_db,
+                muted,
+                reply,
+                ticket: Arc::clone(&ticket),
+            })
+            .is_err()
+        {
+            return Err(stopped());
+        }
+        match answer.recv_timeout(STREAM_VOLUME_TIMEOUT) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(stopped()),
+            Err(mpsc::RecvTimeoutError::Timeout) if ticket.abandon() => Err(RpcError {
+                code: RpcError::IO,
+                message: "the PipeWire graph watcher did not answer in time; nothing was changed"
+                    .into(),
+            }),
+            // The watcher took it just now: its answer is a moment away.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                answer.recv().unwrap_or_else(|_| Err(stopped()))
+            }
+        }
+    }
+
     /// Route one stream to one of our sinks (`Default` unroutes it).
     pub fn route_node(&self, node: u32, sink: SinkChoice) {
         self.send(Command::RouteNode { node, sink });
@@ -567,6 +628,17 @@ enum Command {
         node: u32,
         sink: SinkChoice,
     },
+    SetVolumeGuard(VolumeGuard, Arc<VolumeEventLog>),
+    /// `set_stream_volume`; the answer goes to `reply`.
+    SetStreamVolume {
+        node: u32,
+        volume_db: Option<f64>,
+        muted: Option<bool>,
+        reply: mpsc::Sender<Result<StreamVolume, RpcError>>,
+        ticket: Arc<Ticket>,
+    },
+    /// Periodic: settle new streams, step guarded rises.
+    GuardTick,
     Quit,
     /// Stop without restoring the default (test hook / crash simulation).
     QuitAbandon,
@@ -584,19 +656,177 @@ struct Tracked {
     media_class: Option<String>,
     app_name: Option<String>,
     binary: Option<String>,
+    pid: Option<u32>,
+    /// `client.id`: the client the node belongs to.
+    client: Option<u32>,
     media_name: Option<String>,
     rate: Option<u32>,
     channels: Option<u32>,
     format: Option<String>,
     volume: Option<f64>,
+    /// When the node was first seen (the guard's settle window).
+    appeared: Option<Instant>,
+    /// Per-channel linear volumes, as last reported.
+    channel_volumes: Option<Vec<f32>>,
+    /// Master `volume` (linear), as last reported; what plays is
+    /// `channel_volumes` times this.
+    master_volume: Option<f32>,
     muted: bool,
     serial: Option<u64>,
     running: bool,
+    /// PipeWire is removing the node (proxy removed, or an error state).
+    gone: bool,
+    proxy_listener: Option<pw::proxy::ProxyListener>,
 }
 
 impl Tracked {
     fn is_stream(&self) -> bool {
         self.media_class.as_deref() == Some("Stream/Output/Audio")
+    }
+
+    /// The level reported as `StreamFact::volume_db`: what plays, loudest
+    /// channel times the master.
+    fn reported_level(&self) -> Option<f64> {
+        self.channel_volumes
+            .as_deref()
+            .and_then(|c| played_db(c, self.master_volume))
+            .map(report_db)
+    }
+
+    /// Take a `Props` event (`volume`/`muted` as [`parse_props`] reads
+    /// them, the raw fields from `props`). True when what the facts show
+    /// changed, the level that plays included: a change of the app's
+    /// master alone moves it without touching the loudest channel.
+    fn apply_props(
+        &mut self,
+        volume: Option<f64>,
+        muted: bool,
+        props: Option<audivane_io_pw::sink_volume::SinkProps>,
+    ) -> bool {
+        let before = (self.volume, self.muted, self.reported_level());
+        if let Some(p) = props {
+            if p.channel_volumes.is_some() {
+                self.channel_volumes = p.channel_volumes;
+            }
+            if p.volume.is_some() {
+                self.master_volume = p.volume;
+            }
+        }
+        self.volume = volume;
+        self.muted = muted;
+        before != (self.volume, self.muted, self.reported_level())
+    }
+}
+
+/// Whether `set_stream_volume` may write node `id`: an app stream, linked
+/// to one of our sinks, that PipeWire is not removing.
+fn stream_volume_target(
+    id: u32,
+    node: Option<&Tracked>,
+    on_our_sink: bool,
+) -> Result<(), RpcError> {
+    let Some(node) = node else {
+        return Err(RpcError {
+            code: RpcError::INVALID_PARAMS,
+            message: format!("no stream with node id {id} (see `avdsp ctl streams`)"),
+        });
+    };
+    if !node.is_stream() {
+        return Err(RpcError {
+            code: RpcError::INVALID_PARAMS,
+            message: format!("node {id} is not an app playback stream"),
+        });
+    }
+    let app = node.app_name.as_deref().or(node.binary.as_deref());
+    if node.gone {
+        return Err(RpcError {
+            code: RpcError::BAD_STATE,
+            message: format!(
+                "stream {id} ({}) is going away; nothing was changed",
+                app.unwrap_or("unknown app")
+            ),
+        });
+    }
+    if !on_our_sink {
+        return Err(RpcError {
+            code: RpcError::BAD_STATE,
+            message: format!(
+                "stream {id} ({}) is not playing on an Audivane sink; only streams on \
+                 Audivane DSP or Audivane Direct can be set here (move it with `avdsp ctl \
+                 route`)",
+                app.unwrap_or("unknown app")
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// One `set_stream_volume` request between the control plane and the
+/// watcher thread. Whichever side claims it first decides: the watcher
+/// runs it, or the caller gave up waiting. A request that timed out is
+/// therefore never applied later.
+#[derive(Debug, Default)]
+pub(crate) struct Ticket(AtomicU8);
+
+impl Ticket {
+    const PENDING: u8 = 0;
+    const RUNNING: u8 = 1;
+    const ABANDONED: u8 = 2;
+
+    /// The watcher: run it, unless the caller has given up.
+    fn claim(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::PENDING,
+                Self::RUNNING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// The caller: give up, unless the watcher is already running it.
+    fn abandon(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::PENDING,
+                Self::ABANDONED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+}
+
+/// How long a stream must stay unchanged before its user-set level is
+/// logged at info (the end of a drag).
+const STREAM_LOG_SETTLE: Duration = Duration::from_millis(500);
+
+/// The last `set_stream_volume` line per stream, logged at info once no
+/// newer set came for [`STREAM_LOG_SETTLE`].
+#[derive(Debug, Default)]
+struct SettledLog {
+    pending: HashMap<u32, (Instant, String)>,
+}
+
+impl SettledLog {
+    fn note(&mut self, node: u32, line: String, now: Instant) {
+        self.pending.insert(node, (now, line));
+    }
+
+    /// The lines that settled by `now`, oldest first; they are forgotten.
+    fn due(&mut self, now: Instant) -> Vec<String> {
+        let mut due: Vec<(Instant, String)> = Vec::new();
+        self.pending.retain(|_, (at, line)| {
+            if now.saturating_duration_since(*at) >= STREAM_LOG_SETTLE {
+                due.push((*at, std::mem::take(line)));
+                false
+            } else {
+                true
+            }
+        });
+        due.sort_by_key(|(at, _)| *at);
+        due.into_iter().map(|(_, line)| line).collect()
     }
 }
 
@@ -607,6 +837,9 @@ struct Graph {
     nodes: HashMap<u32, Tracked>,
     /// link id -> (output node, input node)
     links: BTreeMap<u32, (u32, u32)>,
+    /// client id -> the client's process (`pipewire.sec.pid`, which the
+    /// server reads from the socket, else `application.process.id`).
+    clients: HashMap<u32, u32>,
     /// Other `Audio/Sink` nodes: id -> (`node.name`, `node.description`).
     /// Only read from the registry globals; never bound.
     other_sinks: HashMap<u32, (String, Option<String>)>,
@@ -639,6 +872,10 @@ struct Graph {
     /// Streams routed explicitly by the user (rules must not override them).
     routed: HashSet<u32>,
     published: Facts,
+    volume_guard: VolumeGuard,
+    volume_log: Option<Arc<VolumeEventLog>>,
+    stream_guards: StreamGuards,
+    stream_log: SettledLog,
 }
 
 impl Graph {
@@ -692,12 +929,17 @@ impl Graph {
                     node: *id,
                     app_name: node.app_name.clone(),
                     binary: node.binary.clone(),
+                    pid: node
+                        .client
+                        .and_then(|c| self.clients.get(&c).copied())
+                        .or(node.pid),
                     media_name: node.media_name.clone(),
                     rate: node.rate,
                     channels: node.channels,
                     format: node.format.clone(),
                     volume: node.volume,
                     muted: node.muted,
+                    volume_db: node.reported_level(),
                     sink: sink_node.and_then(|n| self.sink_choice(n)),
                     sink_node,
                     running: node.running,
@@ -1096,6 +1338,34 @@ impl Graph {
                 }
                 self.route(node, sink);
             }
+            Command::SetVolumeGuard(guard, log) => {
+                self.volume_log = Some(log);
+                let mode_changed = guard.mode != self.volume_guard.mode;
+                self.volume_guard = guard;
+                // Only a new mode re-takes the streams as they are; a new
+                // rise rate or cap applies to the state as it is.
+                if mode_changed {
+                    self.stream_guards.engage(&guard);
+                    self.seed_stream_guards();
+                }
+            }
+            Command::SetStreamVolume {
+                node,
+                volume_db,
+                muted,
+                reply,
+                ticket,
+            } => {
+                // The caller gave up waiting: it reported that nothing
+                // changed, so nothing must.
+                if !ticket.claim() {
+                    log::debug!("stream {node}: a timed-out set_stream_volume was dropped");
+                    return;
+                }
+                let result = self.set_stream_volume(node, volume_db, muted);
+                let _ = reply.send(result);
+            }
+            Command::GuardTick => self.guard_tick(),
             Command::Quit => {}
             Command::QuitAbandon => {}
         }
@@ -1122,6 +1392,20 @@ impl Graph {
             update(&mut node.media_name, "media.name", &mut changed);
             update(&mut node.media_class, "media.class", &mut changed);
             update(&mut node.node_name, "node.name", &mut changed);
+            if let Some(pid) = dict
+                .get("application.process.id")
+                .and_then(|v| v.parse().ok())
+                && node.pid != Some(pid)
+            {
+                node.pid = Some(pid);
+                changed = true;
+            }
+            if let Some(client) = dict.get("client.id").and_then(parse_u32)
+                && node.client != Some(client)
+            {
+                node.client = Some(client);
+                changed = true;
+            }
             if let Some(serial) = dict.get("object.serial").and_then(|v| v.parse().ok())
                 && node.serial != Some(serial)
             {
@@ -1200,19 +1484,374 @@ impl Graph {
             let Some((volume, muted)) = parse_props(pod) else {
                 return;
             };
+            let props = audivane_io_pw::sink_volume::parse_props(pod);
             let Some(node) = self.nodes.get_mut(&id) else {
                 return;
             };
-            let changed = node.volume != volume || node.muted != muted;
-            if changed {
-                node.volume = volume;
-                node.muted = muted;
-            }
-            if changed {
+            if node.apply_props(volume, muted, props) {
                 self.publish();
+            }
+            self.guard_stream(id);
+        }
+    }
+
+    // -------------------------------------------------------- volume guard
+
+    /// A stream linked to one of our sinks.
+    fn on_our_sink(&self, id: u32) -> bool {
+        self.links
+            .values()
+            .any(|(out, inp)| *out == id && self.sink_choice(*inp).is_some())
+    }
+
+    fn guard_stream(&mut self, id: u32) {
+        if self.volume_guard.mode == GuardMode::Off {
+            return;
+        }
+        let Some(node) = self.nodes.get(&id) else {
+            return;
+        };
+        if !node.is_stream() || !self.on_our_sink(id) {
+            return;
+        }
+        let Some(volume_db) = self.guard_input_db(id) else {
+            return;
+        };
+        let guard = self.volume_guard;
+        let now = Instant::now();
+        let appeared = node.appeared.unwrap_or(now);
+        if let Some(write) = self
+            .stream_guards
+            .observe(&guard, id, volume_db, appeared, now)
+        {
+            self.write_stream_volume(write);
+        }
+    }
+
+    /// The level the guard observes for a stream (see [`level_for_guard`]).
+    fn guard_input_db(&self, id: u32) -> Option<f64> {
+        let node = self.nodes.get(&id)?;
+        let level = guarded_level_db(node.channel_volumes.as_ref()?, node.master_volume);
+        level_for_guard(self.stream_guards.knows(id), level)
+    }
+
+    /// Streams already on our sinks are held at their level from now on.
+    fn seed_stream_guards(&mut self) {
+        if self.volume_guard.mode == GuardMode::Off {
+            return;
+        }
+        let now = Instant::now();
+        let ids: Vec<u32> = self
+            .nodes
+            .iter()
+            .filter(|(id, n)| n.is_stream() && self.on_our_sink(**id))
+            .map(|(id, _)| *id)
+            .collect();
+        let guard = self.volume_guard;
+        for id in ids {
+            if let Some(db) = self.guard_input_db(id) {
+                let appeared = self.nodes.get(&id).and_then(|n| n.appeared).unwrap_or(now);
+                if let Some(write) = self.stream_guards.seed(&guard, id, db, appeared, now) {
+                    self.write_stream_volume(write);
+                }
             }
         }
     }
+
+    fn guard_tick(&mut self) {
+        for line in self.stream_log.due(Instant::now()) {
+            log::info!("{line}");
+        }
+        if self.volume_guard.mode == GuardMode::Off {
+            return;
+        }
+        let guard = self.volume_guard;
+        for write in self.stream_guards.tick(&guard, Instant::now()) {
+            self.write_stream_volume(write);
+        }
+    }
+
+    /// `set_stream_volume`: write one stream's level and/or mute and make
+    /// the level the guard's own (see [`StreamGuards::adopt`]).
+    fn set_stream_volume(
+        &mut self,
+        id: u32,
+        volume_db: Option<f64>,
+        muted: Option<bool>,
+    ) -> Result<StreamVolume, RpcError> {
+        stream_volume_target(id, self.nodes.get(&id), self.on_our_sink(id))?;
+        let Some(node) = self.nodes.get(&id) else {
+            unreachable!("checked above");
+        };
+        let app = node.app_name.clone().or_else(|| node.binary.clone());
+        let guard = self.volume_guard;
+        let plan = plan_stream_volume(
+            &guard,
+            id,
+            node.channel_volumes.as_deref(),
+            node.master_volume,
+            node.muted,
+            volume_db,
+            muted,
+        )?;
+        if plan.channels.is_none() && plan.mute.is_none() {
+            return Ok(plan.reply);
+        }
+        let bytes =
+            audivane_io_pw::sink_volume::stream_props_pod(plan.channels.as_deref(), plan.mute);
+        let now = Instant::now();
+        let Some(node) = self.nodes.get_mut(&id) else {
+            unreachable!("looked up above");
+        };
+        let (Some(proxy), Some(pod)) = (node.node.as_ref(), Pod::from_bytes(&bytes)) else {
+            return Err(RpcError {
+                code: RpcError::IO,
+                message: format!("cannot write the volume of stream {id}"),
+            });
+        };
+        proxy.set_param(ParamType::Props, 0, pod);
+        // Keep the facts in step without waiting for PipeWire's echo.
+        if let Some(channels) = plan.channels {
+            node.volume = channels.iter().copied().map(f64::from).reduce(f64::max);
+            node.channel_volumes = Some(channels);
+        }
+        if let Some(mute) = plan.mute {
+            node.muted = mute;
+        }
+        let appeared = node.appeared.unwrap_or(now);
+        if volume_db.is_some() {
+            self.stream_guards
+                .adopt(&guard, id, plan.applied_db, appeared, now);
+            if let (Some(requested), Some(log)) = (plan.capped_from, &self.volume_log) {
+                log.record(
+                    VolumeSource::Stream {
+                        node: id,
+                        app: app.clone(),
+                    },
+                    requested,
+                    plan.applied_db,
+                    BlockReason::Capped,
+                );
+            }
+        }
+        // A drag sets a stream many times a second: each set is logged at
+        // debug, and the level it settles at once at info.
+        let line = format!(
+            "stream {id} ({}): set to {:.2} dB{}",
+            app.as_deref().unwrap_or("unknown app"),
+            plan.reply.volume_db,
+            match plan.mute {
+                Some(true) => ", muted",
+                Some(false) => ", unmuted",
+                None => "",
+            }
+        );
+        log::debug!("{line}");
+        self.stream_log.note(id, line, now);
+        self.publish();
+        Ok(plan.reply)
+    }
+
+    /// PipeWire is removing this node (its proxy was removed, or it went
+    /// into an error state): no more writes to it are reported as done.
+    fn mark_gone(&mut self, id: u32) {
+        if let Some(node) = self.nodes.get_mut(&id) {
+            node.gone = true;
+        }
+        self.stream_guards.remove(id);
+    }
+
+    /// Scale a stream so its loudest channel plays at `write.volume_db`.
+    fn write_stream_volume(&mut self, write: StreamWrite) {
+        let Some(node) = self.nodes.get_mut(&write.node) else {
+            return;
+        };
+        let Some(channels) = node.channel_volumes.clone() else {
+            return;
+        };
+        // A write held back while the app then set its master to 0.
+        if guarded_level_db(&channels, node.master_volume).is_none() {
+            return;
+        }
+        let scaled = guarded_channels(&channels, node.master_volume, write.volume_db);
+        let bytes = audivane_io_pw::sink_volume::stream_volume_pod(&scaled);
+        let (Some(proxy), Some(pod)) = (node.node.as_ref(), Pod::from_bytes(&bytes)) else {
+            return;
+        };
+        proxy.set_param(ParamType::Props, 0, pod);
+        let level = played_db(&scaled, node.master_volume).unwrap_or(VOLUME_MIN_DB);
+        node.volume = scaled.iter().copied().map(f64::from).reduce(f64::max);
+        node.channel_volumes = Some(scaled);
+        self.stream_guards.wrote(write.node, level, Instant::now());
+        let Some(node) = self.nodes.get(&write.node) else {
+            return;
+        };
+        if let (Some(reason), Some(log)) = (write.reason, &self.volume_log) {
+            log.record(
+                VolumeSource::Stream {
+                    node: write.node,
+                    app: node.app_name.clone().or_else(|| node.binary.clone()),
+                },
+                write.requested_db,
+                write.volume_db,
+                reason,
+            );
+        }
+        // The level shown follows the write at once; the echo is then no
+        // change.
+        self.publish();
+    }
+}
+
+/// How long `set_stream_volume` waits for the watcher thread.
+const STREAM_VOLUME_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A stream level as reported (`list_streams`, `set_stream_volume`): 0.01 dB
+/// steps, so an `f32` round trip is no change.
+fn report_db(db: f64) -> f64 {
+    (db * 100.0).round() / 100.0 + 0.0
+}
+
+/// What `set_stream_volume` writes on a stream, and what it answers.
+#[derive(Clone, Debug, PartialEq)]
+struct StreamVolumePlan {
+    /// New `channelVolumes`, when the level changes.
+    channels: Option<Vec<f32>>,
+    mute: Option<bool>,
+    /// The level it plays at after the write, unrounded.
+    applied_db: f64,
+    /// The request, when the stream cap lowered it (logged as `capped`).
+    capped_from: Option<f64>,
+    reply: StreamVolume,
+}
+
+/// Plan a `set_stream_volume` request on a stream with these `channels`
+/// and app `master` (pure; the watcher writes the result). The level is
+/// written through `channelVolumes` like the guard's own writes: the app's
+/// master stays, the balance is kept, and no channel goes above 100 %.
+fn plan_stream_volume(
+    guard: &VolumeGuard,
+    node: u32,
+    channels: Option<&[f32]>,
+    master: Option<f32>,
+    muted_now: bool,
+    volume_db: Option<f64>,
+    muted: Option<bool>,
+) -> Result<StreamVolumePlan, RpcError> {
+    let bad_state = |message: String| RpcError {
+        code: RpcError::BAD_STATE,
+        message,
+    };
+    let Some(channels) = channels.filter(|c| !c.is_empty()) else {
+        return Err(bad_state(format!(
+            "stream {node} has not reported its volume yet; try again in a moment"
+        )));
+    };
+    let master_db = master.map_or(0.0, |m| {
+        if m > 0.0 {
+            20.0 * f64::from(m).log10()
+        } else {
+            VOLUME_MIN_DB
+        }
+    });
+    let max_db = report_db(stream_cap_db(guard).min(master_db).max(VOLUME_MIN_DB));
+    let current_db = played_db(channels, master).unwrap_or(VOLUME_MIN_DB);
+    let mut plan = StreamVolumePlan {
+        channels: None,
+        mute: muted,
+        applied_db: current_db,
+        capped_from: None,
+        reply: StreamVolume {
+            node,
+            volume_db: report_db(current_db),
+            muted: muted.unwrap_or(muted_now),
+            max_db,
+            limited_by: None,
+        },
+    };
+    let Some(requested) = volume_db else {
+        return Ok(plan);
+    };
+    if master.is_some_and(|m| m <= 0.0) {
+        return Err(bad_state(format!(
+            "the app has turned stream {node}'s own volume down to 0; raise it in the app first"
+        )));
+    }
+    let (target, capped) = user_stream_level(guard, requested);
+    let scaled = guarded_channels(channels, master, target);
+    let applied = played_db(&scaled, master).unwrap_or(VOLUME_MIN_DB);
+    plan.reply.volume_db = report_db(applied);
+    plan.reply.limited_by = if capped && applied >= target - 0.01 {
+        Some(StreamVolumeLimit::StreamMax)
+    } else if applied < requested - 0.01 {
+        Some(StreamVolumeLimit::AppVolume)
+    } else {
+        None
+    };
+    plan.applied_db = applied;
+    plan.capped_from = capped.then_some(requested);
+    plan.channels = Some(scaled);
+    Ok(plan)
+}
+
+/// Loudest channel times the master `volume`, dB.
+fn played_db(channels: &[f32], master: Option<f32>) -> Option<f64> {
+    let master = f64::from(master.unwrap_or(1.0).max(0.0));
+    let loudest = channels.iter().copied().map(f64::from).reduce(f64::max)? * master;
+    Some(if loudest > 0.0 {
+        (20.0 * loudest.log10()).max(VOLUME_MIN_DB)
+    } else {
+        VOLUME_MIN_DB
+    })
+}
+
+/// The `channelVolumes` that play the loudest channel at `target_db` with
+/// the app's own master `volume` left as it is (so its slider does not
+/// jump), keeping the balance. Only a master of 0 (nothing to scale) is
+/// replaced, by 1: then the second value is `Some(1.0)` and the raw
+/// channels are scaled, so the balance still survives.
+fn guarded_channels(channels: &[f32], master: Option<f32>, target_db: f64) -> Vec<f32> {
+    // Callers skip a master of 0 (see `guarded_level_db`).
+    let master = f64::from(master.unwrap_or(1.0)).max(f64::MIN_POSITIVE);
+    let target = 10f64.powf(target_db / 20.0);
+    let loudest = channels.iter().copied().map(f64::from).fold(0.0, f64::max);
+    // Never above 1.0 (unity) on any channel: making up for a turned-down
+    // app master with channel gain would jump when the app restores it,
+    // and PipeWire clamps at its max-volume anyway. Needing more means the
+    // stream stays quieter than decided (the guard sees that level next).
+    let (base, k) = if loudest > 0.0 {
+        (loudest, (target / (loudest * master)).min(1.0 / loudest))
+    } else {
+        (1.0, (target / master).min(1.0))
+    };
+    if loudest > 0.0 {
+        channels
+            .iter()
+            .map(|&v| (f64::from(v) * k) as f32)
+            .collect()
+    } else {
+        vec![(base * k) as f32; channels.len()]
+    }
+}
+
+/// The level the guard judges a stream by, or `None` when it leaves the stream
+/// alone. A master `volume` of 0 is the app's own silence in every mode (lock
+/// does not hold it up, limit does not count it as a level to rise from): a
+/// stream the guard does not know yet is judged from silence (slewed under
+/// limit, blocked under lock), and one it knows keeps the level last accepted.
+fn level_for_guard(known: bool, level: Option<f64>) -> Option<f64> {
+    match level {
+        Some(db) => Some(db),
+        None if !known => Some(VOLUME_MIN_DB),
+        None => None,
+    }
+}
+
+fn guarded_level_db(channels: &[f32], master: Option<f32>) -> Option<f64> {
+    if master.is_some_and(|m| m <= 0.0) {
+        return None;
+    }
+    played_db(channels, master)
 }
 
 fn sink_name(choice: SinkChoice) -> &'static str {
@@ -1311,7 +1950,7 @@ fn run_loop(
             return;
         }
     };
-    let context = match pw::context::ContextRc::new(&main_loop, None) {
+    let context = match audivane_io_pw::rt_context::new_context(&main_loop) {
         Ok(context) => context,
         Err(err) => {
             let _ = ready.send(Err(format!("cannot create context: {err}")));
@@ -1349,6 +1988,7 @@ fn run_loop(
         core: Some(core.clone()),
         nodes: HashMap::new(),
         links: BTreeMap::new(),
+        clients: HashMap::new(),
         other_sinks: HashMap::new(),
         meta: None,
         meta_listener: None,
@@ -1364,6 +2004,10 @@ fn run_loop(
         rule_routed: HashSet::new(),
         routed: HashSet::new(),
         published: Facts::default(),
+        volume_guard: VolumeGuard::default(),
+        volume_log: None,
+        stream_guards: StreamGuards::default(),
+        stream_log: SettledLog::default(),
     }));
 
     // Registry listener: lives until this function returns (the loop thread
@@ -1488,8 +2132,25 @@ fn run_loop(
         }
     });
 
+    // The volume guard settles new streams and steps guarded rises.
+    let guard_timer = main_loop.loop_().add_timer({
+        let weak = Rc::downgrade(&graph);
+        move |_exp| {
+            if let Some(graph) = weak.upgrade()
+                && let Ok(mut g) = graph.try_borrow_mut()
+            {
+                g.handle(Command::GuardTick);
+            }
+        }
+    });
+    let _ = guard_timer.update_timer(
+        Some(crate::control::volume_guard::SLEW_TICK),
+        Some(crate::control::volume_guard::SLEW_TICK),
+    );
+
     let _ = ready.send(Ok(()));
     main_loop.run();
+    drop(guard_timer);
 
     if graph.borrow().journal.is_waiting_for_quit() {
         let quit_timer = main_loop.loop_().add_timer({
@@ -1539,9 +2200,24 @@ fn on_global(
                 let mut graph = graph.borrow_mut();
                 graph.links.insert(global.id, (output, input));
                 graph.publish();
+                // A stream linked (or moved) onto our sink is guarded from
+                // now on, judged by its age, not by when it next changes.
+                graph.guard_stream(output);
             }
         }
         pw::types::ObjectType::Metadata => on_metadata_global(registry, graph, global),
+        pw::types::ObjectType::Client => {
+            let pid = global.props.and_then(|p| {
+                p.get("pipewire.sec.pid")
+                    .or_else(|| p.get("application.process.id"))
+                    .and_then(parse_u32)
+            });
+            if let Some(pid) = pid {
+                let mut graph = graph.borrow_mut();
+                graph.clients.insert(global.id, pid);
+                graph.publish();
+            }
+        }
         _ => {}
     }
 }
@@ -1587,9 +2263,14 @@ fn on_node_global(
     {
         let mut graph = graph.borrow_mut();
         let entry = graph.nodes.entry(id).or_default();
+        entry.appeared.get_or_insert_with(Instant::now);
         if let Some(props) = props {
             entry.app_name = props.get("application.name").map(str::to_string);
             entry.binary = props.get("application.process.binary").map(str::to_string);
+            entry.pid = props
+                .get("application.process.id")
+                .and_then(|v| v.parse().ok());
+            entry.client = props.get("client.id").and_then(parse_u32);
             entry.media_name = props.get("media.name").map(str::to_string);
             entry.media_class = props.get("media.class").map(str::to_string);
             entry.node_name = props.get("node.name").map(str::to_string);
@@ -1612,8 +2293,12 @@ fn on_node_global(
                     graph.on_node_props(id, props);
                 }
                 let running = matches!(info.state(), pw::node::NodeState::Running);
+                let failed = matches!(info.state(), pw::node::NodeState::Error(_));
                 if let Some(node) = graph.nodes.get_mut(&id) {
                     node.running = running;
+                }
+                if failed {
+                    graph.mark_gone(id);
                 }
                 // Params are only meaningful once the node has a format;
                 // re-enumerate when it starts running.
@@ -1633,11 +2318,29 @@ fn on_node_global(
             }
         })
         .register();
+    // The node's removal, as soon as PipeWire tells the proxy (the registry
+    // removal may come later): writes to it are no longer reported done.
+    let proxy_listener = node
+        .upcast_ref()
+        .add_listener_local()
+        .removed({
+            let weak = Weak::clone(&weak);
+            move || {
+                let Some(graph) = weak.upgrade() else { return };
+                // Never inside a borrow (a proxy dropped while the graph
+                // is borrowed): the registry removal handles that case.
+                if let Ok(mut graph) = graph.try_borrow_mut() {
+                    graph.mark_gone(id);
+                }
+            }
+        })
+        .register();
     {
         let mut graph = graph.borrow_mut();
         if let Some(entry) = graph.nodes.get_mut(&id) {
             entry.node = Some(node);
             entry.listener = Some(listener);
+            entry.proxy_listener = Some(proxy_listener);
         }
         graph.publish();
         // Subscribe after the proxy is owned by the graph so it lives as long
@@ -1722,14 +2425,23 @@ impl Graph {
             self.publish();
             return;
         }
+        self.clients.remove(&id);
         let removed_node = self.nodes.remove(&id).is_some();
-        let removed_link = self.links.remove(&id).is_some();
+        let removed_link = self.links.remove(&id);
+        if let Some((output, _)) = removed_link
+            && !self.on_our_sink(output)
+        {
+            // Moved off our sinks: back on, it starts from its level then.
+            self.stream_guards.remove(output);
+        }
+        let removed_link = removed_link.is_some();
         let removed_sink = self.other_sinks.remove(&id).is_some();
         if !removed_node && !removed_link && !removed_sink {
             return;
         }
         self.routed.remove(&id);
         self.rule_routed.remove(&id);
+        self.stream_guards.remove(id);
         // A stream is no longer ours to route once it is gone; keep rules for
         // the next instance of the app.
         self.publish();
@@ -1750,6 +2462,355 @@ fn parse_default_name(value: &str) -> Option<String> {
 
 fn display_name(name: Option<&str>) -> &str {
     name.unwrap_or("(unset)")
+}
+
+#[cfg(test)]
+mod stream_volume_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// What a stream plays after the guard's write: master times channels.
+    /// A write without `volume` leaves the app's master in place.
+    fn plays_db(bytes: &[u8], app_master: f32) -> f64 {
+        let pod = Pod::from_bytes(bytes).unwrap();
+        let p = audivane_io_pw::sink_volume::parse_props(pod).unwrap();
+        played_db(&p.channel_volumes.unwrap(), p.volume.or(Some(app_master))).unwrap()
+    }
+
+    /// The guard writes what plays, whatever master `volume` the app set: a
+    /// master of 2.0 is not left above the cap, 0.5 does not land 6 dB low.
+    /// The app's master stays as it is (its slider does not jump), only a
+    /// master of 0 becomes 1, and the balance survives every case.
+    #[test]
+    fn guard_writes_account_for_the_master_volume() {
+        for master in [2.0_f32, 0.5, 1.0] {
+            let channels = [0.5_f32, 0.25];
+            let scaled = guarded_channels(&channels, Some(master), -12.0);
+            let bytes = audivane_io_pw::sink_volume::stream_volume_pod(&scaled);
+            let got = plays_db(&bytes, master);
+            assert!((got + 12.0).abs() < 1e-4, "master {master}: plays {got} dB");
+            // The pod leaves the master alone.
+            let pod = Pod::from_bytes(&bytes).unwrap();
+            assert_eq!(
+                audivane_io_pw::sink_volume::parse_props(pod)
+                    .unwrap()
+                    .volume,
+                None
+            );
+            // Read back, it is the level the guard wanted: no rewrite loop.
+            assert!((played_db(&scaled, Some(master)).unwrap() + 12.0).abs() < 1e-4);
+            // Balance kept: right 6 dB below left.
+            assert!(
+                (scaled[1] / scaled[0] - 0.5).abs() < 1e-6,
+                "master {master}"
+            );
+        }
+        // What was reported counts the master.
+        let db = played_db(&[0.5, 0.25], Some(2.0)).unwrap();
+        assert!(db.abs() < 1e-6);
+    }
+
+    /// After a guard write the app's own slider still works the way round
+    /// it shows: raising its master from 0.5 to 0.6 makes the stream
+    /// louder (by 20 log 1.2), not quieter.
+    #[test]
+    fn the_apps_master_slider_still_works_after_a_guard_write() {
+        let scaled = guarded_channels(&[1.0, 1.0], Some(0.5), -12.0);
+        let before = played_db(&scaled, Some(0.5)).unwrap();
+        let after = played_db(&scaled, Some(0.6)).unwrap();
+        assert!((after - before - 20.0 * 1.2f64.log10()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_silent_stream_is_seeded_at_silence_only_when_new() {
+        assert_eq!(level_for_guard(false, None), Some(VOLUME_MIN_DB));
+        assert_eq!(level_for_guard(true, None), None);
+        assert_eq!(level_for_guard(true, Some(-12.0)), Some(-12.0));
+        assert_eq!(level_for_guard(false, Some(-12.0)), Some(-12.0));
+    }
+
+    /// The guard never writes a channel volume above 1.0: a level that
+    /// would need more (an app master turned far down) stays lower, with
+    /// the balance kept.
+    #[test]
+    fn guard_writes_never_exceed_unity_per_channel() {
+        let ch = guarded_channels(&[0.1, 0.05], Some(0.1), -10.0);
+        assert!(ch.iter().all(|&v| v <= 1.0), "{ch:?}");
+        assert!((ch[0] - 1.0).abs() < 1e-6);
+        assert!((ch[1] / ch[0] - 0.5).abs() < 1e-6);
+        let flat = guarded_channels(&[0.0, 0.0], Some(0.01), 0.0);
+        assert!(flat.iter().all(|&v| v <= 1.0), "{flat:?}");
+        // Within unity the decided level is met exactly.
+        let ok = guarded_channels(&[0.5, 0.25], Some(2.0), -12.0);
+        assert!((played_db(&ok, Some(2.0)).unwrap() + 12.0).abs() < 1e-4);
+    }
+
+    fn vg(mode: GuardMode, stream_max_db: Option<f64>) -> VolumeGuard {
+        VolumeGuard {
+            mode,
+            stream_max_db,
+            ..VolumeGuard::default()
+        }
+    }
+
+    /// `set_stream_volume` raises a stream the guard turned down: the new
+    /// `channelVolumes` play the request, balance kept, master untouched.
+    #[test]
+    fn stream_volume_raises_through_channel_volumes() {
+        let g = vg(GuardMode::Off, None);
+        // Turned down to -12 dB by an earlier cap, right 6 dB below left.
+        let ch = [0.251_f32, 0.1255];
+        let plan =
+            plan_stream_volume(&g, 7, Some(&ch), Some(1.0), false, Some(-3.0), None).unwrap();
+        let scaled = plan.channels.clone().unwrap();
+        assert!((played_db(&scaled, Some(1.0)).unwrap() + 3.0).abs() < 1e-4);
+        assert!((scaled[1] / scaled[0] - 0.5).abs() < 1e-6);
+        assert_eq!(plan.reply.volume_db, -3.0);
+        assert_eq!(plan.reply.max_db, 0.0);
+        assert_eq!(plan.reply.limited_by, None);
+        assert_eq!(plan.mute, None);
+        assert_eq!(plan.capped_from, None);
+        // To 100 %.
+        let plan = plan_stream_volume(&g, 7, Some(&ch), None, false, Some(0.0), None).unwrap();
+        assert_eq!(plan.channels.unwrap()[0], 1.0);
+        assert_eq!(plan.reply.volume_db, 0.0);
+    }
+
+    /// The stream cap holds in every guard mode, and is reported.
+    #[test]
+    fn stream_volume_is_capped_by_stream_max_in_every_mode() {
+        for mode in [GuardMode::Off, GuardMode::Lock, GuardMode::Limit] {
+            let g = vg(mode, Some(-12.0));
+            let plan =
+                plan_stream_volume(&g, 7, Some(&[0.1, 0.1]), Some(1.0), false, Some(-2.0), None)
+                    .unwrap();
+            assert_eq!(plan.reply.volume_db, -12.0, "{mode:?}");
+            assert_eq!(plan.reply.max_db, -12.0);
+            assert_eq!(plan.reply.limited_by, Some(StreamVolumeLimit::StreamMax));
+            assert_eq!(plan.capped_from, Some(-2.0));
+            // Below the cap: as asked.
+            let plan = plan_stream_volume(
+                &g,
+                7,
+                Some(&[0.1, 0.1]),
+                Some(1.0),
+                false,
+                Some(-20.0),
+                None,
+            )
+            .unwrap();
+            assert_eq!(plan.reply.volume_db, -20.0);
+            assert_eq!(plan.reply.limited_by, None);
+        }
+    }
+
+    /// The app's own master bounds what channel volumes (at most 100 %) can
+    /// reach; the reply says so instead of claiming the request.
+    #[test]
+    fn stream_volume_reports_the_apps_own_limit() {
+        let g = vg(GuardMode::Limit, Some(-3.0));
+        // Master 0.25 = -12 dB.
+        let plan = plan_stream_volume(
+            &g,
+            7,
+            Some(&[0.5, 0.5]),
+            Some(0.25),
+            false,
+            Some(-6.0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.reply.volume_db, -12.04);
+        assert_eq!(plan.reply.max_db, -12.04);
+        assert_eq!(plan.reply.limited_by, Some(StreamVolumeLimit::AppVolume));
+        assert!(plan.channels.unwrap().iter().all(|&v| v <= 1.0));
+        // Above the cap too: the app's volume is the lower bound, and the
+        // request is still logged as capped.
+        let plan = plan_stream_volume(&g, 7, Some(&[0.5, 0.5]), Some(0.25), false, Some(0.0), None)
+            .unwrap();
+        assert_eq!(plan.reply.limited_by, Some(StreamVolumeLimit::AppVolume));
+        assert_eq!(plan.capped_from, Some(0.0));
+    }
+
+    #[test]
+    fn stream_volume_mute_query_and_refusals() {
+        let g = vg(GuardMode::Lock, None);
+        // Mute only: no level written.
+        let plan = plan_stream_volume(
+            &g,
+            7,
+            Some(&[0.5, 0.25]),
+            Some(1.0),
+            false,
+            None,
+            Some(true),
+        )
+        .unwrap();
+        assert_eq!(plan.channels, None);
+        assert_eq!(plan.mute, Some(true));
+        assert!(plan.reply.muted);
+        assert_eq!(plan.reply.volume_db, -6.02);
+        // Query: nothing written.
+        let plan =
+            plan_stream_volume(&g, 7, Some(&[0.5, 0.25]), Some(1.0), true, None, None).unwrap();
+        assert_eq!((plan.channels, plan.mute), (None, None));
+        assert!(plan.reply.muted);
+        // Muting works at the app's master 0; a level does not.
+        assert!(
+            plan_stream_volume(&g, 7, Some(&[1.0]), Some(0.0), false, None, Some(true)).is_ok()
+        );
+        let err = plan_stream_volume(&g, 7, Some(&[1.0]), Some(0.0), false, Some(-6.0), None)
+            .unwrap_err();
+        assert_eq!(err.code, RpcError::BAD_STATE);
+        assert!(
+            err.message.contains("raise it in the app"),
+            "{}",
+            err.message
+        );
+        // No volume reported yet.
+        let err = plan_stream_volume(&g, 7, None, None, false, Some(-6.0), None).unwrap_err();
+        assert_eq!(err.code, RpcError::BAD_STATE);
+        assert!(plan_stream_volume(&g, 7, Some(&[]), None, false, None, None).is_err());
+    }
+
+    /// The level the call sets is the level `list_streams` reports after
+    /// the write and after PipeWire's `f32` echo, so the guard takes it as
+    /// no change.
+    #[test]
+    fn stream_volume_reply_matches_the_reported_level() {
+        let g = vg(GuardMode::Limit, None);
+        let plan = plan_stream_volume(&g, 7, Some(&[0.3, 0.2]), Some(0.9), false, Some(-7.5), None)
+            .unwrap();
+        let echoed = plan.channels.unwrap();
+        let reported = played_db(&echoed, Some(0.9)).map(report_db).unwrap();
+        assert_eq!(reported, plan.reply.volume_db);
+        assert_eq!(reported, -7.5);
+        assert!((plan.applied_db + 7.5).abs() < 1e-4);
+    }
+
+    /// A change of the app's master alone moves the level that plays, and
+    /// is published, though the loudest channel (and so `volume`) is the
+    /// same: channels at 0.5, master 1.0 -> 0.5 is -6.02 -> -12.04 dB.
+    #[test]
+    fn a_master_only_change_republishes_the_level() {
+        let mut node = Tracked {
+            media_class: Some("Stream/Output/Audio".into()),
+            ..Tracked::default()
+        };
+        let props = |volume: Option<f32>, channels: Option<Vec<f32>>| {
+            Some(audivane_io_pw::sink_volume::SinkProps {
+                volume,
+                channel_volumes: channels,
+                ..Default::default()
+            })
+        };
+        assert!(node.apply_props(Some(0.5), false, props(Some(1.0), Some(vec![0.5, 0.5]))));
+        assert_eq!(node.reported_level(), Some(-6.02));
+        // Master-only event: `parse_props` reads `volume` as the master, 0.5,
+        // equal to the old loudest channel.
+        assert!(node.apply_props(Some(0.5), false, props(Some(0.5), None)));
+        assert_eq!(node.reported_level(), Some(-12.04));
+        // The same again is no change.
+        assert!(!node.apply_props(Some(0.5), false, props(Some(0.5), None)));
+        // Mute alone is.
+        assert!(node.apply_props(Some(0.5), true, props(None, None)));
+    }
+
+    /// A node PipeWire is removing is refused before anything is written,
+    /// so the guard adopts nothing and no optimistic level is published.
+    #[test]
+    fn a_vanishing_stream_is_refused() {
+        let mut node = Tracked {
+            media_class: Some("Stream/Output/Audio".into()),
+            app_name: Some("Player".into()),
+            ..Tracked::default()
+        };
+        assert!(stream_volume_target(7, Some(&node), true).is_ok());
+        node.gone = true;
+        let err = stream_volume_target(7, Some(&node), true).unwrap_err();
+        assert_eq!(err.code, RpcError::BAD_STATE);
+        assert!(err.message.contains("going away"), "{}", err.message);
+        assert_eq!(
+            stream_volume_target(7, None, true).unwrap_err().code,
+            RpcError::INVALID_PARAMS
+        );
+        node.gone = false;
+        let err = stream_volume_target(7, Some(&node), false).unwrap_err();
+        assert!(err.message.contains("not playing on an Audivane sink"));
+        node.media_class = Some("Audio/Sink".into());
+        assert_eq!(
+            stream_volume_target(7, Some(&node), true).unwrap_err().code,
+            RpcError::INVALID_PARAMS
+        );
+    }
+
+    /// A request the caller gave up on is never run, and one the watcher
+    /// took is never reported as given up.
+    #[test]
+    fn a_timed_out_request_never_applies_later() {
+        let late = Ticket::default();
+        assert!(late.abandon());
+        assert!(!late.claim(), "the watcher drops it");
+        let taken = Ticket::default();
+        assert!(taken.claim());
+        assert!(!taken.abandon(), "the caller waits for the answer");
+    }
+
+    /// A drag logs its settled level once at info, not every set.
+    #[test]
+    fn user_sets_are_logged_once_settled() {
+        let mut log = SettledLog::default();
+        let t0 = Instant::now();
+        for i in 0..25u32 {
+            log.note(
+                4,
+                format!("set {i}"),
+                t0 + Duration::from_millis(40 * u64::from(i)),
+            );
+        }
+        let last = t0 + Duration::from_millis(40 * 24);
+        assert!(log.due(last + Duration::from_millis(100)).is_empty());
+        assert_eq!(
+            log.due(last + STREAM_LOG_SETTLE),
+            vec!["set 24".to_string()]
+        );
+        assert!(
+            log.due(last + STREAM_LOG_SETTLE * 4).is_empty(),
+            "logged once"
+        );
+        log.note(1, "a".into(), t0);
+        log.note(2, "b".into(), t0 + Duration::from_millis(1));
+        assert_eq!(
+            log.due(t0 + STREAM_LOG_SETTLE * 2),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    /// A stream at master 0 is the app's own silence: the guard has no
+    /// level for it (so it is neither held up under lock nor written with
+    /// master 1), and it is judged again once the app turns it back up.
+    #[test]
+    fn a_stream_at_master_zero_is_left_alone() {
+        assert_eq!(guarded_level_db(&[0.5, 0.25], Some(0.0)), None);
+        assert!(guarded_level_db(&[0.5, 0.25], Some(0.5)).is_some());
+        assert!(guarded_level_db(&[0.5, 0.25], None).is_some());
+        // Lock does not revert the app's master 0, and keeps its level.
+        let lock = VolumeGuard {
+            mode: GuardMode::Lock,
+            ..VolumeGuard::default()
+        };
+        let mut guards = StreamGuards::default();
+        let t0 = Instant::now();
+        let held = guarded_level_db(&[0.5, 0.5], Some(1.0)).unwrap();
+        guards.seed(&lock, 7, held, t0, t0);
+        assert!(
+            guarded_level_db(&[0.5, 0.5], Some(0.0)).is_none(),
+            "nothing to observe"
+        );
+        // Back at its level: nothing to do.
+        let t1 = t0 + Duration::from_secs(5);
+        assert_eq!(guards.observe(&lock, 7, held, t0, t1), None);
+    }
 }
 
 #[cfg(test)]
@@ -1894,7 +2955,7 @@ mod tests {
         let mut tracker = RestoreJournalTracker::<u32>::default();
         tracker.note_snapshot_saved();
         tracker.finish_restore(Some(&path), true, || Ok(42));
-        // File MUST still be present immediately after issuing restore metadata writes.
+        // The file is still there right after the restore metadata is written.
         assert!(path.is_file());
         // Quit must wait for the pending sync seq.
         assert!(tracker.begin_quit_wait());
@@ -1961,7 +3022,7 @@ mod tests {
         tracker.note_snapshot_saved();
         save_snapshot(&path, &DefaultSnapshot::default()).unwrap();
 
-        // Stale seq 10 completes: must NOT delete the newer snapshot!
+        // Stale seq 10 completes: the newer snapshot stays.
         assert!(!tracker.on_sync_done(10));
         assert!(path.is_file());
 

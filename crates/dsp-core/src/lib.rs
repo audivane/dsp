@@ -10,17 +10,37 @@
 //!   construction (including 0). Passing more is a caller bug and may panic.
 //! - Latency is always reported in frames at the stage's *output* rate.
 
+pub mod ab_level;
+pub mod ab_measure;
+pub mod adaptive;
 pub mod biquad;
 pub mod bypass;
 pub mod chain;
 pub mod conv;
+pub mod cpu_bench;
+pub mod crossfeed;
+pub mod dc_block;
+pub mod design;
 pub mod dither;
+pub(crate) mod dot;
+pub mod drift;
 pub mod eq_apo;
 pub mod fft;
+pub mod filter_design;
 pub mod gain;
+pub mod harmonics;
+pub mod limiter;
 pub mod loudness;
 pub mod minphase;
+pub mod pitch;
+pub mod presets;
+pub mod rational;
 pub mod resample;
+pub mod tempo;
+#[doc(hidden)]
+pub mod test_support;
+pub mod tilt;
+pub mod varispeed;
 pub mod window;
 
 pub use rustfft::num_complex::Complex64;

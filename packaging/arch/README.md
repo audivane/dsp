@@ -36,7 +36,8 @@ Flags / variants:
 - `/usr/share/doc/audivane-dsp/` (`DEV.md`, `control-plane.md`)
 
 Runtime deps: PipeWire + WirePlumber, ALSA, `webkit2gtk-4.1`, `gtk3`,
-`libayatana-appindicator`, D-Bus. `rtkit` is optional but recommended
+D-Bus (the tray icon is a StatusNotifierItem over D-Bus; no appindicator
+library). `rtkit` is optional but recommended
 (real-time scheduling for the audio thread).
 
 ## Enable the engine

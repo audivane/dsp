@@ -4,13 +4,13 @@ export const MAX_PLOT_HEIGHT = 6000;
 export const EQ_MIN_HEIGHT = 160;
 export const UPS_TRANS_MIN_HEIGHT = 160;
 export const UPS_TRANS_DEFAULT_HEIGHT = 192;
-export const UPS_SUB_MIN_HEIGHT = 120;
-export const UPS_SUB_DEFAULT_HEIGHT = 140;
+export const UPS_IMPULSE_MIN_HEIGHT = 120;
+export const UPS_IMPULSE_DEFAULT_HEIGHT = 160;
 
 export const PLOT_HEIGHT_KEYS = {
   eq: "avdsp-height-eq",
   upsTrans: "avdsp-height-ups-trans",
-  upsSub: "avdsp-height-ups-sub",
+  upsImpulse: "avdsp-height-ups-impulse",
 } as const;
 
 export function clampPlotHeight(height: number, min: number, max = MAX_PLOT_HEIGHT): number {

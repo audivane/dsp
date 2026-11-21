@@ -58,8 +58,34 @@ export function meterChainGainDb(m: Meters): number | null {
   return bestDelta;
 }
 
+/**
+ * A report that draws nothing: every channel's peak and RMS at or below
+ * `floorDb` and no limiter gain reduction. The meters may sleep through a
+ * run of these (silence still arrives at 30 Hz).
+ */
+export function quietMeters(m: Meters, floorDb: number): boolean {
+  const low = (v: number[] | undefined) => !v || v.every((db) => !Number.isFinite(db) || db <= floorDb);
+  return low(m.peak_db) && low(m.rms_db) && !(m.limiter?.active && m.limiter.gain_reduction_db >= 0.05);
+}
+
+/** Bar state that has nothing left to animate: peak, RMS and hold all rest at the floor. */
+export function metersSettled(ch: readonly { peak: number; rms: number; hold: number }[], floorDb: number): boolean {
+  return ch.every((c) => c.peak <= floorDb && c.hold <= floorDb && c.rms - floorDb < 0.05);
+}
+
 class MeterStore {
   latest: MeterFrame | null = null;
+  private listeners = new Set<() => void>();
+
+  /** Called after every report, clip reset or clear (wakes a sleeping painter). */
+  onChange(fn: () => void): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  private changed() {
+    for (const fn of this.listeners) fn();
+  }
   /** `clipped` count at the time the clip light was last reset. */
   clipBaseline: number | null = null;
   /** Per-channel `clipped_ch` counts at the time each channel LED was last reset. */
@@ -124,6 +150,7 @@ class MeterStore {
     }
     this.prevClipped = m.clipped;
     this.latest = { meters: m, at: now };
+    this.changed();
   }
 
   /** Clipped samples per channel since each channel LED was last reset. */
@@ -155,6 +182,7 @@ class MeterStore {
       this.clipBaseline = m?.clipped ?? null;
       this.clipBaselines = m?.clipped_ch ? [...m.clipped_ch] : [];
       this.lastClipAt = -Infinity;
+      this.changed();
       return;
     }
     if (m?.clipped_ch && channel >= 0 && channel < m.clipped_ch.length) {
@@ -167,6 +195,7 @@ class MeterStore {
       this.clipBaseline = m?.clipped ?? null;
       this.lastClipAt = -Infinity;
     }
+    this.changed();
   }
 
   clear() {
@@ -177,6 +206,7 @@ class MeterStore {
     this.prevClipped = null;
     this.prevClippedCh = [];
     this.lastClipAt = -Infinity;
+    this.changed();
   }
 }
 

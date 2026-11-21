@@ -87,7 +87,7 @@ impl Engine for WaitingEngine {
             format: None,
             graph_rate: cfg.rate.default_rate,
             output_rate: 0,
-            ratio: 1,
+            ratio: audivane_protocol::RateRatio::ONE,
             quantum: cfg.quantum,
             latency_ms: 0.0,
             filter_latency_ms: 0.0,
@@ -107,7 +107,19 @@ impl Engine for WaitingEngine {
             direct_rates: Vec::new(),
             effective_default_rate: None,
             dither_bits: None,
+            bypass_resampler: None,
+            rt_load_max: 0.0,
+            varispeed: None,
+            waiting_for_device: false,
         }
+    }
+
+    fn set_varispeed(
+        &self,
+        cfg: audivane_protocol::ipc::VarispeedConfig,
+    ) -> Result<(), EngineError> {
+        self.lock().varispeed = cfg;
+        Ok(())
     }
 
     fn meters(&self) -> Meters {
@@ -120,6 +132,7 @@ impl Engine for WaitingEngine {
             chain_peak_db: Vec::new(),
             xruns: 0,
             dsp_load: 0.0,
+            limiter: None,
         }
     }
 
@@ -145,7 +158,7 @@ mod tests {
     #[test]
     fn reports_the_missing_device_and_follows_config_edits() {
         let mut cfg = EngineConfig {
-            device: "hw:CARD=ZH3,DEV=0".into(),
+            device: "hw:CARD=USB,DEV=0".into(),
             ..Default::default()
         };
         let reason = start_error_text(&cfg.device, false, "No such device");
@@ -153,7 +166,7 @@ mod tests {
         let snap = engine.snapshot();
         assert_eq!(snap.state, EngineState::Error);
         let error = snap.error.unwrap();
-        assert!(error.contains("hw:CARD=ZH3,DEV=0 not found"), "{error}");
+        assert!(error.contains("hw:CARD=USB,DEV=0 not found"), "{error}");
         assert!(engine.selftest().is_err());
 
         cfg.device = "hw:CARD=PCH,DEV=0".into();

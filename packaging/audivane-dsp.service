@@ -11,6 +11,11 @@ After=graphical-session-pre.target
 [Service]
 Type=simple
 ExecStart=/usr/bin/audivane-dsp --foreground
+# After any stop, a crash included: in the software (fixed hardware level)
+# and hybrid volume modes, bring the DAC's hardware volume down to the
+# configured level so the next program to open it directly is not at the
+# card's fixed level. A no-op in the other modes. `-`: never fail the stop.
+ExecStopPost=-/usr/bin/audivane-dsp --volume-failsafe
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=10

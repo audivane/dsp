@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "shell",
+  "description": "The tray's volume popup and the on-screen volume display: daemon commands (app-defined) and app events only.",
+  "windows": ["popup", "osd"],
+  "permissions": ["core:default"]
+}

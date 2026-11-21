@@ -33,6 +33,7 @@ export const Speaker = ({ muted, className }: P & { muted: boolean }) => (
   </svg>
 );
 export const Check = (p: P) => <I {...p} d="m5 12 5 5 9-10" />;
+export const Refresh = (p: P) => <I {...p} d={["M20 11a8 8 0 1 0-2.3 5.7", "M20 4v7h-7"]} />;
 /** Theme (light/dark) icon: an outlined circle with its right half filled. */
 export const ThemeIcon = ({ className }: P) => (
   <svg className={"i" + (className ? " " + className : "")} viewBox="0 0 24 24" aria-hidden="true">

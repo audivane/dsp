@@ -6,7 +6,7 @@
   "source": "Audivane analytical envelope: lower=min(-1.0*x,-0.5*x), upper=max(-1.0*x,-0.5*x), x=log2(f/1000). Slope endpoints chosen for exploration; not measured preference bounds or confidence intervals.",
   "url": "https://github.com/audivane/dsp",
   "license": "MIT",
-  "citation": "Audivane (2026), docs/research/targets.md, Speaker formulas and defaults. Optional engineering exploration band only; no claim of population coverage.",
+  "citation": "Audivane (2026), Speaker formulas and defaults. Optional engineering exploration band only; no claim of population coverage.",
   "derived": true,
   "points": [
     [20.0,2.8219,5.6439],

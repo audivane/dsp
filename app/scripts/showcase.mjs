@@ -29,9 +29,22 @@ const SHOTS = [
   { name: "status", view: "eq", viewport: [1180, 760], clip: "footer.status", closeEditor: true },
   // Measured upsampler response: transition, full range and impulse.
   { name: "upsampling", view: "ups", viewport: [1440, 1100], clip: ".ups-plots" },
+  // The Custom filter editor started from Recommended (Kaiser, flat to 0.908 and
+  // stopped at 1.0 of the source Nyquist, automatic length, linear phase), with
+  // its cost table, Nyquist transition and impulse response. Advanced stays shut.
+  { name: "upsampling-custom", view: "ups", viewport: [1440, 2000], clip: "section.view", clipTo: ".ups-plots", prepare: customRecommended },
   // The full window: sidebar signal path, spectrum behind the EQ, status bar meters.
   { name: "app", view: "eq", viewport: [1440, 900], clip: null, closeEditor: true },
 ];
+
+async function customRecommended(page) {
+  await page.getByRole("group", { name: "Filter design" }).getByRole("button", { name: "Custom" }).click();
+  await page.getByRole("button", { name: "Recommended", exact: true }).click();
+  await page.waitForSelector(".ups-plots");
+  // Close the "Started from Recommended" toast so it stays out of the shot.
+  const toast = page.locator(".toast").getByRole("button", { name: "Dismiss" });
+  if (await toast.count()) await toast.click();
+}
 
 const server = await preview({ preview: { port: 1432, strictPort: false }, logLevel: "warn" });
 const url = server.resolvedUrls.local[0];
@@ -45,6 +58,7 @@ try {
       await ctx.addInitScript(([s, v]) => {
         localStorage.setItem("avdsp-skin", s);
         localStorage.setItem("avdsp-ui", JSON.stringify({ view: v, autoPreamp: true }));
+        localStorage.setItem("avdsp-upsampling-advanced", "0");
       }, [skin, shot.view]);
       const page = await ctx.newPage();
       page.on("pageerror", (e) => errors.push(`${skin} ${shot.name}: ${e.message}`));
@@ -55,11 +69,17 @@ try {
         const close = page.getByRole("button", { name: "Close editor" });
         if (await close.count()) await close.click();
       }
+      if (shot.prepare) await shot.prepare(page);
       if (shot.clip) await page.waitForSelector(shot.clip);
       // Let the simulated meters and spectrum settle.
       await page.waitForTimeout(1500);
       const file = resolve(outDir, `${shot.name}-${skin}.png`);
-      if (shot.clip) await page.locator(shot.clip).first().screenshot({ path: file, animations: "disabled" });
+      if (shot.clipTo) {
+        // From the top of `clip` to the bottom of `clipTo` (the view head to the plots).
+        const a = await page.locator(shot.clip).first().boundingBox();
+        const b = await page.locator(shot.clipTo).first().boundingBox();
+        await page.screenshot({ path: file, animations: "disabled", clip: { x: a.x, y: a.y, width: a.width, height: b.y + b.height - a.y } });
+      } else if (shot.clip) await page.locator(shot.clip).first().screenshot({ path: file, animations: "disabled" });
       else await page.screenshot({ path: file, animations: "disabled" });
       console.log(file);
       await ctx.close();

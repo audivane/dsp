@@ -26,29 +26,16 @@
 //! 65536 (with 2 or 6 partitions depending on `B0`), and the last stage
 //! (`B = 32768`, `Os = 65536`) covers the rest of the IR.
 //!
-//! (An earlier schedule started the capped stage at 65536 with no extra
-//! delay, so every IR tap at or beyond 65536 came out 32768 frames early.)
-//!
 //! # Real-time cost
 //!
 //! Because each tail stage has a whole period of slack, its work (forward
 //! FFT, frequency-domain multiply-accumulate, inverse FFT) is time-sliced
 //! over the `Bs / B0` base blocks of that period, weighted by a measured
 //! per-job cost model, instead of running all at once on the block that
-//! completes it. Transforms with `Bs > 512` use a four-step decomposition
-//! (`Bs = M·L`), so the biggest indivisible job is a few sub-FFTs of size
-//! ~`sqrt(Bs)` (a few µs); smaller stages use one real FFT per job.
-//!
-//! The worst single `process` call is therefore close to the mean. For a
-//! 1 s stereo IR at 192 kHz with 256-frame blocks (1333 µs period), measured
-//! on one Zen 2 core (`bench_worst_call_1s_ir_192k_block256`, fastrel):
-//! mean ≈ 67 µs, p99 ≈ 110 µs, worst ≈ 200–330 µs (OS noise; the estimated
-//! work per call varies by < 15 %, see
-//! `tail_work_is_spread_evenly_across_process_calls`). The previous schedule
-//! ran each tail stage's whole FFT on one block: mean 43 µs but p99 743 µs
-//! and worst 2.3 ms, over the period. The price is ~1.3x the FFT cost of a
-//! direct `realfft` for the four-step stages and 8 head partitions instead of
-//! 4 (a 65536-tap stereo IR at 192 kHz runs at ~43x real time instead of ~60x).
+//! completes it. Transforms with `Bs > DIRECT_FFT_MAX_BLOCK` use a four-step
+//! decomposition (`Bs = M·L`), so the biggest indivisible job is a few sub-FFTs
+//! of size ~`sqrt(Bs)` (a few µs); smaller stages use one real FFT per job.
+//! The worst single `process` call is therefore close to the mean.
 
 use crate::Complex64;
 use crate::Stage;
@@ -248,9 +235,9 @@ impl HeadChannel {
 
 // ---------------------------------------------------------------- tail stages
 
-// Job costs, in nanoseconds per element as measured on one Zen 2 core
-// (EPYC 7402P, release build). Only their ratios matter: they decide how the
-// work of a period is spread over its base blocks.
+// Job costs, in nanoseconds per element, measured on one x86-64 core in a
+// release build. Only their ratios matter: they decide how the work of a
+// period is spread over its base blocks.
 
 /// Direct real FFT of `2B` points, per `B·log2(2B)`.
 const NS_REAL_FFT: f64 = 0.42;
@@ -1331,8 +1318,8 @@ mod tests {
 
     #[test]
     fn default_schedule_starts_each_tail_stage_at_twice_its_block() {
-        // The repro case: block 1024 used to start a 32768-block stage at
-        // IR offset 65536, playing it out 32768 frames early.
+        // Block 1024: the 32768-block stage must start at IR offset 65536,
+        // not 2 × 32768 short of it.
         let plan = plan_schedule(1024, 1 << 20);
         assert_eq!(
             plan,

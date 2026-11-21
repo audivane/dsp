@@ -9,7 +9,8 @@ use audivane_dsp_core::conv::{combine_irs, combined_ir_length};
 use audivane_dsp_core::dither::ClipStats;
 use audivane_dsp_core::resample::resample_offline;
 use audivane_protocol::{
-    ChainConfig, ChannelEq, ConvolutionConfig, DitherKind, EqProfile, RateTarget, resolve_ratio,
+    ChainConfig, ChannelEq, ConvolutionConfig, DitherKind, EqProfile, RateTarget,
+    resolve_rate_ratio,
 };
 use std::fs;
 use std::path::Path;
@@ -28,11 +29,14 @@ pub fn run(args: ProcessArgs) -> Result<i32> {
     let out_bits = config.output.bits;
     let dither = config.output.dither;
     let irs = load_irs(&config, wav.rate, wav.channels)?;
-    let ratio = resolve_ratio(config.upsampler.target, wav.rate) as usize;
-    let out_rate = wav
-        .rate
-        .checked_mul(u32::try_from(ratio).context("ratio overflow")?)
-        .context("output rate overflow")?;
+    let ratio = if passthrough {
+        audivane_protocol::RateRatio::ONE
+    } else {
+        resolve_rate_ratio(config.upsampler.target, wav.rate)
+    };
+    let out_rate = ratio
+        .output_rate(wav.rate)
+        .context("the output rate is not a whole number of Hz")?;
 
     let spec = ChainSpec {
         config,
@@ -43,12 +47,12 @@ pub fn run(args: ProcessArgs) -> Result<i32> {
     };
 
     let started = Instant::now();
-    let mut chain = Chain::new(spec);
+    let mut chain = Chain::try_new(spec)?;
     let latency = chain.latency_out_frames();
 
     let channels = wav.channels;
-    let total_out = wav.frames() * ratio * channels;
-    let mut out_buf = vec![0i32; args.block * ratio * channels];
+    let total_out = ratio.frames_out_total(wav.frames() as u64) as usize * channels;
+    let mut out_buf = vec![0i32; chain.max_output_frames() * channels];
     let zeros = vec![0.0f32; args.block * channels];
     let mut result: Vec<i32> = Vec::with_capacity(
         total_out
@@ -62,7 +66,7 @@ pub fn run(args: ProcessArgs) -> Result<i32> {
 
     for chunk in wav.samples.chunks(args.block * channels) {
         let frames = chunk.len() / channels;
-        let produced = frames * ratio * channels;
+        let produced = chain.output_frames(frames) * channels;
         stats.merge(chain.process_f32(chunk, &mut out_buf[..produced]));
         result.extend_from_slice(&out_buf[..produced]);
     }
@@ -71,16 +75,23 @@ pub fn run(args: ProcessArgs) -> Result<i32> {
         // Feed silence long enough for the algorithmic delay *and* the
         // upsampler's interpolation tail to flush, then drop exactly the
         // reported latency and keep the input-length signal.
-        let kernel_frames = if ratio > 1 {
-            chain.config().upsampler.taps.div_ceil(ratio)
-        } else {
+        // Latency and kernel length in input frames (the kernel's `taps`
+        // count output frames at most `down` grid samples apart).
+        let per_in = ratio.as_f64();
+        let kernel_frames = if ratio.is_unity() {
             0
+        } else {
+            let taps = audivane_dsp_core::design::Named::of(&chain.config().upsampler)
+                .ok()
+                .and_then(|n| audivane_dsp_core::design::grid_taps(&n.design, wav.rate, ratio).ok())
+                .unwrap_or(65_536);
+            (taps as f64 / per_in).ceil() as usize
         };
-        let flush_frames = latency.div_ceil(ratio) + kernel_frames + 4;
+        let flush_frames = (latency as f64 / per_in).ceil() as usize + kernel_frames + 4;
         let mut remaining = flush_frames;
         while remaining > 0 {
             let frames = remaining.min(args.block);
-            let produced = frames * ratio * channels;
+            let produced = chain.output_frames(frames) * channels;
             chain.process_f32(&zeros[..frames * channels], &mut out_buf[..produced]);
             result.extend_from_slice(&out_buf[..produced]);
             remaining -= frames;
@@ -163,6 +174,15 @@ pub fn dither_name(kind: DitherKind) -> &'static str {
         DitherKind::None => "none",
         DitherKind::Tpdf => "tpdf",
         DitherKind::Shaped => "shaped",
+        DitherKind::HeadroomTpdf => "headroom_tpdf",
+        DitherKind::Rectangular => "rectangular",
+        DitherKind::Gaussian => "gaussian",
+        DitherKind::HighpassTpdf => "highpass_tpdf",
+        DitherKind::Feedback1 => "feedback1",
+        DitherKind::Feedback5 => "feedback5",
+        DitherKind::Resonant5 => "resonant5",
+        DitherKind::Resonant9 => "resonant9",
+        DitherKind::Integrator15 => "integrator15",
     }
 }
 
@@ -175,7 +195,8 @@ fn build_config(args: &ProcessArgs, wav: &WavData) -> Result<(ChainConfig, Conta
             serde_json::from_str(&text)
                 .with_context(|| format!("cannot parse config {}", path.display()))?
         }
-        None => ChainConfig::default(),
+        // Without a config file nothing but what the flags ask for runs.
+        None => ChainConfig::neutral(),
     };
 
     if let Some(path) = &args.eq {
@@ -203,7 +224,7 @@ fn build_config(args: &ProcessArgs, wav: &WavData) -> Result<(ChainConfig, Conta
     }
     if args.auto_preamp {
         let profile = config.eq.as_ref().cloned().unwrap_or_default();
-        let auto = Eq::auto_preamp_db(&profile, f64::from(wav.rate));
+        let auto = Eq::auto_preamp_db(&profile, f64::from(wav.rate)).map_err(anyhow::Error::msg)?;
         let eq = config.eq.get_or_insert_with(EqProfile::default);
         eq.preamp_db = auto;
     }
@@ -232,32 +253,52 @@ fn build_config(args: &ProcessArgs, wav: &WavData) -> Result<(ChainConfig, Conta
     if let Some(max) = args.max_rate {
         config.upsampler.target = RateTarget::MaxRate(max);
     }
-    if let Some(taps) = args.taps {
-        config.upsampler.taps = taps;
+    if let Some(rate) = args.out_rate {
+        config.upsampler.target = RateTarget::Rate(rate);
     }
-    if let Some(phase) = args.phase {
-        config.upsampler.phase = phase.into();
-    }
-    if let Some(beta) = args.beta {
-        config.upsampler.kaiser_beta = beta;
-    }
-    if let Some(cutoff) = args.cutoff {
-        config.upsampler.cutoff = cutoff;
-    }
-    if config.upsampler.taps == 0 {
-        bail!("upsampler taps must be at least 1");
-    }
-    if !(config.upsampler.cutoff > 0.0 && config.upsampler.cutoff <= 1.0) {
-        bail!(
-            "upsampler cutoff must be in (0, 1], got {}",
-            config.upsampler.cutoff
-        );
-    }
-    if !(config.upsampler.kaiser_beta.is_finite() && config.upsampler.kaiser_beta >= 0.0) {
-        bail!(
-            "upsampler beta must be a finite value >= 0, got {}",
-            config.upsampler.kaiser_beta
-        );
+    if args.taps.is_some() || args.phase.is_some() || args.beta.is_some() || args.cutoff.is_some() {
+        let mut m = config
+            .upsampler
+            .design
+            .as_ref()
+            .and_then(|d| match &d.design {
+                audivane_protocol::FilterDesign::Kernel(k)
+                    if k.numerics.path == audivane_protocol::design::ArithmeticPath::Standard =>
+                {
+                    audivane_dsp_core::design::paths::standard::legacy_config(k, wav.rate).ok()
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        if let Some(taps) = args.taps {
+            m.taps = taps;
+        }
+        if let Some(phase) = args.phase {
+            m.phase = phase.into();
+        }
+        if let Some(beta) = args.beta {
+            m.kaiser_beta = beta;
+        }
+        if let Some(cutoff) = args.cutoff {
+            m.cutoff = cutoff;
+        }
+        if m.taps == 0 {
+            bail!("upsampler taps must be at least 1");
+        }
+        if !(m.cutoff > 0.0 && m.cutoff <= 1.0) {
+            bail!("upsampler cutoff must be in (0, 1], got {}", m.cutoff);
+        }
+        if !(m.kaiser_beta.is_finite() && m.kaiser_beta >= 0.0) {
+            bail!(
+                "upsampler beta must be a finite value >= 0, got {}",
+                m.kaiser_beta
+            );
+        }
+        let target = config.upsampler.target;
+        config.upsampler = m
+            .into_upsampler_config()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        config.upsampler.target = target;
     }
 
     let container: Container = match args.format {

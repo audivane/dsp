@@ -1,9 +1,0 @@
-   Compiling scientific-review v0.0.0 (<repo>/docs/research/scientific-review)
-    Finished `release` profile [optimized] target(s) in 0.50s
-     Running `docs/research/scientific-review/target/release/scientific-review phase`
-MINPHASE new winding_full=-6.00000 maxstep=0.27565 Jensen_log_excess=7.139078601e-5 h0=2.856081239e-4 nyquist=-101.2943
-COMPARE N=16384 beta=8 r=16 cut=0.994014154 new pb_diff_db=6.086424e-3 transition_abs=1.597232e-3 all_abs=1.597232e-3 stop_lin=-82.7022 stop_min=-81.4732 ny_lin=-82.7022 ny_min=-81.4732 sb_diff_max_db=168.06@0.45117331 E50=51 E99=1274 gd_dc=37.72511 gd_pb=[37.7104,1998.5801] l1=5.7851
-MINPHASE new winding_full=-6.00000 maxstep=0.75452 Jensen_log_excess=6.476102093e-5 h0=7.990934407e-7 nyquist=-155.7457
-COMPARE N=16384 beta=14 r=16 cut=0.989570676 new pb_diff_db=2.042751e-3 transition_abs=4.569670e-4 all_abs=4.569670e-4 stop_lin=-136.7610 stop_min=-135.5979 ny_lin=-136.7610 ny_min=-135.5979 sb_diff_max_db=124.07@0.37597704 E50=75 E99=1663 gd_dc=58.07489 gd_pb=[58.0749,1748.0110] l1=6.4263
-MINPHASE new winding_full=-20.00000 maxstep=2.50496 Jensen_log_excess=2.855439347e-4 h0=2.236665523e-9 nyquist=-210.1957
-COMPARE N=16384 beta=20 r=16 cut=0.985127198 new pb_diff_db=1.279066e-3 transition_abs=5.194840e-4 all_abs=5.194840e-4 stop_lin=-190.8925 stop_min=-189.9866 ny_lin=-190.8925 ny_min=-189.9866 sb_diff_max_db=69.80@0.36767578 E50=100 E99=1945 gd_dc=78.47201 gd_pb=[78.4720,1650.1899] l1=6.9009

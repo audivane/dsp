@@ -1,12 +1,12 @@
 //! Safe direct ALSA `hw:` PCM playback wrapper with zero-alloc audio-path writes.
 
-use crate::caps::{describe_pcm, plan_open, probe_pcm, ratio_ladder, to_alsa_format};
+use crate::caps::{describe_pcm, plan_open, probe_pcm, to_alsa_format};
 use crate::error::{AlsaError, Result};
 use alsa::pcm::{Access, HwParams, PCM, State, SwParams, TstampType};
 use alsa::poll::Descriptors;
 use alsa::{Direction, ValueOr};
-use audivane_protocol::SampleFormat;
 use audivane_protocol::ipc::DeviceCapabilities;
+use audivane_protocol::{RateRatio, SampleFormat};
 use std::time::Duration;
 
 /// Preferred format negotiation order: highest bit depth first.
@@ -106,39 +106,64 @@ impl OpenPcm {
         AlsaOutput::from_pcm(self.pcm, &self.device, params)
     }
 
-    /// Configure at `source_rate * ratio` for the first ratio on
-    /// [`ratio_ladder`]`(desired_ratio)` the device takes, returning the ratio
-    /// used. With `caps` the ratio and format are planned from the probe
-    /// ([`plan_open`]); without, each rate is tried. There is no "nearest
-    /// rate" fallback: the device rate is always exactly `source_rate * ratio`,
-    /// otherwise the graph would play at the wrong pitch.
+    /// Configure at `source_rate * ratio` for the first ratio of `ladder`
+    /// (usually [`crate::ratio_ladder`] of the wanted ratio) the device takes,
+    /// returning the ratio used. With `caps` the ratio and format are
+    /// planned from the probe ([`plan_open`], which also says why there is
+    /// never a "nearest rate"); without, each rate is tried. Ratios that
+    /// give no whole output rate are skipped.
     ///
-    /// `period_frames` is scaled as `quantum * ratio` whenever `quantum >= 32`.
+    /// `period_frames` is scaled as `quantum * ratio` (rounded) whenever
+    /// `quantum >= 32`.
     pub fn configure_with_ratio_fallback(
         self,
         config: &AlsaConfig,
         source_rate: u32,
-        desired_ratio: u32,
+        ladder: &[RateRatio],
         quantum: u32,
         formats: &[SampleFormat],
         caps: Option<&DeviceCapabilities>,
-    ) -> Result<(AlsaOutput, u32)> {
+    ) -> Result<(AlsaOutput, RateRatio)> {
+        self.configure_with_ratio_plan(config, source_rate, ladder, quantum, formats, caps)
+            .map(|(out, open)| (out, open.ratio))
+    }
+
+    /// [`Self::configure_with_ratio_fallback`], also reporting which ladder
+    /// entries a blind open saw fail before the one it took, and why
+    /// ([`RatioOpen`]).
+    pub fn configure_with_ratio_plan(
+        self,
+        config: &AlsaConfig,
+        source_rate: u32,
+        ladder: &[RateRatio],
+        quantum: u32,
+        formats: &[SampleFormat],
+        caps: Option<&DeviceCapabilities>,
+    ) -> Result<(AlsaOutput, RatioOpen)> {
         let candidate_list = if formats.is_empty() {
             FORMAT_PREFERENCE.to_vec()
         } else {
             formats.to_vec()
         };
-        let cfg_for = |ratio: u32| {
+        let ladder: Vec<RateRatio> = if ladder.is_empty() {
+            vec![RateRatio::ONE]
+        } else {
+            ladder.to_vec()
+        };
+        let desired = ladder[0];
+        let cfg_for = |ratio: RateRatio| {
             let mut c = config.clone();
-            c.rate = source_rate.saturating_mul(ratio);
+            c.rate = ratio.output_rate(source_rate).unwrap_or(source_rate);
             if quantum >= 32 {
-                c.period_frames = quantum.saturating_mul(ratio);
+                let num = u64::from(quantum) * u64::from(ratio.up);
+                let den = u64::from(ratio.down);
+                c.period_frames = ((num + den / 2) / den).max(32) as u32;
             }
             c
         };
 
         if let Some(caps) = caps.filter(|c| !c.rates.is_empty()) {
-            let (ratio, format) = plan_open(caps, source_rate, desired_ratio, &candidate_list)?;
+            let (ratio, format) = plan_open(caps, source_rate, &ladder, &candidate_list)?;
             let try_cfg = cfg_for(ratio);
             // The planned format first, then the other candidates the device
             // takes at this rate (in case the driver disagrees with the probe).
@@ -149,43 +174,107 @@ impl OpenPcm {
                     .copied()
                     .filter(|&f| f != format && caps.supports(try_cfg.rate, f)),
             );
-            if ratio != desired_ratio.max(1) {
+            if ratio != desired {
                 log::info!(
-                    "ALSA '{}' has no {} Hz; using x{ratio} ({} Hz) instead of x{desired_ratio}",
+                    "ALSA '{}' has no {} Hz; using {ratio} ({} Hz) instead of {desired}",
                     self.device,
-                    source_rate.saturating_mul(desired_ratio.max(1)),
+                    desired
+                        .output_rate(source_rate)
+                        .map_or_else(|| "whole".to_string(), |r| r.to_string()),
                     try_cfg.rate
                 );
             }
             let params = negotiate_params(&self.pcm, &self.device, &try_cfg, &order)?;
             let out = AlsaOutput::from_pcm(self.pcm, &self.device, params)?;
-            return Ok((out, ratio));
+            return Ok((out, RatioOpen::at(ratio)));
         }
 
-        let mut last_err = None;
-        for ratio in ratio_ladder(desired_ratio) {
+        let (taken, refused, transient) = walk_ladder(&ladder, source_rate, |ratio| {
             let try_cfg = cfg_for(ratio);
-            match negotiate_params(&self.pcm, &self.device, &try_cfg, &candidate_list) {
-                Ok(params) => {
-                    let out = AlsaOutput::from_pcm(self.pcm, &self.device, params)?;
-                    return Ok((out, ratio));
+            negotiate_params(&self.pcm, &self.device, &try_cfg, &candidate_list).inspect_err(|e| {
+                log::debug!(
+                    "ALSA '{}' rejected {} Hz: {e}; trying a smaller ratio",
+                    self.device,
+                    try_cfg.rate
+                );
+            })
+        });
+        match taken {
+            Ok((ratio, params)) => {
+                let out = AlsaOutput::from_pcm(self.pcm, &self.device, params)?;
+                Ok((
+                    out,
+                    RatioOpen {
+                        ratio,
+                        refused,
+                        transient,
+                    },
+                ))
+            }
+            // The ratio-1 attempt is the last one: its error is the most
+            // telling.
+            Err(last_err) => Err(last_err.unwrap_or_else(|| AlsaError::Unsupported {
+                device: self.device.clone(),
+                rejected: format!("rate {source_rate} Hz"),
+                supported: describe_pcm(&self.pcm),
+            })),
+        }
+    }
+}
+
+/// Try the `ladder` entries in order with `attempt` until one opens. A
+/// failed entry is `refused` only for a confirmed capability rejection
+/// ([`AlsaError::is_capability`]); any other failure (busy, gone during a
+/// hot-plug, an I/O error) is `transient`. `Err` carries the last error.
+#[allow(clippy::type_complexity)]
+fn walk_ladder<T>(
+    ladder: &[RateRatio],
+    source_rate: u32,
+    mut attempt: impl FnMut(RateRatio) -> Result<T>,
+) -> (
+    std::result::Result<(RateRatio, T), Option<AlsaError>>,
+    Vec<RateRatio>,
+    Vec<RateRatio>,
+) {
+    let mut last_err = None;
+    let (mut refused, mut transient) = (Vec::new(), Vec::new());
+    for &ratio in ladder {
+        if ratio.output_rate(source_rate).is_none() {
+            continue;
+        }
+        match attempt(ratio) {
+            Ok(v) => return (Ok((ratio, v)), refused, transient),
+            Err(e) => {
+                if e.is_capability() {
+                    refused.push(ratio);
+                } else {
+                    transient.push(ratio);
                 }
-                Err(e) => {
-                    log::debug!(
-                        "ALSA '{}' rejected {} Hz: {e}; trying a smaller ratio",
-                        self.device,
-                        try_cfg.rate
-                    );
-                    last_err = Some(e);
-                }
+                last_err = Some(e);
             }
         }
-        // The ratio-1 attempt is the last one: its error is the most telling.
-        Err(last_err.unwrap_or_else(|| AlsaError::Unsupported {
-            device: self.device.clone(),
-            rejected: format!("rate {source_rate} Hz"),
-            supported: describe_pcm(&self.pcm),
-        }))
+    }
+    (Err(last_err), refused, transient)
+}
+
+/// What an open with a ratio ladder took, and what a blind open (no probe)
+/// saw fail before it: `refused` for a capability error (a parameter the
+/// device does not support), `transient` for anything a later attempt may
+/// get past ([`AlsaError::is_capability`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RatioOpen {
+    pub ratio: RateRatio,
+    pub refused: Vec<RateRatio>,
+    pub transient: Vec<RateRatio>,
+}
+
+impl RatioOpen {
+    /// An open at `ratio` that saw nothing fail.
+    pub fn at(ratio: RateRatio) -> Self {
+        Self {
+            ratio,
+            ..Self::default()
+        }
     }
 }
 
@@ -199,6 +288,9 @@ pub struct AlsaOutput {
     /// the PCM dropped back to `State::Prepared` and must prefill + `start()`
     /// (because `start_threshold` is set to `boundary`).
     needs_restart: bool,
+    /// `recover()` resumes a suspended PCM (`ESTRPIPE`); off, it returns
+    /// the error instead ([`Self::set_suspend_recovery`]).
+    recover_suspend: bool,
 }
 
 impl AlsaOutput {
@@ -222,15 +314,15 @@ impl AlsaOutput {
     pub fn open_with_ratio_fallback(
         config: &AlsaConfig,
         source_rate: u32,
-        desired_ratio: u32,
+        ladder: &[RateRatio],
         quantum: u32,
         formats: &[SampleFormat],
         caps: Option<&DeviceCapabilities>,
-    ) -> Result<(Self, u32)> {
+    ) -> Result<(Self, RateRatio)> {
         OpenPcm::open(&config.device, config.nonblock)?.configure_with_ratio_fallback(
             config,
             source_rate,
-            desired_ratio,
+            ladder,
             quantum,
             formats,
             caps,
@@ -260,6 +352,7 @@ impl AlsaOutput {
             scratch,
             xruns: 0,
             needs_restart: false,
+            recover_suspend: true,
         })
     }
 
@@ -316,14 +409,27 @@ impl AlsaOutput {
 
     /// Recover from an ALSA error (e.g. `EPIPE` underrun or `ESTRPIPE` suspend).
     /// Increments the xrun counter when `EPIPE` is observed and marks `needs_restart`.
+    /// Real-time safe: it runs on the audio thread (every query and write
+    /// recovers through it), so it never logs; `alsa-lib` is told to stay
+    /// silent too. Callers report [`Self::xruns`] from another thread.
     pub fn recover(&mut self, err: alsa::Error) -> Result<()> {
+        if err.errno() == libc::ESTRPIPE && !self.recover_suspend {
+            return Err(AlsaError::Alsa(err));
+        }
         if err.errno() == libc::EPIPE {
             self.xruns += 1;
-            log::warn!("ALSA xrun #{} on playback", self.xruns);
         }
         self.pcm.try_recover(err, true)?;
         self.needs_restart = true;
         Ok(())
+    }
+
+    /// Whether [`Self::recover`] resumes a suspended PCM (on by default).
+    /// `alsa-lib` waits for the resume in 1 s steps, so a caller on a
+    /// real-time thread turns it off and gets `ESTRPIPE` as an error to
+    /// handle after it has left that thread's loop.
+    pub fn set_suspend_recovery(&mut self, on: bool) {
+        self.recover_suspend = on;
     }
 
     /// Available frames that can currently be written without blocking.
@@ -470,7 +576,8 @@ impl AlsaOutput {
     /// Bounded against infinite zero-progress spins (`AlsaError::WriteTimeout`),
     /// interruptible via `should_stop` (`AlsaError::Interrupted`), and stops
     /// early if `recover()` sets `needs_restart` so the caller can re-prefill
-    /// and restart playback.
+    /// and restart playback. Before `start` (a prepared PCM, whose buffer
+    /// only `start` drains) it returns what fit instead of waiting.
     pub fn write_i32_all_until(
         &mut self,
         samples: &[i32],
@@ -496,6 +603,12 @@ impl AlsaOutput {
                 break;
             }
             if written < total_frames {
+                if n == 0 && self.pcm.state() == State::Prepared {
+                    // Auto-start is off (`start_threshold = boundary`): a
+                    // prepared PCM frees no room before `start`, so waiting
+                    // cannot help. Hand back what fit.
+                    break;
+                }
                 if n == 0 {
                     zero_waits += 1;
                     if zero_waits > MAX_ZERO_PROGRESS_WAITS {
@@ -582,12 +695,98 @@ fn candidate_formats_from_config(config: &AlsaConfig) -> Vec<SampleFormat> {
     candidate_formats
 }
 
-fn negotiate_params(
-    pcm: &PCM,
+/// The hardware-parameter steps of one open attempt, over a fresh
+/// configuration space per format candidate ([`choose_format`]): the real
+/// device ([`PcmSpace`]) or, in tests, a scripted one.
+trait HwSpace {
+    fn begin(&mut self) -> std::result::Result<(), alsa::Error>;
+    fn set_access(&mut self) -> std::result::Result<(), alsa::Error>;
+    fn set_format(&mut self, format: SampleFormat) -> std::result::Result<(), alsa::Error>;
+    fn set_channels(&mut self, channels: u32) -> std::result::Result<(), alsa::Error>;
+    /// Sets the rate (nearest) and returns the rate the space holds.
+    fn set_rate(&mut self, rate: u32) -> std::result::Result<u32, alsa::Error>;
+    fn set_period_and_buffer(
+        &mut self,
+        period_frames: u32,
+        periods: u32,
+    ) -> std::result::Result<(), alsa::Error>;
+    fn install(&mut self) -> std::result::Result<(), alsa::Error>;
+}
+
+struct PcmSpace<'a> {
+    pcm: &'a PCM,
+    hwp: Option<HwParams<'a>>,
+}
+
+impl PcmSpace<'_> {
+    fn hwp(&self) -> std::result::Result<&HwParams<'_>, alsa::Error> {
+        self.hwp
+            .as_ref()
+            .ok_or_else(|| alsa::Error::new("snd_pcm_hw_params_any", libc::EBADFD))
+    }
+}
+
+impl HwSpace for PcmSpace<'_> {
+    fn begin(&mut self) -> std::result::Result<(), alsa::Error> {
+        let hwp = HwParams::any(self.pcm)?;
+        let _ = hwp.set_rate_resample(false);
+        self.hwp = Some(hwp);
+        Ok(())
+    }
+    fn set_access(&mut self) -> std::result::Result<(), alsa::Error> {
+        self.hwp()?.set_access(Access::RWInterleaved)
+    }
+    fn set_format(&mut self, format: SampleFormat) -> std::result::Result<(), alsa::Error> {
+        self.hwp()?.set_format(to_alsa_format(format))
+    }
+    fn set_channels(&mut self, channels: u32) -> std::result::Result<(), alsa::Error> {
+        self.hwp()?.set_channels(channels)
+    }
+    fn set_rate(&mut self, rate: u32) -> std::result::Result<u32, alsa::Error> {
+        let hwp = self.hwp()?;
+        hwp.set_rate(rate, ValueOr::Nearest)?;
+        hwp.get_rate()
+    }
+    fn set_period_and_buffer(
+        &mut self,
+        period_frames: u32,
+        periods: u32,
+    ) -> std::result::Result<(), alsa::Error> {
+        let hwp = self.hwp()?;
+        let period = hwp.set_period_size_near(period_frames as _, ValueOr::Nearest)?;
+        let desired_buf = (period as u32).saturating_mul(periods.max(2));
+        hwp.set_buffer_size_near(desired_buf as _)?;
+        Ok(())
+    }
+    fn install(&mut self) -> std::result::Result<(), alsa::Error> {
+        self.pcm.hw_params(self.hwp()?)
+    }
+}
+
+/// A step's error: `Ok(true)` when the device rejects the value (`EINVAL`,
+/// the value is outside its configuration space: a capability), the error
+/// itself otherwise (busy, gone during a hot-plug, an I/O error: typed,
+/// never reported as unsupported).
+fn rejected(e: alsa::Error) -> Result<bool> {
+    if e.errno().abs() == libc::EINVAL {
+        Ok(true)
+    } else {
+        Err(AlsaError::Alsa(e))
+    }
+}
+
+/// The first of `candidate_formats` the device takes with the rest of
+/// `config`. Only a confirmed capability rejection of every candidate
+/// becomes [`AlsaError::Unsupported`] (naming the parameter); any other
+/// error from a setter or the install step is returned as it is, so a
+/// ladder never records it as a rate the device cannot play.
+fn choose_format(
+    space: &mut impl HwSpace,
     device: &str,
     config: &AlsaConfig,
     candidate_formats: &[SampleFormat],
-) -> Result<NegotiatedParams> {
+    supported: impl FnOnce() -> String,
+) -> Result<SampleFormat> {
     // Why each candidate failed, so the error names the parameter.
     let mut access_rejected = false;
     let mut format_rejected: Vec<SampleFormat> = Vec::new();
@@ -595,69 +794,92 @@ fn negotiate_params(
     let mut rate_rejected: Vec<SampleFormat> = Vec::new();
     let mut install_err: Option<String> = None;
 
-    let mut chosen_format = None;
     for &fmt in candidate_formats {
-        let hwp = HwParams::any(pcm)?;
-        let _ = hwp.set_rate_resample(false);
-        if hwp.set_access(Access::RWInterleaved).is_err() {
+        space.begin().map_err(AlsaError::Alsa)?;
+        if let Err(e) = space.set_access() {
+            rejected(e)?;
             access_rejected = true;
             break;
         }
-        if hwp.set_format(to_alsa_format(fmt)).is_err() {
+        if let Err(e) = space.set_format(fmt) {
+            rejected(e)?;
             format_rejected.push(fmt);
             continue;
         }
-        if hwp.set_channels(config.channels).is_err() {
+        if let Err(e) = space.set_channels(config.channels) {
+            rejected(e)?;
             channels_rejected = true;
             continue;
         }
-        if hwp.set_rate(config.rate, ValueOr::Nearest).is_err()
-            || hwp.get_rate().ok() != Some(config.rate)
-        {
-            rate_rejected.push(fmt);
+        match space.set_rate(config.rate) {
+            Ok(rate) if rate == config.rate => {}
+            Ok(_) => {
+                rate_rejected.push(fmt);
+                continue;
+            }
+            Err(e) => {
+                rejected(e)?;
+                rate_rejected.push(fmt);
+                continue;
+            }
+        }
+        if let Err(e) = space.set_period_and_buffer(config.period_frames, config.buffer_periods) {
+            rejected(e)?;
+            install_err = Some("period or buffer size not supported".into());
             continue;
         }
-        let period = hwp.set_period_size_near(config.period_frames as _, ValueOr::Nearest)?;
-        let desired_buf = (period as u32).saturating_mul(config.buffer_periods.max(2));
-        let _buffer = hwp.set_buffer_size_near(desired_buf as _)?;
-        match pcm.hw_params(&hwp) {
-            Ok(()) => {
-                chosen_format = Some(fmt);
-                break;
+        match space.install() {
+            Ok(()) => return Ok(fmt),
+            Err(e) => {
+                let text = e.to_string();
+                rejected(e)?;
+                install_err = Some(text);
             }
-            Err(e) => install_err = Some(e.to_string()),
         }
     }
 
-    let Some(format) = chosen_format else {
-        let names = |v: &[SampleFormat]| v.iter().map(|f| f.name()).collect::<Vec<_>>().join(", ");
-        let rejected = if access_rejected {
-            "interleaved read/write access".to_string()
-        } else if !rate_rejected.is_empty() {
-            format!(
-                "rate {} Hz (with {} channels, format {})",
-                config.rate,
-                config.channels,
-                names(&rate_rejected)
-            )
-        } else if channels_rejected {
-            format!("{} channels", config.channels)
-        } else if format_rejected.len() == candidate_formats.len() {
-            format!("sample format {}", names(&format_rejected))
-        } else if let Some(e) = install_err {
-            format!(
-                "{} Hz, {} channels with the requested buffer ({e})",
-                config.rate, config.channels
-            )
-        } else {
-            format!("{} Hz, {} channels", config.rate, config.channels)
-        };
-        return Err(AlsaError::Unsupported {
-            device: device.to_string(),
-            rejected,
-            supported: describe_pcm(pcm),
-        });
+    let names = |v: &[SampleFormat]| v.iter().map(|f| f.name()).collect::<Vec<_>>().join(", ");
+    let rejected = if access_rejected {
+        "interleaved read/write access".to_string()
+    } else if !rate_rejected.is_empty() {
+        format!(
+            "rate {} Hz (with {} channels, format {})",
+            config.rate,
+            config.channels,
+            names(&rate_rejected)
+        )
+    } else if channels_rejected {
+        format!("{} channels", config.channels)
+    } else if format_rejected.len() == candidate_formats.len() {
+        format!("sample format {}", names(&format_rejected))
+    } else if let Some(e) = install_err {
+        format!(
+            "{} Hz, {} channels with the requested buffer ({e})",
+            config.rate, config.channels
+        )
+    } else {
+        format!("{} Hz, {} channels", config.rate, config.channels)
     };
+    Err(AlsaError::Unsupported {
+        device: device.to_string(),
+        rejected,
+        supported: supported(),
+    })
+}
+
+fn negotiate_params(
+    pcm: &PCM,
+    device: &str,
+    config: &AlsaConfig,
+    candidate_formats: &[SampleFormat],
+) -> Result<NegotiatedParams> {
+    let format = choose_format(
+        &mut PcmSpace { pcm, hwp: None },
+        device,
+        config,
+        candidate_formats,
+        || describe_pcm(pcm),
+    )?;
 
     let hwp = pcm.hw_params_current()?;
     let rate = hwp.get_rate()?;
@@ -747,6 +969,196 @@ fn _assert_sw_params_send(_: &SwParams<'_>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A configuration space that fails the scripted steps with an errno.
+    #[derive(Default)]
+    struct Scripted {
+        /// Rates the space holds (others round to the first one).
+        rates: Vec<u32>,
+        rate_errno: Option<i32>,
+        install_errno: Option<i32>,
+        buffer_errno: Option<i32>,
+        installs: usize,
+    }
+
+    fn err(errno: i32) -> alsa::Error {
+        alsa::Error::new("scripted", errno)
+    }
+
+    impl HwSpace for Scripted {
+        fn begin(&mut self) -> std::result::Result<(), alsa::Error> {
+            Ok(())
+        }
+        fn set_access(&mut self) -> std::result::Result<(), alsa::Error> {
+            Ok(())
+        }
+        fn set_format(&mut self, _: SampleFormat) -> std::result::Result<(), alsa::Error> {
+            Ok(())
+        }
+        fn set_channels(&mut self, _: u32) -> std::result::Result<(), alsa::Error> {
+            Ok(())
+        }
+        fn set_rate(&mut self, rate: u32) -> std::result::Result<u32, alsa::Error> {
+            if let Some(errno) = self.rate_errno {
+                return Err(err(errno));
+            }
+            Ok(if self.rates.contains(&rate) {
+                rate
+            } else {
+                self.rates[0]
+            })
+        }
+        fn set_period_and_buffer(
+            &mut self,
+            _: u32,
+            _: u32,
+        ) -> std::result::Result<(), alsa::Error> {
+            self.buffer_errno.map_or(Ok(()), |e| Err(err(e)))
+        }
+        fn install(&mut self) -> std::result::Result<(), alsa::Error> {
+            self.installs += 1;
+            self.install_errno.map_or(Ok(()), |e| Err(err(e)))
+        }
+    }
+
+    fn cfg(rate: u32) -> AlsaConfig {
+        AlsaConfig {
+            device: "hw:Test".into(),
+            rate,
+            channels: 2,
+            period_frames: 1024,
+            buffer_periods: 4,
+            preferred_format: None,
+            strict_format: false,
+            nonblock: true,
+        }
+    }
+
+    fn choose(space: &mut Scripted, rate: u32) -> Result<SampleFormat> {
+        choose_format(space, "hw:Test", &cfg(rate), &FORMAT_PREFERENCE, || {
+            "48000 Hz".into()
+        })
+    }
+
+    #[test]
+    fn only_a_confirmed_rejection_is_a_capability() {
+        let space = |rate_errno, install_errno, buffer_errno| Scripted {
+            rates: vec![48_000],
+            rate_errno,
+            install_errno,
+            buffer_errno,
+            ..Default::default()
+        };
+        // The rate rounds away, or a setter or the install says EINVAL:
+        // the device cannot do it.
+        assert!(
+            choose(&mut space(None, None, None), 288_000)
+                .unwrap_err()
+                .is_capability()
+        );
+        for (r, i, b) in [
+            (Some(libc::EINVAL), None, None),
+            (None, Some(libc::EINVAL), None),
+            (None, Some(-libc::EINVAL), None),
+            (None, None, Some(libc::EINVAL)),
+        ] {
+            let e = choose(&mut space(r, i, b), 48_000).unwrap_err();
+            assert!(e.is_capability(), "{r:?} {i:?} {b:?}: {e}");
+        }
+        // Gone during a hot-plug at `set_rate`, busy or not permitted at
+        // the install, an I/O error at the buffer: typed, never
+        // unsupported, and the first one ends the attempt.
+        for (r, i, b) in [
+            (Some(libc::ENODEV), None, None),
+            (Some(-libc::ENODEV), None, None),
+            (None, Some(libc::EBUSY), None),
+            (None, Some(libc::EPERM), None),
+            (None, Some(libc::EBADFD), None),
+            (None, None, Some(libc::EIO)),
+        ] {
+            let mut s = space(r, i, b);
+            let e = choose(&mut s, 48_000).unwrap_err();
+            assert!(!e.is_capability(), "{r:?} {i:?} {b:?}: {e}");
+            assert!(matches!(e, AlsaError::Alsa(_)), "{e}");
+            assert!(s.installs <= 1);
+        }
+        assert_eq!(
+            choose(&mut space(None, None, None), 48_000).unwrap(),
+            FORMAT_PREFERENCE[0]
+        );
+    }
+
+    #[test]
+    #[ignore = "needs the snd-aloop Loopback card"]
+    fn blind_ladder_opens_the_loopback_card() {
+        // 48 kHz x32 (1.536 MHz) is outside the loopback's range: refused
+        // (a capability), then x2 opens.
+        let open = OpenPcm::open("hw:Loopback,0,3", true).expect("open loopback");
+        let x = RateRatio::integer;
+        let (out, plan) = open
+            .configure_with_ratio_plan(&cfg(96_000), 48_000, &[x(32), x(2)], 1024, &[], None)
+            .expect("x2 opens");
+        assert_eq!(plan.ratio, x(2));
+        assert_eq!(plan.refused, [x(32)]);
+        assert!(plan.transient.is_empty());
+        assert_eq!(out.params().rate, 96_000);
+    }
+
+    #[test]
+    #[ignore = "needs the snd-aloop Loopback card"]
+    fn a_write_before_start_never_waits_for_room() {
+        // Auto-start is off: before `start` nothing frees room, so a write
+        // one frame past the buffer returns at once with what fit instead
+        // of waiting for room that never comes.
+        let mut c = cfg(48_000);
+        c.device = "hw:Loopback,0,3".into();
+        let mut out = AlsaOutput::open(&c).expect("open loopback");
+        out.prepare().unwrap();
+        let buffer = out.params().buffer_frames as usize;
+        let samples = vec![0_i32; (buffer + 1) * 2];
+        let t = std::time::Instant::now();
+        let written = out.write_i32_all_until(&samples, || false);
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(50),
+            "{:?}",
+            t.elapsed()
+        );
+        assert_eq!(written.unwrap(), buffer);
+        assert!(!out.is_running());
+    }
+
+    #[test]
+    fn a_ladder_refuses_only_what_the_device_cannot_do() {
+        // A blind open of x6 / x5 / x4 from 48 kHz: x6 is gone for a moment
+        // (hot-plug), x5 is not supported, x4 opens.
+        let x = RateRatio::integer;
+        let (taken, refused, transient) = walk_ladder(&[x(6), x(5), x(4)], 48_000, |q| {
+            let rate = q.output_rate(48_000).unwrap();
+            let mut s = Scripted {
+                rates: vec![192_000],
+                rate_errno: (rate == 288_000).then_some(libc::ENODEV),
+                ..Default::default()
+            };
+            choose(&mut s, rate)
+        });
+        assert_eq!(taken.unwrap().0, x(4));
+        assert_eq!(refused, [x(5)]);
+        assert_eq!(transient, [x(6)]);
+        // Busy at every install: nothing is refused, and the last error
+        // comes back typed.
+        let (taken, refused, transient) = walk_ladder(&[x(2), RateRatio::ONE], 48_000, |q| {
+            let mut s = Scripted {
+                rates: vec![48_000, 96_000],
+                install_errno: Some(libc::EBUSY),
+                ..Default::default()
+            };
+            choose(&mut s, q.output_rate(48_000).unwrap())
+        });
+        let last = taken.unwrap_err().unwrap();
+        assert!(matches!(last, AlsaError::Alsa(_)) && !last.is_capability());
+        assert!(refused.is_empty());
+        assert_eq!(transient, [x(2), RateRatio::ONE]);
+    }
 
     #[test]
     fn pack_s32_exact() {

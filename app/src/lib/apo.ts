@@ -2,7 +2,9 @@
 //
 // The parser follows crates/dsp-core/src/eq_apo.rs (same tokens, same BW and
 // S conversions, same defaults): APO import fills the linked section and warns
-// on Channel: directives. Shelves are written as LSC/HSC (the Q form Equalizer
+// on directives it does not know. `Channel: L` / `Channel: R` put the
+// filters (and a Preamp) that follow into that channel's own section, and
+// `Channel: all` goes back to the linked one. Shelves are written as LSC/HSC (the Q form Equalizer
 // APO and AutoEQ use).
 
 import type { Band, EqProfile, FilterType } from "../api/types";
@@ -123,8 +125,8 @@ function parseFilter(spec: string, line: number): Band | null {
 
 /** Parse a ParametricEQ.txt into the linked EQ section. Throws `ApoError` on malformed Preamp/Filter lines. */
 export function parseApo(text: string, name = ""): ApoParseResult {
-  const bands: Band[] = [];
-  let preamp_db = 0;
+  const sets = { all: { preamp_db: 0, bands: [] as Band[] }, L: { preamp_db: 0, bands: [] as Band[] }, R: { preamp_db: 0, bands: [] as Band[] } };
+  let ch: keyof typeof sets = "all";
   const warnings: string[] = [];
   text.split(/\r?\n/).forEach((raw, idx) => {
     const lineNo = idx + 1;
@@ -143,11 +145,18 @@ export function parseApo(text: string, name = ""): ApoParseResult {
       const toks = rest.split(/\s+/).filter(Boolean);
       const v = num(toks[0], lineNo, "Preamp");
       if (toks[1] !== undefined && toks[1].toLowerCase() !== "db") throw new ApoError(lineNo, `unexpected “${toks[1]}” after the Preamp value`);
-      preamp_db = v;
+      sets[ch].preamp_db = v;
     } else if (key === "filter" || /^filter\s*\d+$/.test(key)) {
       const band = parseFilter(rest, lineNo);
       if (band === null) warnings.push(`Line ${lineNo}: skipped a None filter`);
-      else bands.push(band);
+      else sets[ch].bands.push(band);
+    } else if (key === "channel") {
+      const v = rest.toUpperCase();
+      if (v === "L" || v === "R") ch = v;
+      else {
+        ch = "all";
+        if (v !== "ALL") warnings.push(`Line ${lineNo}: channel “${rest}” read as all channels`);
+      }
     } else {
       warnings.push(`Line ${lineNo}: ignored “${line.slice(0, colon).trim()}”`);
     }
@@ -155,10 +164,17 @@ export function parseApo(text: string, name = ""): ApoParseResult {
   const profile: EqProfile = {
     name,
     version: 2,
-    preamp_db,
+    preamp_db: sets.all.preamp_db,
     linked_enabled: true,
-    bands,
+    bands: sets.all.bands,
   };
+  const side = (s: { preamp_db: number; bands: Band[] }) => (s.bands.length || s.preamp_db ? { enabled: true, ...s } : undefined);
+  const left = side(sets.L);
+  const right = side(sets.R);
+  if (left || right) {
+    profile.left = left ?? { enabled: true, preamp_db: 0, bands: [] };
+    profile.right = right ?? { enabled: true, preamp_db: 0, bands: [] };
+  }
   return { profile, warnings };
 }
 
@@ -173,10 +189,22 @@ function writeSet(lines: string[], preamp: number, bands: readonly Band[]) {
   });
 }
 
-/** Serialize the linked EQ section to ParametricEQ.txt. */
+/** Serialize the EQ to ParametricEQ.txt: the linked section, then any
+ *  per-channel bands under `Channel: L` / `Channel: R`. */
 export function toApo(profile: EqProfile): string {
   const lines: string[] = [];
   writeSet(lines, profile.preamp_db, profile.bands);
+  for (const [name, c] of [["L", profile.left], ["R", profile.right]] as const) {
+    if (!c || !c.enabled || (!c.bands.length && !c.preamp_db)) continue;
+    lines.push(`Channel: ${name}`);
+    if (c.preamp_db) lines.push(`Preamp: ${String(c.preamp_db)} dB`);
+    c.bands.forEach((b, i) => {
+      const one: string[] = [];
+      writeSet(one, 0, [b]);
+      lines.push(one[1].replace(/^Filter 1:/, `Filter ${i + 1}:`));
+    });
+  }
+  if (profile.left || profile.right) lines.push("Channel: all");
   return lines.join("\n") + "\n";
 }
 

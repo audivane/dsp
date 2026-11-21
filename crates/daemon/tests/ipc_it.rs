@@ -9,9 +9,9 @@ use audivane_dsp_daemon::api::{Engine, EngineError};
 use audivane_dsp_daemon::control::daemon::{Daemon, DaemonOptions};
 use audivane_protocol::SampleFormat;
 use audivane_protocol::ipc::{
-    AbConfig, AbSide, AbStatus, AppRule, Call, DeviceInfo, EngineConfig, EngineState, LevelMatch,
-    PassthroughBreak, Preset, PresetInfo, PresetState, RouteTarget, RoutingMode, RpcError,
-    SinkChoice, Spectrum, Status, StreamInfo, Topic,
+    AbB, AbConfig, AbSide, AbStatus, AppRule, Call, DeviceInfo, EngineConfig, EngineState,
+    LevelMatch, PassthroughBreak, Preset, PresetInfo, PresetState, RouteTarget, RoutingMode,
+    RpcError, SinkChoice, Spectrum, Status, StreamInfo, Topic, VolumeStatus,
 };
 use audivane_protocol::{
     Band, ChainConfig, DitherKind, EqProfile, FilterType, OutputConfig, RateTarget, UpsamplerConfig,
@@ -86,6 +86,45 @@ fn every_call_round_trips() {
     assert_eq!(value["config"]["device"], "hw:1,0");
     assert_eq!(harness.engine.config_now().device, "hw:1,0");
 
+    // set_dc_block
+    client.ok(Call::SetDcBlock(Some(
+        audivane_protocol::DcBlockConfig::default(),
+    )));
+    let config: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    assert!(config.chain.dc_block.as_ref().is_some_and(|d| d.enabled));
+    let common::Reply::Error(err) =
+        client.call(Call::SetDcBlock(Some(audivane_protocol::DcBlockConfig {
+            enabled: true,
+            cutoff_hz: 25.0,
+        })))
+    else {
+        panic!("expected INVALID_PARAMS for out-of-range dc_block cutoff");
+    };
+    assert_eq!(err.code, RpcError::INVALID_PARAMS);
+    client.ok(Call::SetDcBlock(None));
+    let config: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    assert!(config.chain.dc_block.is_none());
+
+    // set_crossfeed
+    client.ok(Call::SetCrossfeed(Some(
+        audivane_protocol::CrossfeedConfig::default(),
+    )));
+    let config: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    assert!(config.chain.crossfeed.as_ref().is_some_and(|c| c.enabled));
+    client.ok(Call::SetCrossfeed(None));
+    let config: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    assert!(config.chain.crossfeed.is_none());
+
+    // set_harmonics
+    client.ok(Call::SetHarmonics(Some(
+        audivane_protocol::HarmonicsConfig::default(),
+    )));
+    let config: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    assert!(config.chain.harmonics.as_ref().is_some_and(|h| h.enabled));
+    client.ok(Call::SetHarmonics(None));
+    let config: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    assert!(config.chain.harmonics.is_none());
+
     // set_eq
     client.ok(Call::SetEq(Some(profile())));
     let config: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
@@ -110,11 +149,15 @@ fn every_call_round_trips() {
     client.ok(Call::SetConvolution(Vec::new()));
 
     // set_upsampler
-    client.ok(Call::SetUpsampler(UpsamplerConfig {
-        target: RateTarget::Ratio(4),
-        taps: 8192,
-        ..UpsamplerConfig::default()
-    }));
+    client.ok(Call::SetUpsampler(
+        audivane_dsp_core::resample::ManualConfig {
+            target: RateTarget::Ratio(4),
+            taps: 8192,
+            ..Default::default()
+        }
+        .into_upsampler_config()
+        .unwrap(),
+    ));
     let config: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
     assert_eq!(config.chain.upsampler.target, RateTarget::Ratio(4));
     client.ok(Call::SetUpsampler(UpsamplerConfig::default()));
@@ -130,8 +173,9 @@ fn every_call_round_trips() {
         ..harness.engine.config_now().chain.clone()
     };
     let ab: AbStatus = serde_json::from_value(client.ok(Call::SetAb(Some(AbConfig {
-        chain_b,
         level: LevelMatch::Manual { offset_db: -3.0 },
+        headroom: Default::default(),
+        ..AbConfig::chain(chain_b)
     }))))
     .unwrap();
     assert!(ab.enabled);
@@ -186,6 +230,27 @@ fn every_call_round_trips() {
     match client.call(Call::Route {
         target: RouteTarget::Node(7),
         sink: SinkChoice::Dsp,
+    }) {
+        Reply::Error(error) => assert_eq!(error.code, RpcError::BAD_STATE),
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // set_stream_volume: a level out of range is refused before anything
+    // else; without a graph, BAD_STATE.
+    for volume_db in [0.5, -121.0] {
+        match client.call(Call::SetStreamVolume {
+            node: 7,
+            volume_db: Some(volume_db),
+            muted: None,
+        }) {
+            Reply::Error(error) => assert_eq!(error.code, RpcError::INVALID_PARAMS),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    match client.call(Call::SetStreamVolume {
+        node: 7,
+        volume_db: Some(-6.0),
+        muted: Some(false),
     }) {
         Reply::Error(error) => assert_eq!(error.code, RpcError::BAD_STATE),
         other => panic!("unexpected {other:?}"),
@@ -296,11 +361,31 @@ fn error_paths() {
     let value: Value = serde_json::from_str(client.read_line().unwrap().trim()).unwrap();
     assert_eq!(value["error"]["code"], RpcError::INVALID_PARAMS);
 
+    // Every call is a known method (set_pitch once was not), and an unknown
+    // enum value inside params is bad params, not an unknown method.
+    client.send_raw(
+        br#"{"id":8,"method":"set_pitch","params":{"enabled":true,"cents":0.0,"quality":"high"}}"#,
+    );
+    client.send_raw(b"\n");
+    let value: Value = serde_json::from_str(client.read_line().unwrap().trim()).unwrap();
+    assert_eq!(value["id"], 8);
+    assert!(value.get("error").is_none(), "{value}");
+    client.send_raw(
+        br#"{"id":9,"method":"set_pitch","params":{"enabled":true,"cents":0.0,"quality":"ultra"}}"#,
+    );
+    client.send_raw(b"\n");
+    let value: Value = serde_json::from_str(client.read_line().unwrap().trim()).unwrap();
+    assert_eq!(value["error"]["code"], RpcError::INVALID_PARAMS, "{value}");
+
     // Validation errors name the field.
-    match client.call(Call::SetUpsampler(UpsamplerConfig {
-        taps: 0,
-        ..UpsamplerConfig::default()
-    })) {
+    match client.call(Call::SetUpsampler(
+        audivane_dsp_core::resample::ManualConfig {
+            taps: 0,
+            ..Default::default()
+        }
+        .into_upsampler_config()
+        .unwrap(),
+    )) {
         Reply::Error(error) => {
             assert_eq!(error.code, RpcError::INVALID_PARAMS);
             assert!(error.message.contains("taps"), "{}", error.message);
@@ -389,7 +474,7 @@ fn subscription_pushes_state_and_meters() {
     harness.engine.set_state(EngineState::Playing);
     harness.engine.set_snapshot(|snapshot| {
         snapshot.dsp_active = true;
-        snapshot.ratio = 4;
+        snapshot.ratio = audivane_protocol::RateRatio::integer(4);
         snapshot.output_rate = 192_000;
     });
     let mut client = harness.client();
@@ -576,7 +661,7 @@ fn passthrough_status_combines_engine_and_graph_facts() {
     harness.engine.set_state(EngineState::Playing);
     harness.engine.set_snapshot(|snapshot| {
         snapshot.dsp_active = true;
-        snapshot.ratio = 2;
+        snapshot.ratio = audivane_protocol::RateRatio::integer(2);
         snapshot.format = Some(SampleFormat::S16);
     });
     let mut client = harness.client();
@@ -619,6 +704,277 @@ fn changes_survive_a_restart() {
     assert_eq!(loaded.config.chain.eq.unwrap().bands.len(), 1);
 }
 
+fn volume_of(client: &mut TestClient) -> VolumeStatus {
+    let status: Status = serde_json::from_value(client.ok(Call::Status)).unwrap();
+    status.volume.unwrap()
+}
+
+fn set_volume(
+    client: &mut TestClient,
+    volume_db: f64,
+    balance_db: f64,
+    muted: bool,
+    if_instance: Option<&str>,
+    if_revision: Option<u64>,
+) -> Reply {
+    match (if_instance, if_revision) {
+        (Some(instance), Some(revision)) => client.call(Call::SetVolumeGuarded {
+            volume_db: Some(volume_db),
+            balance_db: Some(balance_db),
+            muted: Some(muted),
+            if_instance: instance.to_string(),
+            if_revision: revision,
+        }),
+        (None, None) => client.call(Call::SetVolume {
+            volume_db,
+            balance_db,
+            muted,
+        }),
+        _ => panic!("a guarded write names both the instance and the revision"),
+    }
+}
+
+/// A `set_volume_guarded` made against one daemon process and delivered to the
+/// one that replaced it on the same socket (a delayed request, a client
+/// retry on a fresh connection) is refused and changes nothing.
+#[test]
+fn a_volume_change_bound_to_a_restarted_daemon_is_refused() {
+    let first = Harness::start_with("instance-a", |c| c.volume.volume_db = -12.0);
+    let socket = first.socket.clone();
+    let old = volume_of(&mut first.client());
+    let old_instance = old.instance.clone().unwrap();
+    assert_eq!(old_instance.len(), 32, "{old_instance}");
+    assert!(old_instance.chars().all(|c| c.is_ascii_hexdigit()));
+    first.daemon.shutdown();
+
+    // The replacement, at -30 dB, on the same socket.
+    let mut config = EngineConfig {
+        device: "hw:0,0".into(),
+        ..EngineConfig::default()
+    };
+    config.routing = RoutingMode::Apps { rules: Vec::new() };
+    config.volume.volume_db = -30.0;
+    let engine = MockEngine::new(config.clone());
+    let opts = DaemonOptions::new(socket.clone()).with_store(std::sync::Arc::new(
+        audivane_dsp_daemon::control::config::ConfigStore::new(first.dir.join("config-b.json")),
+    ));
+    let second = Daemon::start(
+        std::sync::Arc::clone(&engine) as std::sync::Arc<dyn Engine>,
+        config,
+        DaemonOptions {
+            graph: false,
+            mpris: false,
+            ..opts
+        },
+    )
+    .expect("start the replacement");
+    let mut client = TestClient::connect(&socket);
+    let new = volume_of(&mut client);
+    let new_instance = new.instance.clone().unwrap();
+    assert_ne!(new_instance, old_instance);
+
+    // Even with a revision that happens to match the replacement's.
+    match set_volume(
+        &mut client,
+        0.0,
+        -2.0,
+        false,
+        Some(&old_instance),
+        new.revision,
+    ) {
+        Reply::Error(e) => assert_eq!(e.code, RpcError::STALE_INSTANCE, "{e:?}"),
+        Reply::Ok(v) => panic!("the old daemon's volume change was applied: {v}"),
+    }
+    let after = volume_of(&mut client);
+    assert_eq!((after.volume_db, after.balance_db), (-30.0, 0.0));
+    assert_eq!(after.revision, new.revision);
+    assert_eq!(engine.config_now().volume.volume_db, -30.0);
+
+    // Bound to this daemon and its revision, or unbound (the CLI): applied.
+    let Reply::Ok(v) = set_volume(
+        &mut client,
+        -30.5,
+        0.0,
+        false,
+        Some(&new_instance),
+        new.revision,
+    ) else {
+        panic!("a current write was refused")
+    };
+    let echo: VolumeStatus = serde_json::from_value(v).unwrap();
+    assert_eq!(echo.volume_db, -30.5);
+    assert!(echo.revision > new.revision);
+    assert!(matches!(
+        set_volume(&mut client, -31.0, 0.0, false, None, None),
+        Reply::Ok(_)
+    ));
+    assert_eq!(engine.config_now().volume.volume_db, -31.0);
+    second.shutdown();
+}
+
+/// Compare-and-set on the level revision: a write based on a level that
+/// changed since (another client, the CLI) is refused and changes nothing;
+/// the echo carries the revision for the next step.
+#[test]
+fn a_volume_change_based_on_an_old_revision_is_refused() {
+    let harness = Harness::start_with("revision", |c| c.volume.volume_db = -20.0);
+    let mut app = harness.client();
+    let mut cli = harness.client();
+    let start = volume_of(&mut app);
+    let instance = start.instance.clone().unwrap();
+    let r0 = start.revision.unwrap();
+
+    // A drag: each step carries the revision of the previous echo.
+    let Reply::Ok(v) = set_volume(&mut app, -19.0, 0.0, false, Some(&instance), Some(r0)) else {
+        panic!("first step refused")
+    };
+    let r1 = serde_json::from_value::<VolumeStatus>(v)
+        .unwrap()
+        .revision
+        .unwrap();
+    assert!(r1 > r0);
+    // Rewriting the same level is no change: the revision stays.
+    let Reply::Ok(v) = set_volume(&mut app, -19.0, 0.0, false, Some(&instance), Some(r1)) else {
+        panic!("same-level step refused")
+    };
+    assert_eq!(
+        serde_json::from_value::<VolumeStatus>(v).unwrap().revision,
+        Some(r1)
+    );
+
+    // Someone else changes the level (the CLI sends no condition).
+    assert!(matches!(
+        set_volume(&mut cli, -40.0, 0.0, true, None, None),
+        Reply::Ok(_)
+    ));
+    for (vol, bal, muted) in [
+        (-19.5, 0.0, false),
+        (-40.0, -2.0, true),
+        (-40.0, 0.0, false),
+    ] {
+        match set_volume(&mut app, vol, bal, muted, Some(&instance), Some(r1)) {
+            Reply::Error(e) => assert_eq!(e.code, RpcError::STALE_REVISION, "{e:?}"),
+            Reply::Ok(v) => panic!("a write from an old revision was applied: {v}"),
+        }
+    }
+    let now = volume_of(&mut app);
+    assert_eq!(
+        (now.volume_db, now.balance_db, now.muted),
+        (-40.0, 0.0, true)
+    );
+    assert!(now.revision.unwrap() > r1);
+}
+
+/// A guarded write changes only the level fields it carries: a volume step
+/// leaves a mute (acknowledged at the revision it is based on) alone.
+#[test]
+fn a_guarded_write_changes_only_the_fields_it_carries() {
+    let harness = Harness::start_with("partial", |c| c.volume.volume_db = -12.0);
+    let mut app = harness.client();
+    let start = volume_of(&mut app);
+    let instance = start.instance.clone().unwrap();
+    let Reply::Ok(v) = app.call(Call::SetVolumeGuarded {
+        volume_db: None,
+        balance_db: None,
+        muted: Some(true),
+        if_instance: instance.clone(),
+        if_revision: start.revision.unwrap(),
+    }) else {
+        panic!("mute refused")
+    };
+    let muted: VolumeStatus = serde_json::from_value(v).unwrap();
+    assert_eq!((muted.volume_db, muted.muted), (-12.0, true));
+    let Reply::Ok(v) = app.call(Call::SetVolumeGuarded {
+        volume_db: Some(-12.5),
+        balance_db: None,
+        muted: None,
+        if_instance: instance.clone(),
+        if_revision: muted.revision.unwrap(),
+    }) else {
+        panic!("volume step refused")
+    };
+    let after: VolumeStatus = serde_json::from_value(v).unwrap();
+    assert_eq!(
+        (after.volume_db, after.balance_db, after.muted),
+        (-12.5, 0.0, true)
+    );
+    // Nothing to change is still a guarded no-op.
+    let Reply::Ok(v) = app.call(Call::SetVolumeGuarded {
+        volume_db: None,
+        balance_db: None,
+        muted: None,
+        if_instance: instance,
+        if_revision: after.revision.unwrap(),
+    }) else {
+        panic!("empty write refused")
+    };
+    let same: VolumeStatus = serde_json::from_value(v).unwrap();
+    assert_eq!(same.revision, after.revision);
+}
+
+/// `set_config` never sets the level: an edit of other settings that
+/// carries an old volume, balance and mute (a client's stale copy) leaves
+/// the live level and its revision alone, while volume settings apply.
+#[test]
+fn set_config_keeps_the_live_level() {
+    let harness = Harness::start_with("config-level", |c| c.volume.volume_db = -20.0);
+    let mut client = harness.client();
+    let stale: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    // The level moves on (another client).
+    client.ok(Call::SetVolume {
+        volume_db: -35.0,
+        balance_db: 1.5,
+        muted: true,
+    });
+    let before = volume_of(&mut client);
+    // An output-format edit from the stale copy, plus a ceiling change.
+    let mut edit = stale;
+    edit.chain.output.bits = 16;
+    edit.volume.max_volume_db = Some(-6.0);
+    client.ok(Call::SetConfig(edit));
+    let cfg: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    assert_eq!(cfg.chain.output.bits, 16);
+    assert_eq!(cfg.volume.max_volume_db, Some(-6.0));
+    assert_eq!(
+        (
+            cfg.volume.volume_db,
+            cfg.volume.balance_db,
+            cfg.volume.muted
+        ),
+        (-35.0, 1.5, true)
+    );
+    let after = volume_of(&mut client);
+    assert_eq!(
+        (after.volume_db, after.balance_db, after.muted),
+        (-35.0, 1.5, true)
+    );
+    assert_eq!(after.revision, before.revision);
+
+    // A ceiling below the level changes the effective level: a new revision.
+    let mut lower = cfg;
+    lower.volume.max_volume_db = Some(-40.0);
+    client.ok(Call::SetConfig(lower));
+    let capped = volume_of(&mut client);
+    assert!(capped.revision > after.revision);
+}
+
+/// `set_config` ignores the incoming level, so it does not validate it
+/// either: a copy with an out-of-range volume or balance still applies its
+/// other settings, and the live level stays.
+#[test]
+fn set_config_does_not_validate_the_level_it_ignores() {
+    let harness = Harness::start_with("config-level-validate", |c| c.volume.volume_db = -20.0);
+    let mut client = harness.client();
+    let mut edit: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    edit.chain.output.bits = 16;
+    edit.volume.volume_db = 5.0;
+    edit.volume.balance_db = 99.0;
+    client.ok(Call::SetConfig(edit));
+    let cfg: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    assert_eq!(cfg.chain.output.bits, 16);
+    assert_eq!((cfg.volume.volume_db, cfg.volume.balance_db), (-20.0, 0.0));
+}
+
 #[test]
 fn config_file_is_written_atomically() {
     let harness = Harness::start("atomic");
@@ -644,16 +1000,20 @@ fn config_file_is_written_atomically() {
 
 #[test]
 fn upsample_off_after_ab_set_keeps_chain_b_in_step() {
-    // The phase-3 repro: `ab set` while upsampling x4, then `ctl upsample
-    // --off` used to fail because chain B was still x4.
+    // `ab set` while upsampling x4, then `ctl upsample --off`: chain B must
+    // follow chain A and stay in step.
     let harness = Harness::start("ab-repro");
     let mut client = harness.client();
 
-    client.ok(Call::SetUpsampler(UpsamplerConfig {
-        target: RateTarget::Ratio(4),
-        taps: 8192,
-        ..UpsamplerConfig::default()
-    }));
+    client.ok(Call::SetUpsampler(
+        audivane_dsp_core::resample::ManualConfig {
+            target: RateTarget::Ratio(4),
+            taps: 8192,
+            ..Default::default()
+        }
+        .into_upsampler_config()
+        .unwrap(),
+    ));
     let config: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
     // `avdsp ctl ab set` builds chain B from chain A.
     let chain_b = ChainConfig {
@@ -661,15 +1021,16 @@ fn upsample_off_after_ab_set_keeps_chain_b_in_step() {
         ..config.chain.clone()
     };
     let value = client.ok(Call::SetAb(Some(AbConfig {
-        chain_b,
-        level: LevelMatch::Analytic,
+        level: LevelMatch::default(),
+        headroom: Default::default(),
+        ..AbConfig::chain(chain_b)
     })));
     assert!(
         value.get("notes").is_none(),
         "an aligned chain B needs no note: {value}"
     );
 
-    // This is the sequence that used to answer INVALID_PARAMS.
+    // The sequence that must be accepted.
     client.ok(Call::SetUpsampler(UpsamplerConfig {
         target: RateTarget::Off,
         ..UpsamplerConfig::default()
@@ -677,7 +1038,8 @@ fn upsample_off_after_ab_set_keeps_chain_b_in_step() {
     let config: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
     assert_eq!(config.chain.upsampler.target, RateTarget::Off);
     let chain_b = config.ab.expect("A/B still configured").chain_b;
-    assert_eq!(chain_b.upsampler, config.chain.upsampler);
+    // A full chain B keeps its own filter; the target follows A.
+    assert_eq!(chain_b.upsampler.target, config.chain.upsampler.target);
     assert_eq!(chain_b.output, config.chain.output);
     // The engine saw the same thing (not just the stored config).
     let engine = harness.engine.config_now();
@@ -694,26 +1056,111 @@ fn upsample_off_after_ab_set_keeps_chain_b_in_step() {
 
     // Other edits keep B in step too, and re-enabling x2 works.
     client.ok(Call::SetDspEnabled { enabled: false });
-    client.ok(Call::SetUpsampler(UpsamplerConfig {
-        target: RateTarget::Ratio(2),
-        taps: 4096,
-        ..UpsamplerConfig::default()
-    }));
+    client.ok(Call::SetUpsampler(
+        audivane_dsp_core::resample::ManualConfig {
+            target: RateTarget::Ratio(2),
+            taps: 4096,
+            ..Default::default()
+        }
+        .into_upsampler_config()
+        .unwrap(),
+    ));
     let config: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
     let chain_b = config.ab.unwrap().chain_b;
-    assert_eq!(chain_b.upsampler, config.chain.upsampler);
+    assert_eq!(chain_b.upsampler.target, config.chain.upsampler.target);
+    assert_ne!(chain_b.upsampler, config.chain.upsampler);
     assert_eq!(chain_b.output, config.chain.output);
+}
+
+#[test]
+fn a_patch_b_follows_later_edits_to_chain_a() {
+    let harness = Harness::start("ab-patch");
+    let mut client = harness.client();
+    client.ok(Call::SetCrossfeed(Some(Default::default())));
+    let mut ab = AbConfig::new(AbB::Patch(
+        serde_json::json!({"crossfeed": {"enabled": false}}),
+    ));
+    ab.label = Some("Crossfeed off".into());
+    let value = client.ok(Call::SetAb(Some(ab)));
+    assert!(value.get("notes").is_none(), "{value}");
+
+    client.ok(Call::SetEq(Some(profile())));
+    let config: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    let ab = config.ab.as_ref().unwrap();
+    assert_eq!(ab.label.as_deref(), Some("Crossfeed off"));
+    assert_eq!(ab.chain_b.eq, Some(profile()));
+    assert!(!ab.chain_b.crossfeed.as_ref().unwrap().enabled);
+    assert!(config.chain.crossfeed.as_ref().unwrap().enabled);
+    // The engine got the same B.
+    assert_eq!(harness.engine.config_now().ab.unwrap().chain_b, ab.chain_b);
+
+    // A kept list is noted.
+    let value = client.ok(Call::SetAb(Some(AbConfig::new(AbB::Patch(
+        serde_json::json!({"eq": {"bands": profile().bands}}),
+    )))));
+    let notes = value["notes"].as_array().expect("a note");
+    assert!(notes[0].as_str().unwrap().contains("eq.bands"), "{value}");
+}
+
+#[test]
+fn a_patch_on_a_shared_field_is_refused_with_the_field_named() {
+    let harness = Harness::start("ab-patch-refused");
+    let mut client = harness.client();
+    for (patch, field) in [
+        (
+            serde_json::json!({"upsampler": {"target": {"ratio": 2}}}),
+            "ab.b.patch.upsampler.target",
+        ),
+        (
+            serde_json::json!({"limiter": {"mode": "off"}}),
+            "ab.b.patch.limiter",
+        ),
+        (
+            serde_json::json!({"output": {"headroom_db": 0.0}}),
+            "ab.b.patch.output.headroom_db",
+        ),
+        (
+            serde_json::json!({"output": {"format": "s16"}}),
+            "ab.b.patch.output.format",
+        ),
+        (
+            serde_json::json!({"pitch": {"cents": "x"}}),
+            "ab.b.patch.pitch",
+        ),
+    ] {
+        let Reply::Error(err) = client.call(Call::SetAb(Some(AbConfig::new(AbB::Patch(patch)))))
+        else {
+            panic!("expected {field} to be refused");
+        };
+        assert_eq!(err.code, RpcError::INVALID_PARAMS);
+        assert!(err.message.contains(field), "{}", err.message);
+        // So is a whole config carrying it.
+        let mut config: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+        config.ab = Some(AbConfig::new(AbB::Patch(
+            serde_json::json!({"output": {"format": "s16"}}),
+        )));
+        let Reply::Error(err) = client.call(Call::SetConfig(config)) else {
+            panic!("expected a refused config");
+        };
+        assert!(err.message.contains("ab.b.patch.output"), "{}", err.message);
+    }
+    let config: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    assert!(config.ab.is_none());
 }
 
 #[test]
 fn set_ab_realigns_a_stale_chain_b_and_says_so() {
     let harness = Harness::start("ab-realign");
     let mut client = harness.client();
-    client.ok(Call::SetUpsampler(UpsamplerConfig {
-        target: RateTarget::Ratio(4),
-        taps: 8192,
-        ..UpsamplerConfig::default()
-    }));
+    client.ok(Call::SetUpsampler(
+        audivane_dsp_core::resample::ManualConfig {
+            target: RateTarget::Ratio(4),
+            taps: 8192,
+            ..Default::default()
+        }
+        .into_upsampler_config()
+        .unwrap(),
+    ));
 
     // A client that sends a chain B from before the upsampler changed.
     let stale_b = ChainConfig {
@@ -725,28 +1172,41 @@ fn set_ab_realigns_a_stale_chain_b_and_says_so() {
         output: OutputConfig {
             bits: 16,
             dither: DitherKind::Shaped,
+            headroom_db: 0.0,
         },
-        ..Default::default()
+        ..ChainConfig::neutral()
     };
     let value = client.ok(Call::SetAb(Some(AbConfig {
-        chain_b: stale_b,
         level: LevelMatch::Manual { offset_db: -3.0 },
+        headroom: Default::default(),
+        ..AbConfig::chain(stale_b)
     })));
     let notes = value["notes"].as_array().expect("a note");
     assert_eq!(notes.len(), 1, "{value}");
     let note = notes[0].as_str().unwrap();
-    assert!(note.contains("ab.chain_b.upsampler"), "{note}");
-    assert!(note.contains("ab.chain_b.output"), "{note}");
+    assert!(note.contains("upsampler.target"), "{note}");
+    assert!(note.contains("output"), "{note}");
     assert!(note.contains("x4"), "{note}");
 
     let config: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
-    let chain_b = &config.ab.as_ref().unwrap().chain_b;
-    assert_eq!(chain_b.upsampler, config.chain.upsampler);
+    let ab = config.ab.as_ref().unwrap();
+    let chain_b = &ab.chain_b;
+    assert_eq!(chain_b.upsampler.target, config.chain.upsampler.target);
+    // The whole output follows A: a preset is never an output compare.
     assert_eq!(chain_b.output, config.chain.output);
     assert_eq!(chain_b.eq.as_ref().unwrap().bands.len(), 1);
+    // Stored realigned, so the note is said once.
+    assert_eq!(ab.b, AbB::Chain(Box::new(chain_b.clone())));
     assert_eq!(
-        harness.engine.config_now().ab.unwrap().chain_b.upsampler,
-        config.chain.upsampler
+        harness
+            .engine
+            .config_now()
+            .ab
+            .unwrap()
+            .chain_b
+            .upsampler
+            .target,
+        config.chain.upsampler.target
     );
 }
 
@@ -758,8 +1218,9 @@ fn set_config_realigns_chain_b_before_validation() {
     config.chain.upsampler.target = RateTarget::Ratio(8);
     // Chain B left at "off": invalid as written, normalized on the way in.
     config.ab = Some(AbConfig {
-        chain_b: ChainConfig::default(),
-        level: LevelMatch::Analytic,
+        level: LevelMatch::default(),
+        headroom: Default::default(),
+        ..AbConfig::chain(ChainConfig::neutral())
     });
     client.ok(Call::SetConfig(config));
     let stored: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
@@ -780,11 +1241,15 @@ fn presets_round_trip_and_track_the_active_one() {
     let harness = Harness::start("presets");
     let mut client = harness.client();
     client.ok(Call::SetEq(Some(profile())));
-    client.ok(Call::SetUpsampler(UpsamplerConfig {
-        target: RateTarget::Ratio(4),
-        taps: 8192,
-        ..UpsamplerConfig::default()
-    }));
+    client.ok(Call::SetUpsampler(
+        audivane_dsp_core::resample::ManualConfig {
+            target: RateTarget::Ratio(4),
+            taps: 8192,
+            ..Default::default()
+        }
+        .into_upsampler_config()
+        .unwrap(),
+    ));
 
     // Save chain A; the name is trimmed and normalized.
     let info: PresetInfo = serde_json::from_value(client.ok(Call::SavePreset {
@@ -889,8 +1354,9 @@ fn presets_round_trip_and_track_the_active_one() {
         ..harness.engine.config_now().chain.clone()
     };
     client.ok(Call::SetAb(Some(AbConfig {
-        chain_b,
-        level: LevelMatch::Analytic,
+        level: LevelMatch::default(),
+        headroom: Default::default(),
+        ..AbConfig::chain(chain_b)
     })));
     client.ok(Call::SetUpsampler(UpsamplerConfig {
         target: RateTarget::Off,
@@ -967,14 +1433,17 @@ fn import_apo_creates_a_preset_without_loading_it() {
     let mut client = harness.client();
     let ir = harness.dir.write("room.wav", "RIFF....WAVE");
     let mut cfg: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
-    cfg.chain.upsampler = UpsamplerConfig {
+    cfg.chain.upsampler = audivane_dsp_core::resample::ManualConfig {
         target: RateTarget::Ratio(2),
         taps: 8192,
-        ..UpsamplerConfig::default()
-    };
+        ..Default::default()
+    }
+    .into_upsampler_config()
+    .unwrap();
     cfg.chain.output = OutputConfig {
         bits: 16,
         dither: DitherKind::Shaped,
+        headroom_db: 0.0,
     };
     cfg.chain.convolution = vec![audivane_protocol::ConvolutionConfig {
         name: Some("Room".into()),
@@ -1457,7 +1926,7 @@ fn set_eq_supports_layered_sections_and_validates_left_and_right_channels() {
     });
     client.ok(Call::SetEq(Some(all_off)));
     let after: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
-    assert!(after.chain.is_passthrough());
+    assert!(!after.chain.eq.as_ref().is_some_and(|e| e.is_active()));
 }
 
 #[test]
@@ -1502,10 +1971,21 @@ fn set_volume_validates_ranges_surfaces_hardware_and_persists() {
         hardware: true,
         min_db: -60.0,
         max_db: 0.0,
+        ..VolumeStatus::from_config(&Default::default())
     };
-    harness.engine.set_snapshot(|s| s.volume = Some(hw));
+    harness.engine.set_snapshot(|s| s.volume = Some(hw.clone()));
     let status: Status = serde_json::from_value(client.ok(Call::Status)).unwrap();
-    assert_eq!(status.volume, Some(hw));
+    let reported = status.volume.unwrap();
+    // The service adds this daemon's instance and level revision.
+    assert!(reported.instance.is_some() && reported.revision.is_some());
+    assert_eq!(
+        VolumeStatus {
+            instance: None,
+            revision: None,
+            ..reported
+        },
+        hw
+    );
 
     harness.daemon.shutdown();
     drop(client);
@@ -1861,4 +2341,205 @@ fn spectrum_subscription_yields_events() {
         }
         other => panic!("unexpected event {other:?}"),
     }
+}
+
+#[test]
+fn set_varispeed_live_call_persists_without_chain_rebuild_and_reports_status() {
+    use audivane_protocol::ipc::{
+        VarispeedCapReason, VarispeedConfig, VarispeedHeldReason, VarispeedOverloadHold,
+        VarispeedStatus,
+    };
+
+    let harness = Harness::start("varispeed-live");
+    let mut client = harness.client();
+    let applies_before = harness
+        .engine
+        .applies
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    // Default config: varispeed off, speed 1.0, ramp_ms 200.
+    let cfg: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    assert_eq!(cfg.varispeed, VarispeedConfig::default());
+
+    // Live enable with speed and ramp_ms: does not call Engine::apply.
+    let st: VarispeedStatus = serde_json::from_value(client.ok(Call::SetVarispeed {
+        enabled: Some(true),
+        speed: Some(1.02),
+        ramp_ms: Some(500.0),
+        keep_pitch: None,
+    }))
+    .unwrap();
+    assert!(st.enabled);
+    assert!(!st.active);
+    assert_eq!(st.requested, 1.02);
+    assert_eq!(st.target, 1.0);
+    assert_eq!(
+        harness
+            .engine
+            .applies
+            .load(std::sync::atomic::Ordering::Relaxed),
+        applies_before,
+        "set_varispeed must not rebuild the chain via Engine::apply"
+    );
+    assert_eq!(
+        *harness.engine.varispeed_calls.lock().unwrap(),
+        vec![(true, 1.02, 500.0)]
+    );
+
+    // Partial update (speed only) keeps enabled and ramp_ms.
+    client.ok(Call::SetVarispeed {
+        enabled: None,
+        speed: Some(1.05),
+        ramp_ms: None,
+        keep_pitch: None,
+    });
+    assert_eq!(
+        harness.engine.varispeed_calls.lock().unwrap().last(),
+        Some(&(true, 1.05, 500.0))
+    );
+
+    // Persisted via deferred writer.
+    let on_disk = harness.wait_for_config(Duration::from_secs(3), |c| {
+        c.varispeed.enabled && (c.varispeed.speed - 1.05).abs() < 1e-12
+    });
+    assert_eq!(on_disk.varispeed.ramp_ms, 500.0);
+    assert!(!on_disk.varispeed.keep_pitch);
+
+    // Keep pitch alone: the rest stays, status and the config follow.
+    let st: VarispeedStatus = serde_json::from_value(client.ok(Call::SetVarispeed {
+        enabled: None,
+        speed: None,
+        ramp_ms: None,
+        keep_pitch: Some(true),
+    }))
+    .unwrap();
+    assert!(st.keep_pitch && st.enabled);
+    assert_eq!(st.requested, 1.05);
+    let on_disk = harness.wait_for_config(Duration::from_secs(3), |c| c.varispeed.keep_pitch);
+    assert_eq!(on_disk.varispeed.speed, 1.05);
+    client.ok(Call::SetVarispeed {
+        enabled: None,
+        speed: Some(1.05),
+        ramp_ms: None,
+        keep_pitch: None,
+    });
+    let cfg: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    assert!(
+        cfg.varispeed.keep_pitch,
+        "a speed-only call keeps Keep pitch"
+    );
+    client.ok(Call::SetVarispeed {
+        enabled: None,
+        speed: None,
+        ramp_ms: None,
+        keep_pitch: Some(false),
+    });
+
+    // Validation errors leave state untouched.
+    let Reply::Error(err) = client.call(Call::SetVarispeed {
+        enabled: None,
+        speed: Some(2.5),
+        ramp_ms: None,
+        keep_pitch: None,
+    }) else {
+        panic!("expected INVALID_PARAMS for speed 2.5");
+    };
+    assert_eq!(err.code, RpcError::INVALID_PARAMS);
+    assert!(err.message.contains("varispeed.speed"), "{}", err.message);
+
+    let Reply::Error(err) = client.call(Call::SetVarispeed {
+        enabled: None,
+        speed: None,
+        ramp_ms: Some(20_000.0),
+        keep_pitch: None,
+    }) else {
+        panic!("expected INVALID_PARAMS for ramp_ms 20000");
+    };
+    assert_eq!(err.code, RpcError::INVALID_PARAMS);
+    assert!(err.message.contains("varispeed.ramp_ms"), "{}", err.message);
+
+    // Explicit `null` values on the wire must be rejected, not treated as omitted.
+    for (id, params) in [
+        (501, r#"{"enabled":true,"speed":null}"#),
+        (502, r#"{"ramp_ms":null}"#),
+        (503, r#"{"enabled":null}"#),
+    ] {
+        let line = format!(r#"{{"id":{id},"method":"set_varispeed","params":{params}}}"#);
+        client.send_raw(format!("{line}\n").as_bytes());
+        let reply: Value = serde_json::from_str(client.read_line().unwrap().trim()).unwrap();
+        assert_eq!(reply["id"], id);
+        assert!(
+            reply.get("error").is_some(),
+            "explicit null must be rejected: {reply}"
+        );
+    }
+
+    // Applied state from engine snapshot flows into Status and Passthrough.
+    harness.engine.set_snapshot(|s| {
+        s.state = EngineState::Playing;
+        s.format = Some(SampleFormat::S32);
+        s.rt_load_max = 0.14;
+        s.varispeed = Some(VarispeedStatus {
+            enabled: true,
+            keep_pitch: false,
+            active: true,
+            speed: 1.03,
+            target: 1.05,
+            requested: 1.05,
+            speed_limit: 1.5,
+            cap_reason: Some(VarispeedCapReason::PeriodQuantum),
+            ramping: true,
+            fading: false,
+            latency_frames: 512.0,
+            latency_exact: false,
+            held: Some(VarispeedHeldReason::Underfeed),
+            overload_hold: VarispeedOverloadHold::None,
+            underfeed_events: 3,
+            underfeed_frames: 96,
+            short_cycles: 1,
+            gap_fades: 1,
+            error: None,
+        });
+    });
+    let status: Status = serde_json::from_value(client.ok(Call::Status)).unwrap();
+    assert_eq!(status.rt_load_max, 0.14);
+    let vs = status.varispeed.expect("varispeed status");
+    assert_eq!(vs.speed, 1.03);
+    assert_eq!(vs.target, 1.05);
+    assert_eq!(vs.cap_reason, Some(VarispeedCapReason::PeriodQuantum));
+    assert_eq!(vs.held, Some(VarispeedHeldReason::Underfeed));
+    assert_eq!(vs.underfeed_events, 3);
+    assert_eq!(vs.underfeed_frames, 96);
+    assert_eq!(vs.short_cycles, 1);
+    assert!(
+        status
+            .passthrough
+            .broken_because
+            .contains(&PassthroughBreak::DspActive)
+    );
+    assert!(
+        status
+            .passthrough
+            .broken_because
+            .contains(&PassthroughBreak::Varispeed { speed: 1.03 })
+    );
+
+    // Disabling keeps configured speed and ramp_ms and still skips Engine::apply.
+    client.ok(Call::SetVarispeed {
+        enabled: Some(false),
+        speed: None,
+        ramp_ms: None,
+        keep_pitch: None,
+    });
+    let cfg: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    assert!(!cfg.varispeed.enabled);
+    assert_eq!(cfg.varispeed.speed, 1.05);
+    assert_eq!(cfg.varispeed.ramp_ms, 500.0);
+    assert_eq!(
+        harness
+            .engine
+            .applies
+            .load(std::sync::atomic::Ordering::Relaxed),
+        applies_before
+    );
 }

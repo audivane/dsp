@@ -1,16 +1,14 @@
 // EQ graph overlays: target curves, preference bounds and measurements.
 //
-// The input files are the ones people already have: REW text/CSV exports,
+// Input files are the ones people already have: REW text/CSV exports,
 // squig.link and AutoEq CSV (`frequency,raw`), or any plain `freq dB` list,
 // comma/tab/semicolon/space separated, with an optional header and comment
-// lines (`*`, `#`, `;`). Everything is reduced to sorted [Hz, dB] points; the
-// graph resamples them onto one log grid (`DRAW_FREQS`).
+// lines (`*`, `#`, `;`). Everything is reduced to sorted [Hz, dB] points and
+// resampled onto one log grid (`DRAW_FREQS`).
 //
-// A curve is normalised at a reference frequency (1 kHz by default) so it
-// sits on the graph's 0 dB line, then shifted by the overlay's own offset.
-// A measurement can also show "measurement + current EQ" (the predicted
-// curve); `eqResponseDb` is the single place that asks the EQ maths for the
-// response, so the layered L/R sections need change only there.
+// A curve is normalised at a reference frequency (1 kHz by default) onto the
+// graph's 0 dB line, then shifted by the overlay's own offset. `eqResponseDb`
+// is the single place that asks the EQ maths for a response.
 
 import type { EqProfile } from "../api/types";
 import { parseNumber } from "./format";

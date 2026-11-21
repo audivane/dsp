@@ -125,15 +125,150 @@ fn first_playback_channel(selem: &Selem<'_>) -> SelemChannelId {
     SelemChannelId::FrontLeft
 }
 
+/// A name for the card of `device` that survives reboots and other cards
+/// coming and going: its ALSA id (`/proc/asound/cardN/id`, e.g. "Loopback"),
+/// or the `CARD=` name in the device string. `None` when neither is known.
+pub fn card_identity(device: &str) -> Option<String> {
+    let rest = device
+        .strip_prefix("hw:")
+        .or_else(|| device.strip_prefix("plughw:"))?;
+    let card_part = rest.split(',').next().unwrap_or("");
+    let named = card_part.strip_prefix("CARD=").unwrap_or(card_part);
+    if !named.is_empty() && named.parse::<u32>().is_err() {
+        return Some(named.to_string());
+    }
+    let index = card_index_from_device(device).ok()?;
+    std::fs::read_to_string(format!("/proc/asound/card{index}/id"))
+        .ok()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+/// Run `read` on the volume element [`apply_playback_volume`] uses on the
+/// card of `device`; `Ok(None)` when no element qualifies.
+fn with_playback_element<T>(
+    device: &str,
+    read: impl FnOnce(&Selem<'_>, &MixerElementCandidate) -> Result<Option<T>>,
+) -> Result<Option<T>> {
+    let card = card_index_from_device(device)?;
+    let mixer = Mixer::new(&format!("hw:{card}"), false)?;
+    let mut ids = Vec::new();
+    let mut candidates = Vec::new();
+    for elem in mixer.iter() {
+        let Some(selem) = Selem::new(elem) else {
+            continue;
+        };
+        if let Some((id, cand)) = inspect_selem(&selem) {
+            ids.push(id);
+            candidates.push(cand);
+        }
+    }
+    let Some(chosen) = select_playback_element(&candidates) else {
+        return Ok(None);
+    };
+    let Some(selem) = mixer.find_selem(&ids[chosen]) else {
+        return Ok(None);
+    };
+    read(&selem, &candidates[chosen])
+}
+
+/// The playback switch of the volume element [`apply_playback_volume`]
+/// uses on the card of `device`: `Some(true)` on, `Some(false)` muted,
+/// `None` when that element has no switch (or no element qualifies).
+///
+/// Must NEVER be called on the real-time audio thread.
+pub fn playback_switch(device: &str) -> Result<Option<bool>> {
+    with_playback_element(device, |selem, cand| {
+        if !cand.has_playback_switch {
+            return Ok(None);
+        }
+        let ch = first_playback_channel(selem);
+        Ok(Some(selem.get_playback_switch(ch)? != 0))
+    })
+}
+
+/// The level, dB, of the volume element [`apply_playback_volume`] uses on
+/// the card of `device`: its quietest playback channel (an unlinked
+/// control can hold its channels apart), clamped to its range, or `None`
+/// when no element qualifies. A caller that only lowers the card writes
+/// nothing when this is at or below its target: its write sets every
+/// channel and would raise that one.
+///
+/// Must NEVER be called on the real-time audio thread.
+pub fn playback_level(device: &str) -> Result<Option<f64>> {
+    with_playback_element(device, |selem, cand| {
+        let Some(range) = cand.db_range else {
+            return Ok(None);
+        };
+        let mut levels = Vec::new();
+        for ch in SelemChannelId::all() {
+            if selem.has_playback_channel(*ch) {
+                levels.push(selem.get_playback_vol_db(*ch)?.0 as f64 / 100.0);
+            }
+        }
+        Ok(quietest_level(&levels, range))
+    })
+}
+
+/// One playback channel of the volume element [`apply_playback_volume`]
+/// uses: its level (clamped to the control's range) and its switch (`None`:
+/// the element has none).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlaybackChannel {
+    pub level_db: f64,
+    pub switch_on: Option<bool>,
+}
+
+/// Every playback channel of the volume element [`apply_playback_volume`]
+/// uses on the card of `device` (an unlinked control can hold them apart),
+/// or `None` when no element qualifies.
+///
+/// Must NEVER be called on the real-time audio thread.
+pub fn playback_channels(device: &str) -> Result<Option<Vec<PlaybackChannel>>> {
+    with_playback_element(device, |selem, cand| {
+        let Some((min_db, max_db)) = cand.db_range else {
+            return Ok(None);
+        };
+        let mut channels = Vec::new();
+        for ch in SelemChannelId::all() {
+            if selem.has_playback_channel(*ch) {
+                let level_db =
+                    (selem.get_playback_vol_db(*ch)?.0 as f64 / 100.0).clamp(min_db, max_db);
+                let switch_on = if cand.has_playback_switch {
+                    Some(selem.get_playback_switch(*ch)? != 0)
+                } else {
+                    None
+                };
+                channels.push(PlaybackChannel {
+                    level_db,
+                    switch_on,
+                });
+            }
+        }
+        Ok(Some(channels))
+    })
+}
+
+/// The quietest of a control's channel levels, clamped to its range.
+fn quietest_level(levels: &[f64], (min_db, max_db): (f64, f64)) -> Option<f64> {
+    levels
+        .iter()
+        .copied()
+        .reduce(f64::min)
+        .map(|l| l.clamp(min_db, max_db))
+}
+
 /// Inspect the ALSA mixer on the card of `device` and, if a suitable playback
-/// volume control exists, apply `volume_db` (and `muted` via its playback
-/// switch if present).
+/// volume control exists, apply `volume_db` (clamped to the control's range,
+/// so `f64::INFINITY` means "its maximum") and, when `muted` is `Some`, set
+/// its playback switch if it has one. `None` leaves the switch alone
+/// (`hardware_mute` is then false: the caller mutes digitally).
 ///
 /// Must NEVER be called on the real-time audio thread.
 pub fn apply_playback_volume(
     device: &str,
     volume_db: f64,
-    muted: bool,
+    muted: Option<bool>,
 ) -> Result<MixerApplyOutcome> {
     let card = card_index_from_device(device)?;
     let mixer = Mixer::new(&format!("hw:{card}"), false)?;
@@ -170,11 +305,12 @@ pub fn apply_playback_volume(
         .map(|mb| ((mb.0 as f64) / 100.0).clamp(min_db, max_db))
         .unwrap_or(target_db);
 
-    let hardware_mute = if cand.has_playback_switch {
-        selem.set_playback_switch_all(if muted { 0 } else { 1 })?;
-        true
-    } else {
-        false
+    let hardware_mute = match muted {
+        Some(muted) if cand.has_playback_switch => {
+            selem.set_playback_switch_all(if muted { 0 } else { 1 })?;
+            true
+        }
+        _ => false,
     };
 
     Ok(MixerApplyOutcome {
@@ -189,6 +325,16 @@ pub fn apply_playback_volume(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Left -10 dB, right -45 dB on an unlinked control: the level a
+    /// never-raise check compares with is the right one's.
+    #[test]
+    fn the_level_is_the_quietest_channel() {
+        assert_eq!(quietest_level(&[-10.0, -45.0], (-64.0, 0.0)), Some(-45.0));
+        assert_eq!(quietest_level(&[-45.0, -10.0], (-64.0, 0.0)), Some(-45.0));
+        assert_eq!(quietest_level(&[-80.0, -10.0], (-64.0, 0.0)), Some(-64.0));
+        assert_eq!(quietest_level(&[], (-64.0, 0.0)), None);
+    }
 
     fn elem(
         name: &str,
@@ -259,5 +405,15 @@ mod tests {
         // Degenerate min == max dB range is not eligible.
         let flat_db = vec![elem("PCM", 0, true, false, Some((0.0, 0.0)))];
         assert_eq!(select_playback_element(&flat_db), None);
+    }
+
+    #[test]
+    fn card_identity_prefers_the_card_name() {
+        assert_eq!(card_identity("hw:CARD=Dac,DEV=0").as_deref(), Some("Dac"));
+        assert_eq!(
+            card_identity("hw:Loopback,0,0").as_deref(),
+            Some("Loopback")
+        );
+        assert_eq!(card_identity("default"), None);
     }
 }

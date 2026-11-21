@@ -133,7 +133,10 @@ fn response(
         }
     };
 
-    let eq = Eq::new(&profile, f64::from(rate), 2);
+    let eq = Eq::new(&profile, f64::from(rate), 2).map_err(anyhow::Error::msg)?;
+    if let Some(clamped) = eq.tilt_clamped_end_hz() {
+        eprintln!("note: tilt end_hz clamped to {clamped:.1} Hz at {rate} Hz sample rate");
+    }
     let rows: Vec<(f64, f64, f64)> = frequencies
         .iter()
         .map(|&f| {

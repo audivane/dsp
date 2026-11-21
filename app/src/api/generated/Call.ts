@@ -2,18 +2,28 @@
 import type { AbConfig } from "./AbConfig";
 import type { AbSide } from "./AbSide";
 import type { ConvolutionConfig } from "./ConvolutionConfig";
+import type { CrossfeedConfig } from "./CrossfeedConfig";
+import type { DcBlockConfig } from "./DcBlockConfig";
 import type { EngineConfig } from "./EngineConfig";
 import type { EqProfile } from "./EqProfile";
+import type { FilterDesign } from "./FilterDesign";
+import type { HarmonicsConfig } from "./HarmonicsConfig";
+import type { LimiterConfig } from "./LimiterConfig";
+import type { OutputConfig } from "./OutputConfig";
+import type { PitchConfig } from "./PitchConfig";
+import type { RatePolicy } from "./RatePolicy";
+import type { RateTarget } from "./RateTarget";
 import type { ResponseWindowRequest } from "./ResponseWindowRequest";
 import type { RouteTarget } from "./RouteTarget";
 import type { RoutingMode } from "./RoutingMode";
+import type { SampleFormat } from "./SampleFormat";
 import type { SinkChoice } from "./SinkChoice";
 import type { Topic } from "./Topic";
 import type { UpsamplerConfig } from "./UpsamplerConfig";
 
-export type Call = { "method": "status" } | { "method": "get_config" } | { "method": "set_config", "params": EngineConfig } | { "method": "set_eq", "params": EqProfile | null } | { "method": "set_convolution", "params": Array<ConvolutionConfig> } | { "method": "set_upsampler", "params": UpsamplerConfig } | { "method": "set_dsp_enabled", "params": { enabled: boolean, } } | { "method": "set_ab", "params": AbConfig | null } | { "method": "ab_select", "params": { side: AbSide, crossfade_ms: number, } } | { "method": "set_volume", "params": { volume_db: number, balance_db: number, muted: boolean, } } | { "method": "list_streams" } | { "method": "list_presets" } | { "method": "get_preset", "params": { name: string, } } | { "method": "save_preset", "params": { name: string, overwrite: boolean, } } | { "method": "load_preset", "params": { name: string, } } | { "method": "delete_preset", "params": { name: string, } } | { "method": "rename_preset", "params": { from: string, to: string, } } | { "method": "import_apo", "params": { name: string, text: string, } } | { "method": "list_devices" } | { "method": "route", "params": { target: RouteTarget, sink: SinkChoice, } } | { "method": "set_routing_mode", "params": RoutingMode } | { "method": "now_playing" } | { "method": "self_test" } | { "method": "upsampler_response", "params": { config: UpsamplerConfig | null, source_rate: number | null, 
+export type Call = { "method": "status" } | { "method": "get_config" } | { "method": "set_config", "params": EngineConfig } | { "method": "set_dc_block", "params": DcBlockConfig | null } | { "method": "set_crossfeed", "params": CrossfeedConfig | null } | { "method": "set_eq", "params": EqProfile | null } | { "method": "set_convolution", "params": Array<ConvolutionConfig> } | { "method": "set_upsampler", "params": UpsamplerConfig } | { "method": "set_pitch", "params": PitchConfig } | { "method": "set_harmonics", "params": HarmonicsConfig | null } | { "method": "set_limiter", "params": LimiterConfig } | { "method": "set_dsp_enabled", "params": { enabled: boolean, } } | { "method": "set_output", "params": OutputConfig } | { "method": "set_formats", "params": Array<SampleFormat> } | { "method": "set_rate", "params": RatePolicy } | { "method": "set_device", "params": { device: string, } } | { "method": "set_ab", "params": AbConfig | null } | { "method": "ab_select", "params": { side: AbSide, crossfade_ms: number, } } | { "method": "ab_measure", "params": { max_seconds?: number, cancel?: boolean, accept?: boolean, } } | { "method": "set_volume", "params": { volume_db: number, balance_db: number, muted: boolean, } } | { "method": "set_volume_guarded", "params": { volume_db?: number, balance_db?: number, muted?: boolean, if_instance: string, if_revision: number, } } | { "method": "set_varispeed", "params": { enabled?: boolean, speed?: number, ramp_ms?: number, keep_pitch?: boolean, } } | { "method": "set_follower", "params": { device: string, remove?: boolean, enabled?: boolean, trim_ms?: number, volume_db?: number, } } | { "method": "list_streams" } | { "method": "list_presets" } | { "method": "get_preset", "params": { name: string, } } | { "method": "save_preset", "params": { name: string, overwrite: boolean, } } | { "method": "load_preset", "params": { name: string, } } | { "method": "delete_preset", "params": { name: string, } } | { "method": "rename_preset", "params": { from: string, to: string, } } | { "method": "import_apo", "params": { name: string, text: string, } } | { "method": "list_devices" } | { "method": "route", "params": { target: RouteTarget, sink: SinkChoice, } } | { "method": "set_stream_volume", "params": { node: number, volume_db?: number, muted?: boolean, } } | { "method": "set_routing_mode", "params": RoutingMode } | { "method": "now_playing" } | { "method": "self_test" } | { "method": "upsampler_response", "params": { config: UpsamplerConfig | null, source_rate: number | null, 
 /**
  * Also evaluate this frequency window directly from the measured
  * impulse (zoom). Reuses the cached measurement.
  */
-window?: ResponseWindowRequest | null, } } | { "method": "meters" } | { "method": "release_device" } | { "method": "acquire_device" } | { "method": "subscribe", "params": { topics: Array<Topic>, } } | { "method": "shutdown" };
+window?: ResponseWindowRequest | null, } } | { "method": "resolve_design", "params": { preset: string, } } | { "method": "check_design", "params": { design: FilterDesign, target?: RateTarget, source_rate?: number, } } | { "method": "meters" } | { "method": "release_device" } | { "method": "acquire_device" } | { "method": "subscribe", "params": { topics: Array<Topic>, } } | { "method": "shutdown" };

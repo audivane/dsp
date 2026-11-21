@@ -3,9 +3,9 @@ import { MockDaemon } from "../api/mock";
 import type { DeviceCapabilities } from "../api/types";
 import { directRateNote, directResamples, ditherAdvice, effectiveDitherBits, formatUnavailableReason, rateSupportNote, ratioLadder, sbitsAt, suggestedDitherBits, supportsFormat, usedBits } from "./deviceCaps";
 
-/** Creative Pebble V3 (the bug report): S16_LE, 2 channels, 48000 Hz only. */
-const PEBBLE_V3: DeviceCapabilities = {
-  device: "hw:CARD=V3,DEV=0",
+/** A USB speaker that plays S16_LE, 2 channels, 48000 Hz only. */
+const SPK48: DeviceCapabilities = {
+  device: "hw:CARD=SPK,DEV=0",
   channels: 2,
   channels_min: 2,
   channels_max: 2,
@@ -15,9 +15,21 @@ const PEBBLE_V3: DeviceCapabilities = {
   formats: ["s16"],
 };
 
+/** A USB DAC that plays 48 kHz only (the mock's `USB48`). */
+const USB48: DeviceCapabilities = {
+  device: "hw:CARD=USB48,DEV=0",
+  channels: 2,
+  channels_min: 2,
+  channels_max: 2,
+  rates: [{ rate: 48000, formats: [{ format: "s16", sbits: 16 }, { format: "s24", sbits: 24 }, { format: "s32", sbits: 24 }] }],
+  rate_min: 48000,
+  rate_max: 48000,
+  formats: ["s16", "s24", "s32"],
+};
+
 /** USB DAC with 24-bit only up to 96k. */
 const TIED: DeviceCapabilities = {
-  ...PEBBLE_V3,
+  ...SPK48,
   device: "hw:X",
   rates: [48000, 96000, 192000].map((rate) => ({
     rate,
@@ -28,7 +40,7 @@ const TIED: DeviceCapabilities = {
 describe("device capabilities", () => {
   it("falls back to the unfiltered formats for an unusable device", () => {
     // Mono-only 48k S16 device: the stereo probe found no usable rate.
-    const mono: DeviceCapabilities = { ...PEBBLE_V3, channels_min: 1, channels_max: 1, rates: [] };
+    const mono: DeviceCapabilities = { ...SPK48, channels_min: 1, channels_max: 1, rates: [] };
     expect(supportsFormat(mono, "s16")).toBe(true);
     expect(supportsFormat(mono, "s32")).toBe(false);
   });
@@ -39,6 +51,11 @@ describe("device capabilities", () => {
       "Audivane Direct is bit-perfect at 96 kHz only on this device; a Direct stream at another rate is resampled by PipeWire.",
     );
     expect(directRateNote([48000], [])).toMatch(/cannot play on this device/);
+    // The engine bypass resampler converts 44.1 kHz on a 48 kHz-only DAC.
+    expect(directRateNote([44100, 48000], [44100, 48000], USB48)).toBe(
+      "Audivane Direct is bit-perfect at 48 kHz on this device; at 44.1 kHz the engine converts to a rate the DAC plays (not bit-perfect).",
+    );
+    expect(directRateNote([44100], [44100], USB48)).toMatch(/^Audivane Direct is not bit-perfect on this device: at 44.1 kHz/);
     expect(directRateNote([44100, 48000], [44100, 48000])).toBeNull();
     expect(directRateNote([], [])).toBeNull();
     expect(directResamples(48000, [96000])).toBe(true);
@@ -46,10 +63,10 @@ describe("device capabilities", () => {
     expect(directResamples(48000, [])).toBe(false);
   });
 
-  it("greys out formats the Pebble V3 never takes", () => {
-    expect(supportsFormat(PEBBLE_V3, "s16")).toBe(true);
-    for (const f of ["s32", "s24", "s24_3"] as const) expect(supportsFormat(PEBBLE_V3, f)).toBe(false);
-    expect(formatUnavailableReason(PEBBLE_V3, "s32", "s16", 48000)).toBe("S32 not supported by this device");
+  it("greys out formats a 48 kHz S16-only speaker never takes", () => {
+    expect(supportsFormat(SPK48, "s16")).toBe(true);
+    for (const f of ["s32", "s24", "s24_3"] as const) expect(supportsFormat(SPK48, f)).toBe(false);
+    expect(formatUnavailableReason(SPK48, "s32", "s16", 48000)).toBe("S32 not supported by this device");
     expect(sbitsAt(TIED, 96000, "s32")).toBe(24);
   });
 
@@ -82,14 +99,16 @@ describe("device capabilities", () => {
   });
 });
 
-describe("mock daemon on a Pebble V3", () => {
+describe("mock daemon on a 48 kHz S16-only speaker", () => {
   it("reports 48k only, ratio 1, S16 and 16-bit dither with the default (S32, x4, 24-bit) config", () => {
-    const d = new MockDaemon({ device: "hw:CARD=V3,DEV=0" });
+    const d = new MockDaemon({ device: "hw:CARD=SPK,DEV=0" });
     const st = d.status();
     d.stop();
     expect(d.config.formats[0]).toBe("s32");
     expect(d.config.chain.output.bits).toBe(24);
-    expect(st.effective_rates).toEqual([48000]);
+    // The published rates add the ones Direct converts with the engine
+    // bypass resampler; the DSP sink itself still plays 48k only.
+    expect(st.effective_rates).toEqual([44100, 48000, 88200, 96000, 176400, 192000]);
     expect(st.effective_default_rate).toBe(48000);
     // The 44.1k stream is resampled into the 48k graph; x4 falls back to x1.
     expect(st.graph_rate).toBe(48000);
@@ -99,6 +118,15 @@ describe("mock daemon on a Pebble V3", () => {
     expect(st.dither_bits).toBe(16);
     expect(st.device_caps?.rates.map((r) => r.rate)).toEqual([48000]);
     expect(st.passthrough.broken_because).toContainEqual({ reason: "resampled", stream_rate: 44100, graph_rate: 48000 });
+  });
+
+  it("publishes 48k only when PipeWire converts for Direct", () => {
+    const d = new MockDaemon({ device: "hw:CARD=USB48,DEV=0" });
+    d.handle("set_rate", { ...d.config.rate, bypass_resampler: "pipewire" });
+    const st = d.status();
+    d.stop();
+    expect(st.effective_rates).toEqual([48000]);
+    expect(st.direct_rates).toEqual([48000]);
   });
 
   it("keeps the default DAC unchanged", () => {

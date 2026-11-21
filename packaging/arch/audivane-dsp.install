@@ -56,14 +56,38 @@ post_upgrade() {
   return 0
 }
 
+# Same as audivane_remove_everything in packaging/release/postinstall.sh.
 pre_remove() {
-  cat <<'EOF'
-==> Before removing audivane-dsp, stop and disable the engine and close the
-    desktop app, e.g.:
-
-    systemctl --user disable --now audivane-dsp
-
-    Otherwise the running engine keeps your DAC claimed until it is stopped
-    by hand (or at logout).
-EOF
+  _t=
+  command -v timeout >/dev/null 2>&1 && _t="timeout 30"
+  if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    for _dir in /run/user/[0-9]*; do
+      [ -S "$_dir/systemd/private" ] || continue
+      _user=$(getent passwd "${_dir##*/}" 2>/dev/null | cut -d: -f1)
+      [ -n "$_user" ] || continue
+      $_t systemctl --no-ask-password --user -M "$_user@" disable --now audivane-dsp.service >/dev/null 2>&1 || true
+    done
+  fi
+  pkill -x audivane-dsp-ui >/dev/null 2>&1 || true
+  pkill -x audivane-dsp >/dev/null 2>&1 || true
+  getent passwd | while IFS=: read -r _user _x _uid _gid _gecos _home _shell; do
+    [ "$_uid" -ge 1000 ] 2>/dev/null || continue
+    [ -d "$_home" ] || continue
+    rm -rf "$_home/.config/audivane-dsp" "$_home/.config/com.audivane.dsp" \
+      "$_home/.local/share/com.audivane.dsp" "$_home/.cache/audivane-dsp" \
+      "$_home/.local/state/audivane-dsp" "/run/user/$_uid/audivane-dsp" \
+      "$_home/.config/autostart/audivane-dsp-ui.desktop"
+    for _p in "$_home"/.config/audivane-dsp.backup-* "$_home"/.config/systemd/user/*.wants/audivane-dsp.service; do
+      [ -e "$_p" ] || [ -L "$_p" ] || continue
+      rm -rf "$_p"
+    done
+    # KDE: drop the app's (now inactive) global shortcuts.
+    if [ -S "/run/user/$_uid/bus" ] && command -v gdbus >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then
+      DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$_uid/bus" $_t runuser -u "$_user" -- \
+        gdbus call --session --dest org.kde.kglobalaccel --object-path /component/audivane_dsp_ui \
+        --method org.kde.kglobalaccel.Component.cleanUp >/dev/null 2>&1 || true
+    fi
+  done
+  echo "==> Audivane DSP removed: the engine and the app are stopped, and their settings deleted."
+  return 0
 }

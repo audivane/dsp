@@ -60,30 +60,17 @@ impl EventFd {
 /// shared between PipeWire's `io_changed` / `state_changed` callbacks and the
 /// single ALSA real-time reader thread.
 ///
-/// # Lifetime & Soundness Invariant (Single-Reader SeqCst Quiescence)
-/// PipeWire maps and unmaps `SPA_IO_Position` / `SPA_IO_Clock` memory areas
-/// around `io_changed` and `StreamState::Unconnected` callbacks. Once
-/// `io_changed` returns, PipeWire may immediately unmap or reuse the old area.
+/// PipeWire maps and unmaps those areas around `io_changed` and
+/// `StreamState::Unconnected`, and may reuse the old area as soon as
+/// `io_changed` returns. So, all `SeqCst`: the writer (PipeWire thread)
+/// stores the new pointer (or null), then calls [`Self::quiesce_reader`] and
+/// waits until `reader_active` is `false`; the reader (the ALSA RT thread
+/// only) touches the pointers solely inside [`Self::with_clock`], whose
+/// [`IoAccessGuard`] sets `reader_active = true` before loading one and
+/// clears it on drop. Either the writer sees the flag and waits, or the
+/// reader sees the new pointer and never touches the old mapping.
 ///
-/// To guarantee the ALSA thread never dereferences an unmapped IO area:
-/// - **Writer (PipeWire thread)**: stores the new pointer (or null) into
-///   `io_position` / `io_clock` with `Ordering::SeqCst`, then calls
-///   [`Self::quiesce_reader`], spinning until `reader_active` is observed
-///   `false` with `Ordering::SeqCst` before returning to PipeWire.
-/// - **Reader (ALSA RT thread only)**: accesses the pointers exclusively
-///   inside [`Self::with_clock`] (which holds an RAII [`IoAccessGuard`] setting
-///   `reader_active = true` with `Ordering::SeqCst` before loading any pointer
-///   and resetting `reader_active = false` with `Ordering::SeqCst` on drop).
-///
-/// By `SeqCst` total ordering:
-/// - If the reader stores `reader_active = true` before the writer updates the
-///   pointer, the writer MUST observe `reader_active == true` and wait until
-///   the reader drops the guard.
-/// - If the writer updates the pointer before the reader stores
-///   `reader_active = true`, the reader MUST observe the new pointer and never
-///   touches the old mapping.
-///
-/// While holding the guard, the ALSA thread performs no syscalls, locks, or
+/// While holding the guard, the ALSA thread performs no syscalls, locks or
 /// waits — only ~20 ns of non-blocking loads/stores on `spa_io_clock`.
 pub(crate) struct SynchronizedIo {
     io_position: AtomicPtr<spa::sys::spa_io_position>,
@@ -126,22 +113,15 @@ impl SynchronizedIo {
         self.quiesce_reader();
     }
 
-    /// Block unconditionally until `reader_active` is observed `false`.
-    ///
-    /// # Why unbounded wait instead of copying-only or a bounded timeout
-    /// [`DriverClockState::advance_and_trigger`] must write `nsec`, `rate`,
-    /// `position`, `duration`, `delay`, `rate_diff`, and `next_nsec` directly
-    /// into PipeWire's `spa_io_clock` synchronously right before
-    /// `pw_stream_trigger_process`, so reading a PipeWire-loop-copied struct
-    /// alone would not satisfy driver-clock publication. Meanwhile, the ALSA RT
-    /// reader holds [`IoAccessGuard`] only around lock-free, syscall-free memory
-    /// loads/stores (~20 ns, never across `pw_stream_trigger_process`). A bounded
-    /// timeout cannot protect pointer lifetime because returning early to
-    /// PipeWire allows PipeWire to immediately unmap the old IO area while the
-    /// reader is inside `with_clock`, causing use-after-unmap UB. Therefore this
-    /// wait must never return while `reader_active == true`; it spins briefly,
-    /// backs off via `yield_now` -> short sleep, and logs once if it exceeds
-    /// 100 ms.
+    /// Block unconditionally until `reader_active` is observed `false`: it
+    /// must never return while the reader is inside `with_clock`, or
+    /// PipeWire could unmap the old IO area under it (a bounded timeout is
+    /// unsafe for that reason). [`DriverClockState::advance_and_trigger`]
+    /// writes the driver clock in place right before
+    /// `pw_stream_trigger_process`, so copying the struct would not do. The
+    /// reader holds its guard only around lock-free, syscall-free
+    /// loads/stores (~20 ns), so the wait spins briefly, then yields and
+    /// sleeps, and logs once if it exceeds 100 ms.
     #[inline]
     fn quiesce_reader(&self) {
         self.quiesce_reader_with_warn_threshold(QUIESCE_SLOW_LOG_THRESHOLD_NS);
@@ -321,6 +301,24 @@ pub(crate) fn mono_now_ns() -> u64 {
         .saturating_add(ts.tv_nsec as u64)
 }
 
+/// `CLOCK_MONOTONIC_RAW`, ns: the clock ALSA's status timestamps use
+/// (`io-alsa` sets `TstampType::MonotonicRaw`), so DAC readings from every
+/// device share one domain (multi-device phase comparisons).
+#[inline]
+pub fn mono_raw_now_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // Safety: CLOCK_MONOTONIC_RAW is always valid on Linux.
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts);
+    }
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
+}
+
 /// Read `target_rate` and `target_duration` from PipeWire's `spa_io_clock`
 /// using its seqlock (`target_seq`) inside [`SynchronizedIo::with_clock`].
 #[inline]
@@ -391,11 +389,25 @@ impl DriverClockState {
         duration: u64,
         delay_graph_frames: i64,
     ) {
+        self.advance_and_trigger_at(io, raw_stream, rate, duration, delay_graph_frames, 1.0);
+    }
+
+    /// [`Self::advance_and_trigger`] for cycles scheduled at `speed` times
+    /// the graph rate (varispeed): `next_nsec` is one cycle interval
+    /// `Q / (speed · G)` ahead, and the resync threshold is measured in the
+    /// same interval. `position` still advances by `Q`, `rate` stays
+    /// `1/G` and `rate_diff` stays 1.0.
+    pub(crate) fn advance_and_trigger_at(
+        &mut self,
+        io: &SynchronizedIo,
+        raw_stream: *mut pw::sys::pw_stream,
+        rate: u32,
+        duration: u64,
+        delay_graph_frames: i64,
+        speed: f64,
+    ) {
         let now = mono_now_ns();
-        let nominal_ns = duration
-            .saturating_mul(1_000_000_000)
-            .checked_div(rate as u64)
-            .unwrap_or(5_333_333);
+        let nominal_ns = cycle_interval_ns(duration, rate, speed);
 
         if self.next_time_ns == 0 || now.abs_diff(self.next_time_ns) > nominal_ns.saturating_mul(2)
         {
@@ -435,6 +447,21 @@ impl DriverClockState {
             }
         }
     }
+}
+
+/// One graph cycle's interval, ns: `duration / (speed · rate)`, or a
+/// 5.33 ms default for a zero rate. `speed` 1 (or not a usable speed) gives
+/// the plain integer interval.
+pub(crate) fn cycle_interval_ns(duration: u64, rate: u32, speed: f64) -> u64 {
+    let base = duration
+        .saturating_mul(1_000_000_000)
+        .checked_div(rate as u64)
+        .unwrap_or(5_333_333);
+    if speed == 1.0 || !speed.is_finite() || speed <= 0.0 {
+        return base;
+    }
+    let ns = duration as f64 * 1e9 / (f64::from(rate.max(1)) * speed);
+    (ns as u64).max(1)
 }
 
 /// Allocation-free raised-cosine mute/fade ramp applied to interleaved `i32`
@@ -623,6 +650,15 @@ mod tests {
             drop(Box::from_raw(current));
         }
         assert!(reads.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn cycle_interval_follows_the_speed() {
+        assert_eq!(cycle_interval_ns(1024, 48_000, 1.0), 21_333_333);
+        assert_eq!(cycle_interval_ns(1024, 48_000, 2.0), 10_666_666);
+        assert_eq!(cycle_interval_ns(1024, 48_000, 0.5), 42_666_666);
+        assert_eq!(cycle_interval_ns(1024, 48_000, f64::NAN), 21_333_333);
+        assert_eq!(cycle_interval_ns(1024, 0, 1.0), 5_333_333);
     }
 
     #[test]

@@ -1,7 +1,0 @@
-$ REVIEW_POINTS=256 REVIEW_SPAN=0.1 scientific-review dense 32767 {8,14,20}
-DENSE N=32767 beta=8 ratio=16 lin worst=-82.716638 at_offset_widths=0.037890625 target=-81.295281
-DENSE N=32767 beta=8 ratio=16 min worst=-82.716638 at_offset_widths=0.037890625 target=-81.295281
-DENSE N=32767 beta=14 ratio=16 lin worst=-136.744233 at_offset_widths=0.006640625 target=-135.741742
-DENSE N=32767 beta=14 ratio=16 min worst=-136.744234 at_offset_widths=0.006640625 target=-135.741742
-DENSE N=32767 beta=20 ratio=16 lin worst=-190.841093 at_offset_widths=0.029687500 target=-190.188203
-DENSE N=32767 beta=20 ratio=16 min worst=-190.841466 at_offset_widths=0.029687500 target=-190.188203

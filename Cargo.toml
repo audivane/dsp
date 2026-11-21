@@ -15,7 +15,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.9.4"
+version = "0.10.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 authors = ["Triet"]
@@ -27,7 +27,7 @@ audivane-protocol = { path = "crates/protocol" }
 audivane-io-pw = { path = "crates/io-pw" }
 audivane-io-alsa = { path = "crates/io-alsa" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 rustfft = "6"
 realfft = "3"
 hound = "3"
@@ -52,7 +52,6 @@ debug = "line-tables-only"
 [profile.release]
 lto = "fat"
 codegen-units = 1
-debug = "line-tables-only"
 
 # The desktop app: thin LTO and parallel codegen. Fat LTO with one codegen
 # unit (the release profile, kept for the audio engine) serialises the whole

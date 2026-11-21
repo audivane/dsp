@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { fmtDb } from "../lib/format";
-import { meterChainGainDb, meterStore } from "../store/meters";
+import { meterChainGainDb, meterStore, metersSettled, quietMeters } from "../store/meters";
+import { useApp } from "../store/store";
 import { cssVar } from "../theme";
 
 const FLOOR = -60;
@@ -29,6 +30,7 @@ export function Meters() {
   const canvas = useRef<HTMLCanvasElement>(null);
   const readout = useRef<HTMLSpanElement>(null);
   const headroom = useRef<HTMLSpanElement>(null);
+  const gr = useRef<HTMLSpanElement>(null);
   const [clips, setClips] = useState<[number, number]>([0, 0]);
 
   useEffect(() => {
@@ -53,6 +55,17 @@ export function Meters() {
         mono: cssVar("--mono"),
       };
     };
+    // The loop sleeps while there is nothing to draw (silence, stale or no
+    // reports, the bars resting at the floor) and wakes on the next report
+    // with signal, a clip reset, a resize or a theme change.
+    let sleeping = false;
+    let paintedLimiter = false;
+    const wake = () => {
+      if (!sleeping) return;
+      sleeping = false;
+      last = performance.now();
+      raf = requestAnimationFrame(frame);
+    };
     const resize = () => {
       const r = cv.getBoundingClientRect();
       const d = window.devicePixelRatio || 1;
@@ -62,10 +75,14 @@ export function Meters() {
       cv.height = Math.round(h * d);
       ctx.setTransform(d, 0, 0, d, 0, 0);
       readColors();
+      wake();
     };
     const ro = new ResizeObserver(resize);
     ro.observe(cv);
-    const mo = new MutationObserver(readColors);
+    const mo = new MutationObserver(() => {
+      readColors();
+      wake();
+    });
     mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-skin"] });
     resize();
     let lastText = "";
@@ -73,7 +90,6 @@ export function Meters() {
     let lastHrWarn = false;
     let lastClipKey = "0:0";
     const frame = (now: number) => {
-      raf = requestAnimationFrame(frame);
       const dt = Math.min(0.1, (now - last) / 1000);
       last = now;
       const m = meterStore.latest;
@@ -115,13 +131,44 @@ export function Meters() {
         lastHrWarn = hrWarn;
       }
 
+      // Limiter gain reduction, only while the limiter is in the path.
+      const lim = fresh ? m.meters.limiter : undefined;
+      const grEl = gr.current;
+      if (grEl) {
+        const show = limiterOnRef.current && !!lim?.active;
+        if (grEl.hidden === show) grEl.hidden = !show;
+        if (show) {
+          const red = Math.max(0, lim!.gain_reduction_db);
+          const t = `GR ${fmtDb(-Math.min(red, READOUT_MAX_DB), 1)}`;
+          if (grEl.textContent !== t) grEl.textContent = t;
+          const idle = red < 0.05;
+          if (grEl.classList.contains("idle") !== idle) grEl.classList.toggle("idle", idle);
+        }
+      }
+
       const [cL, cR] = meterStore.clipsPerChannel(2);
       const clipKey = `${cL}:${cR}`;
       if (clipKey !== lastClipKey) {
         lastClipKey = clipKey;
         setClips([cL, cR]);
       }
+
+      paintedLimiter = limiterOnRef.current && !!lim?.active;
+      if ((!fresh || quietMeters(m.meters, FLOOR)) && metersSettled(ch, FLOOR) && hrSmooth === null) {
+        sleeping = true;
+        return;
+      }
+      raf = requestAnimationFrame(frame);
     };
+    const offChange = meterStore.onChange(() => {
+      const m = meterStore.latest;
+      // A quiet report while asleep changes nothing on screen, unless the
+      // limiter came or went.
+      if (m && quietMeters(m.meters, FLOOR) && (limiterOnRef.current && !!m.meters.limiter?.active) === paintedLimiter) {
+        if (meterStore.clipsPerChannel(2).join(":") === lastClipKey) return;
+      }
+      wake();
+    });
     const paint = () => {
       ctx.clearRect(0, 0, w, h);
       const labelW = 12;
@@ -183,11 +230,17 @@ export function Meters() {
     raf = requestAnimationFrame(frame);
     return () => {
       cancelAnimationFrame(raf);
+      offChange();
       ro.disconnect();
       mo.disconnect();
     };
   }, []);
 
+  // The configured limiter state, read by the frame loop: a meter report
+  // can still carry the limiter for a moment after it is turned off.
+  const limiterOn = useApp((st) => !!st.config?.dsp_enabled && (st.config?.chain.limiter?.mode ?? "off") !== "off");
+  const limiterOnRef = useRef(limiterOn);
+  limiterOnRef.current = limiterOn;
   const chanNames = ["Left", "Right"] as const;
   return (
     <div className="meters">
@@ -205,6 +258,14 @@ export function Meters() {
         title="Chain gain at the peaks: what EQ, convolution and the upsampler add (output peak before the volume minus input peak). A relative gain, not a level: +2 dB only clips if the music already peaks within 2 dB of full scale. The volume is not included."
       >
         {"chain —"}
+      </span>
+      <span
+        className="gr-mini mono idle"
+        ref={gr}
+        hidden
+        title="Limiter gain reduction in dB over the last meter window: how far the limiter is pulling the level down (0 = not limiting). Open the Limiter view for the meter."
+      >
+        GR 0.0
       </span>
       <div className="clip-leds" role="group" aria-label="Channel clip indicators">
         {([0, 1] as const).map((i) => {

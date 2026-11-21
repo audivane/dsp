@@ -23,9 +23,16 @@ pub fn run(args: BenchArgs) -> Result<i32> {
     }
 
     let channels = 2usize;
-    let mut config = ChainConfig::default();
-    config.upsampler.target = RateTarget::Ratio(args.ratio as u32);
-    config.upsampler.taps = args.taps;
+    let mut config = ChainConfig {
+        upsampler: audivane_dsp_core::resample::ManualConfig {
+            target: RateTarget::Ratio(args.ratio as u32),
+            taps: args.taps,
+            ..Default::default()
+        }
+        .into_upsampler_config()
+        .map_err(|e| anyhow::anyhow!("{e}"))?,
+        ..Default::default()
+    };
     config.output.dither = DitherKind::Tpdf;
 
     if let Some(path) = &args.eq {
@@ -60,21 +67,18 @@ pub fn run(args: BenchArgs) -> Result<i32> {
         irs,
     };
     let mut chain = Chain::new(spec);
-    let ratio = chain.ratio();
     let latency = chain.latency_out_frames();
-    let mut out = vec![0i32; args.block * ratio * channels];
+    let mut out = vec![0i32; chain.max_output_frames() * channels];
 
     // Warm up: page in the buffers and the FFT plans.
     for chunk in input.chunks(args.block * channels).take(4) {
-        let frames = chunk.len() / channels;
-        chain.process_f32(chunk, &mut out[..frames * ratio * channels]);
+        chain.process_f32(chunk, &mut out);
     }
     chain.reset();
 
     let started = Instant::now();
     for chunk in input.chunks(args.block * channels) {
-        let frames = chunk.len() / channels;
-        chain.process_f32(chunk, &mut out[..frames * ratio * channels]);
+        chain.process_f32(chunk, &mut out);
     }
     let elapsed = started.elapsed().as_secs_f64();
     let audio_seconds = frames as f64 / f64::from(args.rate);

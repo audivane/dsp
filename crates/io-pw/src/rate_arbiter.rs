@@ -56,6 +56,23 @@ pub fn choose_allowed_rate(native: u32, policy: &RatePolicy) -> u32 {
     above.unwrap_or(best_closest)
 }
 
+/// The graph rate for a client at `native` on a sink with `policy` and
+/// native base `base` (`None`: `policy`): the rate itself when the sink
+/// plays it, else [`choose_allowed_rate`] in the base. A rate the engine
+/// bypass resampler converts is in `policy` but not in the base, so it is
+/// only chosen for a client at exactly that rate: a source is converted
+/// once at most (by PipeWire into a native rate, or by the engine), and a
+/// native rate never.
+pub fn sink_rate(native: u32, policy: &RatePolicy, base: Option<&RatePolicy>) -> u32 {
+    if policy.allowed_rates.contains(&native) {
+        return native;
+    }
+    let base = base
+        .filter(|b| !b.allowed_rates.is_empty())
+        .unwrap_or(policy);
+    choose_allowed_rate(native, base)
+}
+
 /// A running client with a known native rate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RateClient {
@@ -80,6 +97,18 @@ pub struct RateInputs<'a> {
     /// effective ones, see `rate_caps::direct_rate_policy`). `None`, or an
     /// empty list, means the same as `policy`.
     pub direct_policy: Option<&'a RatePolicy>,
+    /// Rates the DSP sink plays, when fewer than `policy` (the engine bypass
+    /// resampler lets Direct run at rates the DSP chain cannot play while
+    /// DSP is on, see `rate_caps::RatePolicies`). The DSP sink's clients
+    /// map through it. `None`, or an empty list, means the same as `policy`.
+    pub dsp_policy: Option<&'a RatePolicy>,
+    /// The native bases of Direct's and the DSP sink's policies (without
+    /// the rates the engine bypass resampler converts,
+    /// `rate_caps::RatePolicies`): a client at another rate than its
+    /// sink's maps through them ([`sink_rate`]). `None` means the sink's
+    /// policy itself.
+    pub direct_native: Option<&'a RatePolicy>,
+    pub dsp_native: Option<&'a RatePolicy>,
 }
 
 /// Why a rate was chosen.
@@ -153,8 +182,8 @@ impl Choice {
 /// opinion, leave the rate alone.
 pub fn choose_rate(inp: &RateInputs<'_>) -> Option<Choice> {
     let policy = inp.policy;
-    // Direct never upsamples: it only runs the graph at rates the device
-    // plays natively.
+    // Direct never runs the DSP chain: it only runs the graph at rates the
+    // device plays natively, or that the engine bypass resampler converts.
     let direct_policy = inp
         .direct_policy
         .filter(|p| !p.allowed_rates.is_empty())
@@ -182,6 +211,7 @@ pub fn choose_rate(inp: &RateInputs<'_>) -> Option<Choice> {
             inp.direct,
             inp.current,
             direct_policy,
+            inp.direct_native,
             RateConflict::KeepCurrent,
         )
         .map(|mut c| {
@@ -189,19 +219,30 @@ pub fn choose_rate(inp: &RateInputs<'_>) -> Option<Choice> {
             c
         });
     }
-    pick(inp.dsp, inp.current, policy, policy.conflict)
+    let dsp_policy = inp
+        .dsp_policy
+        .filter(|p| !p.allowed_rates.is_empty())
+        .unwrap_or(policy);
+    pick(
+        inp.dsp,
+        inp.current,
+        dsp_policy,
+        inp.dsp_native,
+        policy.conflict,
+    )
 }
 
 fn pick(
     clients: &[RateClient],
     current: u32,
     policy: &RatePolicy,
+    base: Option<&RatePolicy>,
     mode: RateConflict,
 ) -> Option<Choice> {
     let mut sorted: Vec<&RateClient> = clients.iter().collect();
     sorted.sort_by_key(|c| (c.since, c.id));
     let first = *sorted.first()?;
-    let target = |c: &RateClient| choose_allowed_rate(c.native_rate, policy);
+    let target = |c: &RateClient| sink_rate(c.native_rate, policy, base);
     let first_target = target(first);
     if sorted.iter().all(|c| target(c) == first_target) {
         // Prefer naming a client that plays at exactly the chosen rate.
@@ -471,6 +512,9 @@ mod tests {
             direct: &[],
             dsp,
             direct_policy: None,
+            dsp_policy: None,
+            direct_native: None,
+            dsp_native: None,
         }
     }
 
@@ -786,6 +830,9 @@ mod tests {
             direct: &direct,
             dsp: &dsp,
             direct_policy: None,
+            dsp_policy: None,
+            direct_native: None,
+            dsp_native: None,
         };
         let c = choose_rate(&inp).unwrap();
         assert_eq!(c.rate, 44_100);
@@ -821,6 +868,9 @@ mod tests {
             direct: &direct,
             dsp: &[],
             direct_policy: Some(&d),
+            dsp_policy: None,
+            direct_native: None,
+            dsp_native: None,
         };
         let c = choose_rate(&inp).unwrap();
         assert_eq!((c.rate, c.direct), (96_000, true));

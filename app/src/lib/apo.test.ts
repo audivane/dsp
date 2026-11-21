@@ -25,7 +25,7 @@ describe("ParametricEQ.txt import", () => {
     expect(profile.bands[3].kind).toBe("low_shelf");
     expect(profile.bands[4].kind).toBe("high_shelf");
     expect(profile.right).toBeUndefined();
-    expect(warnings).toHaveLength(2); // Device: and Channel:
+    expect(warnings).toHaveLength(1); // Device:
   });
 
   it("converts BW and S like dsp-core and defaults Q", () => {
@@ -36,15 +36,15 @@ describe("ParametricEQ.txt import", () => {
     expect(profile.bands[2]).toMatchObject({ kind: "low_pass", gain_db: 0, q: Math.SQRT1_2 });
   });
 
-  it("warns on Channel directives and fills the linked section", () => {
+  it("puts Channel L and R filters in their own sections", () => {
     const { profile, warnings } = parseApo("Preamp: -3 dB\nChannel: L\nFilter: ON PK Fc 100 Hz Gain 2 dB Q 1\nChannel: R\nFilter: ON PK Fc 200 Hz Gain -2 dB Q 1\nChannel: all\nFilter: ON HS Fc 8000 Hz Gain 1 dB Q 0.7");
     expect(profile.version).toBe(2);
     expect(profile.linked_enabled).toBe(true);
     expect(profile.preamp_db).toBe(-3);
-    expect(profile.bands.map((b) => b.freq_hz)).toEqual([100, 200, 8000]);
-    expect(profile.left).toBeUndefined();
-    expect(profile.right).toBeUndefined();
-    expect(warnings).toHaveLength(3);
+    expect(profile.bands.map((b) => b.freq_hz)).toEqual([8000]);
+    expect(profile.left?.bands.map((b) => b.freq_hz)).toEqual([100]);
+    expect(profile.right?.bands.map((b) => b.freq_hz)).toEqual([200]);
+    expect(warnings).toHaveLength(0);
   });
 
   it("rejects malformed filters with the line number", () => {

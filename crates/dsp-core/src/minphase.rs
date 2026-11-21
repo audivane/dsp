@@ -25,117 +25,39 @@
 //!   [`zero_tolerance`]): along the radial segment from it to the circle,
 //!   `|B(zeta)| <= delta sum |b_k| |zeta|^-k`, i.e. changing every coefficient
 //!   by at most `delta` relatively (a few ulps) moves it onto the circle
-//!   (Mosier; Trefethen and Toh). That is as tight as an f64 kernel allows:
-//!   where `|H|` is at the rounding floor of its own coefficients, its zeros
-//!   are not determined more closely. In the sweep tests (every length 2 to
-//!   1024, 47,000 designs) no zero lies outside the circle where `|B|` there
-//!   is above -250 dB re the DC gain, the largest outside radius (at the
-//!   noise floor) is `1 + 2.5e-3` and the largest perturbation needed is 0.04
-//!   `delta`. Longer kernels are checked by the cepstral unwrapping below and,
-//!   in the tests, by winding counts on `|z| = e^{0.25/N}`.
+//!   (Mosier; Trefethen and Toh). That is as tight as an f64 kernel allows.
+//!   Longer kernels are checked by the cepstral unwrapping and, in the tests,
+//!   by winding counts on `|z| = e^{0.25/N}`.
 //!
-//! # Method, up to [`ROOT_MAX_TAPS`] taps: polynomial roots
+//! # Method
 //!
-//! All `N - 1` zeros are found with the Aberth-Ehrlich iteration (Newton
-//! polygon start, total-step sweeps, backward-stable stopping) and then
-//! polished by Newton-Aberth steps with the polynomial evaluated in
-//! double-double, so each ends within a few ulps of an exact zero of the f64
-//! polynomial even where it is ill-conditioned (a reciprocal pair close to the
-//! circle: 36 taps, x2, beta 20 has one at `1 +- 1.09e-3` with condition
-//! number 3e8). The ones outside the circle by more than that uncertainty
-//! are reflected exactly in the frequency domain, `B(e^jw) = H(e^jw) *
-//! prod (conj(z) - e^-jw) / (1 - z e^-jw)` (each factor is all-pass), on a
-//! `16 N`-point grid, and the inverse FFT gives the kernel. The product
-//! cancels the reflected zeros' factors, so the result has `N` taps; what
-//! lands past `N` measures the root error ([`MinimumPhase::tail`], at most
-//! 1e-9, measured 3e-14). Then the zeros of the result are computed again and
-//! checked as above. Exact leading zero taps (a pure delay, zeros at
-//! infinity) become trailing ones. Design time: 0.1 s at 512 taps, 0.3 to
-//! 0.6 s at 1024 (threaded sweeps).
+//! Up to [`ROOT_MAX_TAPS`] taps, the `N - 1` zeros are found (Aberth-Ehrlich
+//! from Newton-polygon starts, then polished by Newton-Aberth steps with the
+//! polynomial in double-double, so each ends within a few ulps of an exact
+//! zero even where it is ill-conditioned) and the ones outside the circle are
+//! reflected exactly in the frequency domain, each an all-pass factor
+//! `(conj(z) - e^-jw) / (1 - z e^-jw)`, on a `16 N`-point grid. What lands
+//! past `N` taps measures the root error ([`MinimumPhase::tail`]).
 //!
-//! The contour method below needs every zero outside the circle to lie
-//! outside its contour. Short kernels break that: a 15-tap x16 beta-14
-//! kernel has a conjugate pair at `|z| = 1.035`, inside the contour
-//! (`docs/research/scientific-review-2/`), and the uncapped contour `2/N`
-//! still misses outside zeros up to 186 taps (once at 416) in a 325,000-design
-//! scan. Roots have no such assumption; the switch at 1024 taps leaves a
-//! margin over the largest length where the contour failed.
-//!
-//! # Method, longer kernels: radially scaled complex cepstrum
-//!
-//! Rooting a polynomial of degree 4M is not an option, so the reflection is
-//! done in the cepstral domain, where it is linear: the complex cepstrum
-//! `ĥ[n]` of `H` (pure delay removed) is causal for zeros inside the circle
-//! and anticausal for zeros outside, and the reflected filter has
-//! `ĉ[n] = ĥ[n] + ĥ[-n]` for `n > 0`, `ĉ[0] = ĥ[0]`.
-//!
-//! The usual homomorphic recipe evaluates `ln|H|` on the unit circle. A
-//! linear-phase low-pass has up to millions of zeros *on* that circle, so
-//! `ln|H|` is singular, its cepstrum decays only like `1/n` (with a comb at
-//! multiples of the null spacing), and any finite FFT aliases it.
-//!
-//! Here the cepstrum is evaluated on the circle `|z| = rho = e^{alpha}`,
-//! `alpha = R / N`, just outside the unit circle:
-//! `g[n] = h[n] e^{-alpha n}` has `G(e^{jw}) = H(rho e^{jw})`. The radius is
-//! adaptive: [`contour_radii`] lists `R` = 2, 1.5, 1 (1.5, 2, 1, 1.25 from
-//! [`LONG_CONTOUR_TAPS`] up), and the first one whose result passes the
-//! unwrap and magnitude checks is returned. Below, `R = 2`.
-//!
-//! * Zero geometry. The on-circle zeros of `H` are now `2/N` inside the
-//!   contour. Above [`ROOT_MAX_TAPS`] taps its off-circle zeros come in
-//!   reciprocal pairs at least 6/N from the unit circle for every beta >= 2,
-//!   any cutoff and ratio (>= 16/N at beta 8, 21/N at 14, 25/N at 20),
-//!   measured by rooting and by winding counts. The exception is real pairs
-//!   next to `z = -1` on odd lengths, reflected exactly first
-//!   (`reflect_nyquist_real_zeros`). So `G` has no zero within 2/N of its
-//!   unit circle and the outside zeros of `H` are exactly those outside the
-//!   contour.
-//! * The phase of `G` is unwrapped bin by bin. Every zero is at least `2/N`
-//!   from the contour and the FFT has at least `8 N` points, so adjacent bins
-//!   differ by well under `pi/2` (checked; a failure is an error). The one
-//!   exception is rounding noise: deep in the stopband of long high-beta
-//!   kernels the f64 coefficients' own rounding dominates and scatters zeros
-//!   near the circle; see [`NOISE_LEVEL`]. `arg G(pi) = -pi * (zeros outside
-//!   the contour)` gives the pure delay to remove.
-//! * `ln G` is analytic in an annulus of width ~`2/N` on each side, so its
-//!   cepstrum decays like `e^{-2|n|/N}`. With `L >= 8 N` the aliased part is
-//!   at most `e^{-8}` of the stopband comb and lands on the stopband nulls; the
-//!   passband sees ~1e-8 dB.
-//! * The scaling is undone exactly: `ĥ[n] = ĝ[n] rho^n`, so the reflected
-//!   cepstrum in the scaled domain is `ĝ[n] + ĝ[-n] rho^{-2n}`, and the
-//!   result is `b[n] = b_g[n] rho^n`. The amplification `rho^N = e^R` costs
-//!   about 17 dB of rounding headroom at `R = 2`. At 4M taps and low ratios
-//!   that lifts the stopband error over its bound (x2, beta 20: -206.3 dB,
-//!   bound -215.2), hence `R = 1.5` first on long kernels (-215.9 dB), at
-//!   the price of a larger aliased part (passband still ~1e-6 dB).
-//! * At 4M taps and beta 20 the stopband error is a rounding floor of about
-//!   -206 to -229 dB against the -215.2 dB bound, peaking on single bins at
-//!   the first stopband nulls, and which radius lands under the bound is
-//!   effectively random (x3, Stop at Nyquist: -212.7 dB at 2/N, -210.9 at
-//!   1.5/N, -229.2 at 1.75/N, -218.8 at 1.25/N, passband 1.01e-4 dB at 1/N).
-//!   The fourth long radius, 1.25, catches the one design of the long-length
-//!   matrix that the first three miss.
-//! * The exact twin has exactly `N` taps, so truncating to `N` drops only
-//!   aliasing and rounding residue; [`MinimumPhase::tail`] reports its size.
-//!
-//! FFT length `L = next_power_of_two(8 N)`. At the 4,194,304-tap limit that is
-//! a 33,554,432-point real FFT. Measured on the dev box, single-threaded,
-//! with the magnitude check: about 6 s and 1.47 GiB peak RSS for the whole
-//! process, including the linear kernel
-//! (`minimum_phase_4m_contract_time_and_memory`). Each further radius adds
-//! about 5 to 6 s. In the long-length matrix of
-//! `docs/research/minimum-phase/README.md` (1,782 designs, 65,535 to
-//! 4,194,304 taps) only 4M-tap beta-20 designs needed one: five needed a
-//! second radius (up to 11.5 s), two a third (15.2 s), one the fourth
-//! (28 s with six designs in parallel).
+//! Longer kernels use a radially scaled complex cepstrum, where the reflection
+//! is linear. `ln|H|` on the unit circle is singular for these kernels (zeros
+//! *on* the circle), so it is evaluated on `|z| = rho = e^{R/N}` just outside,
+//! in the annulus where `H` has no zero; the radius is adaptive
+//! ([`contour_radii`], `R` from 1 to 2), the first whose result passes the
+//! unwrap and magnitude checks being returned. Odd-length real zero pairs next
+//! to `z = -1` sit closer to the circle than the contour and are reflected
+//! exactly first (`reflect_nyquist_real_zeros`). Short kernels break the
+//! contour's no-zero-inside assumption, so roots build them; the switch at
+//! [`ROOT_MAX_TAPS`] leaves a margin over the largest length where the contour
+//! failed. FFT length `L = next_power_of_two(8 N)`: at the 4,194,304-tap limit
+//! a 33,554,432-point real FFT, about 6 s and 1.5 GiB for one radius.
 //!
 //! # Limits
 //!
 //! Above [`MAX_MINIMUM_PHASE_BETA`] the stopband (> 190 dB) approaches the
-//! f64 floor of long kernels and the tolerances fail at the largest lengths
-//! (4M taps, beta 22: minimum-phase stopband peak 3.5 dB above the linear
-//! one; beta 24: the unwrap fails). Below [`MIN_MINIMUM_PHASE_BETA`] the zero
-//! geometry above does not hold. The daemon rejects both.
+//! f64 floor of long kernels and the tolerances fail at the largest lengths.
+//! Below [`MIN_MINIMUM_PHASE_BETA`] the zero geometry above does not hold. The
+//! daemon rejects both.
 
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex64;
@@ -178,6 +100,20 @@ pub const UPPER_LEVEL_DB: f64 = -100.0;
 /// under the Kaiser stopband specification `A`.
 pub const STOPBAND_ERROR_MARGIN_DB: f64 = 25.0;
 
+/// Longest intermediate-phase kernel, relative to its linear twin. The
+/// blended response is not finite: it rings on both sides of the linear and
+/// minimum-phase supports. Cut where it meets the contract it needs about 1.2
+/// to 2.2 times the linear length over the supported betas and lengths.
+pub const INTERMEDIATE_MAX_GROWTH: f64 = 4.0;
+
+/// Each intermediate-phase cut attempt discards this much less energy than
+/// the one before (the first is at the contract's stopband error bound).
+const INTERMEDIATE_CUT_STEP_DB: f64 = 10.0;
+
+/// Cut attempts per intermediate-phase design before giving up (down to
+/// 110 dB under the first cut level).
+const INTERMEDIATE_CUT_TRIES: usize = 12;
+
 /// Zero tolerance, as a relative coefficient perturbation in units of
 /// `u N` (`u = 2^-53`); see [`zero_tolerance`].
 pub const ZERO_TOLERANCE_ULPS: f64 = 64.0;
@@ -192,17 +128,15 @@ const MAX_RESIDUE: f64 = 0.25;
 /// The same when the Nyquist bin itself is under [`NOISE_FLOOR`] and its
 /// phase is extrapolated over the trailing floored run. That happens on long
 /// kernels: even lengths have a zero at `z = -1` just inside the contour, so
-/// the phase still turns by ~0.4 rad over the last bin (4,000,000 taps, x2,
-/// beta 14: residue 0.317), and a long floored run near Nyquist (1,048,576
-/// taps, x16, beta 14: 1.24 rad) carries no phase information at all. Any
+/// the phase still turns by a fraction of a radian over the last bin, and a
+/// long floored run near Nyquist carries no phase information at all. Any
 /// residue then only picks the nearest multiple of pi; the residue is spread
 /// over the floored bins, and the magnitude check covers the result.
 const MAX_RESIDUE_FLOORED: f64 = PI / 2.0;
 
 /// From this length up the contour radius 1.5/N is tried first: radius 2/N
-/// amplifies the f64 rounding of the cepstral solution by `e^2`, which at
-/// 4M taps and low ratios lifts the stopband error over its bound (4,194,304
-/// taps, x2, beta 20: -206.3 dB at 2/N, -215.9 dB at 1.5/N, bound -215.2).
+/// amplifies the f64 rounding of the cepstral solution by `e^2`, which at the
+/// largest lengths and low ratios lifts the stopband error over its bound.
 pub const LONG_CONTOUR_TAPS: usize = 1 << 19;
 
 /// Contour radii (units of 1/N) tried in order until one passes the checks.
@@ -333,6 +267,9 @@ pub enum MinimumPhaseError {
         radius: f64,
         tolerance: f64,
     },
+    /// An intermediate-phase response does not fit in
+    /// [`INTERMEDIATE_MAX_GROWTH`] times the linear twin's length.
+    TooLong { taps: usize, needed: usize },
     /// The magnitude does not match within the contract.
     Magnitude {
         taps: usize,
@@ -349,6 +286,11 @@ impl std::fmt::Display for MinimumPhaseError {
             "the minimum-phase filter could not be designed to tolerance: "
         )?;
         match self {
+            Self::TooLong { taps, needed } => write!(
+                f,
+                "the intermediate-phase twin of {taps} taps needs {needed} taps, more than \
+                 {INTERMEDIATE_MAX_GROWTH} times the linear length"
+            ),
             Self::BadInput => write!(f, "the linear-phase kernel is zero or not finite"),
             Self::Roots { taps } => {
                 write!(f, "the zeros of the {taps}-tap kernel did not converge")
@@ -500,6 +442,315 @@ fn by_cepstrum(h: &[f64], contract: &Contract) -> Result<MinimumPhase, MinimumPh
                 result.check = Some(check);
                 return Ok(result);
             }
+            Err(e) => last_error = e,
+        }
+    }
+    Err(last_error)
+}
+
+// ---------------------------------------------------------------------------
+// Intermediate phase
+
+/// Intermediate-phase twin of the linear-phase `h`: the same magnitude, and
+/// a phase `mix * phase_linear + (1 - mix) * phase_minimum` (pure delay
+/// aside), so `mix = 0` is [`minimum_phase`] and `mix = 1` returns `h`.
+///
+/// # Method
+///
+/// The linear twin is the minimum-phase one times an all-pass `F` (one
+/// factor per zero outside the unit circle). The blend multiplies the
+/// minimum-phase twin by `F^mix`, or equivalently the linear one by
+/// `F^-(1 - mix)`, a fractional power that only changes the phase:
+///
+/// * Up to [`ROOT_MAX_TAPS`] taps the outside zeros come from the root path
+///   and each factor's phase is evaluated in closed form, continuous in
+///   frequency: `arg(1 - e^{-jw} / conj z) - arg(1 - e^{jw} / z)` (both
+///   arguments stay in the right half plane). Its constant and linear terms
+///   (a phase offset and a pure delay) are dropped.
+/// * Longer kernels use the radially scaled complex cepstrum of
+///   [`minimum_phase`]: the anticausal part `ĝ[-m]` (the outside zeros) is
+///   folded onto the causal side by the fraction `1 - mix` and kept by the
+///   fraction `mix`, which leaves `ĝ[m] + ĝ[-m]`, and so the magnitude, as
+///   it was. The odd-length real zeros next to `z = -1` are still reflected
+///   whole first (a small phase deviation, no magnitude change).
+///
+/// The result is not finite: fractional powers of the zero factors ring on
+/// both sides of the linear support. The response is evaluated over `[-2N,
+/// 3N)` and cut where its samples fall under the contract's stopband error
+/// bound (relative to the impulse peak), then checked against the contract
+/// exactly like the minimum-phase twin. A failed check tightens the
+/// cut by `INTERMEDIATE_CUT_STEP_DB` at a time; the kernel may grow to
+/// [`INTERMEDIATE_MAX_GROWTH`] times the linear length, so the returned
+/// kernel is always longer than `h`.
+pub fn intermediate_phase(
+    h: &[f64],
+    contract: &Contract,
+    mix: f64,
+) -> Result<MinimumPhase, MinimumPhaseError> {
+    let n = h.len();
+    if h.iter().any(|x| !x.is_finite()) || h.iter().all(|&x| x == 0.0) || !mix.is_finite() {
+        return Err(MinimumPhaseError::BadInput);
+    }
+    let mix = mix.clamp(0.0, 1.0);
+    if mix == 0.0 {
+        return minimum_phase(h, contract);
+    }
+    if mix == 1.0 || n <= 1 {
+        return Ok(MinimumPhase {
+            kernel: h.to_vec(),
+            method: if n <= ROOT_MAX_TAPS {
+                Method::Roots
+            } else {
+                Method::Cepstrum
+            },
+            fft_len: 0,
+            radius_taps: 0.0,
+            max_phase_step: 0.0,
+            reflected_zeros: 0,
+            tail: 0.0,
+            floored_bins: 0,
+            exact: true,
+            check: None,
+        });
+    }
+    if n <= ROOT_MAX_TAPS {
+        intermediate_by_roots(h, contract, mix)
+    } else {
+        intermediate_by_cepstrum(h, contract, mix)
+    }
+}
+
+/// Cut a two-sided response `x` to the span from its first to its last
+/// sample above `level` (absolute), returning `(start, end)` indices. A
+/// per-sample level, unlike an energy budget, ignores the f64 rounding noise
+/// spread over millions of samples of a long kernel's far tails.
+fn cut_level(x: &[f64], level: f64) -> (usize, usize) {
+    let start = x.iter().position(|v| v.abs() > level).unwrap_or(0);
+    let end = x
+        .iter()
+        .rposition(|v| v.abs() > level)
+        .map_or(x.len(), |i| i + 1);
+    (start, end.max(start + 1))
+}
+
+/// First cut level of an intermediate-phase design (dB re the impulse
+/// peak): the stopband error bound, or, where stopband sidelobes reach above
+/// -100 dB (beta under ~14), the absolute error that keeps them within 0.01
+/// dB there: `-100 - 59` dB.
+fn intermediate_first_cut_db(contract: &Contract) -> f64 {
+    let upper = UPPER_LEVEL_DB
+        - 20.0
+            * (10.0_f64.powf(UPPER_TOLERANCE_DB / 20.0) - 1.0)
+                .recip()
+                .log10();
+    contract.stopband_error_bound_db().min(upper)
+}
+
+/// End index (exclusive) of the block with the smallest peak after the
+/// impulse peak, blocks of `x.len() / 512` samples: where a decaying tail
+/// meets noise that grows with time.
+fn envelope_minimum_after_peak(x: &[f64]) -> usize {
+    let block = (x.len() / 512).max(1);
+    let peak_at = x
+        .iter()
+        .enumerate()
+        .fold((0, 0.0_f64), |(bi, bv), (i, v)| {
+            if v.abs() > bv { (i, v.abs()) } else { (bi, bv) }
+        })
+        .0;
+    let mut best = (x.len(), f64::INFINITY);
+    let mut start = (peak_at / block + 1) * block;
+    while start < x.len() {
+        let end = (start + block).min(x.len());
+        let m = x[start..end].iter().fold(0.0_f64, |a, v| a.max(v.abs()));
+        if m < best.1 {
+            best = (end, m);
+        }
+        start = end;
+    }
+    best.0
+}
+
+/// Shared tail of both intermediate paths: cut `x` (a two-sided response,
+/// sign already fixed) where its samples fall under a level, and check it.
+/// The level starts at [`intermediate_first_cut_db`] and drops by
+/// [`INTERMEDIATE_CUT_STEP_DB`] until the check passes.
+fn cut_and_check(
+    x: &[f64],
+    n: usize,
+    lin_mag: &[f64],
+    contract: &Contract,
+    w: &mut Work,
+) -> Result<(Vec<f64>, Check, f64), MinimumPhaseError> {
+    let peak = x.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    let total: f64 = x.iter().map(|v| v * v).sum();
+    // On the cepstral path the far right of `x` is f64 rounding noise
+    // amplified by the contour scaling `e^{alpha t}` (about -200 dB re the
+    // peak at 1M taps, 3N); the decaying tail meets it at the envelope's
+    // minimum. Never cut past that.
+    let right_limit = envelope_minimum_after_peak(x);
+    let x = &x[..right_limit];
+    let max_len = (INTERMEDIATE_MAX_GROWTH * n as f64) as usize;
+    let mut last_error = MinimumPhaseError::BadInput;
+    let mut last_cut = (usize::MAX, usize::MAX);
+    for attempt in 0..INTERMEDIATE_CUT_TRIES {
+        let level_db =
+            intermediate_first_cut_db(contract) - INTERMEDIATE_CUT_STEP_DB * attempt as f64;
+        let (start, end) = cut_level(x, peak * 10.0_f64.powf(level_db / 20.0));
+        if end - start > max_len {
+            return Err(MinimumPhaseError::TooLong {
+                taps: n,
+                needed: end - start,
+            });
+        }
+        if (start, end) == last_cut {
+            continue;
+        }
+        last_cut = (start, end);
+        let kernel = x[start..end].to_vec();
+        let res = check_magnitude(lin_mag, &kernel, contract, w);
+        match res {
+            Ok(check) => {
+                let kept: f64 = kernel.iter().map(|v| v * v).sum();
+                let tail = ((total - kept).max(0.0) / kept.max(f64::MIN_POSITIVE)).sqrt();
+                return Ok((kernel, check, tail));
+            }
+            Err(e) => last_error = e,
+        }
+    }
+    Err(last_error)
+}
+
+fn intermediate_by_roots(
+    h: &[f64],
+    contract: &Contract,
+    mix: f64,
+) -> Result<MinimumPhase, MinimumPhaseError> {
+    let n = h.len();
+    let (lead, trail) = trim_zeros(h);
+    let core = &h[lead..n - trail];
+    let m = core.len();
+    // The cut response spans up to 3N; keep the circular grid well clear.
+    let l = (n * ROOT_FFT_LEN_PER_TAP).next_power_of_two().max(512);
+    let mut work = Work::new(l);
+    let lin_mag = unit_magnitudes(h, &mut work);
+    if m < 2 {
+        return intermediate_phase(h, contract, 1.0);
+    }
+    let mut roots = polynomial_roots(core).ok_or(MinimumPhaseError::Roots { taps: n })?;
+    polish_roots(core, &mut roots);
+    let eps = f64::EPSILON / 2.0;
+    let outside: Vec<Complex64> = roots
+        .iter()
+        .copied()
+        .filter(|&z| {
+            let cond = eval_poly(core, z).cond;
+            let uncertain = 64.0 * (eps + (m + 1) as f64 * eps * eps * cond);
+            z.norm() - 1.0 > uncertain
+        })
+        .collect();
+    let p = 1.0 - mix;
+    work.time.fill(0.0);
+    work.time[..m].copy_from_slice(core);
+    work.forward();
+    let half = l / 2;
+    let one = Complex64::new(1.0, 0.0);
+    for (k, c) in work.spec.iter_mut().enumerate() {
+        let e = Complex64::from_polar(1.0, -PI * k as f64 / half as f64);
+        let mut phase = 0.0;
+        for &z in &outside {
+            phase += (one - e / z.conj()).arg() - (one - e.conj() / z).arg();
+        }
+        *c *= Complex64::from_polar(1.0, p * phase);
+    }
+    work.inverse();
+    // Two-sided response over t in [-n, 2n): negative times wrap.
+    let sign = if work.time.iter().sum::<f64>() * core.iter().sum::<f64>() < 0.0 {
+        -1.0
+    } else {
+        1.0
+    };
+    let x: Vec<f64> = (-2 * n as i64..3 * n as i64)
+        .map(|t| sign * work.time[t.rem_euclid(l as i64) as usize])
+        .collect();
+    let (kernel, check, tail) = cut_and_check(&x, n, &lin_mag, contract, &mut work)?;
+    Ok(MinimumPhase {
+        kernel,
+        method: Method::Roots,
+        fft_len: l,
+        radius_taps: 0.0,
+        max_phase_step: 0.0,
+        reflected_zeros: outside.len(),
+        tail,
+        floored_bins: 0,
+        exact: true,
+        check: Some(check),
+    })
+}
+
+fn intermediate_by_cepstrum(
+    h: &[f64],
+    contract: &Contract,
+    mix: f64,
+) -> Result<MinimumPhase, MinimumPhaseError> {
+    let n = h.len();
+    let l = fft_len_for(n);
+    let half = l / 2;
+    let mut work = Work::new(l);
+    let lin_mag = unit_magnitudes(h, &mut work);
+    let p = 1.0 - mix;
+    let mut last_error = MinimumPhaseError::BadInput;
+    for &radius in contour_radii(n) {
+        let alpha = radius / n as f64;
+        let mut g = h.to_vec();
+        let deflated = reflect_nyquist_real_zeros(&mut g, alpha.exp());
+        let info = match scaled_log_cepstrum(&g, alpha, &mut work) {
+            Ok(info) => info,
+            Err(e) => {
+                last_error = e;
+                continue;
+            }
+        };
+        drop(g);
+        // Fold the fraction p of the anticausal part (outside zeros) onto
+        // the causal side, keep the fraction mix where it is.
+        {
+            let (causal, anti) = work.time.split_at_mut(half);
+            for (m, c) in causal.iter_mut().enumerate().skip(1) {
+                let a = &mut anti[half - m];
+                *c += p * *a * (-2.0 * alpha * m as f64).exp();
+                *a *= mix;
+            }
+        }
+        work.time[0] += info.lag * alpha;
+        work.exponentiate();
+        // Unscale over t in [-2n, 3n) (negative times wrap to the end).
+        let x: Vec<f64> = (-2 * n as i64..3 * n as i64)
+            .map(|t| {
+                let v = work.time[t.rem_euclid(l as i64) as usize];
+                info.sign * v * (alpha * t as f64).exp()
+            })
+            .collect();
+        if x.iter().any(|v| !v.is_finite()) {
+            last_error = MinimumPhaseError::BadInput;
+            continue;
+        }
+        match cut_and_check(&x, n, &lin_mag, contract, &mut work) {
+            Ok((kernel, check, tail)) => {
+                return Ok(MinimumPhase {
+                    kernel,
+                    method: Method::Cepstrum,
+                    fft_len: l,
+                    radius_taps: radius,
+                    max_phase_step: info.max_step,
+                    reflected_zeros: info.lag as usize + deflated,
+                    tail,
+                    floored_bins: info.floored,
+                    exact: true,
+                    check: Some(check),
+                });
+            }
+            Err(e @ MinimumPhaseError::TooLong { .. }) => return Err(e),
             Err(e) => last_error = e,
         }
     }
@@ -1188,7 +1439,23 @@ impl Work {
     }
 }
 
-fn scaled_cepstrum(h: &[f64], alpha: f64, w: &mut Work) -> Result<MinimumPhase, MinimumPhaseError> {
+/// What [`scaled_log_cepstrum`] found besides the cepstrum itself.
+struct LogCepstrum {
+    /// Sign that makes the DC gain positive.
+    sign: f64,
+    /// Zeros outside the contour (the pure delay removed).
+    lag: f64,
+    max_step: f64,
+    floored: usize,
+}
+
+/// Complex cepstrum `ĝ` of `g[k] = h[k] e^{-alpha k}` with the pure delay
+/// removed, left in `w.time` (index `L - m` holds `ĝ[-m]`).
+fn scaled_log_cepstrum(
+    h: &[f64],
+    alpha: f64,
+    w: &mut Work,
+) -> Result<LogCepstrum, MinimumPhaseError> {
     let n = h.len();
     let l = w.fft_len;
     let half = l / 2;
@@ -1289,6 +1556,24 @@ fn scaled_cepstrum(h: &[f64], alpha: f64, w: &mut Work) -> Result<MinimumPhase, 
         c.im += lag * dw * k as f64;
     }
     w.inverse();
+    Ok(LogCepstrum {
+        sign,
+        lag,
+        max_step,
+        floored,
+    })
+}
+
+fn scaled_cepstrum(h: &[f64], alpha: f64, w: &mut Work) -> Result<MinimumPhase, MinimumPhaseError> {
+    let n = h.len();
+    let l = w.fft_len;
+    let half = l / 2;
+    let LogCepstrum {
+        sign,
+        lag,
+        max_step,
+        floored,
+    } = scaled_log_cepstrum(h, alpha, w)?;
 
     // Reflect: c[m] = g^[m] + g^[-m] rho^{-2m}; the delay removal scaled the
     // gain by rho^{-lag}, restore it in c[0].

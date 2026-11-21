@@ -100,8 +100,8 @@ fn slug(name: &str) -> String {
 
 /// `(EQ bands, convolution impulse responses)` in `chain`, for `PresetInfo`.
 ///
-/// The convolution stage is a single IR today and becomes a list with the
-/// convolution-chain work; counting through serialization accepts either shape.
+/// The convolution stage's IRs are counted through serialization, which accepts
+/// either a single IR or a list.
 pub fn chain_stats(chain: &ChainConfig) -> (u32, u32) {
     let bands = chain.eq.as_ref().map_or(0, |eq| {
         (eq.bands.len()
@@ -298,10 +298,11 @@ fn info_with_mtime(preset: &Preset, path: &Path) -> PresetInfo {
 
 /// Validate a preset read from disk or received over IPC before it is loaded:
 /// the name and its chain (same rules as `config.json`, prefixed with
-/// `preset`).
+/// `preset`). Rational upsampler ratios depend on the rate policy a preset
+/// is loaded under, so they are checked when it is loaded into the config.
 pub fn validate(preset: &Preset) -> Result<(), String> {
     normalize_name(&preset.name)?;
-    config::validate_chain("preset.chain", &preset.chain)
+    config::validate_chain_at("preset.chain", &preset.chain, &[], 1)
 }
 
 #[cfg(test)]
@@ -340,7 +341,7 @@ mod tests {
                 ..Default::default()
             }),
             upsampler: UpsamplerConfig::default(),
-            ..ChainConfig::default()
+            ..ChainConfig::neutral()
         }
     }
 

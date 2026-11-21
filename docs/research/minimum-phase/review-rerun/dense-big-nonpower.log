@@ -1,3 +1,0 @@
-$ REVIEW_POINTS=256 REVIEW_SPAN=0.1 <tmp>/review-target/release/scientific-review dense 4194303 20
-DENSE N=4194303 beta=20 ratio=16 lin worst=-190.833999 at_offset_widths=0.032812500 target=-190.188203
-DENSE N=4194303 beta=20 ratio=16 min worst=-191.065230 at_offset_widths=0.032421875 target=-190.188203

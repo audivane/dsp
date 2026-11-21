@@ -23,23 +23,25 @@ cargo build                       # dev; dsp-core is always opt-level 3
 cargo nextest run                 # all tests, parallel (or: cargo test)
 cargo nextest run -p audivane-dsp-core
 cargo build --profile fastrel     # optimized, thin LTO, incremental: benches/spikes
-cargo build --release             # fat LTO: the shipped engine and CLI
+cargo build --release             # fat LTO, no debug info: the shipped engine and CLI
 python3 tests/reference/run.py    # numpy/scipy cross-checks (needs avdsp built)
 ```
 
 Rules for code on the audio thread: no allocation, no locks, no syscalls
 except the ALSA/PipeWire calls themselves. Long tests (> ~2 s) go behind
-`#[ignore]` and run with `cargo nextest run --run-ignored all`.
+`#[ignore]` and run with `cargo nextest run --run-ignored all`: tier B of the
+filter fingerprints, the measurement reports and the refactor pins (the ones
+that compare against removed code) live there.
 
 ## Build from source
 
 Needs Rust (stable), Node 22+, clang, and the development packages for
-WebKitGTK 4.1, GTK 3, ayatana-appindicator, PipeWire (1.0 or newer), ALSA and
+WebKitGTK 4.1, GTK 3, PipeWire (1.0 or newer), ALSA and
 D-Bus. On Ubuntu/Debian:
 
 ```sh
 sudo apt install build-essential pkg-config clang libclang-dev \
-  libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+  libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
   libpipewire-0.3-dev libspa-0.2-dev libasound2-dev libdbus-1-dev
 (cd app && npm ci && npm run build)
 cargo build --release -p audivane-dsp-daemon -p audivane-dsp-cli
@@ -70,8 +72,11 @@ smoke tests, each installed twice so the upgrade scriptlet runs too
 GitHub release. The `Release packages` GitHub workflow runs the same scripts
 on demand (manual trigger only) when no local machine is available.
 
-The engine uses the `release` profile (fat LTO, one codegen unit); the app
-uses `release-ui` (thin LTO, 16 units), and both compile at the same time.
+The engine uses the `release` profile (fat LTO, one codegen unit, no debug
+info: every packaged binary is stripped); the app uses `release-ui` (thin LTO,
+16 units). Both compile at the same time, and the protocol unit tests run in
+release mode in the engine's target dir afterwards (so the packages need one
+release build, not two).
 
 Scriptlets: `packaging/release/postinstall.sh` is the one post-install script
 for all three formats; `package.sh` appends a dispatch line per format (deb
@@ -89,7 +94,7 @@ package step directly. Both are for testing only.
 
 ## Headless test rig (no real DAC)
 
-The dev box has no speakers. A virtual soundcard stands in for the DAC:
+On a headless machine, a virtual soundcard stands in for the DAC:
 
 ```sh
 sudo modprobe snd-aloop index=10 id=Loopback pcm_substreams=4
@@ -112,7 +117,7 @@ target/fastrel/audivane-dsp --foreground            # or: systemctl --user start
 avdsp ctl status
 avdsp ctl eq set ~/eq/ParametricEQ.txt              # AutoEQ / Equalizer APO file
 avdsp ctl upsample --max-rate 768000 --taps 100000  # 44.1k→705.6k, 48k→768k
-avdsp ctl ab set other.txt && avdsp ctl ab b        # A/B, A-weighted level match
+avdsp ctl ab set other.txt && avdsp ctl ab b        # A/B, K-weighted level match
 avdsp ctl route --app strawberry direct             # bit-perfect path for one app
 avdsp ctl mode system                               # everything through Audivane DSP
 avdsp ctl preset save "HD 650"                      # presets next to config.json
@@ -150,7 +155,7 @@ Offline tools (no daemon needed): `avdsp process`, `eq`, `levelmatch`,
 | `tests/daemon/engine_device_switch.sh` | device handoff, error state, recovery |
 | `tests/daemon/engine_metadata.sh` | PipeWire settings restored, also after `kill -9` |
 | `tests/daemon/engine_xrun.sh` | forced xrun recovers |
-| `tests/spike/test_*.sh` | phase-2 driver spike (60 s drift, bit-perfect, rate switch) |
+| `tests/spike/test_*.sh` | driver spike tests (60 s drift, bit-perfect, rate switch) |
 | `tests/stress/direct_start.sh` | 30x fresh-start stress for the Direct bit-perfect path (not in the suite; `tests/stress/direct_start.sh 30`) |
 | `tests/reference/run.py` | DSP vs numpy/scipy (EQ, convolution, upsampling, bypass, level match) |
 

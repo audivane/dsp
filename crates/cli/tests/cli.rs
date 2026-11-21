@@ -126,6 +126,7 @@ fn help_lists_every_subcommand() {
     let text = stdout(&output);
     for subcommand in [
         "process",
+        "render",
         "eq",
         "levelmatch",
         "kernel",
@@ -293,6 +294,70 @@ fn process_passthrough_is_bit_exact() {
         data_chunk(&output),
         "24-bit passthrough must be byte-identical"
     );
+}
+
+#[test]
+fn render_plays_at_another_speed() {
+    let dir = TempDir::new("render");
+    run_ok(
+        &dir,
+        &[
+            "gen",
+            "sine",
+            "--rate",
+            "48000",
+            "--seconds",
+            "0.5",
+            "--channels",
+            "2",
+            "--freq",
+            "1000",
+            "in.wav",
+        ],
+    );
+    let frames = |name: &str| {
+        let bytes = fs::read(dir.path(name)).unwrap();
+        data_chunk(&bytes).len() / 8 // f32 stereo
+    };
+    for (speed, want) in [("2", 12_000usize), ("0.5", 48_000), ("1.0123", 23_708)] {
+        let out = run_ok(
+            &dir,
+            &[
+                "render",
+                "in.wav",
+                "out.wav",
+                "--speed",
+                speed,
+                "--trim-latency",
+            ],
+        );
+        let peak = value(&stdout(&out), "peak");
+        assert!((peak + 6.0).abs() < 0.05, "peak {peak} dBFS");
+        let got = frames("out.wav");
+        assert!(
+            got.abs_diff(want) <= 4,
+            "speed {speed}: {got} frames, want about {want}"
+        );
+    }
+    let out = run_ok(
+        &dir,
+        &[
+            "render",
+            "in.wav",
+            "out.wav",
+            "--change",
+            "0.1:1.5:100",
+            "--change",
+            "0.2:0.8",
+            "--block",
+            "1",
+        ],
+    );
+    assert!(stdout(&out).contains("0.8 at the end"), "{}", stdout(&out));
+    let bad = run(&dir, &["render", "in.wav", "out.wav", "--speed", "3"]);
+    assert_eq!(bad.status.code(), Some(3), "{}", stderr(&bad));
+    let bad = run(&dir, &["render", "in.wav", "out.wav", "--change", "1:9"]);
+    assert_eq!(bad.status.code(), Some(3), "{}", stderr(&bad));
 }
 
 #[test]

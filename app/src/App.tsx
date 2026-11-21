@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { StatusBar } from "./components/StatusBar";
 import { Sidebar } from "./components/Sidebar";
 import { TopBar } from "./components/TopBar";
 import { Close } from "./components/Icons";
+import { useMainViewMemory } from "./store/mainView";
 import { store, useApp } from "./store/store";
 import { AbView } from "./views/AbView";
 import { ConvolutionView } from "./views/ConvolutionView";
@@ -12,6 +13,11 @@ import { EqView } from "./views/EqView";
 import { OutputView } from "./views/OutputView";
 import { RoutingView } from "./views/RoutingView";
 import { UpsamplingView } from "./views/UpsamplingView";
+import { CrossfeedView } from "./views/CrossfeedView";
+import { DcBlockView } from "./views/DcBlockView";
+import { HarmonicsView } from "./views/HarmonicsView";
+import { LimiterView } from "./views/LimiterView";
+import { PitchView } from "./views/PitchView";
 import { versionSkew } from "./lib/versions";
 
 function Toast() {
@@ -108,6 +114,11 @@ function useShortcuts() {
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       if (k === "a" || k === "b") {
         if (st.getState().config?.ab) void st.abSelect(k);
+      } else if (e.key === "`") {
+        if (st.getState().config?.ab) {
+          e.preventDefault();
+          void st.abFlip();
+        }
       } else if ((k === "delete" || k === "backspace") && st.getState().view === "eq") {
         const i = st.getState().selectedBand;
         if (st.editedSet().bands[i]) {
@@ -118,6 +129,19 @@ function useShortcuts() {
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
+  }, []);
+}
+
+/** A DAC plugged in or out while the window was in the background: read the device list again when it comes back. */
+function useDevicesOnFocus() {
+  useEffect(() => {
+    const onFocus = () => {
+      const st = store();
+      const s = st.getState();
+      if (s.conn === "up" && s.caps.devices) void st.refreshDevices();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
   }, []);
 }
 
@@ -136,9 +160,31 @@ function MainView() {
       return <AbView />;
     case "device":
       return <DeviceView />;
+    case "dc_block":
+      return <DcBlockView />;
+    case "pitch":
+      return <PitchView />;
+    case "crossfeed":
+      return <CrossfeedView />;
+    case "harmonics":
+      return <HarmonicsView />;
+    case "limiter":
+      return <LimiterView />;
     default:
       return <EqView />;
   }
+}
+
+/** The view area; its scroll position survives the window being closed to the tray. */
+function MainArea() {
+  const view = useApp((s) => s.view);
+  const ref = useRef<HTMLElement>(null);
+  useMainViewMemory(ref, view);
+  return (
+    <main className="main" id="main" ref={ref}>
+      <MainView />
+    </main>
+  );
 }
 
 export function App() {
@@ -146,6 +192,7 @@ export function App() {
   const hasConfig = useApp((s) => !!s.config);
   const [grace, setGrace] = useState(true);
   useShortcuts();
+  useDevicesOnFocus();
   useEffect(() => {
     store().connect();
     const t = setTimeout(() => setGrace(false), 1200);
@@ -162,9 +209,7 @@ export function App() {
       <TopBar />
       <EngineErrorBanner />
       <Sidebar />
-      <main className="main" id="main">
-        <MainView />
-      </main>
+      <MainArea />
       <StatusBar />
       <Toast />
     </div>

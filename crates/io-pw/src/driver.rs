@@ -603,7 +603,7 @@ fn run_pw_loop(
             return;
         }
     };
-    let context = match pw::context::ContextRc::new(&mainloop, None) {
+    let context = match crate::rt_context::new_context(&mainloop) {
         Ok(c) => c,
         Err(e) => {
             let _ = ready_tx.send(Err(PwError::PipeWire(e)));
@@ -1481,9 +1481,9 @@ fn run_alsa_thread<P: AudioProcessor>(
             .alsa_xruns
             .store(alsa.xruns(), Ordering::Relaxed);
 
-        // Finding 1 fix: if `avail_and_delay()` recovered from EPIPE/ESTRPIPE,
-        // the PCM is back in `State::Prepared` with `start_threshold = boundary`,
-        // so we MUST drop back to `!alsa_running` to re-prefill and `start()`.
+        // A recovery leaves the PCM in `State::Prepared` with
+        // `start_threshold = boundary`: drop back to `!alsa_running` so it is
+        // prefilled and started again.
         if alsa.needs_restart() || !alsa.is_running() {
             alsa_running = false;
             continue;
@@ -1560,15 +1560,14 @@ fn run_alsa_thread<P: AudioProcessor>(
             }
         }
 
-        // Finding 1 fix: if `write_i32_all_until` hit EPIPE and recovered,
-        // immediately transition back to prefill + `start()`.
+        // Same after a write: a recovered write leaves the PCM prepared too.
         if alsa.needs_restart() || !alsa.is_running() {
             alsa_running = false;
             continue;
         }
 
-        // Finding 4 fix: once the ~25 ms fade-out finishes, drop ALSA and hand
-        // the reopen off to the non-RT control thread.
+        // Once the fade-out finishes, drop ALSA and hand the reopen off to the
+        // non-RT control thread.
         if let Some((target_rate, target_quantum)) = pending_reopen
             && fade_ramp.is_fade_out_done()
         {

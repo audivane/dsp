@@ -4,22 +4,33 @@
 
 use crate::clock::{
     BoundedEventStash, DriverClockState, EventFd, FadeRamp, SynchronizedIo, mono_now_ns,
-    read_target_clock,
+    mono_raw_now_ns, read_target_clock,
 };
 use crate::error::{PwError, Result};
 use crate::lifecycle::{
-    DesiredDspConfig, DeviceBackend, DeviceLifecycle, NegotiatedKey, OpenedDevice, ReopenGate,
-    decide_rt_reopen, negotiated_key,
+    DesiredDspConfig, DeviceBackend, DeviceLifecycle, DeviceRates, NegotiatedKey, OpenedDevice,
+    PlaybackSessions, ReopenGate, decide_rt_reopen, negotiated_key,
 };
 use crate::metadata::{MetadataOp, MetadataTracker};
-use crate::rate_arbiter::{RateArbiter, RateClient, RateInputs, Verdict, choose_allowed_rate};
-use crate::rate_caps::{direct_rate_policy, effective_rate_policy};
+use crate::rate_arbiter::{RateArbiter, RateClient, RateInputs, Verdict};
+use crate::rate_caps::{GraphRate, MoveAttempts, effective_rate_policy};
+use crate::sink_volume::{self, SinkVolumeRequest, SinkVolumeShared, SinkVolumeView};
+use crate::varispeed_loop::{
+    self as vsl, Handover, PeriodBufs, PeriodPlan, VsDelay, VsDrain, VsGraph,
+};
+use crate::varispeed_rt::{
+    VarispeedCommandSlot, VarispeedDriver, VarispeedDriverSnapshot, VarispeedDriverStatus,
+    VarispeedPort,
+};
+use crate::varispeed_sched::{PullKind, RING_ALLOC_FRAMES, Timing};
 use audivane_io_alsa::{
     AlsaConfig, AlsaOutput, DEFAULT_RESERVE_PRIORITY, DeviceReservation, NegotiatedParams, OpenPcm,
-    card_index_from_device, probe_rates, try_promote_current_thread_rt,
+    alsa_lib_errors, card_index_from_device, probe_rates, silence_alsa_lib_on_this_thread,
 };
-use audivane_protocol::ipc::{DeviceCapabilities, EngineState, RatePolicy, SinkChoice};
-use audivane_protocol::{ALLOWED_RATES, MAX_OUTPUT_RATE, RateTarget, SampleFormat, resolve_ratio};
+use audivane_protocol::ipc::{
+    BypassResampler, DeviceCapabilities, EngineState, RatePolicy, SinkChoice,
+};
+use audivane_protocol::{ALLOWED_RATES, MAX_OUTPUT_RATE, RateRatio, RateTarget, SampleFormat};
 use pipewire as pw;
 use pw::spa;
 use spa::param::audio::{AudioFormat, AudioInfoRaw};
@@ -51,7 +62,13 @@ pub trait EngineAudioProcessor: Send + 'static {
     /// - `active_sink`: `SinkChoice::Direct` (ratio guaranteed 1) or `SinkChoice::Dsp`.
     /// - `dsp_in`: interleaved `f32` frames from `audivane_dsp`.
     /// - `direct_in`: interleaved `f32` frames from `audivane_direct`.
-    /// - `out`: interleaved left-justified `i32` output at `rate * ratio`.
+    /// - `out`: interleaved left-justified `i32` output at `rate * ratio`:
+    ///   exactly `ratio.frames_out(in_pos, frames)` frames (see
+    ///   [`RateRatio::frames_out`]; `frames * ratio` for integer ratios).
+    /// - `in_pos`: input frames handed to `process_block` since the last
+    ///   [`Self::reset_dsp_state`]: where this block sits on the rational
+    ///   frame grid. A processor keeps its chains on that grid (a chain that
+    ///   is not, e.g. one just installed, is moved onto it).
     #[allow(clippy::too_many_arguments)]
     fn process_block(
         &mut self,
@@ -60,8 +77,9 @@ pub trait EngineAudioProcessor: Send + 'static {
         direct_in: &[f32],
         out: &mut [i32],
         channels: usize,
-        ratio: u32,
+        ratio: RateRatio,
         graph_rate: u32,
+        in_pos: u64,
     );
 
     /// Execute an injected deterministic self-test block through the exact
@@ -78,7 +96,7 @@ pub trait EngineAudioProcessor: Send + 'static {
         &mut self,
         active_sink: SinkChoice,
         graph_rate: u32,
-        actual_ratio: u32,
+        actual_ratio: RateRatio,
         is_streaming: bool,
     );
 
@@ -94,10 +112,417 @@ pub trait EngineAudioProcessor: Send + 'static {
     fn is_chain_ready(
         &self,
         _active_sink: SinkChoice,
-        _actual_ratio: u32,
+        _actual_ratio: RateRatio,
         _required_seq: Option<u64>,
     ) -> bool {
         true
+    }
+
+    /// Whether `sink` has what it plays at `ratio` (no chain needed, or one
+    /// built for it is installed or on its way in), so a switch to it needs
+    /// no reopen. A sink without it would wait for a chain only a
+    /// negotiation builds.
+    fn has_chain_for(&self, sink: SinkChoice, ratio: RateRatio) -> bool {
+        self.is_chain_ready(sink, ratio, None)
+    }
+
+    /// The varispeed stage, when one runs for the next block of
+    /// `active_sink` at `ratio` and `graph_rate` with `channels` channels
+    /// (the DSP sink with DSP on, a stage built for that rate and channel
+    /// count). While it returns one, the driver pulls through it (the block
+    /// handed to [`Self::process_block`] then holds the planned source
+    /// frames, and the processor knows the nominal count from its plan) and
+    /// schedules graph cycles by watermark
+    /// ([`crate::varispeed_sched::VarispeedScheduler`]). `None`: no stage,
+    /// so the driver plays raw blocks.
+    fn varispeed(
+        &mut self,
+        _active_sink: SinkChoice,
+        _ratio: RateRatio,
+        _graph_rate: u32,
+        _channels: usize,
+    ) -> Option<&mut dyn VarispeedPort> {
+        None
+    }
+
+    /// The newest config generation whose chain runs on this thread: the
+    /// active one, or one warming up next to it (unheard, but its cost is
+    /// the thread's). An overload demotion is published with it. 0 when the
+    /// processor has no generations.
+    fn running_generation(&self) -> u64 {
+        0
+    }
+
+    /// The DAC was read at a wakeup: `delay` device frames queued ahead of
+    /// the DAC at `time_ns` (`CLOCK_MONOTONIC_RAW`, the domain of ALSA's
+    /// status timestamps), with everything [`Self::process_block`] has
+    /// output written. Multi-device: the processor publishes its position
+    /// at the DAC from it.
+    fn dac_read(&mut self, _delay: i64, _time_ns: u64) {}
+
+    /// The part of [`Self::latency_out_frames`] that delays the source
+    /// before any stage (multi-device alignment), graph frames, on the
+    /// path `active_sink` plays. The clock's `delay` and the stream-end
+    /// flush count it on the path without varispeed.
+    fn alignment_frames(&self, _active_sink: SinkChoice) -> usize {
+        0
+    }
+
+    /// The most [`Self::alignment_frames`] can grow to while a drain runs
+    /// (the stream-end flush budgets it).
+    fn alignment_max_frames(&self, active_sink: SinkChoice) -> usize {
+        self.alignment_frames(active_sink)
+    }
+
+    /// The PCM was prepared for a new stream (a start, a reopen, a
+    /// recovery): nothing the processor delayed before belongs to it.
+    fn stream_prepared(&mut self) {}
+}
+
+/// Source frames a varispeed block can take: the stage's most for the
+/// largest call (`2n + 1` at `n` = 8192), so the input buffers never grow
+/// for it.
+const VS_MAX_SRC_FRAMES: usize = 2 * 8192 + 2;
+
+/// Splits the DAC's fixed periods into input blocks on the rational frame
+/// grid ([`RateRatio::frames_out`]).
+///
+/// Integer ratios: `period / ratio` input frames give `period / ratio *
+/// ratio` output frames, every period.
+/// Rational ratios: one input frame can complete several output frames, so
+/// a period is planned as the fewest input frames that produce at least
+/// what the DAC still needs, and the few frames written beyond a period
+/// (fewer than `ceil(up / down)`) are credited to the next one.
+///
+/// The planner restarts (position and carried frames back to 0) on every
+/// DSP reset and device reopen, and on its own when the ratio changes: a
+/// position on one ratio's frame grid means nothing on another's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PeriodPlanner {
+    /// Input frames processed since the last DSP reset.
+    pos: u64,
+    /// Output frames written beyond the periods so far.
+    credit: usize,
+    /// The ratio `pos` and `credit` count on.
+    ratio: RateRatio,
+}
+
+impl PeriodPlanner {
+    /// `(input frames, output frames)` for the next `period_out`-frame period.
+    fn plan(&mut self, ratio: RateRatio, period_out: u32) -> (usize, usize) {
+        if ratio != self.ratio {
+            *self = Self {
+                ratio,
+                ..Self::default()
+            };
+        }
+        let period_out = period_out.max(1) as usize;
+        if ratio.is_integer() {
+            let r = ratio.up.max(1) as usize;
+            let n_in = (period_out.max(r) / r).max(1);
+            return (n_in, n_in * r);
+        }
+        let want = period_out.saturating_sub(self.credit).max(1);
+        let n_in = ratio.frames_in_for(self.pos, want);
+        (n_in, ratio.frames_out(self.pos, n_in))
+    }
+
+    /// Account a processed block of `n_in` -> `n_out` frames.
+    fn commit(&mut self, n_in: usize, n_out: usize, period_out: u32) {
+        self.pos += n_in as u64;
+        self.credit = (self.credit + n_out).saturating_sub(period_out as usize);
+    }
+
+    /// Account a silent prime of `n_out` frames: no input was processed,
+    /// so the position stays, but the frames count toward the credit like
+    /// audio, so the primes after it still fit the buffer.
+    fn commit_silence(&mut self, n_out: usize, period_out: u32) {
+        self.credit = (self.credit + n_out).saturating_sub(period_out as usize);
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// A silent prime (no source data yet): the planned period's frames of
+/// silence, no more than the buffer takes (auto-start is off, so nothing
+/// frees room), credited to the planner. Frames written, `None` when the
+/// write failed.
+fn prime_silence<W: PcmSink>(
+    w: &mut W,
+    planner: &mut PeriodPlanner,
+    prime_out: usize,
+    period_out: u32,
+) -> Option<usize> {
+    let frames = prime_out.min(w.room().unwrap_or(prime_out));
+    let n = w.write_silence(frames)?;
+    planner.commit_silence(n, period_out);
+    Some(n)
+}
+
+/// [`OutCarry::write_ahead`] on the running device, counting the carried
+/// frames written (in `frames_out` and on their own).
+fn write_carry_ahead<W: PcmSink>(
+    carry: &mut OutCarry,
+    w: &mut W,
+    channels: usize,
+    shared: &SharedEngineState,
+) -> CarryNext {
+    let stop =
+        || shared.stop.load(Ordering::Acquire) || shared.release_requested.load(Ordering::Acquire);
+    let (n, next) = carry.write_ahead(w, channels, &stop);
+    if n > 0 {
+        shared.frames_out.fetch_add(n as u64, Ordering::Relaxed);
+        shared
+            .carry_frames_out
+            .fetch_add(n as u64, Ordering::Relaxed);
+    }
+    next
+}
+
+/// The device started after its prefill: it plays, and a resume waiting
+/// for that is acknowledged.
+fn on_device_started(
+    shared: &SharedEngineState,
+    resume_ack: &mut bool,
+    event_stash: &mut BoundedEventStash<RtEvent, 16>,
+    rt_to_ctrl_tx: &mut rtrb::Producer<RtEvent>,
+    ctrl_efd: &EventFd,
+) {
+    shared.set_state(EngineState::Playing);
+    if std::mem::take(resume_ack) {
+        let _ = event_stash.push_or_stash(RtEvent::Resumed, rt_to_ctrl_tx, ctrl_efd);
+    }
+}
+
+/// Count the open's landing once: the graph runs at the rate the device
+/// was opened for (a graph move it asked for, if any, was followed).
+#[inline]
+fn note_landing(shared: &SharedEngineState, landed: &mut bool, cur_rate: u32, opened_rate: u32) {
+    if !*landed && cur_rate == opened_rate {
+        *landed = true;
+        shared.graph_landings.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Where the RT thread writes output: the ALSA device, or a test double.
+#[doc(hidden)]
+pub trait PcmSink {
+    /// Frames the buffer has room for now (`None` when ALSA cannot say).
+    fn room(&mut self) -> Option<usize>;
+    /// Write all of `samples`, waiting (bounded) for room; frames written,
+    /// `None` when the write failed.
+    fn write_all(&mut self, samples: &[i32], stop: &dyn Fn() -> bool) -> Option<usize>;
+    /// Write `frames` of digital silence; frames written, `None` when the
+    /// write failed.
+    fn write_silence(&mut self, frames: usize) -> Option<usize>;
+    /// An underrun recovery prepared the device: it must be prefilled and
+    /// started again before the next block.
+    fn needs_restart(&self) -> bool;
+}
+
+impl PcmSink for AlsaOutput {
+    fn room(&mut self) -> Option<usize> {
+        self.avail().ok().map(|a| a as usize)
+    }
+
+    fn write_all(&mut self, samples: &[i32], stop: &dyn Fn() -> bool) -> Option<usize> {
+        self.write_i32_all_until(samples, stop).ok()
+    }
+
+    fn write_silence(&mut self, frames: usize) -> Option<usize> {
+        AlsaOutput::write_silence(self, frames as u32).ok()
+    }
+
+    fn needs_restart(&self) -> bool {
+        AlsaOutput::needs_restart(self)
+    }
+}
+
+/// What may follow [`OutCarry::write_ahead`].
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CarryNext {
+    /// Nothing is carried: write the block.
+    Block,
+    /// Frames are still carried and the device has no room yet: wait for
+    /// it before taking the next block.
+    Wait,
+    /// The device was prepared again (an underrun): prefill and restart;
+    /// the prefill writes the carried frames first.
+    Restart,
+}
+
+/// Most frames the prefill can carry: fewer than `ceil(up / down)` for any
+/// rational pair of engine rates (integer ratios carry none), with room.
+pub const CARRY_MAX_FRAMES: usize = 64;
+
+/// Count the open handle's xruns (`now`, [`AlsaOutput::xruns`], which
+/// starts at 0 on every open) into the driver's lifetime total, and publish
+/// the handle's count for status. `seen` is what was counted of this handle
+/// so far (0 for a new one). Real-time safe: atomics only, no logging.
+#[inline]
+fn note_xruns(shared: &SharedEngineState, now: u64, seen: &mut u64) {
+    if now > *seen {
+        shared.xrun_events.fetch_add(now - *seen, Ordering::Relaxed);
+    }
+    *seen = now;
+    shared.xruns.store(now, Ordering::Relaxed);
+}
+
+/// Close-side [`Option::take`] of the open handle: its xruns not counted
+/// yet (an underrun in the tail drain, with no steady iteration after it)
+/// are counted first, so none goes unreported. `xruns` reads a handle's
+/// count.
+#[inline]
+fn take_counted<A>(
+    handle: &mut Option<A>,
+    xruns: impl Fn(&A) -> u64,
+    shared: &SharedEngineState,
+    seen: &mut u64,
+) -> Option<A> {
+    if let Some(h) = handle.as_ref() {
+        note_xruns(shared, xruns(h), seen);
+    }
+    handle.take()
+}
+
+/// On the control thread: log the underruns the RT thread counted since
+/// the last call (`logged`: the total logged so far). Returns how many were
+/// new.
+fn log_new_xruns(shared: &SharedEngineState, logged: &mut u64) -> u64 {
+    let total = shared.xrun_events.load(Ordering::Relaxed);
+    let new = total.saturating_sub(*logged);
+    if new > 0 {
+        log::warn!("ALSA xrun on playback ({new} new, {total} since the driver started)");
+        *logged = total;
+    }
+    new
+}
+
+/// On the control thread: log the alsa-lib messages counted on the audio
+/// thread (`total`, [`alsa_lib_errors`]) since the last call. Returns how
+/// many were new.
+fn log_new_alsa_lib_errors(total: u64, logged: &mut u64) -> u64 {
+    let new = total.saturating_sub(*logged);
+    if new > 0 {
+        log::warn!(
+            "alsa-lib reported {new} error(s) on the audio thread (not printed there; \
+             the driver's own messages say what failed)"
+        );
+        *logged = total;
+    }
+    new
+}
+
+/// How many whole periods the prefill writes before `start()`: as many as
+/// the negotiated buffer holds, at least one. Auto-start is off, so nothing
+/// frees room before `start()`; a period past the buffer would overflow the
+/// carry. The margin is the carry itself: on a rational grid the periods
+/// add up to fewer than `ceil(up / down)` frames more than planned (at most
+/// 59 for any pair the driver opens), which it holds until the device runs.
+/// A buffer under two periods (a byte-capped USB buffer at 3.072 MHz holds
+/// 1.5 periods of 65,536 frames) so starts with one period queued.
+pub fn prefill_periods(buffer_frames: u32, period_frames: u32) -> u32 {
+    (buffer_frames / period_frames.max(1)).max(1)
+}
+
+/// Output frames planned before the device starts that its buffer cannot
+/// take yet. On a rational grid the prefill periods add up to a few frames
+/// more than the buffer (the planner credits them to the next period), and
+/// with auto-start off nothing frees room before `start()`, so they wait
+/// here, in order, and go out first once the device runs. Preallocated:
+/// never grows on the RT thread.
+#[doc(hidden)]
+pub struct OutCarry {
+    buf: Vec<i32>,
+    /// Samples held (interleaved).
+    len: usize,
+}
+
+impl OutCarry {
+    pub fn with_capacity(samples: usize) -> Self {
+        Self {
+            buf: vec![0; samples],
+            len: 0,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Prefill write of `out` (the device is not running): what fits goes
+    /// to the device without waiting, after anything already carried; the
+    /// rest is carried. `(frames written, frames dropped)`: a drop only if
+    /// the carry is full, which a prefill of whole periods never reaches.
+    pub fn prime_write<W: PcmSink>(
+        &mut self,
+        w: &mut W,
+        out: &[i32],
+        channels: usize,
+        stop: &dyn Fn() -> bool,
+    ) -> (usize, usize) {
+        let ch = channels.max(1);
+        let mut room = w.room().unwrap_or(0);
+        let mut written = 0;
+        if self.len > 0 && room > 0 {
+            let frames = (self.len / ch).min(room);
+            let n = w.write_all(&self.buf[..frames * ch], stop).unwrap_or(0);
+            self.buf.copy_within(n * ch..self.len, 0);
+            self.len -= n * ch;
+            room -= n;
+            written += n;
+        }
+        let mut rest = out;
+        if self.len == 0 && room > 0 {
+            let frames = (out.len() / ch).min(room);
+            let n = w.write_all(&out[..frames * ch], stop).unwrap_or(0);
+            rest = &out[n * ch..];
+            written += n;
+        }
+        let keep = rest.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + keep].copy_from_slice(&rest[..keep]);
+        self.len += keep;
+        (written, (rest.len() - keep) / ch)
+    }
+
+    /// Write what the device has room for of the carried frames, without
+    /// waiting; the rest stays, in order. Frames written.
+    pub fn flush<W: PcmSink>(
+        &mut self,
+        w: &mut W,
+        channels: usize,
+        stop: &dyn Fn() -> bool,
+    ) -> usize {
+        self.prime_write(w, &[], channels, stop).0
+    }
+
+    /// Before a block goes to a running device: the carried frames first.
+    /// `(frames written from the carry, what next)`.
+    pub fn write_ahead<W: PcmSink>(
+        &mut self,
+        w: &mut W,
+        channels: usize,
+        stop: &dyn Fn() -> bool,
+    ) -> (usize, CarryNext) {
+        if self.is_empty() {
+            return (0, CarryNext::Block);
+        }
+        let n = self.flush(w, channels, stop);
+        let next = if w.needs_restart() {
+            CarryNext::Restart
+        } else if self.is_empty() {
+            CarryNext::Block
+        } else {
+            CarryNext::Wait
+        };
+        (n, next)
     }
 }
 
@@ -122,22 +547,189 @@ pub struct NegotiatedChain {
     /// generation (or newer) clears a previously recorded fallback warning,
     /// while a stale success can never clear a newer failure.
     pub generation: u64,
+    /// The engine's config has moved to another device since this open
+    /// began (its config change is queued behind it): the engine did not
+    /// take the card (no mixer write, nothing built), so the driver closes
+    /// it without resuming and lets the queued change reopen.
+    pub superseded: bool,
+    /// Direct or DSP off opened away from x1 (the engine bypass
+    /// resampler), and its chain could not be built: the driver drops the
+    /// pair from the bypass mask and reopens into the PipeWire path (the
+    /// graph moves to the native rate) before resuming
+    /// ([`crate::lifecycle::open_with_bypass_fallback`]).
+    pub bypass_unbuildable: bool,
+    /// As `bypass_unbuildable`, but the chain's design is still running
+    /// (off the negotiation): the pair falls back to PipeWire until the
+    /// engine reports the design done ([`BypassNotifier::designed`]).
+    pub bypass_pending: bool,
+    /// The engine's design epoch the negotiation ran in, for a bypass miss
+    /// ([`crate::lifecycle::BypassMiss::epoch`]).
+    pub bypass_epoch: u64,
 }
 
-/// Callback invoked off the RT thread right after ALSA opens/reopens at
-/// `(graph_rate, actual_ratio, sink, negotiated format)` and before `Resume`
-/// is sent to the RT thread.
+impl NegotiatedChain {
+    /// The pair whose engine bypass resampler chain this open misses.
+    pub fn bypass_miss(&self, input: u32, output: u32) -> Option<crate::lifecycle::BypassMiss> {
+        (self.bypass_unbuildable || self.bypass_pending).then_some(crate::lifecycle::BypassMiss {
+            input,
+            output,
+            pending: !self.bypass_unbuildable,
+            epoch: self.bypass_epoch,
+        })
+    }
+}
+
+/// Tells the driver about the engine bypass resampler's designs
+/// ([`EngineDriverHandle::bypass_notifier`]): a pair that fell back to
+/// PipeWire while its design ran comes back (or stays out, when it
+/// failed), and holds from a superseded design epoch are released
+/// ([`crate::lifecycle::BypassNote`]).
+#[derive(Clone)]
+pub struct BypassNotifier {
+    tx: mpsc::Sender<CtrlReq>,
+    ctrl_efd: Arc<EventFd>,
+}
+
+impl BypassNotifier {
+    pub fn send(&self, note: crate::lifecycle::BypassNote) {
+        let _ = self.tx.send(CtrlReq::Bypass(note));
+        self.ctrl_efd.signal();
+    }
+
+    pub fn designed(&self, input: u32, output: u32, ok: bool) {
+        self.send(crate::lifecycle::BypassNote::Designed { input, output, ok });
+    }
+}
+
+/// Callback invoked off the RT thread right after ALSA opens/reopens
+/// `device` at `(graph_rate, actual_ratio, sink, negotiated format, the
+/// open's key)` and before `Resume` is sent to the RT thread. The device is
+/// the one actually opened: the engine's config may have moved on in the
+/// meantime (see [`NegotiatedChain::superseded`]). The key is what the RT
+/// thread predicts later opens from ([`DesiredDspConfig::open_landing`]).
 ///
 /// Returns the swap sequence the resume gate must wait for (when the engine
 /// queued a chain swap) plus any rebuild failure that was recovered from with a
 /// fallback chain.
-pub type RatioNegotiator =
-    Arc<dyn Fn(u32, u32, SinkChoice, SampleFormat) -> NegotiatedChain + Send + Sync>;
+pub type RatioNegotiator = Arc<
+    dyn Fn(&str, u32, RateRatio, SinkChoice, SampleFormat, &NegotiatedKey) -> NegotiatedChain
+        + Send
+        + Sync,
+>;
+
+/// Run on the control thread whenever the driver stops holding a card,
+/// with that card's device. The engine uses it to leave the card's hardware
+/// volume at a safe level for the program that gets the DAC next, and to
+/// stop writing the mixer; a device it does not hold is no business of it.
+pub type ReleaseHook = Arc<dyn Fn(ReleaseKind, &str) + Send + Sync>;
+
+/// How the DAC is let go (see [`ReleaseHook`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseKind {
+    /// Playback has stopped and the card is still ours (reservation held):
+    /// an explicit release, a ReserveDevice1 request, the driver stopping,
+    /// or a failed reconnect. The hook may still write the card.
+    HandOver,
+    /// The card was already let go (a failed open or reopen released the
+    /// reservation): the hook must not write it.
+    Lost,
+}
+
+/// From the first negotiation of [`EngineDriverHandle::spawn`] on, the
+/// engine holds the card (and may have written its mixer): a start-up that
+/// fails after it (PipeWire registration, a thread spawn) hands the card
+/// over through the release hook before ALSA and the reservation go. Runs
+/// at most once: explicitly, or when dropped while still armed.
+struct InitHandOver {
+    shared: Arc<SharedEngineState>,
+    device: String,
+    armed: bool,
+}
+
+impl InitHandOver {
+    fn new(shared: Arc<SharedEngineState>, device: String) -> Self {
+        Self {
+            shared,
+            device,
+            armed: true,
+        }
+    }
+
+    fn run(&mut self) {
+        if std::mem::take(&mut self.armed) {
+            run_release_hook(&self.shared, ReleaseKind::HandOver, &self.device);
+        }
+    }
+
+    /// The driver runs: from now on its own paths hand the card over.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InitHandOver {
+    fn drop(&mut self) {
+        self.run();
+    }
+}
+
+/// `release_device`'s error when the teardown is slower than its wait.
+const RELEASE_TIMEOUT_MSG: &str = "release_device timed out waiting for control teardown";
+
+fn run_release_hook(shared: &SharedEngineState, kind: ReleaseKind, device: &str) {
+    let hook = shared
+        .before_release
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(kind, device);
+    }
+}
 
 /// DAC rates worth probing: every engine graph rate times every ratio up to
-/// `max_ratio`, capped at 768 kHz.
-fn engine_probe_rates(max_ratio: u32) -> Vec<u32> {
+/// `max_ratio`, capped at [`MAX_OUTPUT_RATE`], kept to the rates a ladder
+/// can offer ([`crate::lifecycle::MASK_OUTPUT_RATES`]: every multiple up to
+/// 768 kHz, then the x32 and x64 rates 1.4112, 1.536, 2.8224 and
+/// 3.072 MHz).
+pub fn engine_probe_rates(max_ratio: u32) -> Vec<u32> {
     probe_rates(ALLOWED_RATES, max_ratio.max(1), MAX_OUTPUT_RATE)
+        .into_iter()
+        .filter(|r| crate::lifecycle::MASK_OUTPUT_RATES.contains(r))
+        .collect()
+}
+
+/// Where the DSP sink lands for `config` on a device with `caps`: for each
+/// graph rate the driver offers PipeWire (the configured rates the device
+/// can play, widened to the engine's rates when none can, exactly as the
+/// driver computes its policy), the ratio a fresh open picks (the first
+/// buildable ladder entry the device plays in a configured format,
+/// [`DesiredDspConfig::open_landing`]). Rates where no ladder entry plays
+/// are left out. Without `caps` (no probe), the configured rates and each
+/// one's first ladder entry. `Err`: the device plays none of the engine's
+/// rates. The control plane prices a design at these landings and checks
+/// that a fallback can play at all.
+pub fn predicted_dsp_landings(
+    config: &EngineDriverConfig,
+    caps: Option<&DeviceCapabilities>,
+) -> std::result::Result<Vec<(u32, RateRatio)>, String> {
+    let desired = config.desired_dsp(0);
+    let policy = compute_effective_policy(config, desired, caps)?;
+    let rates = DeviceRates::playable(caps, &config.formats);
+    Ok(policy
+        .allowed_rates
+        .iter()
+        .filter_map(|&rate| {
+            desired
+                .open_landing(
+                    SinkChoice::Dsp,
+                    rate,
+                    rates,
+                    &crate::lifecycle::Rungs::EMPTY,
+                )
+                .map(|r| (rate, r))
+        })
+        .collect())
 }
 
 /// The rate policy the driver runs with for `caps`: the configured one
@@ -192,6 +784,27 @@ impl DriverWaker {
     }
 }
 
+/// Shows the engine's volume on our sinks and switches sink volume
+/// ownership on or off ([`crate::sink_volume`]).
+pub struct SinkVolumePort {
+    shared: Arc<SinkVolumeShared>,
+    pw_tx: Option<pw::channel::Sender<PwMsg>>,
+}
+
+impl SinkVolumePort {
+    /// `follow`: own the sink volume and show `view` on `audivane_dsp`
+    /// (`audivane_direct` shows unity with `view.muted`). Turning `follow`
+    /// off puts both sinks back to plain unity once.
+    pub fn set(&self, follow: bool, view: SinkVolumeView) {
+        let follow_changed = self.shared.set(follow, view);
+        if (follow || follow_changed)
+            && let Some(tx) = &self.pw_tx
+        {
+            let _ = tx.send(PwMsg::SinkVolume { follow_changed });
+        }
+    }
+}
+
 /// Configuration for [`EngineDriverHandle`].
 #[derive(Clone, Debug)]
 pub struct EngineDriverConfig {
@@ -208,10 +821,20 @@ pub struct EngineDriverConfig {
     pub dsp_rate_target: RateTarget,
     /// Upper clamp for resolved upsampling ratios (`>= 1`).
     pub max_dsp_ratio: u32,
+    /// The rate pairs the DSP chain can be built for (ratio ladders skip
+    /// the others).
+    pub dsp_buildable: crate::lifecycle::RatePairMask,
+    /// The rate pairs the resample-only chain of the engine bypass
+    /// resampler can be built for (`rate_policy.bypass_resampler: engine`).
+    pub bypass_buildable: crate::lifecycle::RatePairMask,
     pub rate_policy: RatePolicy,
     pub reserve_device: bool,
     pub reserve_priority: i32,
     pub rt_priority: u32,
+    /// `Some(view)`: own the sink volume from the start (see
+    /// [`crate::sink_volume`]); later changes go through
+    /// [`EngineDriverHandle::sink_volume_port`].
+    pub sink_volume: Option<SinkVolumeView>,
 }
 
 impl EngineDriverConfig {
@@ -221,6 +844,12 @@ impl EngineDriverConfig {
             rate_target: self.dsp_rate_target,
             max_ratio: self.max_dsp_ratio.max(1),
             generation,
+            buildable: self.dsp_buildable,
+            bypass: crate::lifecycle::BypassLeg {
+                engine: self.rate_policy.bypass_resampler == BypassResampler::Engine,
+                buildable: self.bypass_buildable,
+                allowed: crate::lifecycle::BypassLeg::allowed_bits(&self.rate_policy.allowed_rates),
+            },
         }
     }
 }
@@ -241,10 +870,13 @@ impl Default for EngineDriverConfig {
             dsp_enabled: true,
             dsp_rate_target: RateTarget::Off,
             max_dsp_ratio: 16,
+            dsp_buildable: crate::lifecycle::RatePairMask::ALL,
+            bypass_buildable: crate::lifecycle::RatePairMask::NONE,
             rate_policy: RatePolicy::default(),
             reserve_device: true,
             reserve_priority: DEFAULT_RESERVE_PRIORITY,
             rt_priority: 20,
+            sink_volume: None,
         }
     }
 }
@@ -301,11 +933,49 @@ pub struct DriverGapCounters {
     pub drain_silence_periods: u64,
     /// Silence periods written while priming a fresh ALSA start.
     pub prime_silence_periods: u64,
+    /// Frames written from the prefill carry once the device ran (also in
+    /// `frames_out`).
+    pub carry_frames_out: u64,
     /// PipeWire sink state transitions.
     pub stream_starts_direct: u64,
     pub stream_starts_dsp: u64,
     pub stream_pauses_direct: u64,
     pub stream_pauses_dsp: u64,
+    /// Overloads that moved the audio thread from real-time to normal
+    /// priority: it ran to the `RLIMIT_RTTIME` soft limit without sleeping
+    /// (`SIGXCPU`) and the demotion took. Only these are overloads.
+    pub rt_overloads: u64,
+    /// `SIGXCPU` signals the audio thread saw (a signal that finds it at
+    /// normal priority already moves only this).
+    pub rt_signals: u64,
+    /// Demotions of the real-time audio thread the kernel refused.
+    pub rt_failed_demotions: u64,
+    /// The chain generation that ran on the audio thread at the last
+    /// `rt_overloads` demotion ([`EngineAudioProcessor::running_generation`],
+    /// published before the count moves).
+    pub rt_overload_generation: u64,
+    /// The varispeed hold's sequence the audio thread applied at that
+    /// demotion (published with it).
+    pub rt_overload_hold_seq: u64,
+    /// Probes of the device that answered (its capabilities read), since
+    /// the driver started: a failed open is followed by one, so a count
+    /// that moved since an attempt began says the device was there for it.
+    pub probes: u64,
+    /// Short naps the audio thread took because it had not slept for
+    /// 50 ms (the chain costs more than real time).
+    pub rt_naps: u64,
+    /// 1 while the audio thread is demoted after an overload (not
+    /// real-time again yet), else 0.
+    pub rt_demoted: u64,
+    /// 1 while the DSP sink should drive the DAC (a client streams to it:
+    /// playback is requested there), else 0.
+    pub dsp_wanted: u64,
+    /// Underrun recoveries since the driver started, across reopens
+    /// (`xruns` is the open handle's own count and restarts at 0).
+    pub xrun_events: u64,
+    /// Steady-state periods processed and written since the driver
+    /// started: with `xrun_events`, the share of failed periods.
+    pub processed_periods: u64,
 }
 
 /// Point-in-time driver telemetry used by `RealEngine::snapshot()`.
@@ -316,7 +986,7 @@ pub struct EngineDriverSnapshot {
     pub format: Option<SampleFormat>,
     pub graph_rate: u32,
     pub output_rate: u32,
-    pub ratio: u32,
+    pub ratio: RateRatio,
     pub quantum: u32,
     pub alsa_delay_frames: i64,
     pub xruns: u64,
@@ -330,12 +1000,26 @@ pub struct EngineDriverSnapshot {
     pub gaps: DriverGapCounters,
     /// Probed capabilities of the open device.
     pub device_caps: Option<DeviceCapabilities>,
+    /// What the last open found ([`NegotiatedKey`]): the reopen decisions
+    /// predict a fresh open from it. `None` before the first open.
+    pub open_key: Option<NegotiatedKey>,
+    /// The playback session now: [`NegotiatedKey::in_session`] with it is
+    /// what the RT thread predicts from.
+    pub playback_session: u64,
     /// Rate policy actually published to PipeWire (configured policy
     /// restricted to the device). `None` before the first open.
     pub effective_policy: Option<RatePolicy>,
     /// Graph rates the Direct sink plays bit-perfect (native x1 rates among
     /// the effective ones). Empty while no device is open.
     pub direct_rates: Vec<u32>,
+    /// Varispeed scheduling: cap, hold, underfeed and cycle counters.
+    pub varispeed: VarispeedDriverSnapshot,
+    /// The largest processing time of one period over the period's length,
+    /// over the last one to two seconds (stage, chains, swaps and A/B).
+    pub rt_load_max: f64,
+    /// The configured device is not there: the sinks stay up and run on
+    /// the engine's own clock (audio is discarded) until it comes back.
+    pub waiting_for_device: bool,
 }
 
 fn state_to_u8(s: EngineState) -> u8 {
@@ -402,10 +1086,9 @@ fn sink_from_u8(v: u8) -> Option<SinkChoice> {
 /// PipeWire turns `node.latency = q/rate` into `q * graph_rate / rate` and,
 /// with `clock.power-of-two-quantum` (the default), rounds that *down* to a
 /// power of two. So a 1024 quantum runs 512 at 44.1 kHz, 1024 at 88.2 kHz,
-/// 2048 at 176.4 kHz and 4096 at 352.8 kHz, never 1881 or 3763. Opening the
-/// DAC with a 1881-frame period while the graph ran 1024 needed almost two
-/// graph cycles per period, fired back to back, and the source clients could
-/// not keep up: PipeWire filled ~45% of the output with silence.
+/// 2048 at 176.4 kHz and 4096 at 352.8 kHz, never 1881 or 3763. A period
+/// that does not match the quantum costs several back-to-back cycles per
+/// period and the source clients cannot keep up.
 ///
 /// The result is also capped at PipeWire's default `clock.quantum-limit`
 /// (8192): at 768 kHz a 1024 quantum would be 16384, but the graph runs 8192.
@@ -443,6 +1126,9 @@ struct SharedEngineState {
     direct_has_links: AtomicBool,
     /// Set by PipeWire Registry when >= 1 node is linked to the DSP sink.
     dsp_has_links: AtomicBool,
+    /// Set by PipeWire Registry when >= 1 running node is linked to the DSP
+    /// sink.
+    dsp_client_running: AtomicBool,
     /// Native sample rate tracked for active Direct/DSP clients (0 = none).
     desired_client_rate: AtomicU32,
     stop: AtomicBool,
@@ -451,10 +1137,15 @@ struct SharedEngineState {
     direct_node_id: AtomicU32,
     graph_rate: AtomicU32,
     output_rate: AtomicU32,
-    ratio: AtomicU32,
+    /// [`RateRatio::to_bits`] of the negotiated ratio.
+    ratio: AtomicU64,
     quantum: AtomicU32,
     alsa_delay_frames: AtomicI64,
     xruns: AtomicU64,
+    /// Underrun recoveries since the driver started, across reopens (the
+    /// RT thread adds them, [`note_xruns`]; the control thread logs them,
+    /// [`log_new_xruns`]).
+    xrun_events: AtomicU64,
     ring_underruns: AtomicU64,
     direct_zero_periods: AtomicU64,
     direct_zero_frames: AtomicU64,
@@ -478,6 +1169,8 @@ struct SharedEngineState {
     direct_drained_unused: AtomicU64,
     dsp_drained_unused: AtomicU64,
     reopens: AtomicU64,
+    /// Device probes that answered ([`DriverGapCounters::probes`]).
+    probes: AtomicU64,
     resumes: AtomicU64,
     rate_switches: AtomicU64,
     fade_outs: AtomicU64,
@@ -485,10 +1178,13 @@ struct SharedEngineState {
     idle_stops: AtomicU64,
     drain_silence_periods: AtomicU64,
     prime_silence_periods: AtomicU64,
+    carry_frames_out: AtomicU64,
     stream_starts_direct: AtomicU64,
     stream_starts_dsp: AtomicU64,
     stream_pauses_direct: AtomicU64,
     stream_pauses_dsp: AtomicU64,
+    /// The audio thread's overload guard ([`crate::rt_overload`]).
+    rt: crate::rt_overload::RtOverloadState,
     frames_out: AtomicU64,
     dsp_load_bits: AtomicU64,
     dsp_latency_out: AtomicU64,
@@ -496,14 +1192,47 @@ struct SharedEngineState {
     last_error: Mutex<Option<String>>,
     metadata_warning: Mutex<Option<String>>,
     device_caps: Mutex<Option<DeviceCapabilities>>,
+    open_key: Mutex<Option<NegotiatedKey>>,
+    /// Opens whose graph the RT thread saw at the rate it opened for (once
+    /// per open): a pending graph move landed ([`MoveAttempts`]).
+    graph_landings: AtomicU64,
+    /// The playback session the RT thread is in ([`PlaybackSessions`]).
+    playback_session: AtomicU64,
     effective_policy: Mutex<Option<RatePolicy>>,
-    /// Rates the Direct sink may run the graph at (native x1 rates among
-    /// the effective ones). Read by the PipeWire thread's rate arbiter.
-    direct_policy: Mutex<Option<RatePolicy>>,
+    /// Each sink's rates and native base on the open device
+    /// ([`crate::rate_caps::RatePolicies`]): Direct runs the graph at native
+    /// x1 rates and the ones the engine bypass resampler converts, and the
+    /// DSP sink's clients map through its own rates. Read by the PipeWire
+    /// thread's rate arbiter.
+    sink_policies: Mutex<Option<crate::rate_caps::RatePolicies>>,
     /// Recovered chain-rebuild failure plus the config generation that produced
     /// it. Kept with a generation so a success from an older chain build cannot
     /// clear a warning recorded by a newer one.
     chain_warning: Mutex<ChainWarningState>,
+    /// Sink volume ownership (PipeWire thread + control threads).
+    sink_volume: Arc<SinkVolumeShared>,
+    before_release: Mutex<Option<ReleaseHook>>,
+    /// The latest varispeed speed command (control side writes, the RT
+    /// thread reads at a DAC wakeup).
+    varispeed_cmd: VarispeedCommandSlot,
+    /// What the RT thread's varispeed scheduling publishes.
+    varispeed: VarispeedDriverStatus,
+    /// `rt_load_max`: the largest processing time of one period over the
+    /// period's length, over the last one to two seconds (f64 bits).
+    rt_load_max_bits: AtomicU64,
+    /// The configured device is not there (unplugged, or missing at
+    /// start-up). With no output open, the RT thread then runs the graph on
+    /// its own clock and discards what the sinks receive, so streams
+    /// neither stall nor move to another output. Written by the control
+    /// thread.
+    device_missing: AtomicBool,
+    /// Bumped by the control thread to make the RT thread retry the open
+    /// while it has no output (the device came back, or a retry is due).
+    device_retry: AtomicU64,
+    /// The open device is no longer in the system ([`PresenceWatch`]): the
+    /// RT thread hands its output back for a reopen, also while nothing
+    /// plays (when ALSA reports nothing). Written by the control thread.
+    device_gone: AtomicBool,
 }
 
 struct ChainWarning {
@@ -522,14 +1251,42 @@ struct ChainWarningState {
 }
 
 impl SharedEngineState {
+    /// The sink that should drive the DAC now, `None` when neither has a
+    /// stream: Direct when a running client feeds it
+    /// ([`Self::session_streams`]), else the DSP sink while its node streams.
+    fn pick_sink(&self) -> Option<SinkChoice> {
+        let (_, direct) = self.session_streams();
+        if direct {
+            Some(SinkChoice::Direct)
+        } else if self.dsp_streaming.load(Ordering::Acquire) {
+            Some(SinkChoice::Dsp)
+        } else {
+            None
+        }
+    }
+
+    /// Whether each sink (DSP, Direct) has a stream for the playback
+    /// sessions ([`PlaybackSessions::observe`]): its node streams and a
+    /// running client feeds it. The node's flag alone is not enough (the
+    /// driver group runs both nodes while either sink's stream drives it),
+    /// and neither is a link (a paused client stays linked), so a paused
+    /// client never keeps a playing one on the other sink silent.
+    fn session_streams(&self) -> (bool, bool) {
+        let fed = |streaming: &AtomicBool, running: &AtomicBool| {
+            streaming.load(Ordering::Acquire) && running.load(Ordering::Acquire)
+        };
+        (
+            fed(&self.dsp_streaming, &self.dsp_client_running),
+            fed(&self.direct_streaming, &self.direct_client_running),
+        )
+    }
+
     fn new(cfg: &EngineDriverConfig) -> Self {
         let init_rate = cfg.rate_policy.default_rate.max(8_000);
         let init_q = scaled_quantum(cfg.quantum, init_rate);
-        let init_ratio = if cfg.dsp_enabled {
-            resolve_ratio(cfg.dsp_rate_target, init_rate).clamp(1, cfg.max_dsp_ratio.max(1))
-        } else {
-            1
-        };
+        let init_ratio = cfg
+            .desired_dsp(0)
+            .resolve_ratio_for(SinkChoice::Dsp, init_rate);
         Self {
             io: SynchronizedIo::new(),
             state: AtomicU8::new(state_to_u8(EngineState::Ready)),
@@ -541,17 +1298,19 @@ impl SharedEngineState {
             direct_client_running: AtomicBool::new(false),
             direct_has_links: AtomicBool::new(false),
             dsp_has_links: AtomicBool::new(false),
+            dsp_client_running: AtomicBool::new(false),
             desired_client_rate: AtomicU32::new(0),
             stop: AtomicBool::new(false),
             release_requested: AtomicBool::new(false),
             dsp_node_id: AtomicU32::new(pw::constants::ID_ANY),
             direct_node_id: AtomicU32::new(pw::constants::ID_ANY),
             graph_rate: AtomicU32::new(init_rate),
-            output_rate: AtomicU32::new(init_rate * init_ratio),
-            ratio: AtomicU32::new(init_ratio),
+            output_rate: AtomicU32::new(init_ratio.output_rate(init_rate).unwrap_or(init_rate)),
+            ratio: AtomicU64::new(init_ratio.to_bits()),
             quantum: AtomicU32::new(init_q),
             alsa_delay_frames: AtomicI64::new(0),
             xruns: AtomicU64::new(0),
+            xrun_events: AtomicU64::new(0),
             ring_underruns: AtomicU64::new(0),
             direct_zero_periods: AtomicU64::new(0),
             direct_zero_frames: AtomicU64::new(0),
@@ -575,6 +1334,7 @@ impl SharedEngineState {
             direct_drained_unused: AtomicU64::new(0),
             dsp_drained_unused: AtomicU64::new(0),
             reopens: AtomicU64::new(0),
+            probes: AtomicU64::new(0),
             resumes: AtomicU64::new(0),
             rate_switches: AtomicU64::new(0),
             fade_outs: AtomicU64::new(0),
@@ -582,10 +1342,12 @@ impl SharedEngineState {
             idle_stops: AtomicU64::new(0),
             drain_silence_periods: AtomicU64::new(0),
             prime_silence_periods: AtomicU64::new(0),
+            carry_frames_out: AtomicU64::new(0),
             stream_starts_direct: AtomicU64::new(0),
             stream_starts_dsp: AtomicU64::new(0),
             stream_pauses_direct: AtomicU64::new(0),
             stream_pauses_dsp: AtomicU64::new(0),
+            rt: Default::default(),
             frames_out: AtomicU64::new(0),
             dsp_load_bits: AtomicU64::new(0.0_f64.to_bits()),
             dsp_latency_out: AtomicU64::new(0),
@@ -593,9 +1355,26 @@ impl SharedEngineState {
             last_error: Mutex::new(None),
             metadata_warning: Mutex::new(None),
             device_caps: Mutex::new(None),
+            open_key: Mutex::new(None),
+            graph_landings: AtomicU64::new(0),
+            playback_session: AtomicU64::new(0),
             effective_policy: Mutex::new(None),
-            direct_policy: Mutex::new(None),
+            sink_policies: Mutex::new(None),
             chain_warning: Mutex::new(ChainWarningState::default()),
+            sink_volume: Arc::new(SinkVolumeShared::new(cfg.sink_volume)),
+            before_release: Mutex::new(None),
+            varispeed_cmd: VarispeedCommandSlot::default(),
+            varispeed: VarispeedDriverStatus::default(),
+            rt_load_max_bits: AtomicU64::new(0.0_f64.to_bits()),
+            device_missing: AtomicBool::new(false),
+            device_retry: AtomicU64::new(0),
+            device_gone: AtomicBool::new(false),
+        }
+    }
+
+    fn set_open_key(&self, key: NegotiatedKey) {
+        if let Ok(mut g) = self.open_key.lock() {
+            *g = Some(key);
         }
     }
 
@@ -605,20 +1384,39 @@ impl SharedEngineState {
         }
     }
 
+    /// A probe of the device answered (its capabilities were read).
+    fn note_probe(&self) {
+        self.probes.fetch_add(1, Ordering::AcqRel);
+    }
+
     fn set_effective_policy(&self, policy: Option<RatePolicy>) {
         if let Ok(mut g) = self.effective_policy.lock() {
             *g = policy;
         }
     }
 
-    fn set_direct_policy(&self, policy: Option<RatePolicy>) {
-        if let Ok(mut g) = self.direct_policy.lock() {
-            *g = policy;
-        }
+    fn sink_policies(&self) -> Option<crate::rate_caps::RatePolicies> {
+        self.sink_policies.lock().ok().and_then(|g| g.clone())
     }
 
     fn direct_policy(&self) -> Option<RatePolicy> {
-        self.direct_policy.lock().ok().and_then(|g| g.clone())
+        self.sink_policies().map(|p| p.direct)
+    }
+
+    /// Drop the rate policies (no device, or an unusable one).
+    fn clear_policies(&self) {
+        self.set_effective_policy(None);
+        if let Ok(mut g) = self.sink_policies.lock() {
+            *g = None;
+        }
+    }
+
+    /// Publish the policies the driver runs with on the open device.
+    fn set_policies(&self, policies: &crate::rate_caps::RatePolicies) {
+        self.set_effective_policy(Some(policies.published.clone()));
+        if let Ok(mut g) = self.sink_policies.lock() {
+            *g = Some(policies.clone());
+        }
     }
 
     /// The output is closed (open failed, reopen aborted, released): drop
@@ -628,8 +1426,7 @@ impl SharedEngineState {
     /// target was probed, possibly unusable).
     fn clear_negotiation(&self, device: &str) {
         self.format.store(0, Ordering::Release);
-        self.set_effective_policy(None);
-        self.set_direct_policy(None);
+        self.clear_policies();
         if let Ok(mut g) = self.device_caps.lock()
             && g.as_ref().is_some_and(|c| c.device != device)
         {
@@ -654,6 +1451,16 @@ impl SharedEngineState {
 
     fn clear_error(&self) {
         if let Ok(mut g) = self.last_error.lock() {
+            *g = None;
+        }
+    }
+
+    /// Clear the error only when it is `msg` (a later, different error
+    /// stays).
+    fn clear_error_if(&self, msg: &str) {
+        if let Ok(mut g) = self.last_error.lock()
+            && g.as_deref() == Some(msg)
+        {
             *g = None;
         }
     }
@@ -781,18 +1588,22 @@ enum PwMsg {
         ack_tx: mpsc::SyncSender<Result<()>>,
     },
     Reconnect {
-        config: EngineDriverConfig,
+        config: Box<EngineDriverConfig>,
         last_rate: u32,
         dsp_prod: rtrb::Producer<f32>,
         direct_prod: rtrb::Producer<f32>,
         reply_tx: mpsc::SyncSender<Result<SendRawStream>>,
+    },
+    /// The engine's volume or the ownership mode changed.
+    SinkVolume {
+        follow_changed: bool,
     },
     Stop,
 }
 
 enum CtrlReq {
     UpdateConfig {
-        config: EngineDriverConfig,
+        config: Box<EngineDriverConfig>,
         force_reopen: bool,
     },
     ReleaseDevice {
@@ -801,6 +1612,8 @@ enum CtrlReq {
     AcquireDevice {
         reply_tx: mpsc::SyncSender<Result<()>>,
     },
+    /// [`BypassNotifier::send`].
+    Bypass(crate::lifecycle::BypassNote),
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -811,7 +1624,7 @@ enum RtControlCmd {
         alsa_fds: Vec<libc::pollfd>,
         params: NegotiatedParams,
         graph_rate: u32,
-        actual_ratio: u32,
+        actual_ratio: RateRatio,
         target_sink: SinkChoice,
         desired_dsp: DesiredDspConfig,
         negotiated_key: NegotiatedKey,
@@ -839,6 +1652,9 @@ enum RtEvent {
         target_sink: SinkChoice,
         old_alsa: Option<Box<AlsaOutput>>,
         old_fds: Vec<libc::pollfd>,
+        /// The device failed in a way a restart of the stream cannot fix
+        /// (usually unplugged): a failed reopen waits for it to come back.
+        device_failed: bool,
     },
     ReleasedIdle {
         old_alsa: Option<Box<AlsaOutput>>,
@@ -858,6 +1674,149 @@ enum RtEvent {
     },
 }
 
+/// `AUDIVANE_TEST_UNPLUG=<file>`: while that file holds `1`, the configured
+/// device counts as unplugged. It is reported missing, every open fails as
+/// for a card that is not there, and the RT thread lets a running device go
+/// as if it had disappeared. Lets a rig test unplug and replug without
+/// touching the hardware.
+fn test_unplug_file() -> Option<&'static std::path::Path> {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var_os("AUDIVANE_TEST_UNPLUG")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+    })
+    .as_deref()
+}
+
+const TEST_UNPLUGGED_MSG: &str = "No such device (AUDIVANE_TEST_UNPLUG)";
+
+fn test_unplugged() -> bool {
+    test_unplug_file()
+        .and_then(|p| std::fs::read(p).ok())
+        .is_some_and(|b| b.first() == Some(&b'1'))
+}
+
+/// Whether the output device `device` names is in the system now
+/// ([`audivane_io_alsa::device_present`]; nothing is opened).
+pub fn device_present(device: &str) -> bool {
+    !test_unplugged() && audivane_io_alsa::device_present(device)
+}
+
+/// `status.error` while the engine waits for its device: "USB is not
+/// connected." (the card name of a `hw:CARD=…` id, else the id).
+pub fn waiting_text(device: &str) -> String {
+    let name = device
+        .split_once("CARD=")
+        .map_or(device, |(_, rest)| rest.split(',').next().unwrap_or(rest));
+    format!("{name} is not connected.")
+}
+
+/// How often the control thread looks for a missing device.
+const DEVICE_POLL: Duration = Duration::from_millis(500);
+/// Retries of a device that is there but fails to open after a loss:
+/// first after this long, doubling up to [`DEVICE_RETRY_MAX`].
+const DEVICE_RETRY_FIRST: Duration = Duration::from_secs(1);
+const DEVICE_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// The control thread's watch on the device it holds open: `/proc/asound`
+/// every [`DEVICE_POLL`]. ALSA only reports an unplug to a device that
+/// plays, so between tracks this is what notices it. The device counts as
+/// gone only after this watch saw it there, so a name it cannot resolve
+/// never takes a working device away.
+#[derive(Debug)]
+struct PresenceWatch {
+    next: Instant,
+    seen: bool,
+}
+
+impl PresenceWatch {
+    fn new(now: Instant) -> Self {
+        Self {
+            next: now,
+            seen: false,
+        }
+    }
+
+    /// Forget what was seen (no output held, or a new one).
+    fn reset(&mut self) {
+        self.seen = false;
+    }
+
+    /// `Some(gone)` when a look is due at `now`; `present` is asked then.
+    fn look(&mut self, now: Instant, present: impl FnOnce() -> bool) -> Option<bool> {
+        if now < self.next {
+            return None;
+        }
+        self.next = now + DEVICE_POLL;
+        if present() {
+            self.seen = true;
+            Some(false)
+        } else {
+            Some(self.seen)
+        }
+    }
+}
+
+/// The engine stops waiting for its device: it was released on request,
+/// or opened again. `lost` ends, and the status no longer says it waits.
+fn end_waiting(shared: &SharedEngineState, lost: &mut Option<LostDevice>, device: &str) {
+    *lost = None;
+    shared.device_missing.store(false, Ordering::Release);
+    shared.device_gone.store(false, Ordering::Release);
+    shared.clear_error_if(&waiting_text(device));
+}
+
+/// The control thread's view of a lost device: it waits for the device to
+/// appear (missing), or retries a present one that keeps failing.
+#[derive(Debug)]
+struct LostDevice {
+    /// When to look (or retry) next.
+    next: Instant,
+    /// The wait before the next retry of a present device.
+    backoff: Duration,
+    /// Whether it was there at the last look.
+    present: bool,
+}
+
+impl LostDevice {
+    fn new(present: bool, now: Instant) -> Self {
+        Self {
+            next: now
+                + if present {
+                    DEVICE_RETRY_FIRST
+                } else {
+                    DEVICE_POLL
+                },
+            backoff: DEVICE_RETRY_FIRST,
+            present,
+        }
+    }
+
+    /// A look at `now`: `true` when an open is due (the device appeared,
+    /// or a present one's retry time came).
+    fn due(&mut self, present: bool, now: Instant) -> bool {
+        if now < self.next {
+            return false;
+        }
+        let appeared = present && !self.present;
+        let retry = present && self.present;
+        self.present = present;
+        if appeared {
+            self.backoff = DEVICE_RETRY_FIRST;
+            self.next = now + self.backoff;
+            true
+        } else if retry {
+            self.backoff = (self.backoff * 2).min(DEVICE_RETRY_MAX);
+            self.next = now + self.backoff;
+            true
+        } else {
+            self.next = now + DEVICE_POLL;
+            false
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct TestStallConfig {
     stall_ms: u64,
@@ -865,7 +1824,7 @@ struct TestStallConfig {
 }
 
 impl TestStallConfig {
-    fn from_env(rate: u32, ratio: u32) -> Option<Self> {
+    fn from_env(rate: u32, ratio: RateRatio) -> Option<Self> {
         let stall_ms: u64 = std::env::var("AUDIVANE_TEST_STALL_MS").ok()?.parse().ok()?;
         if stall_ms == 0 {
             return None;
@@ -874,7 +1833,7 @@ impl TestStallConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1000);
-        let out_rate = rate.saturating_mul(ratio.max(1)) as u64;
+        let out_rate = u64::from(ratio.output_rate(rate).unwrap_or(rate));
         Some(Self {
             stall_ms,
             after_frames_out: (out_rate * after_ms) / 1000,
@@ -898,136 +1857,107 @@ pub struct EngineDriverHandle {
 impl EngineDriverHandle {
     /// Start the dual-sink PipeWire + ALSA driver threads and wait until ALSA
     /// is opened and both PipeWire sink nodes + initial settings metadata are ready.
+    ///
+    /// `before_release` (see [`ReleaseHook`]) is installed before the first
+    /// negotiation, so a start-up that fails after it still hands the card
+    /// over.
     pub fn spawn<P: EngineAudioProcessor>(
         config: EngineDriverConfig,
         processor: P,
         on_negotiated: Option<RatioNegotiator>,
+        before_release: Option<ReleaseHook>,
     ) -> Result<Self> {
         let channels = config.channels.max(1);
         let init_desired = config.desired_dsp(0);
 
         let shared = Arc::new(SharedEngineState::new(&config));
+        *shared
+            .before_release
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = before_release;
         let cmd_efd = Arc::new(EventFd::new()?);
         let data_efd = Arc::new(EventFd::new()?);
         let ctrl_efd = Arc::new(EventFd::new()?);
 
         // Step 1: Reserve card + open ALSA off-RT before starting RT thread.
-        let reservation = if config.reserve_device {
-            let efd_cb = Arc::clone(&ctrl_efd);
-            let flag_cb = Arc::clone(&shared);
-            let card = card_index_from_device(&config.device)?;
-            let res = DeviceReservation::acquire_for_device_with_wakeup(
-                &config.device,
-                config.reserve_priority,
-                Arc::new(move || {
-                    flag_cb.release_requested.store(true, Ordering::Release);
-                    efd_cb.signal();
-                }),
-            )?;
-            Some((card, res))
+        // A device that is not there (unplugged, a card that is not plugged
+        // in) does not stop the start: the sinks come up and run on the
+        // engine's own clock, and the control thread opens the device once
+        // it appears.
+        let started = if device_present(&config.device) {
+            startup_open(
+                &config,
+                init_desired,
+                &shared,
+                &ctrl_efd,
+                on_negotiated.as_ref(),
+            )?
         } else {
-            None
+            log::warn!(
+                "output device '{}' not found; starting without it and waiting for it",
+                config.device
+            );
+            startup_missing(&config, init_desired, &shared)?
         };
-
-        // Open the PCM, probe what it accepts on this very handle (no second
-        // open, so a device we already reserved is never EBUSY), then pick
-        // the graph rate and ratio from that.
-        let open = match OpenPcm::open(&config.device, true) {
-            Ok(o) => o,
-            Err(e) => {
-                drop(reservation);
-                return Err(e.into());
-            }
-        };
-        let caps = match open.probe(channels, &engine_probe_rates(config.max_dsp_ratio)) {
-            Ok(c) => {
-                log::info!("Device '{}' supports {}", config.device, c.summary());
-                Some(c)
-            }
-            Err(e) => {
-                log::warn!(
-                    "Probing '{}' failed ({e}); trying rates blind",
-                    config.device
-                );
-                None
-            }
-        };
-        let effective = match compute_effective_policy(&config, init_desired, caps.as_ref()) {
-            Ok(p) => p,
-            Err(msg) => {
-                drop(open);
-                drop(reservation);
-                return Err(PwError::Init(msg));
-            }
-        };
-        let init_rate = effective.default_rate.max(8_000);
-        let init_q = scaled_quantum(config.quantum, init_rate);
-        let desired_ratio = init_desired.resolve_ratio_for(SinkChoice::Dsp, init_rate);
-        let test_stall = TestStallConfig::from_env(init_rate, desired_ratio);
-        shared.set_device_caps(caps.clone());
-        shared.set_effective_policy(Some(effective.clone()));
-        shared.set_direct_policy(Some(direct_rate_policy(
-            &effective,
-            caps.as_ref(),
-            &config.formats,
-        )));
-
-        let mut base_alsa_cfg = AlsaConfig {
-            device: config.device.clone(),
-            rate: init_rate.saturating_mul(desired_ratio),
-            channels,
-            period_frames: init_q.saturating_mul(desired_ratio),
-            buffer_periods: config.buffer_periods.max(2),
-            preferred_format: config.formats.first().copied(),
-            strict_format: false,
-            nonblock: true,
-        };
-        let (mut alsa_init, actual_ratio) = match open.configure_with_ratio_fallback(
-            &base_alsa_cfg,
+        let StartupDevice {
+            reservation,
+            caps,
+            effective,
+            bypass_held: init_bypass_held,
+            desired: init_desired,
+            rate: init_rate,
+            quantum: init_q,
+            ratio: actual_ratio,
+            alsa: alsa_init,
+            params: init_params,
+            key: init_key,
+            negotiated: init_negotiated,
+        } = started;
+        let missing = alsa_init.is_none();
+        let test_stall = TestStallConfig::from_env(
             init_rate,
-            desired_ratio,
-            init_q,
-            &config.formats,
-            caps.as_ref(),
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                drop(reservation);
-                return Err(e.into());
-            }
-        };
-        if let Err(e) = alsa_init.prepare() {
-            drop(alsa_init);
-            drop(reservation);
-            return Err(e.into());
+            init_desired.resolve_ratio_for(SinkChoice::Dsp, init_rate),
+        );
+        if let Some(key) = init_key {
+            shared.set_open_key(key);
         }
-        let init_params = alsa_init.params();
-        let alsa_fds = alsa_init.poll_descriptors()?;
+        let alsa_fds = match &alsa_init {
+            Some(a) => a.poll_descriptors()?,
+            None => Vec::new(),
+        };
 
-        base_alsa_cfg.rate = init_params.rate;
-        shared
-            .format
-            .store(format_to_u8(Some(init_params.format)), Ordering::Release);
+        shared.format.store(
+            format_to_u8(alsa_init.as_ref().map(|_| init_params.format)),
+            Ordering::Release,
+        );
         shared.graph_rate.store(init_rate, Ordering::Release);
+        shared.output_rate.store(
+            if missing { 0 } else { init_params.rate },
+            Ordering::Release,
+        );
         shared
-            .output_rate
-            .store(init_params.rate, Ordering::Release);
-        shared.ratio.store(actual_ratio, Ordering::Release);
+            .ratio
+            .store(actual_ratio.to_bits(), Ordering::Release);
         shared.quantum.store(
-            (init_params.period_frames / actual_ratio).max(32),
+            actual_ratio
+                .scale_to_input(init_params.period_frames)
+                .max(32),
             Ordering::Release,
         );
 
-        let init_negotiated = on_negotiated
-            .as_ref()
-            .map(|cb| cb(init_rate, actual_ratio, SinkChoice::Dsp, init_params.format))
-            .unwrap_or_default();
+        // Declared after the output and the reservation, so on an early
+        // return it runs before they are dropped.
+        let mut init_hand_over = InitHandOver::new(Arc::clone(&shared), config.device.clone());
         let mut init_waiters: Vec<mpsc::SyncSender<Result<()>>> = Vec::new();
-        let (init_required_seq, init_hold_error) =
-            apply_negotiated_chain(init_negotiated, &shared, &mut init_waiters);
+        let (init_required_seq, init_hold_error) = match init_negotiated {
+            Some(n) => apply_negotiated_chain(n, &shared, &mut init_waiters),
+            None => (None, false),
+        };
 
         // Step 2: Create lock-free audio rings (~16 * 1024 frames) and control rings.
-        let ring_samples = (16 * 1024 * channels as usize).max(32 * 1024);
+        // Sized for varispeed's largest watermark schedule
+        // (`RING_ALLOC_FRAMES`), once, before the thread turns real-time.
+        let ring_samples = (RING_ALLOC_FRAMES * channels as usize).max(32 * 1024);
         let (dsp_prod, dsp_cons) = rtrb::RingBuffer::<f32>::new(ring_samples);
         let (direct_prod, direct_cons) = rtrb::RingBuffer::<f32>::new(ring_samples);
         let (ctrl_to_rt_tx, ctrl_to_rt_rx) = rtrb::RingBuffer::<RtControlCmd>::new(32);
@@ -1069,6 +1999,7 @@ impl EngineDriverHandle {
                 shared.stop.store(true, Ordering::Release);
                 let _ = pw_tx.send(PwMsg::Stop);
                 let _ = pw_thread.join();
+                init_hand_over.run();
                 drop(alsa_init);
                 drop(reservation);
                 return Err(e);
@@ -1076,6 +2007,7 @@ impl EngineDriverHandle {
             Err(e) => {
                 shared.stop.store(true, Ordering::Release);
                 let _ = pw_thread.join();
+                init_hand_over.run();
                 drop(alsa_init);
                 drop(reservation);
                 return Err(PwError::Init(format!("PipeWire startup failed: {e}")));
@@ -1106,12 +2038,15 @@ impl EngineDriverHandle {
             .spawn(move || {
                 run_control_thread(
                     ctrl_cfg,
+                    init_desired,
+                    init_bypass_held,
                     channels as usize,
                     init_rate,
                     actual_ratio,
                     caps,
                     effective,
                     reservation,
+                    missing,
                     ctrl_shared,
                     ctrl_cmd_efd,
                     ctrl_ctrl_efd,
@@ -1137,9 +2072,11 @@ impl EngineDriverHandle {
                     init_rate,
                     actual_ratio,
                     init_desired,
+                    init_key,
                     init_required_seq,
                     init_hold_error,
-                    Box::new(alsa_init),
+                    alsa_init.map(Box::new),
+                    init_params,
                     alsa_fds,
                     raw_driver_stream,
                     rt_shared,
@@ -1155,6 +2092,7 @@ impl EngineDriverHandle {
                 );
             })
             .map_err(|e| PwError::Init(format!("spawn audivane-alsa-rt failed: {e}")))?;
+        init_hand_over.disarm();
 
         Ok(Self {
             shared,
@@ -1179,7 +2117,7 @@ impl EngineDriverHandle {
             format: format_from_u8(self.shared.format.load(Ordering::Acquire)),
             graph_rate: self.shared.graph_rate.load(Ordering::Acquire),
             output_rate: self.shared.output_rate.load(Ordering::Acquire),
-            ratio: self.shared.ratio.load(Ordering::Acquire),
+            ratio: RateRatio::from_bits(self.shared.ratio.load(Ordering::Acquire)),
             quantum: self.shared.quantum.load(Ordering::Acquire),
             alsa_delay_frames: self.shared.alsa_delay_frames.load(Ordering::Relaxed),
             xruns: self.shared.xruns.load(Ordering::Relaxed),
@@ -1220,12 +2158,27 @@ impl EngineDriverHandle {
                 idle_stops: self.shared.idle_stops.load(Ordering::Relaxed),
                 drain_silence_periods: self.shared.drain_silence_periods.load(Ordering::Relaxed),
                 prime_silence_periods: self.shared.prime_silence_periods.load(Ordering::Relaxed),
+                carry_frames_out: self.shared.carry_frames_out.load(Ordering::Relaxed),
                 stream_starts_direct: self.shared.stream_starts_direct.load(Ordering::Relaxed),
                 stream_starts_dsp: self.shared.stream_starts_dsp.load(Ordering::Relaxed),
                 stream_pauses_direct: self.shared.stream_pauses_direct.load(Ordering::Relaxed),
                 stream_pauses_dsp: self.shared.stream_pauses_dsp.load(Ordering::Relaxed),
+                // The count before its generation (published in that order).
+                rt_overloads: self.shared.rt.demotions(),
+                rt_signals: self.shared.rt.signals(),
+                rt_failed_demotions: self.shared.rt.failed_demotions(),
+                rt_overload_generation: self.shared.rt.demotion_generation(),
+                rt_overload_hold_seq: self.shared.rt.demotion_hold_seq(),
+                probes: self.shared.probes.load(Ordering::Acquire),
+                rt_naps: self.shared.rt.naps(),
+                rt_demoted: u64::from(self.shared.rt.demoted()),
+                dsp_wanted: u64::from(self.shared.pick_sink() == Some(SinkChoice::Dsp)),
+                xrun_events: self.shared.xrun_events.load(Ordering::Relaxed),
+                processed_periods: self.shared.rt.periods(),
             },
             device_caps: self.shared.device_caps.lock().ok().and_then(|g| g.clone()),
+            open_key: self.shared.open_key.lock().ok().and_then(|g| *g),
+            playback_session: self.shared.playback_session.load(Ordering::Acquire),
             effective_policy: self
                 .shared
                 .effective_policy
@@ -1237,6 +2190,86 @@ impl EngineDriverHandle {
                 .direct_policy()
                 .map(|p| p.allowed_rates)
                 .unwrap_or_default(),
+            varispeed: self.shared.varispeed.snapshot(),
+            rt_load_max: f64::from_bits(self.shared.rt_load_max_bits.load(Ordering::Relaxed)),
+            waiting_for_device: self.shared.device_missing.load(Ordering::Acquire),
+        }
+    }
+
+    /// Ask for varispeed `speed` with a ramp of at least `ramp_ms` (the
+    /// stage's envelope decides the shortest). The RT thread takes it at
+    /// its next DAC wakeup (the last command wins), clamps it to the cap the
+    /// negotiated timing allows and releases an underfeed hold. It applies
+    /// only while a stage runs (the processor installs and retires it);
+    /// the request is kept for when one does.
+    pub fn set_varispeed_speed(&self, speed: f64, ramp_ms: f64) {
+        self.shared.varispeed_cmd.send(speed, ramp_ms);
+        self.cmd_efd.signal();
+    }
+
+    /// The overload fallback's hold on varispeed (its budget and speed
+    /// cap; `Off` is the control side's: it retires the stage). The RT
+    /// thread applies it at the stage's next plan. Returns its sequence
+    /// ([`crate::varispeed_rt::VarispeedCommandSlot::set_hold`]), which the
+    /// audio thread acknowledges once it applies it
+    /// ([`crate::varispeed_rt::VarispeedDriverSnapshot::hold_ack`]).
+    pub fn set_varispeed_hold(&self, hold: crate::varispeed_rt::VarispeedHold) -> u64 {
+        let seq = self.shared.varispeed_cmd.set_hold(hold);
+        self.cmd_efd.signal();
+        seq
+    }
+
+    /// Volume changes made on our sinks from outside (desktop, media keys,
+    /// `wpctl`) while the engine owns the sink volume. A new call replaces
+    /// the previous receiver.
+    pub fn sink_volume_requests(&self) -> mpsc::Receiver<SinkVolumeRequest> {
+        self.shared.sink_volume.subscribe()
+    }
+
+    /// Audio already handed to ALSA or held in the DSP chain's filter delay
+    /// but not yet heard, plus one period: the ALSA delay is sampled when
+    /// the output thread wakes, before it writes the next period. `None`
+    /// while nothing is open.
+    pub fn output_latency_probe(&self) -> impl Fn() -> Option<Duration> + Send + Sync + 'static {
+        let shared = Arc::clone(&self.shared);
+        move || {
+            let rate = shared.output_rate.load(Ordering::Relaxed);
+            if rate == 0 || shared.state() == EngineState::Idle {
+                return None;
+            }
+            let frames = shared.alsa_delay_frames.load(Ordering::Relaxed).max(0) as f64
+                + shared.dsp_latency_out.load(Ordering::Relaxed) as f64;
+            let graph_rate = shared.graph_rate.load(Ordering::Relaxed);
+            let period = if graph_rate > 0 {
+                f64::from(shared.quantum.load(Ordering::Relaxed)) / f64::from(graph_rate)
+            } else {
+                0.0
+            };
+            Some(Duration::from_secs_f64(frames / f64::from(rate) + period))
+        }
+    }
+
+    /// The driver's current state, readable from any thread (an RT
+    /// `FatalError` shows here before the next config apply).
+    pub fn state_probe(&self) -> impl Fn() -> EngineState + Send + Sync + 'static {
+        let shared = Arc::clone(&self.shared);
+        move || shared.state()
+    }
+
+    /// See [`ReleaseHook`]. Replaces an earlier hook.
+    pub fn set_before_release(&self, hook: ReleaseHook) {
+        *self
+            .shared
+            .before_release
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
+    /// A clonable handle for [`SinkVolumePort::set`], usable from any thread.
+    pub fn sink_volume_port(&self) -> SinkVolumePort {
+        SinkVolumePort {
+            shared: Arc::clone(&self.shared.sink_volume),
+            pw_tx: self.pw_tx.lock().ok().map(|tx| tx.clone()),
         }
     }
 
@@ -1245,6 +2278,18 @@ impl EngineDriverHandle {
     pub fn waker(&self) -> DriverWaker {
         DriverWaker {
             cmd_efd: Arc::clone(&self.cmd_efd),
+        }
+    }
+
+    /// A [`BypassNotifier`] for the engine's bypass resampler designer.
+    pub fn bypass_notifier(&self) -> BypassNotifier {
+        let tx = match self.ctrl_req_tx.lock() {
+            Ok(g) => g.clone(),
+            Err(e) => e.into_inner().clone(),
+        };
+        BypassNotifier {
+            tx,
+            ctrl_efd: Arc::clone(&self.ctrl_efd),
         }
     }
 
@@ -1267,7 +2312,7 @@ impl EngineDriverHandle {
     pub fn update_config(&self, config: EngineDriverConfig, force_reopen: bool) {
         if let Ok(tx) = self.ctrl_req_tx.lock() {
             let _ = tx.send(CtrlReq::UpdateConfig {
-                config,
+                config: Box::new(config),
                 force_reopen,
             });
         }
@@ -1298,7 +2343,9 @@ impl EngineDriverHandle {
         match reply_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(res) => res,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let msg = "release_device timed out waiting for control teardown".to_string();
+                // The release can still complete (the engine's release hook
+                // may wait for a chain build); it clears this error then.
+                let msg = RELEASE_TIMEOUT_MSG.to_string();
                 self.shared.set_error(msg.clone());
                 Err(PwError::Init(msg))
             }
@@ -1393,6 +2440,8 @@ impl Drop for EngineDriverHandle {
 
 struct StreamSideData {
     is_direct: bool,
+    /// The owned sink volume was written on this stream after it connected.
+    volume_asserted: bool,
     channels: usize,
     quantum_48k: u32,
     peer_direct: Option<pw::stream::StreamRc>,
@@ -1400,6 +2449,16 @@ struct StreamSideData {
     cmd_efd: Arc<EventFd>,
     data_efd: Arc<EventFd>,
     prod: rtrb::Producer<f32>,
+}
+
+impl StreamSideData {
+    fn sink_choice(&self) -> SinkChoice {
+        if self.is_direct {
+            SinkChoice::Direct
+        } else {
+            SinkChoice::Dsp
+        }
+    }
 }
 
 struct ClientNodeEntry {
@@ -1652,6 +2711,7 @@ impl RegistryTracker {
         let mut direct_has_link = false;
         let mut dsp_has_link = false;
         let mut direct_client_running = false;
+        let mut dsp_client_running = false;
         // Keyed by client node: a stereo client has one link per channel.
         let mut direct_clients: HashMap<u32, RateClient> = HashMap::new();
         let mut dsp_clients: HashMap<u32, RateClient> = HashMap::new();
@@ -1672,6 +2732,8 @@ impl RegistryTracker {
             };
             if to_direct {
                 direct_client_running = true;
+            } else {
+                dsp_client_running = true;
             }
             let Some(native_rate) = c.native_rate else {
                 continue;
@@ -1698,13 +2760,20 @@ impl RegistryTracker {
         self.shared
             .direct_client_running
             .store(direct_client_running, Ordering::Release);
+        self.shared
+            .dsp_client_running
+            .store(dsp_client_running, Ordering::Release);
 
         if !self.rate_following_disabled {
             let direct: Vec<RateClient> = direct_clients.into_values().collect();
             let dsp: Vec<RateClient> = dsp_clients.into_values().collect();
-            let direct_policy = self.shared.direct_policy();
-            let direct_active = direct_client_running || direct_has_link;
-            self.direct_rates = match (&direct_policy, direct_active) {
+            let policies = self.shared.sink_policies();
+            let direct_policy = policies.as_ref().map(|p| &p.direct);
+            // Direct's rates apply while a running client feeds it (as for
+            // sink selection, `SharedEngineState::pick_sink`): a paused one
+            // that stays linked leaves the graph to the DSP sink's clients.
+            let direct_active = direct_client_running;
+            self.direct_rates = match (direct_policy, direct_active) {
                 (Some(p), true) if !p.allowed_rates.is_empty() => Some(p.allowed_rates.clone()),
                 _ => None,
             };
@@ -1714,7 +2783,10 @@ impl RegistryTracker {
                 direct_active,
                 direct: &direct,
                 dsp: &dsp,
-                direct_policy: direct_policy.as_ref(),
+                direct_policy,
+                dsp_policy: policies.as_ref().map(|p| &p.dsp),
+                direct_native: policies.as_ref().map(|p| &p.direct_native),
+                dsp_native: policies.as_ref().map(|p| &p.dsp_native),
             };
             let now = Instant::now();
             let verdict = self.arbiter.decide(&inputs, now, self.driver_switching());
@@ -1901,6 +2973,7 @@ struct PwSession {
     _direct_listener: pw::stream::StreamListener<StreamSideData>,
     dsp_stream: pw::stream::StreamRc,
     direct_stream: pw::stream::StreamRc,
+    channels: usize,
     shared: Arc<SharedEngineState>,
     _registry: pw::registry::RegistryRc,
     core: pw::core::CoreRc,
@@ -1921,7 +2994,7 @@ impl PwSession {
         direct_prod: rtrb::Producer<f32>,
         on_core_done: Rc<dyn Fn(AsyncSeq)>,
     ) -> Result<(Self, SendRawStream)> {
-        let context = pw::context::ContextRc::new(mainloop, None).map_err(PwError::PipeWire)?;
+        let context = crate::rt_context::new_context(mainloop).map_err(PwError::PipeWire)?;
         let core = context.connect_rc(None).map_err(PwError::PipeWire)?;
         let registry = core.get_registry_rc().map_err(PwError::PipeWire)?;
 
@@ -1951,6 +3024,9 @@ impl PwSession {
             dsp_props.insert(*pw::keys::NODE_RATE, format!("1/{init_rate}"));
         }
 
+        if shared.sink_volume.follow() {
+            dsp_props.insert(sink_volume::RESTORE_PROPS_KEY, "false");
+        }
         let dsp_stream = pw::stream::StreamRc::new(core.clone(), "Audivane DSP", dsp_props)
             .map_err(PwError::PipeWire)?;
 
@@ -1971,6 +3047,9 @@ impl PwSession {
         direct_props.insert(*pw::keys::AUDIO_CHANNELS, format!("{channels}"));
         direct_props.insert(*pw::keys::AUDIO_ALLOWED_RATES, allowed_str);
 
+        if shared.sink_volume.follow() {
+            direct_props.insert(sink_volume::RESTORE_PROPS_KEY, "false");
+        }
         let direct_stream =
             pw::stream::StreamRc::new(core.clone(), "Audivane Direct", direct_props)
                 .map_err(PwError::PipeWire)?;
@@ -2170,6 +3249,7 @@ impl PwSession {
              -> Result<pw::stream::StreamListener<StreamSideData>> {
                 let data = StreamSideData {
                     is_direct,
+                    volume_asserted: false,
                     channels: channels as usize,
                     quantum_48k: config.quantum,
                     peer_direct,
@@ -2189,6 +3269,18 @@ impl PwSession {
                             } else {
                                 data.shared.dsp_node_id.store(nid, Ordering::Release);
                             }
+                        }
+                        if matches!(new, S::Paused | S::Streaming) && !data.volume_asserted {
+                            data.volume_asserted = true;
+                            let sink = data.sink_choice();
+                            data.shared.sink_volume.forget_shown(sink);
+                            sink_volume::assert_owned(
+                                stream,
+                                &data.shared.sink_volume,
+                                sink,
+                                data.channels,
+                                false,
+                            );
                         }
                         match new {
                             S::Streaming => {
@@ -2275,6 +3367,16 @@ impl PwSession {
                     })
                     .param_changed(|stream, data, id, param| {
                         let Some(param) = param else { return };
+                        if id == spa::param::ParamType::Props.as_raw() {
+                            sink_volume::on_props_changed(
+                                stream,
+                                &data.shared.sink_volume,
+                                data.sink_choice(),
+                                data.channels,
+                                param,
+                            );
+                            return;
+                        }
                         if id != spa::param::ParamType::Format.as_raw() {
                             return;
                         }
@@ -2327,6 +3429,7 @@ impl PwSession {
                 _direct_listener: direct_listener,
                 dsp_stream,
                 direct_stream,
+                channels: channels as usize,
                 shared: Arc::clone(shared),
                 _registry: registry,
                 core,
@@ -2334,6 +3437,20 @@ impl PwSession {
             },
             SendRawStream(raw),
         ))
+    }
+
+    /// Show the engine's volume on both sinks (or release them).
+    fn apply_sink_volume(&self, follow_changed: bool) {
+        let shared = &self.shared.sink_volume;
+        for (stream, sink) in [
+            (&self.dsp_stream, SinkChoice::Dsp),
+            (&self.direct_stream, SinkChoice::Direct),
+        ] {
+            if follow_changed {
+                sink_volume::update_restore_props(stream, shared.follow());
+            }
+            sink_volume::assert_owned(stream, shared, sink, self.channels, follow_changed);
+        }
     }
 
     fn force_initial_synced(&self) {
@@ -2361,6 +3478,9 @@ impl PwSession {
         self.shared
             .direct_client_running
             .store(false, Ordering::Release);
+        self.shared
+            .dsp_client_running
+            .store(false, Ordering::Release);
         self.shared.io.clear_all();
         let meta_dirty = self.tracker.borrow_mut().restore_metadata();
         (self.core.sync(0).ok(), meta_dirty)
@@ -2378,7 +3498,7 @@ enum TeardownAction {
         ack_tx: mpsc::SyncSender<Result<()>>,
     },
     Reconnect {
-        config: EngineDriverConfig,
+        config: Box<EngineDriverConfig>,
         last_rate: u32,
         dsp_prod: rtrb::Producer<f32>,
         direct_prod: rtrb::Producer<f32>,
@@ -2661,13 +3781,14 @@ fn run_pw_loop(
                         t.publish_allowed_rates_on_streams();
                     }
                     let before = t.forced_rate;
-                    // Never force a rate outside the (device-restricted) set.
-                    let follow_rate = if policy.allowed_rates.is_empty()
-                        || policy.allowed_rates.contains(&last_rate)
-                    {
+                    // Never force a rate outside the (device-restricted) set,
+                    // and move to a native one (never to a rate the engine
+                    // bypass resampler converts).
+                    let follow_rate = if policy.allowed_rates.is_empty() {
                         last_rate
                     } else {
-                        choose_allowed_rate(last_rate, &policy)
+                        let native = shared.sink_policies().map(|p| p.dsp_native);
+                        crate::rate_arbiter::sink_rate(last_rate, &policy, native.as_ref())
                     };
                     // With following off this is still the default rate,
                     // unless the Direct sink had to open at a native rate.
@@ -2681,6 +3802,11 @@ fn run_pw_loop(
                     }
                     // The conflict mode may have changed: decide again.
                     t.recompute_routing_and_rate();
+                }
+            }
+            PwMsg::SinkVolume { follow_changed } => {
+                if let Some(ref s) = st_rc.borrow().session {
+                    s.apply_sink_volume(follow_changed);
                 }
             }
             PwMsg::DisconnectAndRestore { ack_tx } => {
@@ -2822,6 +3948,9 @@ struct RealDeviceBackend {
     probe_handle: Option<OpenPcm>,
     /// Last computed effective rate policy for `probed_device`.
     effective: Option<RatePolicy>,
+    /// Back-to-back attempts to move the graph that PipeWire did not follow
+    /// ([`MoveAttempts`]).
+    moves: Option<MoveAttempts>,
 }
 
 impl RealDeviceBackend {
@@ -2831,6 +3960,20 @@ impl RealDeviceBackend {
         self.caps = None;
         self.probe_handle = None;
         self.effective = None;
+        self.moves = None;
+    }
+
+    /// After a failed open: probe `device` again (holding no handle), so
+    /// the status says whether it is there now and what it plays, never
+    /// what an earlier probe of it found.
+    fn reprobe_after_failure(&mut self, device: &str) {
+        self.invalidate_caps();
+        let caps = match self.ensure_caps(device) {
+            Ok(()) => self.caps_for(device).cloned(),
+            Err(_) => None,
+        };
+        self.probe_handle = None;
+        self.shared.set_device_caps(caps);
     }
 
     fn caps_for(&self, device: &str) -> Option<&DeviceCapabilities> {
@@ -2847,6 +3990,9 @@ impl RealDeviceBackend {
             return Ok(());
         }
         self.invalidate_caps();
+        if test_unplugged() {
+            return Err(TEST_UNPLUGGED_MSG.into());
+        }
         let open = OpenPcm::open(device, true).map_err(|e| e.to_string())?;
         let caps = match open.probe(
             self.channels,
@@ -2854,6 +4000,7 @@ impl RealDeviceBackend {
         ) {
             Ok(c) => {
                 log::info!("Device '{device}' supports {}", c.summary());
+                self.shared.note_probe();
                 Some(c)
             }
             Err(e) => {
@@ -2876,16 +4023,14 @@ impl RealDeviceBackend {
         if self.probed_device.as_deref() != Some(self.config.device.as_str()) {
             return None;
         }
-        let res = compute_effective_policy(&self.config, desired, self.caps.as_ref());
+        let res = compute_effective_policy(&self.config, desired, self.caps.as_ref()).map(|p| {
+            crate::rate_caps::rate_policies(p, self.caps.as_ref(), &self.config.formats, desired)
+        });
         if let Ok(p) = &res {
-            self.effective = Some(p.clone());
-            self.shared.set_direct_policy(Some(direct_rate_policy(
-                p,
-                self.caps.as_ref(),
-                &self.config.formats,
-            )));
+            self.effective = Some(p.published.clone());
+            self.shared.set_policies(p);
         }
-        Some(res)
+        Some(res.map(|p| p.published))
     }
 }
 
@@ -2893,7 +4038,14 @@ impl DeviceBackend for RealDeviceBackend {
     type Reservation = DeviceReservation;
     type Output = Box<AlsaOutput>;
 
+    fn playback_session(&self) -> u64 {
+        self.shared.playback_session.load(Ordering::Acquire)
+    }
+
     fn card_index(&mut self, device: &str) -> std::result::Result<u32, String> {
+        if test_unplugged() {
+            return Err(TEST_UNPLUGGED_MSG.into());
+        }
         card_index_from_device(device).map_err(|e| e.to_string())
     }
 
@@ -2932,7 +4084,12 @@ impl DeviceBackend for RealDeviceBackend {
         target_sink: SinkChoice,
         desired_dsp: DesiredDspConfig,
     ) -> std::result::Result<(u32, u32), String> {
-        self.ensure_caps(device)?;
+        if let Err(e) = self.ensure_caps(device) {
+            // Not there (or not answering): no capabilities of an earlier
+            // probe stay in the status.
+            self.shared.set_device_caps(None);
+            return Err(e);
+        }
         let caps = self.caps_for(device).cloned();
         let eff = match compute_effective_policy(&self.config, desired_dsp, caps.as_ref()) {
             Ok(p) => p,
@@ -2940,55 +4097,85 @@ impl DeviceBackend for RealDeviceBackend {
                 // Unusable device: still report what it supports.
                 self.probe_handle = None;
                 self.shared.set_device_caps(caps);
-                self.shared.set_effective_policy(None);
-                self.shared.set_direct_policy(None);
+                self.shared.clear_policies();
                 return Err(msg);
             }
         };
-        let direct = direct_rate_policy(&eff, caps.as_ref(), &self.config.formats);
+        let policies =
+            crate::rate_caps::rate_policies(eff, caps.as_ref(), &self.config.formats, desired_dsp);
+        let eff = policies.published.clone();
         self.shared.set_device_caps(caps);
-        self.shared.set_effective_policy(Some(eff.clone()));
-        self.shared.set_direct_policy(Some(direct.clone()));
+        self.shared.set_policies(&policies);
         self.effective = Some(eff.clone());
-        if target_sink == SinkChoice::Direct
-            && !direct.allowed_rates.is_empty()
-            && !direct.allowed_rates.contains(&graph_rate)
-        {
-            // Direct never upsamples, and the device does not play this
+        let rate = match crate::rate_caps::plan_graph_rate(&policies, graph_rate, target_sink) {
+            GraphRate::Keep => {
+                self.moves = None;
+                return Ok((graph_rate, quantum));
+            }
+            GraphRate::Move(rate) => rate,
+            GraphRate::DirectCannotPlay => {
+                let rates: Vec<String> = eff.allowed_rates.iter().map(u32::to_string).collect();
+                let supports = self
+                    .caps_for(device)
+                    .map(|c| c.summary())
+                    .unwrap_or_else(|| "unknown".into());
+                self.probe_handle = None;
+                return Err(format!(
+                    "Audivane Direct cannot play on '{device}': it does not upsample, and none of the allowed rates ({} Hz) is native to the device (device supports {supports}). Route the app to Audivane DSP, or allow a native rate",
+                    rates.join(", ")
+                ));
+            }
+        };
+        let bypass = target_sink == SinkChoice::Direct || !desired_dsp.dsp_enabled;
+        if MoveAttempts::note(
+            &mut self.moves,
+            graph_rate,
+            rate,
+            mono_now_ns(),
+            self.shared.graph_landings.load(Ordering::Acquire),
+        ) {
+            // The graph stays where it is (another driver or client fixes
+            // the rate): reopening for the rate it would move to only
+            // loops. Say so; the DSP path keeps working.
+            self.moves = None;
+            self.probe_handle = None;
+            return Err(if bypass {
+                format!(
+                    "{} cannot play {graph_rate} Hz on '{device}': the device does not play it natively, and PipeWire keeps the graph at {graph_rate} Hz instead of moving it to {rate} Hz (another client or driver fixes the rate). {}",
+                    if target_sink == SinkChoice::Direct {
+                        "Audivane Direct"
+                    } else {
+                        "With DSP off, Audivane"
+                    },
+                    if target_sink == SinkChoice::Direct {
+                        "Route the app to Audivane DSP, or let the graph rate change"
+                    } else {
+                        "Turn DSP on, or let the graph rate change"
+                    }
+                )
+            } else {
+                format!(
+                    "'{device}' cannot play a {graph_rate} Hz graph, and PipeWire keeps it there instead of moving it to {rate} Hz (another client or driver fixes the rate)"
+                )
+            });
+        }
+        if target_sink == SinkChoice::Direct {
+            // Direct is bit-perfect at x1, and the device does not play this
             // rate natively (it may only take it upsampled through DSP):
             // run the graph at a native rate instead; PipeWire resamples the
             // stream into Direct, which status reports as not bit-perfect.
-            let rate = choose_allowed_rate(graph_rate, &direct);
             log::info!(
                 "'{device}' cannot play {graph_rate} Hz natively for Audivane Direct; moving the graph to {rate} Hz (the stream is resampled)"
             );
-            return Ok((rate, scaled_quantum(self.config.quantum, rate)));
-        }
-        if target_sink == SinkChoice::Direct && direct.allowed_rates.is_empty() {
-            let rates: Vec<String> = eff.allowed_rates.iter().map(u32::to_string).collect();
-            let supports = self
-                .caps_for(device)
-                .map(|c| c.summary())
-                .unwrap_or_else(|| "unknown".into());
-            self.probe_handle = None;
-            return Err(format!(
-                "Audivane Direct cannot play on '{device}': it does not upsample, and none of the allowed rates ({} Hz) is native to the device (device supports {supports}). Route the app to Audivane DSP, or allow a native rate",
-                rates.join(", ")
-            ));
-        }
-        if eff.allowed_rates.is_empty() || eff.allowed_rates.contains(&graph_rate) {
-            return Ok((graph_rate, quantum));
-        }
-        // The graph is at a rate this device cannot play (device switch, or
-        // PipeWire had not applied our allowed rates yet). Open at the rate
-        // we are about to force instead; never at graph rate != device rate
-        // / ratio.
-        let rate = if eff.follow_source {
-            choose_allowed_rate(graph_rate, &eff)
         } else {
-            eff.default_rate
-        };
-        log::info!("'{device}' cannot play a {graph_rate} Hz graph; moving the graph to {rate} Hz");
+            // The graph is at a rate this device cannot play (device switch,
+            // DSP off, or PipeWire had not applied our allowed rates yet).
+            // Open at the rate we are about to force instead; never at graph
+            // rate != device rate / ratio.
+            log::info!(
+                "'{device}' cannot play a {graph_rate} Hz graph; moving the graph to {rate} Hz"
+            );
+        }
         Ok((rate, scaled_quantum(self.config.quantum, rate)))
     }
 
@@ -2996,14 +4183,15 @@ impl DeviceBackend for RealDeviceBackend {
         &mut self,
         device: &str,
         graph_rate: u32,
-        desired_ratio: u32,
+        ladder: &[RateRatio],
         quantum: u32,
     ) -> std::result::Result<OpenedDevice<Self::Output>, String> {
+        let desired_ratio = ladder.first().copied().unwrap_or(RateRatio::ONE);
         let alsa_cfg = AlsaConfig {
             device: device.to_string(),
-            rate: graph_rate.saturating_mul(desired_ratio),
+            rate: desired_ratio.output_rate(graph_rate).unwrap_or(graph_rate),
             channels: self.channels,
-            period_frames: quantum.saturating_mul(desired_ratio),
+            period_frames: desired_ratio.scale_to_output(quantum),
             buffer_periods: self.buffer_periods.max(2),
             preferred_format: self.formats.first().copied(),
             strict_format: false,
@@ -3014,11 +4202,11 @@ impl DeviceBackend for RealDeviceBackend {
             _ => OpenPcm::open(device, true).map_err(|e| e.to_string())?,
         };
         let caps = self.caps_for(device).cloned();
-        let (mut alsa, actual_ratio) = open
-            .configure_with_ratio_fallback(
+        let (mut alsa, plan) = open
+            .configure_with_ratio_plan(
                 &alsa_cfg,
                 graph_rate,
-                desired_ratio,
+                ladder,
                 quantum,
                 &self.formats,
                 caps.as_ref(),
@@ -3028,15 +4216,39 @@ impl DeviceBackend for RealDeviceBackend {
         let output_rate = alsa.params().rate;
         Ok(OpenedDevice {
             output: Box::new(alsa),
-            actual_ratio,
+            actual_ratio: plan.ratio,
             output_rate,
             graph_rate,
             quantum,
+            plan,
+            session: 0,
         })
     }
 
     fn close_output(&mut self, out: Self::Output) {
         drop(out);
+    }
+
+    fn ratio_ladder(
+        &self,
+        desired_dsp: DesiredDspConfig,
+        target_sink: SinkChoice,
+        graph_rate: u32,
+    ) -> Vec<RateRatio> {
+        // `resolve_graph_rate` probed the target device just before.
+        let caps = self.probed_device.as_ref().and(self.caps.as_ref());
+        desired_dsp.ratio_ladder_for(target_sink, graph_rate, caps, &self.formats)
+    }
+}
+
+impl RealDeviceBackend {
+    /// The probed rates of the device [`DeviceBackend::ratio_ladder`] opens
+    /// (the key of the open, [`negotiated_key`]).
+    fn device_rates(&self) -> Option<DeviceRates> {
+        DeviceRates::playable(
+            self.probed_device.as_ref().and(self.caps.as_ref()),
+            &self.formats,
+        )
     }
 }
 
@@ -3136,20 +4348,26 @@ fn complete_release_teardown<B: DeviceBackend, F>(
 where
     F: FnOnce() -> Result<()>,
 {
+    // Playback has stopped; the card is still ours. Whatever the engine
+    // must do to it (a safe hardware volume) happens before anyone else
+    // can open it.
+    if let Some(device) = lifecycle.active_device.clone() {
+        run_release_hook(shared, ReleaseKind::HandOver, &device);
+    }
     if let Some(out) = old_alsa {
         backend.close_output(out);
     }
     let teardown_res = disconnect_and_wait();
     lifecycle.finish_release_to_idle(backend, None);
     shared.format.store(0, Ordering::Release);
-    shared.set_effective_policy(None);
-    shared.set_direct_policy(None);
+    shared.clear_policies();
     shared.active_sink.store(0, Ordering::Release);
     shared.alsa_delay_frames.store(0, Ordering::Relaxed);
     *awaiting_release_teardown = false;
 
     match teardown_res {
         Ok(()) => {
+            shared.clear_error_if(RELEASE_TIMEOUT_MSG);
             shared.set_state(EngineState::Idle);
             log::info!("Engine released device to Idle");
             finish_waiters(pending_release_waiters, || Ok(()));
@@ -3168,15 +4386,453 @@ where
     }
 }
 
+/// Reopen's and reacquire's open, for
+/// [`crate::lifecycle::open_with_bypass_fallback`]: the lifecycle's
+/// handoff, then the engine's negotiation.
+/// What start-up found on the device ([`startup_open`]), or the stand-in
+/// for a device that is not there ([`startup_missing`]).
+struct StartupDevice {
+    reservation: Option<(u32, DeviceReservation)>,
+    caps: Option<DeviceCapabilities>,
+    effective: RatePolicy,
+    bypass_held: crate::lifecycle::BypassHeld,
+    desired: DesiredDspConfig,
+    rate: u32,
+    quantum: u32,
+    ratio: RateRatio,
+    /// `None`: started without the device.
+    alsa: Option<AlsaOutput>,
+    /// The open's parameters, or the nominal ones the RT thread sizes its
+    /// buffers from while there is no device.
+    params: NegotiatedParams,
+    key: Option<NegotiatedKey>,
+    negotiated: Option<NegotiatedChain>,
+}
+
+/// Start-up without the device: the published rates are the configured
+/// ones (nothing was probed), the graph starts at the default rate, and no
+/// card is reserved. The RT thread runs the graph on its own clock until
+/// the control thread opens the device.
+fn startup_missing(
+    config: &EngineDriverConfig,
+    desired: DesiredDspConfig,
+    shared: &SharedEngineState,
+) -> Result<StartupDevice> {
+    let effective = compute_effective_policy(config, desired, None).map_err(PwError::Init)?;
+    let policies = crate::rate_caps::rate_policies(effective, None, &config.formats, desired);
+    shared.set_device_caps(None);
+    shared.set_policies(&policies);
+    let rate = policies.published.default_rate.max(8_000);
+    let quantum = scaled_quantum(config.quantum, rate);
+    shared.device_missing.store(true, Ordering::Release);
+    shared.set_error(waiting_text(&config.device));
+    shared.set_state(EngineState::Error);
+    Ok(StartupDevice {
+        reservation: None,
+        caps: None,
+        effective: policies.published,
+        bypass_held: crate::lifecycle::BypassHeld::NONE,
+        desired,
+        rate,
+        quantum,
+        ratio: RateRatio::ONE,
+        alsa: None,
+        params: NegotiatedParams {
+            format: config.formats.first().copied().unwrap_or(SampleFormat::S32),
+            rate,
+            channels: config.channels.max(1),
+            period_frames: quantum,
+            buffer_frames: quantum * config.buffer_periods.max(2),
+        },
+        key: None,
+        negotiated: None,
+    })
+}
+
+/// Start-up's open: reserve the card, open and probe the PCM, pick the
+/// graph rate and ratio from what it plays, and negotiate the chain.
+fn startup_open(
+    config: &EngineDriverConfig,
+    init_desired: DesiredDspConfig,
+    shared: &Arc<SharedEngineState>,
+    ctrl_efd: &Arc<EventFd>,
+    on_negotiated: Option<&RatioNegotiator>,
+) -> Result<StartupDevice> {
+    let channels = config.channels.max(1);
+    let reservation = if config.reserve_device {
+        let efd_cb = Arc::clone(ctrl_efd);
+        let flag_cb = Arc::clone(shared);
+        let card = card_index_from_device(&config.device)?;
+        let res = DeviceReservation::acquire_for_device_with_wakeup(
+            &config.device,
+            config.reserve_priority,
+            Arc::new(move || {
+                flag_cb.release_requested.store(true, Ordering::Release);
+                efd_cb.signal();
+            }),
+        )?;
+        Some((card, res))
+    } else {
+        None
+    };
+
+    // Open the PCM, probe what it accepts on this very handle (no second
+    // open, so a device we already reserved is never EBUSY), then pick
+    // the graph rate and ratio from that.
+    let open = match OpenPcm::open(&config.device, true) {
+        Ok(o) => o,
+        Err(e) => {
+            drop(reservation);
+            return Err(e.into());
+        }
+    };
+    let caps = match open.probe(channels, &engine_probe_rates(config.max_dsp_ratio)) {
+        Ok(c) => {
+            log::info!("Device '{}' supports {}", config.device, c.summary());
+            shared.note_probe();
+            Some(c)
+        }
+        Err(e) => {
+            log::warn!(
+                "Probing '{}' failed ({e}); trying rates blind",
+                config.device
+            );
+            None
+        }
+    };
+    let effective = match compute_effective_policy(config, init_desired, caps.as_ref()) {
+        Ok(p) => p,
+        Err(msg) => {
+            drop(open);
+            drop(reservation);
+            return Err(PwError::Init(msg));
+        }
+    };
+    let policies =
+        crate::rate_caps::rate_policies(effective, caps.as_ref(), &config.formats, init_desired);
+    shared.set_device_caps(caps.clone());
+    shared.set_policies(&policies);
+
+    // The open and its negotiation, falling back to PipeWire before
+    // anything resumes when the engine bypass resampler's chain is not
+    // there (as reopen and reacquire do).
+    let mut init_bypass_held = crate::lifecycle::BypassHeld::NONE;
+    let mut opener = StartupOpen {
+        pcm: Some(open),
+        config,
+        caps: caps.as_ref(),
+        shared,
+        on_negotiated,
+        rate: policies.published.default_rate.max(8_000),
+        policies,
+        channels,
+        error: None,
+        negotiated: false,
+    };
+    let base = |keep| config.desired_dsp(0).keep_bypass(keep);
+    let mut init_desired = init_desired;
+    let opened = crate::lifecycle::open_and_keep(
+        &mut opener,
+        &mut init_desired,
+        &mut init_bypass_held,
+        base,
+    );
+    let StartupOpen {
+        policies,
+        error,
+        negotiated: negotiated_once,
+        ..
+    } = opener;
+    let (opened, (init_negotiated, init_key)) = match opened {
+        Ok(v) => v,
+        Err(msg) => {
+            if negotiated_once {
+                run_release_hook(shared, ReleaseKind::HandOver, &config.device);
+            }
+            drop(reservation);
+            return Err(error.unwrap_or(PwError::Init(msg)));
+        }
+    };
+    let params = opened.alsa.params();
+    Ok(StartupDevice {
+        reservation,
+        caps,
+        effective: policies.published,
+        bypass_held: init_bypass_held,
+        desired: init_desired,
+        rate: opened.rate,
+        quantum: opened.quantum,
+        ratio: opened.plan.ratio,
+        alsa: Some(opened.alsa),
+        params,
+        key: Some(init_key),
+        negotiated: Some(init_negotiated),
+    })
+}
+
+struct DeviceOpen<'a> {
+    lifecycle: &'a mut DeviceLifecycle<RealDeviceBackend>,
+    backend: &'a mut RealDeviceBackend,
+    /// The output the RT thread handed back (reopen), closed by the first
+    /// open.
+    old: Option<Box<AlsaOutput>>,
+    config: &'a EngineDriverConfig,
+    shared: &'a Arc<SharedEngineState>,
+    pw_tx: &'a pw::channel::Sender<PwMsg>,
+    published: &'a mut SentRatePolicies,
+    on_negotiated: Option<&'a RatioNegotiator>,
+    graph_rate: u32,
+    quantum: u32,
+    sink: SinkChoice,
+}
+
+impl crate::lifecycle::BypassOpen for DeviceOpen<'_> {
+    type Output = crate::lifecycle::OpenedDevice<Box<AlsaOutput>>;
+    type Negotiated = (NegotiatedChain, NegotiatedKey);
+
+    fn open(
+        &mut self,
+        previous: Option<Self::Output>,
+        desired: DesiredDspConfig,
+    ) -> std::result::Result<Self::Output, String> {
+        let old = previous.map(|p| p.output).or_else(|| self.old.take());
+        let shared = self.shared;
+        self.lifecycle.handoff_and_open(
+            self.backend,
+            old,
+            &self.config.device,
+            self.config.reserve_device,
+            self.config.reserve_priority,
+            self.graph_rate,
+            self.quantum,
+            self.sink,
+            desired,
+            &|kind, device| run_release_hook(shared, kind, device),
+        )
+    }
+
+    fn negotiate(
+        &mut self,
+        out: &Self::Output,
+        desired: DesiredDspConfig,
+    ) -> (Self::Negotiated, Option<crate::lifecycle::BypassMiss>) {
+        let params = out.output.params();
+        let key = negotiated_key(
+            desired,
+            self.sink,
+            out.graph_rate,
+            self.backend.device_rates(),
+            &out.plan,
+        )
+        .with_session(out.session);
+        // Rebuild the chain for (graph rate, ratio) off-RT before Resume.
+        let negotiated = self
+            .on_negotiated
+            .map(|cb| {
+                cb(
+                    &self.config.device,
+                    out.graph_rate,
+                    out.actual_ratio,
+                    self.sink,
+                    params.format,
+                    &key,
+                )
+            })
+            .unwrap_or_default();
+        let miss = negotiated.bypass_miss(out.graph_rate, params.rate);
+        if let Some(m) = miss {
+            log::info!(
+                "{} Hz to {} Hz: the engine's resampler {}; PipeWire converts instead",
+                m.input,
+                m.output,
+                if m.pending {
+                    "is still being designed"
+                } else {
+                    "cannot be built"
+                }
+            );
+        }
+        ((negotiated, key), miss)
+    }
+
+    fn republish(&mut self, desired: DesiredDspConfig) {
+        if let Some(Ok(eff)) = self.backend.refresh_effective(desired) {
+            self.published
+                .note(eff.clone(), self.shared.sink_policies());
+            let _ = self.pw_tx.send(PwMsg::ApplyRatePolicy {
+                policy: eff,
+                quantum_48k: self.config.quantum,
+                last_rate: self.graph_rate,
+            });
+        }
+    }
+}
+
+/// Start-up's open, for [`crate::lifecycle::open_with_bypass_fallback`]:
+/// the probed PCM handle first (a fallback opens a fresh one; the card
+/// stays reserved), at the DSP sink's graph rate.
+struct StartupOpen<'a> {
+    pcm: Option<OpenPcm>,
+    config: &'a EngineDriverConfig,
+    caps: Option<&'a DeviceCapabilities>,
+    shared: &'a Arc<SharedEngineState>,
+    on_negotiated: Option<&'a RatioNegotiator>,
+    policies: crate::rate_caps::RatePolicies,
+    rate: u32,
+    channels: u32,
+    /// The open's own error, returned as is.
+    error: Option<PwError>,
+    /// The engine heard of an open (it may have written the mixer): a
+    /// failure after it hands the card over.
+    negotiated: bool,
+}
+
+struct StartupOpened {
+    alsa: AlsaOutput,
+    plan: audivane_io_alsa::RatioOpen,
+    rate: u32,
+    quantum: u32,
+}
+
+impl StartupOpen<'_> {
+    fn fail(&mut self, e: PwError) -> String {
+        let msg = e.to_string();
+        self.error = Some(e);
+        msg
+    }
+}
+
+impl crate::lifecycle::BypassOpen for StartupOpen<'_> {
+    type Output = StartupOpened;
+    type Negotiated = (NegotiatedChain, NegotiatedKey);
+
+    fn open(
+        &mut self,
+        previous: Option<Self::Output>,
+        desired: DesiredDspConfig,
+    ) -> std::result::Result<Self::Output, String> {
+        drop(previous);
+        let pcm = match self.pcm.take() {
+            Some(p) => p,
+            None => OpenPcm::open(&self.config.device, true).map_err(|e| self.fail(e.into()))?,
+        };
+        // A fallback moves the graph to a native rate.
+        if let crate::rate_caps::GraphRate::Move(r) =
+            crate::rate_caps::plan_graph_rate(&self.policies, self.rate, SinkChoice::Dsp)
+        {
+            self.rate = r;
+        }
+        let rate = self.rate;
+        let quantum = scaled_quantum(self.config.quantum, rate);
+        let ratio = desired.resolve_ratio_for(SinkChoice::Dsp, rate);
+        let ladder =
+            desired.ratio_ladder_for(SinkChoice::Dsp, rate, self.caps, &self.config.formats);
+        let alsa_cfg = AlsaConfig {
+            device: self.config.device.clone(),
+            rate: ratio.output_rate(rate).unwrap_or(rate),
+            channels: self.channels,
+            period_frames: ratio.scale_to_output(quantum),
+            buffer_periods: self.config.buffer_periods.max(2),
+            preferred_format: self.config.formats.first().copied(),
+            strict_format: false,
+            nonblock: true,
+        };
+        let (mut alsa, plan) = pcm
+            .configure_with_ratio_plan(
+                &alsa_cfg,
+                rate,
+                &ladder,
+                quantum,
+                &self.config.formats,
+                self.caps,
+            )
+            .map_err(|e| self.fail(e.into()))?;
+        alsa.prepare().map_err(|e| self.fail(e.into()))?;
+        Ok(StartupOpened {
+            alsa,
+            plan,
+            rate,
+            quantum,
+        })
+    }
+
+    fn negotiate(
+        &mut self,
+        out: &Self::Output,
+        desired: DesiredDspConfig,
+    ) -> (Self::Negotiated, Option<crate::lifecycle::BypassMiss>) {
+        let params = out.alsa.params();
+        let key = negotiated_key(
+            desired,
+            SinkChoice::Dsp,
+            out.rate,
+            DeviceRates::playable(self.caps, &self.config.formats),
+            &out.plan,
+        );
+        self.negotiated |= self.on_negotiated.is_some();
+        let negotiated = self
+            .on_negotiated
+            .map(|cb| {
+                cb(
+                    &self.config.device,
+                    out.rate,
+                    out.plan.ratio,
+                    SinkChoice::Dsp,
+                    params.format,
+                    &key,
+                )
+            })
+            .unwrap_or_default();
+        let miss = negotiated.bypass_miss(out.rate, params.rate);
+        ((negotiated, key), miss)
+    }
+
+    fn republish(&mut self, desired: DesiredDspConfig) {
+        if let Ok(eff) = compute_effective_policy(self.config, desired, self.caps) {
+            self.policies =
+                crate::rate_caps::rate_policies(eff, self.caps, &self.config.formats, desired);
+            self.shared.set_policies(&self.policies);
+        }
+    }
+}
+
+/// What the PipeWire thread last heard of the rate policies
+/// ([`PwMsg::ApplyRatePolicy`]).
+#[derive(Clone, Debug, PartialEq)]
+struct SentRatePolicies {
+    published: RatePolicy,
+    sinks: Option<crate::rate_caps::RatePolicies>,
+}
+
+impl SentRatePolicies {
+    /// Whether the policies must be sent again: the published rates
+    /// changed, or either sink's own policy did. The rate arbiter maps each
+    /// sink's clients through that sink's policy, so a change there must
+    /// reach it even when the published union stays the same (turning DSP
+    /// off at 44.1 kHz on a 48 kHz-only DAC adds 44.1 kHz to the DSP sink's
+    /// rates, which Direct had already published).
+    fn due(&self, published: &RatePolicy, sinks: &Option<crate::rate_caps::RatePolicies>) -> bool {
+        self.published != *published || self.sinks != *sinks
+    }
+
+    fn note(&mut self, published: RatePolicy, sinks: Option<crate::rate_caps::RatePolicies>) {
+        self.published = published;
+        self.sinks = sinks;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_control_thread(
     mut config: EngineDriverConfig,
+    init_desired: DesiredDspConfig,
+    init_bypass_held: crate::lifecycle::BypassHeld,
     channels: usize,
     init_rate: u32,
-    init_actual_ratio: u32,
+    init_actual_ratio: RateRatio,
     init_caps: Option<DeviceCapabilities>,
     init_effective: RatePolicy,
     init_reservation: Option<(u32, DeviceReservation)>,
+    init_missing: bool,
     shared: Arc<SharedEngineState>,
     cmd_efd: Arc<EventFd>,
     ctrl_efd: Arc<EventFd>,
@@ -3193,31 +4849,53 @@ fn run_control_thread(
         ctrl_efd: Arc::clone(&ctrl_efd),
         shared: Arc::clone(&shared),
         config: config.clone(),
-        probed_device: Some(config.device.clone()),
+        probed_device: (!init_missing).then(|| config.device.clone()),
         caps: init_caps,
         probe_handle: None,
         effective: Some(init_effective.clone()),
+        moves: None,
     };
     // Rate policy last sent to the PipeWire thread.
-    let mut published_policy: RatePolicy = init_effective;
+    let mut published_policy = SentRatePolicies {
+        published: init_effective,
+        sinks: shared.sink_policies(),
+    };
+    let mut logged_xruns = 0u64;
+    let mut repromote = crate::rt_overload::RepromoteGate::default();
+    let mut logged_alsa_lib = alsa_lib_errors();
     let mut lifecycle = DeviceLifecycle::<RealDeviceBackend> {
-        state: EngineState::Ready,
+        state: if init_missing {
+            EngineState::Error
+        } else {
+            EngineState::Ready
+        },
         last_error: None,
         reservation: init_reservation,
-        active_device: Some(config.device.clone()),
+        active_device: (!init_missing).then(|| config.device.clone()),
         active_graph_rate: init_rate,
         active_ratio: init_actual_ratio,
         active_sink: SinkChoice::Dsp,
-        output_held: true,
+        output_held: !init_missing,
     };
+    // The device is gone (or keeps failing after it went): look for it and
+    // have the RT thread open it again. The graph meanwhile runs on the RT
+    // thread's own clock (`device_missing`).
+    let mut lost: Option<LostDevice> = init_missing.then(|| LostDevice::new(false, Instant::now()));
+    let mut presence = PresenceWatch::new(Instant::now());
 
-    let mut desired_gen: u64 = 0;
-    let mut desired_dsp = config.desired_dsp(desired_gen);
+    // What start-up opened with (its fallback may hold a pair back).
+    let mut desired_dsp = init_desired;
+    // The engine bypass resampler's pairs held back on this device (a
+    // chain that failed, until the device changes; a design still running,
+    // until it is done): they fall back to PipeWire.
+    let mut bypass_held = init_bypass_held;
     let mut last_graph_rate = init_rate;
     let mut last_ratio = init_actual_ratio;
     let mut last_quantum = scaled_quantum(config.quantum, init_rate);
-    let mut in_cap = (config.buffer_periods.max(2) * last_quantum).max(4096) as usize * channels;
-    let mut out_cap = in_cap * init_actual_ratio.max(1) as usize;
+    let base_in = (config.buffer_periods.max(2) * last_quantum).max(4096) as usize * channels;
+    let mut out_cap = init_actual_ratio.max_frames_out(base_in);
+    // The input buffers always hold a varispeed block's largest pull.
+    let mut in_cap = base_in.max(VS_MAX_SRC_FRAMES * channels);
     let mut released_externally = false;
     let mut awaiting_release_teardown = false;
     let mut reopen_gate = ReopenGate::new();
@@ -3225,154 +4903,233 @@ fn run_control_thread(
     let mut pending_release_waiters: Vec<mpsc::SyncSender<Result<()>>> = Vec::new();
     let mut pending_acquire_waiters: Vec<mpsc::SyncSender<Result<()>>> = Vec::new();
 
-    #[allow(clippy::too_many_arguments)]
-    let perform_acquire =
-        |config: &EngineDriverConfig,
-         desired_dsp: DesiredDspConfig,
-         last_graph_rate_io: &mut u32,
-         published_policy: &mut RatePolicy,
-         last_ratio: &mut u32,
-         last_quantum: &mut u32,
-         in_cap: &mut usize,
-         out_cap: &mut usize,
-         backend: &mut RealDeviceBackend,
-         lifecycle: &mut DeviceLifecycle<RealDeviceBackend>,
-         pending_rt_cmds: &mut VecDeque<RtControlCmd>,
-         ctrl_to_rt_tx: &mut rtrb::Producer<RtControlCmd>,
-         pending_acquire_waiters: &mut Vec<mpsc::SyncSender<Result<()>>>| {
-            shared.clear_error();
-            shared.clear_chain_warning();
-            shared.release_requested.store(false, Ordering::Release);
-            shared.set_state(EngineState::Switching);
+    // An acquire whose open the engine refused as superseded (its config
+    // moved to another device meanwhile): redone with the queued config.
+    let mut reacquire_pending = false;
 
-            let active_sink =
-                sink_from_u8(shared.active_sink.load(Ordering::Acquire)).unwrap_or(SinkChoice::Dsp);
-            let q = scaled_quantum(config.quantum, *last_graph_rate_io);
-            let opened = match lifecycle.handoff_and_open(
-                backend,
-                None,
-                &config.device,
-                config.reserve_device,
-                config.reserve_priority,
-                *last_graph_rate_io,
-                q,
-                active_sink,
-                desired_dsp,
-            ) {
-                Ok(o) => o,
+    // Returns whether the engine refused the open as superseded.
+    #[allow(clippy::too_many_arguments)]
+    let perform_acquire = |config: &EngineDriverConfig,
+                           desired_dsp: &mut DesiredDspConfig,
+                           last_graph_rate_io: &mut u32,
+                           published_policy: &mut SentRatePolicies,
+                           bypass_held: &mut crate::lifecycle::BypassHeld,
+                           last_ratio: &mut RateRatio,
+                           last_quantum: &mut u32,
+                           in_cap: &mut usize,
+                           out_cap: &mut usize,
+                           backend: &mut RealDeviceBackend,
+                           lifecycle: &mut DeviceLifecycle<RealDeviceBackend>,
+                           pending_rt_cmds: &mut VecDeque<RtControlCmd>,
+                           ctrl_to_rt_tx: &mut rtrb::Producer<RtControlCmd>,
+                           pending_acquire_waiters: &mut Vec<mpsc::SyncSender<Result<()>>>|
+     -> bool {
+        shared.clear_error();
+        shared.clear_chain_warning();
+        shared.release_requested.store(false, Ordering::Release);
+        shared.set_state(EngineState::Switching);
+
+        let active_sink =
+            sink_from_u8(shared.active_sink.load(Ordering::Acquire)).unwrap_or(SinkChoice::Dsp);
+        let q = scaled_quantum(config.quantum, *last_graph_rate_io);
+        let mut opener = DeviceOpen {
+            lifecycle,
+            backend,
+            old: None,
+            config,
+            shared: &shared,
+            pw_tx: &pw_tx,
+            published: published_policy,
+            on_negotiated: on_negotiated.as_ref(),
+            graph_rate: *last_graph_rate_io,
+            quantum: q,
+            sink: active_sink,
+        };
+        // The control loop keeps the config the open ran with (a
+        // fallback's, with the pair held back) before anything resumes.
+        let base = |keep| config.desired_dsp(0).keep_bypass(keep);
+        let (opened, negotiated, negotiated_key) =
+            match crate::lifecycle::open_and_keep(&mut opener, desired_dsp, bypass_held, base) {
+                Ok((o, (n, k))) => (o, n, k),
                 Err(msg) => {
-                    backend.invalidate_caps();
+                    run_release_hook(&shared, ReleaseKind::Lost, &config.device);
+                    backend.reprobe_after_failure(&config.device);
                     shared.clear_negotiation(&config.device);
                     shared.set_error(msg.clone());
                     finish_waiters(pending_acquire_waiters, || Err(PwError::Init(msg.clone())));
-                    return;
+                    return false;
                 }
             };
 
-            let alsa = opened.output;
-            let actual_ratio = opened.actual_ratio;
-            let last_graph_rate = opened.graph_rate;
-            let q = opened.quantum;
-            *last_graph_rate_io = last_graph_rate;
-            let params = alsa.params();
-            let fds = alsa.poll_descriptors().unwrap_or_default();
-            *last_ratio = actual_ratio;
-            *last_quantum = q;
-            shared
-                .format
-                .store(format_to_u8(Some(params.format)), Ordering::Release);
-            shared.graph_rate.store(last_graph_rate, Ordering::Release);
-            shared.output_rate.store(params.rate, Ordering::Release);
-            shared.ratio.store(actual_ratio, Ordering::Release);
-            shared.quantum.store(
-                (params.period_frames / actual_ratio).max(32),
-                Ordering::Release,
+        let alsa = opened.output;
+        let actual_ratio = opened.actual_ratio;
+        let last_graph_rate = opened.graph_rate;
+        let q = opened.quantum;
+        *last_graph_rate_io = last_graph_rate;
+        let params = alsa.params();
+        let fds = alsa.poll_descriptors().unwrap_or_default();
+        *last_ratio = actual_ratio;
+        *last_quantum = q;
+        shared
+            .format
+            .store(format_to_u8(Some(params.format)), Ordering::Release);
+        shared.graph_rate.store(last_graph_rate, Ordering::Release);
+        shared.output_rate.store(params.rate, Ordering::Release);
+        shared
+            .ratio
+            .store(actual_ratio.to_bits(), Ordering::Release);
+        shared.quantum.store(
+            actual_ratio.scale_to_input(params.period_frames).max(32),
+            Ordering::Release,
+        );
+
+        if negotiated.superseded {
+            // The engine moved to another device while this one opened;
+            // its config change is queued: acquire again with it.
+            log::info!(
+                "acquire of '{}' superseded by a device change; acquiring again",
+                config.device
             );
+            run_release_hook(&shared, ReleaseKind::HandOver, &config.device);
+            backend.close_output(alsa);
+            lifecycle.output_held = false;
+            lifecycle.release_reservation(backend);
+            lifecycle.active_device = None;
+            lifecycle.state = EngineState::Idle;
+            shared.set_state(EngineState::Idle);
+            return true;
+        }
+        let (required_chain_seq, hold_error) =
+            apply_negotiated_chain(negotiated, &shared, pending_acquire_waiters);
+        let needed_in =
+            (actual_ratio.scale_to_input(params.buffer_frames) + 2).max(4096) as usize * channels;
+        let (dsp_in_buf, direct_in_buf, out_buf) =
+            maybe_grow_buffers(needed_in, actual_ratio, in_cap, out_cap);
 
-            // Rebuild DSP chain for (last_graph_rate, actual_ratio) off-RT before Resume.
-            let negotiated = on_negotiated
-                .as_ref()
-                .map(|cb| cb(last_graph_rate, actual_ratio, active_sink, params.format))
-                .unwrap_or_default();
-            let (required_chain_seq, hold_error) =
-                apply_negotiated_chain(negotiated, &shared, pending_acquire_waiters);
-            let needed_in = (params.buffer_frames / actual_ratio).max(4096) as usize * channels;
-            let (dsp_in_buf, direct_in_buf, out_buf) =
-                maybe_grow_buffers(needed_in, actual_ratio, in_cap, out_cap);
-
-            let ring_samples = (16 * 1024 * channels).max(32 * 1024);
-            let (dsp_prod, dsp_cons) = rtrb::RingBuffer::<f32>::new(ring_samples);
-            let (direct_prod, direct_cons) = rtrb::RingBuffer::<f32>::new(ring_samples);
-            let (reply_tx, reply_rx) = mpsc::sync_channel::<Result<SendRawStream>>(1);
-            // The new session publishes the device-restricted rates.
-            let mut pw_config = config.clone();
-            if let Some(eff) = backend.effective.clone() {
-                pw_config.rate_policy = eff;
+        let ring_samples = (RING_ALLOC_FRAMES * channels).max(32 * 1024);
+        let (dsp_prod, dsp_cons) = rtrb::RingBuffer::<f32>::new(ring_samples);
+        let (direct_prod, direct_cons) = rtrb::RingBuffer::<f32>::new(ring_samples);
+        let (reply_tx, reply_rx) = mpsc::sync_channel::<Result<SendRawStream>>(1);
+        // The new session publishes the device-restricted rates.
+        let mut pw_config = config.clone();
+        if let Some(eff) = backend.effective.clone() {
+            pw_config.rate_policy = eff;
+        }
+        published_policy.note(pw_config.rate_policy.clone(), shared.sink_policies());
+        let _ = pw_tx.send(PwMsg::Reconnect {
+            config: Box::new(pw_config),
+            last_rate: last_graph_rate,
+            dsp_prod,
+            direct_prod,
+            reply_tx,
+        });
+        let new_raw = match reply_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(raw)) => raw,
+            Ok(Err(e)) => {
+                // Negotiation already told the engine it holds the DAC.
+                run_release_hook(&shared, ReleaseKind::HandOver, &config.device);
+                backend.close_output(alsa);
+                lifecycle.output_held = false;
+                lifecycle.release_reservation(backend);
+                lifecycle.active_device = None;
+                lifecycle.state = EngineState::Error;
+                let msg = format!("PipeWire reconnect failed: {e}");
+                shared.set_error(msg.clone());
+                finish_waiters(pending_acquire_waiters, || Err(PwError::Init(msg.clone())));
+                return false;
             }
-            *published_policy = pw_config.rate_policy.clone();
-            let _ = pw_tx.send(PwMsg::Reconnect {
-                config: pw_config,
-                last_rate: last_graph_rate,
-                dsp_prod,
-                direct_prod,
-                reply_tx,
-            });
-            let new_raw = match reply_rx.recv_timeout(Duration::from_secs(5)) {
-                Ok(Ok(raw)) => raw,
-                Ok(Err(e)) => {
-                    backend.close_output(alsa);
-                    lifecycle.output_held = false;
-                    lifecycle.release_reservation(backend);
-                    lifecycle.active_device = None;
-                    lifecycle.state = EngineState::Error;
-                    let msg = format!("PipeWire reconnect failed: {e}");
-                    shared.set_error(msg.clone());
-                    finish_waiters(pending_acquire_waiters, || Err(PwError::Init(msg.clone())));
-                    return;
-                }
-                Err(e) => {
-                    backend.close_output(alsa);
-                    lifecycle.output_held = false;
-                    lifecycle.release_reservation(backend);
-                    lifecycle.active_device = None;
-                    lifecycle.state = EngineState::Error;
-                    let msg = format!("PipeWire reconnect timed out: {e}");
-                    shared.set_error(msg.clone());
-                    finish_waiters(pending_acquire_waiters, || Err(PwError::Init(msg.clone())));
-                    return;
-                }
-            };
-
-            let fade_in_frames = ((params.rate as usize) * FADE_MS) / 1000;
-            let negotiated_key = negotiated_key(desired_dsp, active_sink, last_graph_rate);
-            push_or_queue_rt_cmd(
-                pending_rt_cmds,
-                ctrl_to_rt_tx,
-                &cmd_efd,
-                RtControlCmd::Resume {
-                    alsa,
-                    alsa_fds: fds,
-                    params,
-                    graph_rate: last_graph_rate,
-                    actual_ratio,
-                    target_sink: active_sink,
-                    desired_dsp,
-                    negotiated_key,
-                    required_chain_seq,
-                    hold_error,
-                    new_driver_stream: Some(new_raw),
-                    new_dsp_cons: Some(dsp_cons),
-                    new_direct_cons: Some(direct_cons),
-                    dsp_in_buf,
-                    direct_in_buf,
-                    out_buf,
-                    fade_in_frames,
-                },
-            );
+            Err(e) => {
+                run_release_hook(&shared, ReleaseKind::HandOver, &config.device);
+                backend.close_output(alsa);
+                lifecycle.output_held = false;
+                lifecycle.release_reservation(backend);
+                lifecycle.active_device = None;
+                lifecycle.state = EngineState::Error;
+                let msg = format!("PipeWire reconnect timed out: {e}");
+                shared.set_error(msg.clone());
+                finish_waiters(pending_acquire_waiters, || Err(PwError::Init(msg.clone())));
+                return false;
+            }
         };
+
+        let fade_in_frames = ((params.rate as usize) * FADE_MS) / 1000;
+        shared.set_open_key(negotiated_key);
+        // Opened again: not waiting for it any more (the control loop ends
+        // its `lost` watch on seeing this).
+        shared.device_missing.store(false, Ordering::Release);
+        shared.device_gone.store(false, Ordering::Release);
+        shared.clear_error_if(&waiting_text(&config.device));
+        push_or_queue_rt_cmd(
+            pending_rt_cmds,
+            ctrl_to_rt_tx,
+            &cmd_efd,
+            RtControlCmd::Resume {
+                alsa,
+                alsa_fds: fds,
+                params,
+                graph_rate: last_graph_rate,
+                actual_ratio,
+                target_sink: active_sink,
+                desired_dsp: *desired_dsp,
+                negotiated_key,
+                required_chain_seq,
+                hold_error,
+                new_driver_stream: Some(new_raw),
+                new_dsp_cons: Some(dsp_cons),
+                new_direct_cons: Some(direct_cons),
+                dsp_in_buf,
+                direct_in_buf,
+                out_buf,
+                fade_in_frames,
+            },
+        );
+        false
+    };
 
     while !shared.stop.load(Ordering::Acquire) {
         flush_pending_rt_cmds(&mut pending_rt_cmds, &mut ctrl_to_rt_tx, &cmd_efd);
+
+        // A reacquire opened the device again (`device_missing` cleared):
+        // nothing to wait for.
+        if lost.is_some() && !shared.device_missing.load(Ordering::Acquire) {
+            lost = None;
+        }
+        // The device held open went away while nothing played.
+        match lifecycle.active_device.as_deref() {
+            Some(device)
+                if lost.is_none()
+                    && lifecycle.output_held
+                    && !released_externally
+                    && !awaiting_release_teardown =>
+            {
+                if let Some(gone) = presence.look(Instant::now(), || device_present(device))
+                    && gone != shared.device_gone.load(Ordering::Acquire)
+                {
+                    if gone {
+                        log::warn!("output device '{device}' disappeared");
+                    }
+                    shared.device_gone.store(gone, Ordering::Release);
+                    cmd_efd.signal();
+                }
+            }
+            _ => presence.reset(),
+        }
+        // A lost device: once it is there again (or a present one's retry
+        // is due), the RT thread opens it through the usual reopen.
+        if let Some(l) = lost.as_mut()
+            && !released_externally
+            && !awaiting_release_teardown
+        {
+            let now = Instant::now();
+            if now >= l.next {
+                let present = device_present(&config.device);
+                if l.due(present, now) {
+                    log::info!("output device '{}' is there; opening it", config.device);
+                    shared.device_retry.fetch_add(1, Ordering::AcqRel);
+                    cmd_efd.signal();
+                }
+            }
+        }
 
         // 1. Check ReserveDevice1 external release request.
         let ext_rel = shared.release_requested.load(Ordering::Acquire)
@@ -3400,9 +5157,17 @@ fn run_control_thread(
                 } => {
                     let rate_policy_changed = config.rate_policy != new_cfg.rate_policy
                         || config.quantum != new_cfg.quantum;
-                    desired_gen = desired_gen.saturating_add(1);
-                    config = new_cfg;
-                    desired_dsp = config.desired_dsp(desired_gen);
+                    if config.device != new_cfg.device {
+                        bypass_held = crate::lifecycle::BypassHeld::NONE;
+                    }
+                    config = *new_cfg;
+                    // Only an edit that steers negotiation (or reopens
+                    // anyway) starts a new retry generation.
+                    desired_dsp = desired_dsp.next(
+                        config.desired_dsp(0).keep_bypass(bypass_held.keep()),
+                        force_reopen,
+                    );
+                    let desired_gen = desired_dsp.generation;
                     backend.formats = config.formats.clone();
                     backend.channels = config.channels.max(1);
                     backend.buffer_periods = config.buffer_periods.max(2);
@@ -3416,8 +5181,7 @@ fn run_control_thread(
                         }
                         Some(Err(msg)) => {
                             log::error!("{msg}");
-                            shared.set_effective_policy(None);
-                            shared.set_direct_policy(None);
+                            shared.clear_policies();
                             shared.set_error(msg);
                             None
                         }
@@ -3438,16 +5202,36 @@ fn run_control_thread(
                     );
 
                     if let Some(eff) = effective
-                        && (rate_policy_changed || eff != published_policy)
+                        && (rate_policy_changed
+                            || published_policy.due(&eff, &shared.sink_policies()))
                     {
-                        published_policy = eff.clone();
+                        published_policy.note(eff.clone(), shared.sink_policies());
                         let _ = pw_tx.send(PwMsg::ApplyRatePolicy {
                             policy: eff,
                             quantum_48k: config.quantum,
                             last_rate: last_graph_rate,
                         });
                     }
-                    if reopen_gate.ctrl_request_reopen(
+                    if std::mem::take(&mut reacquire_pending) {
+                        // The device change a superseded acquire waited for:
+                        // the new device is opened from scratch, no reopen.
+                        reacquire_pending = perform_acquire(
+                            &config,
+                            &mut desired_dsp,
+                            &mut last_graph_rate,
+                            &mut published_policy,
+                            &mut bypass_held,
+                            &mut last_ratio,
+                            &mut last_quantum,
+                            &mut in_cap,
+                            &mut out_cap,
+                            &mut backend,
+                            &mut lifecycle,
+                            &mut pending_rt_cmds,
+                            &mut ctrl_to_rt_tx,
+                            &mut pending_acquire_waiters,
+                        );
+                    } else if reopen_gate.ctrl_request_reopen(
                         force_reopen,
                         released_externally || awaiting_release_teardown,
                         shared.state(),
@@ -3461,7 +5245,44 @@ fn run_control_thread(
                         );
                     }
                 }
+                CtrlReq::Bypass(note) => {
+                    // A design that ran while its pair fell back to PipeWire
+                    // is done: the pair comes back (or stays out). Or an
+                    // edit made the designs obsolete: held pairs are
+                    // released (their new design is asked for when a client
+                    // moves the graph there again). Either way the arbiter
+                    // hears of it.
+                    if crate::lifecycle::bypass_note(
+                        &mut desired_dsp,
+                        &mut bypass_held,
+                        note,
+                        |keep| config.desired_dsp(0).keep_bypass(keep),
+                    ) {
+                        push_or_queue_rt_cmd(
+                            &mut pending_rt_cmds,
+                            &mut ctrl_to_rt_tx,
+                            &cmd_efd,
+                            RtControlCmd::UpdateDesiredDsp(desired_dsp),
+                        );
+                        if let Some(Ok(eff)) = backend.refresh_effective(desired_dsp) {
+                            shared.set_effective_policy(Some(eff.clone()));
+                            if published_policy.due(&eff, &shared.sink_policies()) {
+                                published_policy.note(eff.clone(), shared.sink_policies());
+                                let _ = pw_tx.send(PwMsg::ApplyRatePolicy {
+                                    policy: eff,
+                                    quantum_48k: config.quantum,
+                                    last_rate: last_graph_rate,
+                                });
+                            }
+                        }
+                    }
+                }
                 CtrlReq::ReleaseDevice { reply_tx } => {
+                    if std::mem::take(&mut reacquire_pending) {
+                        finish_waiters(&mut pending_acquire_waiters, || {
+                            Err(PwError::Init("released during acquire".into()))
+                        });
+                    }
                     if shared.state() == EngineState::Idle
                         && !awaiting_release_teardown
                         && lifecycle.reservation.is_none()
@@ -3485,7 +5306,10 @@ fn run_control_thread(
                     }
                 }
                 CtrlReq::AcquireDevice { reply_tx } => {
-                    if awaiting_release_teardown {
+                    if reacquire_pending {
+                        // Already acquiring (waiting for the device change).
+                        pending_acquire_waiters.push(reply_tx);
+                    } else if awaiting_release_teardown {
                         // Release teardown is still in flight; queue acquire until
                         // `ReleasedIdle` finishes full teardown.
                         released_externally = false;
@@ -3493,11 +5317,12 @@ fn run_control_thread(
                     } else if matches!(shared.state(), EngineState::Idle | EngineState::Error) {
                         released_externally = false;
                         pending_acquire_waiters.push(reply_tx);
-                        perform_acquire(
+                        reacquire_pending = perform_acquire(
                             &config,
-                            desired_dsp,
+                            &mut desired_dsp,
                             &mut last_graph_rate,
                             &mut published_policy,
+                            &mut bypass_held,
                             &mut last_ratio,
                             &mut last_quantum,
                             &mut in_cap,
@@ -3524,6 +5349,7 @@ fn run_control_thread(
                     target_sink,
                     old_alsa,
                     old_fds,
+                    device_failed,
                 } => {
                     drop(old_fds);
                     if shared.stop.load(Ordering::Acquire)
@@ -3535,6 +5361,12 @@ fn run_control_thread(
                         }
                         lifecycle.output_held = false;
                         continue;
+                    }
+                    if device_failed {
+                        log::warn!(
+                            "output device '{}' stopped working; opening it again",
+                            config.device
+                        );
                     }
                     let awaiting_cfg = reopen_gate.ctrl_take_awaiting_cfg();
 
@@ -3558,18 +5390,27 @@ fn run_control_thread(
                         desired_dsp.generation
                     );
 
-                    match lifecycle.handoff_and_open(
-                        &mut backend,
-                        old_alsa,
-                        &config.device,
-                        config.reserve_device,
-                        config.reserve_priority,
-                        eff_rate,
-                        q,
-                        target_sink,
-                        desired_dsp,
+                    let mut opener = DeviceOpen {
+                        lifecycle: &mut lifecycle,
+                        backend: &mut backend,
+                        old: old_alsa,
+                        config: &config,
+                        shared: &shared,
+                        pw_tx: &pw_tx,
+                        published: &mut published_policy,
+                        on_negotiated: on_negotiated.as_ref(),
+                        graph_rate: eff_rate,
+                        quantum: q,
+                        sink: target_sink,
+                    };
+                    let base = |keep| config.desired_dsp(0).keep_bypass(keep);
+                    match crate::lifecycle::open_and_keep(
+                        &mut opener,
+                        &mut desired_dsp,
+                        &mut bypass_held,
+                        base,
                     ) {
-                        Ok(opened) => {
+                        Ok((opened, (negotiated, negotiated_key))) => {
                             // The backend may have moved the graph to a rate
                             // the (new) device can play.
                             let eff_rate = opened.graph_rate;
@@ -3587,9 +5428,13 @@ fn run_control_thread(
                                 .store(format_to_u8(Some(new_params.format)), Ordering::Release);
                             shared.graph_rate.store(eff_rate, Ordering::Release);
                             shared.output_rate.store(new_params.rate, Ordering::Release);
-                            shared.ratio.store(actual_ratio, Ordering::Release);
+                            shared
+                                .ratio
+                                .store(actual_ratio.to_bits(), Ordering::Release);
                             shared.quantum.store(
-                                (new_params.period_frames / actual_ratio).max(32),
+                                actual_ratio
+                                    .scale_to_input(new_params.period_frames)
+                                    .max(32),
                                 Ordering::Release,
                             );
                             shared.clear_error();
@@ -3599,9 +5444,10 @@ fn run_control_thread(
                             // the device cannot play): publish the restricted
                             // rates and force the rate we opened at.
                             if let Some(eff) = backend.effective.clone()
-                                && (eff != published_policy || eff_rate != target_rate)
+                                && (published_policy.due(&eff, &shared.sink_policies())
+                                    || eff_rate != target_rate)
                             {
-                                published_policy = eff.clone();
+                                published_policy.note(eff.clone(), shared.sink_policies());
                                 let _ = pw_tx.send(PwMsg::ApplyRatePolicy {
                                     policy: eff,
                                     quantum_48k: config.quantum,
@@ -3609,21 +5455,35 @@ fn run_control_thread(
                                 });
                             }
 
-                            // Rebuild DSP chain for (eff_rate, actual_ratio) off-RT before Resume.
-                            let negotiated = on_negotiated
-                                .as_ref()
-                                .map(|cb| {
-                                    cb(eff_rate, actual_ratio, target_sink, new_params.format)
-                                })
-                                .unwrap_or_default();
+                            if negotiated.superseded {
+                                // The engine moved to another device while
+                                // this one reopened: never resume it. The
+                                // queued config change reopens on the new
+                                // device (no mixer was written here).
+                                log::info!(
+                                    "reopen of '{}' superseded by a device change",
+                                    config.device
+                                );
+                                drop(new_fds);
+                                backend.close_output(new_alsa);
+                                lifecycle.output_held = false;
+                                push_or_queue_rt_cmd(
+                                    &mut pending_rt_cmds,
+                                    &mut ctrl_to_rt_tx,
+                                    &cmd_efd,
+                                    RtControlCmd::ReopenAborted,
+                                );
+                                continue;
+                            }
                             let (required_chain_seq, hold_error) = apply_negotiated_chain(
                                 negotiated,
                                 &shared,
                                 &mut pending_acquire_waiters,
                             );
 
-                            let needed_in = (new_params.buffer_frames / actual_ratio).max(4096)
-                                as usize
+                            let needed_in = (actual_ratio.scale_to_input(new_params.buffer_frames)
+                                + 2)
+                            .max(4096) as usize
                                 * channels;
                             let (dsp_in_buf, direct_in_buf, out_buf) = maybe_grow_buffers(
                                 needed_in,
@@ -3633,7 +5493,15 @@ fn run_control_thread(
                             );
 
                             let fade_in_frames = ((new_params.rate as usize) * FADE_MS) / 1000;
-                            let negotiated_key = negotiated_key(desired_dsp, target_sink, eff_rate);
+                            shared.set_open_key(negotiated_key);
+                            if lost.is_some() {
+                                log::info!(
+                                    "output device '{}' is back; playing on it",
+                                    config.device
+                                );
+                            }
+                            end_waiting(&shared, &mut lost, &config.device);
+                            presence.reset();
                             push_or_queue_rt_cmd(
                                 &mut pending_rt_cmds,
                                 &mut ctrl_to_rt_tx,
@@ -3660,10 +5528,39 @@ fn run_control_thread(
                             );
                         }
                         Err(msg) => {
-                            backend.invalidate_caps();
-                            log::error!("Reopening '{}' failed: {msg}", config.device);
+                            run_release_hook(&shared, ReleaseKind::Lost, &config.device);
+                            backend.reprobe_after_failure(&config.device);
                             shared.clear_negotiation(&config.device);
-                            shared.set_error(msg);
+                            // A device that went (or is not there) is
+                            // waited for, and one that failed and keeps
+                            // failing is retried; the sinks stay up on the
+                            // engine's own clock meanwhile.
+                            let present = device_present(&config.device);
+                            if device_failed || lost.is_some() || !present {
+                                match lost.as_mut() {
+                                    Some(l) => l.present = present,
+                                    None => {
+                                        lost = Some(LostDevice::new(present, Instant::now()));
+                                    }
+                                }
+                                shared.device_missing.store(true, Ordering::Release);
+                                if present {
+                                    log::warn!(
+                                        "Reopening '{}' failed: {msg}; retrying",
+                                        config.device
+                                    );
+                                    shared.set_error(format!("{msg} (retrying)"));
+                                } else {
+                                    log::warn!(
+                                        "output device '{}' is gone; waiting for it",
+                                        config.device
+                                    );
+                                    shared.set_error(waiting_text(&config.device));
+                                }
+                            } else {
+                                log::error!("Reopening '{}' failed: {msg}", config.device);
+                                shared.set_error(msg);
+                            }
                             push_or_queue_rt_cmd(
                                 &mut pending_rt_cmds,
                                 &mut ctrl_to_rt_tx,
@@ -3675,6 +5572,9 @@ fn run_control_thread(
                 }
                 RtEvent::ReleasedIdle { old_alsa, old_fds } => {
                     drop(old_fds);
+                    // Released on request: no longer waiting for the device
+                    // (taking it back opens it from scratch).
+                    end_waiting(&shared, &mut lost, &config.device);
                     // Re-probe on the next acquire: the device may have changed.
                     backend.invalidate_caps();
                     let (ack_tx, ack_rx) = mpsc::sync_channel::<Result<()>>(1);
@@ -3711,11 +5611,12 @@ fn run_control_thread(
                     );
 
                     if should_acquire {
-                        perform_acquire(
+                        reacquire_pending = perform_acquire(
                             &config,
-                            desired_dsp,
+                            &mut desired_dsp,
                             &mut last_graph_rate,
                             &mut published_policy,
+                            &mut bypass_held,
                             &mut last_ratio,
                             &mut last_quantum,
                             &mut in_cap,
@@ -3760,6 +5661,14 @@ fn run_control_thread(
         }
 
         let _ = (last_ratio, last_quantum);
+        log_new_xruns(&shared, &mut logged_xruns);
+        repromote.tick(
+            &shared.rt,
+            config.rt_priority,
+            f64::from_bits(shared.dsp_load_bits.load(Ordering::Relaxed)),
+            shared.xruns.load(Ordering::Relaxed),
+        );
+        log_new_alsa_lib_errors(alsa_lib_errors(), &mut logged_alsa_lib);
 
         let mut pfd = [libc::pollfd {
             fd: ctrl_efd.as_raw_fd(),
@@ -3790,18 +5699,36 @@ fn run_control_thread(
             _ => {}
         }
     }
-    lifecycle.release_reservation(&mut backend);
+    release_on_stop(&mut backend, &mut lifecycle, &shared);
+}
+
+/// Stopping: playback has stopped (the output thread is joined) and the
+/// reservation is still ours, so the engine gets the same hand-over as on a
+/// release, before the reservation goes.
+fn release_on_stop<B: DeviceBackend>(
+    backend: &mut B,
+    lifecycle: &mut DeviceLifecycle<B>,
+    shared: &SharedEngineState,
+) {
+    if (lifecycle.reservation.is_some() || lifecycle.output_held)
+        && let Some(device) = lifecycle.active_device.clone()
+    {
+        run_release_hook(shared, ReleaseKind::HandOver, &device);
+    }
+    lifecycle.release_reservation(backend);
 }
 
 type GrowthBuffers = (Option<Vec<f32>>, Option<Vec<f32>>, Option<Vec<i32>>);
 
 fn maybe_grow_buffers(
     needed_in: usize,
-    actual_ratio: u32,
+    actual_ratio: RateRatio,
     in_cap: &mut usize,
     out_cap: &mut usize,
 ) -> GrowthBuffers {
-    let needed_out = needed_in * (actual_ratio.max(1) as usize);
+    // `needed_in` counts samples of whole frames; one extra output frame per
+    // channel covers the rounding of a rational ratio.
+    let needed_out = actual_ratio.max_frames_out(needed_in) + 64;
     let (dsp_in, direct_in) = if needed_in > *in_cap {
         *in_cap = needed_in;
         (Some(vec![0.0f32; *in_cap]), Some(vec![0.0f32; *in_cap]))
@@ -3825,8 +5752,9 @@ fn try_complete_resume_gate<P: EngineAudioProcessor>(
     shared: &SharedEngineState,
     awaiting_chain_for_resume: &mut Option<Option<u64>>,
     suspended: &mut bool,
+    resume_ack: &mut bool,
     active_sink: SinkChoice,
-    active_ratio: u32,
+    active_ratio: RateRatio,
     event_stash: &mut BoundedEventStash<RtEvent, 16>,
     rt_to_ctrl_tx: &mut rtrb::Producer<RtEvent>,
     ctrl_efd: &EventFd,
@@ -3843,12 +5771,16 @@ fn try_complete_resume_gate<P: EngineAudioProcessor>(
     *suspended = false;
     let streaming_now = shared.dsp_streaming.load(Ordering::Acquire)
         || shared.direct_streaming.load(Ordering::Acquire);
-    shared.set_state(if streaming_now {
-        EngineState::Playing
+    if streaming_now {
+        // The live graph check, the prefill and the start come first: the
+        // device plays (and the resume is acknowledged) once it started
+        // (`on_device_started`).
+        shared.set_state(EngineState::Switching);
+        *resume_ack = true;
     } else {
-        EngineState::Ready
-    });
-    let _ = event_stash.push_or_stash(RtEvent::Resumed, rt_to_ctrl_tx, ctrl_efd);
+        shared.set_state(EngineState::Ready);
+        let _ = event_stash.push_or_stash(RtEvent::Resumed, rt_to_ctrl_tx, ctrl_efd);
+    }
     true
 }
 
@@ -3856,11 +5788,13 @@ fn try_complete_resume_gate<P: EngineAudioProcessor>(
 fn run_alsa_thread<P: EngineAudioProcessor>(
     config: EngineDriverConfig,
     init_rate: u32,
-    init_ratio: u32,
+    init_ratio: RateRatio,
     init_desired: DesiredDspConfig,
+    init_key: Option<NegotiatedKey>,
     init_required_seq: Option<u64>,
     init_hold_error: bool,
-    alsa_init: Box<AlsaOutput>,
+    alsa_init: Option<Box<AlsaOutput>>,
+    init_params: NegotiatedParams,
     mut alsa_fds: Vec<libc::pollfd>,
     mut raw_stream: SendRawStream,
     shared: Arc<SharedEngineState>,
@@ -3874,30 +5808,46 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
     mut processor: P,
     test_stall: Option<TestStallConfig>,
 ) {
-    try_promote_current_thread_rt(config.rt_priority);
-
-    let mut alsa_opt: Option<Box<AlsaOutput>> = Some(alsa_init);
-    let mut params = alsa_opt.as_ref().unwrap().params();
+    let started_missing = alsa_init.is_none();
+    let mut alsa_opt: Option<Box<AlsaOutput>> = alsa_init;
+    // The xruns of the open handle already counted into `xrun_events`.
+    let mut handle_xruns = 0u64;
+    let mut params = init_params;
     let channels = params.channels as usize;
     let mut active_graph_rate = init_rate;
-    let mut active_ratio = init_ratio.max(1);
+    // Whether this open's graph was seen at `active_graph_rate` yet.
+    let mut landed = false;
+    let mut active_ratio = init_ratio;
     let mut active_sink = SinkChoice::Dsp;
     let mut rt_dsp_cfg = init_desired;
-    let mut last_negotiated_key: Option<NegotiatedKey> =
-        Some(negotiated_key(init_desired, SinkChoice::Dsp, init_rate));
+    let mut last_negotiated_key: Option<NegotiatedKey> = init_key;
+    let mut sessions = PlaybackSessions::default();
 
-    let max_in_frames = (params.buffer_frames / active_ratio).max(4096) as usize;
-    let mut dsp_in_buf = vec![0.0f32; max_in_frames * channels];
-    let mut direct_in_buf = vec![0.0f32; max_in_frames * channels];
-    let mut out_buf = vec![0i32; max_in_frames * (active_ratio as usize) * channels];
+    let max_in_frames = (active_ratio.scale_to_input(params.buffer_frames) + 2).max(4096) as usize;
+    // The input buffers always hold a varispeed block's largest pull.
+    let in_frames_cap = max_in_frames.max(VS_MAX_SRC_FRAMES);
+    let mut dsp_in_buf = vec![0.0f32; in_frames_cap * channels];
+    let mut direct_in_buf = vec![0.0f32; in_frames_cap * channels];
+    let mut out_buf = vec![0i32; active_ratio.max_frames_out(max_in_frames) * channels];
+    let mut planner = PeriodPlanner::default();
+    // Sized for every reopen: the channel count is the thread's, and no
+    // ratio carries more than `CARRY_MAX_FRAMES`.
+    let mut carry = OutCarry::with_capacity(CARRY_MAX_FRAMES * channels);
     let mut pollfds: Vec<libc::pollfd> = Vec::with_capacity(16);
     let mut event_stash: BoundedEventStash<RtEvent, 16> = BoundedEventStash::new();
+    // alsa-lib's own messages (a failed recovery `prepare`) go to a
+    // counter the control thread logs, not to stderr from this thread.
+    silence_alsa_lib_on_this_thread();
+    // After the allocations above.
+    let mut rt_guard = crate::rt_overload::RtLoopGuard::start(&shared.rt, config.rt_priority);
 
     let mut clock_state = DriverClockState::new();
     let mut fade_ramp = FadeRamp::unity();
     let mut alsa_running = false;
     let mut suspended = false;
     let mut awaiting_chain_for_resume: Option<Option<u64>> = None;
+    // A resume is acknowledged (`RtEvent::Resumed`) once the device started.
+    let mut resume_ack = false;
     let mut released_idle = false;
     let mut reopen_gate = ReopenGate::new();
     let mut pending_reopen: Option<(u32, u32, SinkChoice)> = None;
@@ -3905,7 +5855,11 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
     // control thread aborted (open failed): a later route or rate change
     // retries from there instead of staying in `Error`.
     let mut inflight_reopen: Option<(u32, SinkChoice)> = None;
-    let mut aborted_reopen: Option<(u32, SinkChoice)> = None;
+    // Started without the device: as after a failed open, the control
+    // thread's retry (`device_retry`) opens it.
+    let mut aborted_reopen: Option<(u32, SinkChoice)> =
+        started_missing.then_some((init_rate, SinkChoice::Dsp));
+    let mut seen_retry = shared.device_retry.load(Ordering::Acquire);
     let mut pacer = CyclePacer::default();
     // Quantum, rate and DAC delay of the last written period, for cycles the
     // pacer fires between DAC periods.
@@ -3915,6 +5869,11 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
     let mut first_prime_after_reopen = false;
     let mut dsp_load_ewma = 0.0_f64;
     let mut stalled_once = false;
+    // Varispeed: the watermark schedule while a stage runs, when to poll it
+    // next, and the clock delay for cycles between DAC wakeups.
+    let mut vs = VarispeedDriver::new();
+    let mut vs_wake: Option<u64> = None;
+    let mut vs_delay = VsDelay::default();
 
     processor.poll_updates(active_sink, active_graph_rate, active_ratio, false);
     if init_hold_error {
@@ -3966,13 +5925,15 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
     };
 
     while !shared.stop.load(Ordering::Acquire) {
+        vs.sync_hold(&shared.varispeed_cmd, &shared.varispeed);
+        rt_guard.on_iteration(&shared.rt, processor.running_generation(), vs.hold_seq());
         event_stash.flush(&mut rt_to_ctrl_tx, &ctrl_efd);
 
         // 1. Drain control commands.
         while let Ok(cmd) = ctrl_to_rt_rx.pop() {
             match cmd {
                 RtControlCmd::UpdateDesiredDsp(cfg) => {
-                    if cfg.generation >= rt_dsp_cfg.generation {
+                    if crate::lifecycle::rt_takes(&rt_dsp_cfg, &cfg) {
                         rt_dsp_cfg = cfg;
                     }
                 }
@@ -4026,7 +5987,7 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                             &ctrl_efd,
                         );
                     }
-                    if desired_dsp.generation >= rt_dsp_cfg.generation {
+                    if crate::lifecycle::rt_takes(&rt_dsp_cfg, &desired_dsp) {
                         rt_dsp_cfg = desired_dsp;
                     }
                     last_negotiated_key = Some(negotiated_key);
@@ -4036,9 +5997,11 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                     shared.resumes.fetch_add(1, Ordering::Relaxed);
                     shared.fade_ins.fetch_add(1, Ordering::Relaxed);
                     alsa_opt = Some(alsa);
+                    handle_xruns = 0;
                     params = new_params;
                     active_graph_rate = graph_rate;
-                    active_ratio = actual_ratio.max(1);
+                    landed = false;
+                    active_ratio = actual_ratio;
                     active_sink = target_sink;
                     released_idle = false;
                     reopen_gate.rt_finish_reopen();
@@ -4047,8 +6010,21 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                     aborted_reopen = None;
                     alsa_running = false;
                     first_prime_after_reopen = true;
+                    // A reopen starts a new stream on the device: the frames
+                    // carried from the old one's periods do not apply.
+                    planner.reset();
+                    carry.clear();
                     fade_ramp.start_fade_in(fade_in_frames);
                     processor.poll_updates(active_sink, active_graph_rate, active_ratio, false);
+                    // A reopen restarts the stage under the fade-in;
+                    // the priming starts the schedule again.
+                    if let Some(port) =
+                        processor.varispeed(active_sink, active_ratio, active_graph_rate, channels)
+                    {
+                        port.reset();
+                    }
+                    vs.stop();
+                    vs.publish(&shared.varispeed);
                     if hold_error {
                         // The chain rebuild failed outright (no fallback chain
                         // valid for this ratio): never report `Playing` or clear
@@ -4064,6 +6040,7 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                             &shared,
                             &mut awaiting_chain_for_resume,
                             &mut suspended,
+                            &mut resume_ack,
                             active_sink,
                             active_ratio,
                             &mut event_stash,
@@ -4073,10 +6050,13 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                     }
                 }
                 RtControlCmd::SuspendForRelease => {
-                    let old_alsa = alsa_opt.take().map(|mut a| {
-                        let _ = a.drop_frames();
-                        a
-                    });
+                    let old_alsa =
+                        take_counted(&mut alsa_opt, |a| a.xruns(), &shared, &mut handle_xruns).map(
+                            |mut a| {
+                                let _ = a.drop_frames();
+                                a
+                            },
+                        );
                     let old_fds = std::mem::take(&mut alsa_fds);
                     let _ = event_stash.push_or_stash(
                         RtEvent::ReleasedIdle { old_alsa, old_fds },
@@ -4097,13 +6077,15 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                 }
                 RtControlCmd::SuspendForReopen => {
                     if !released_idle && reopen_gate.rt_try_begin_reopen() {
-                        let old_alsa = alsa_opt.take().map(|mut a| {
-                            let _ = a.drop_frames();
-                            a
-                        });
+                        let old_alsa =
+                            take_counted(&mut alsa_opt, |a| a.xruns(), &shared, &mut handle_xruns)
+                                .map(|mut a| {
+                                    let _ = a.drop_frames();
+                                    a
+                                });
                         let old_fds = std::mem::take(&mut alsa_fds);
                         let cur_q = if old_alsa.is_some() {
-                            (params.period_frames / active_ratio).max(32)
+                            active_ratio.scale_to_input(params.period_frames).max(32)
                         } else {
                             scaled_quantum(config.quantum, active_graph_rate)
                         };
@@ -4116,6 +6098,7 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                                 target_sink: active_sink,
                                 old_alsa,
                                 old_fds,
+                                device_failed: false,
                             },
                             &mut rt_to_ctrl_tx,
                             &ctrl_efd,
@@ -4135,6 +6118,14 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
             }
         }
 
+        // A stream starting on either sink starts a playback session:
+        // every ladder entry a blind open saw fail gets another try, here
+        // and in the daemon's predictions (`NegotiatedKey::in_session`).
+        let (dsp_streams, direct_streams) = shared.session_streams();
+        let session = sessions.observe(dsp_streams, direct_streams);
+        shared.playback_session.store(session, Ordering::Release);
+        let live_key = last_negotiated_key.map(|k| k.in_session(session));
+
         // Poll lock-free DSP updates (chain swaps, A/B side, self-tests) on RT thread.
         let is_streaming = alsa_running && !suspended && !released_idle;
         processor.poll_updates(active_sink, active_graph_rate, active_ratio, is_streaming);
@@ -4144,6 +6135,7 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                 &shared,
                 &mut awaiting_chain_for_resume,
                 &mut suspended,
+                &mut resume_ack,
                 active_sink,
                 active_ratio,
                 &mut event_stash,
@@ -4166,21 +6158,15 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                 && alsa_opt.is_none()
                 && awaiting_chain_for_resume.is_none()
             {
-                let direct_running = shared.direct_streaming.load(Ordering::Acquire)
-                    && (shared.direct_client_running.load(Ordering::Acquire)
-                        || shared.direct_has_links.load(Ordering::Acquire));
-                let want_sink = if direct_running {
-                    SinkChoice::Direct
-                } else if shared.dsp_streaming.load(Ordering::Acquire) {
-                    SinkChoice::Dsp
-                } else {
-                    failed_sink
-                };
+                let want_sink = shared.pick_sink().unwrap_or(failed_sink);
                 let fallback_q = scaled_quantum(config.quantum, failed_rate) as u64;
                 let (cur_rate, cur_q) = read_target_clock(&shared.io, failed_rate, fallback_q);
-                if (want_sink != failed_sink || cur_rate != failed_rate)
+                // The control thread asks again once a lost device is back.
+                let retry = shared.device_retry.load(Ordering::Acquire);
+                if (want_sink != failed_sink || cur_rate != failed_rate || retry != seen_retry)
                     && reopen_gate.rt_try_begin_reopen()
                 {
+                    seen_retry = retry;
                     aborted_reopen = None;
                     inflight_reopen = Some((cur_rate, want_sink));
                     let _ = event_stash.push_or_stash(
@@ -4190,6 +6176,7 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                             target_sink: want_sink,
                             old_alsa: None,
                             old_fds: Vec::new(),
+                            device_failed: false,
                         },
                         &mut rt_to_ctrl_tx,
                         &ctrl_efd,
@@ -4208,35 +6195,64 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
             shared
                 .direct_drained_idle
                 .fetch_add(n_dir as u64, Ordering::Relaxed);
+            // No device to pace the graph: while the control thread waits
+            // for it, run the graph on our own clock at the rate PipeWire
+            // asks for, so streams keep progressing (their audio is drained
+            // above and discarded) instead of stalling or moving elsewhere.
+            let mut wait_ns = 100_000_000u64;
+            if alsa_opt.is_none()
+                && !released_idle
+                && shared.device_missing.load(Ordering::Acquire)
+                && shared.driving.load(Ordering::Acquire)
+                && shared.pick_sink().is_some()
+            {
+                let fallback_q = scaled_quantum(config.quantum, active_graph_rate) as u64;
+                let (cur_rate, cur_q) =
+                    read_target_clock(&shared.io, active_graph_rate, fallback_q);
+                if mono_now_ns() >= clock_state.next_time_ns.saturating_sub(FREE_RUN_EARLY_NS) {
+                    clock_state.advance_and_trigger(
+                        &shared.io,
+                        raw_stream.0.as_ptr(),
+                        cur_rate,
+                        cur_q,
+                        0,
+                    );
+                    shared.graph_rate.store(cur_rate, Ordering::Release);
+                    shared.quantum.store(cur_q as u32, Ordering::Release);
+                }
+                wait_ns = clock_state
+                    .next_time_ns
+                    .saturating_sub(mono_now_ns())
+                    .min(wait_ns);
+            } else {
+                // A new run (or the device's priming) starts a fresh clock.
+                clock_state.next_time_ns = 0;
+            }
             let mut fds = [libc::pollfd {
                 fd: cmd_efd.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             }];
+            let timeout = libc::timespec {
+                tv_sec: (wait_ns / 1_000_000_000) as libc::time_t,
+                tv_nsec: (wait_ns % 1_000_000_000) as libc::c_long,
+            };
             unsafe {
-                libc::poll(fds.as_mut_ptr(), 1, 100);
+                libc::ppoll(fds.as_mut_ptr(), 1, &timeout, std::ptr::null());
             }
             cmd_efd.drain();
             continue;
         }
 
         // Determine active sink under v1 policy:
-        // Direct owns DAC exclusively whenever it has an active/linked streaming client.
+        // Direct owns the DAC exclusively while a running client feeds it
+        // (`SharedEngineState::pick_sink`), otherwise the DSP sink while it
+        // streams.
         // Note: PipeWire always invokes `direct_stream.process()` (with silence) when the
         // `audivane-dac` driver group runs, so `direct_cons.slots()` is NOT a client indicator.
-        let direct_running = shared.direct_streaming.load(Ordering::Acquire)
-            && (shared.direct_client_running.load(Ordering::Acquire)
-                || shared.direct_has_links.load(Ordering::Acquire));
-        let dsp_running = shared.dsp_streaming.load(Ordering::Acquire);
-        let want_active = shared.driving.load(Ordering::Acquire) && (direct_running || dsp_running);
-
-        let target_sink = if direct_running {
-            SinkChoice::Direct
-        } else if dsp_running {
-            SinkChoice::Dsp
-        } else {
-            active_sink
-        };
+        let picked = shared.pick_sink();
+        let want_active = shared.driving.load(Ordering::Acquire) && picked.is_some();
+        let target_sink = picked.unwrap_or(active_sink);
         shared.active_sink.store(
             if want_active {
                 sink_to_u8(Some(target_sink))
@@ -4265,15 +6281,26 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                             channels,
                             active_ratio,
                             active_graph_rate,
+                            &mut planner,
+                            &mut carry,
+                            &mut vs,
                             &shared.stop,
                             &shared,
+                            &mut rt_guard,
                         );
                     }
                     let _ = alsa.drop_frames();
+                    // An idle handle may stay open a long time: count an
+                    // underrun in the drain now, not at the close.
+                    note_xruns(&shared, alsa.xruns(), &mut handle_xruns);
                 }
                 processor.reset_dsp_state();
+                planner.reset();
+                carry.clear();
                 alsa_running = false;
                 pacer.reset();
+                vs.stop();
+                vs.publish(&shared.varispeed);
                 shared.alsa_delay_frames.store(0, Ordering::Relaxed);
                 shared
                     .dsp_load_bits
@@ -4281,6 +6308,40 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                 if shared.state() == EngineState::Playing {
                     shared.set_state(EngineState::Ready);
                 }
+            }
+            // The device went while nothing played: ALSA says nothing
+            // then, the control thread's presence watch does. Hand it back
+            // as after a failure; the reopen finds it gone and waits.
+            if shared.device_gone.load(Ordering::Acquire)
+                && !suspended
+                && hand_back_failed_device(
+                    &mut alsa_opt,
+                    &mut alsa_fds,
+                    &shared,
+                    &mut handle_xruns,
+                    &mut reopen_gate,
+                    &mut event_stash,
+                    &mut rt_to_ctrl_tx,
+                    &ctrl_efd,
+                    (
+                        active_graph_rate,
+                        scaled_quantum(config.quantum, active_graph_rate),
+                    ),
+                    active_sink,
+                )
+            {
+                inflight_reopen = Some((active_graph_rate, active_sink));
+                aborted_reopen = None;
+                suspended = true;
+                awaiting_chain_for_resume = None;
+                pending_reopen = None;
+                continue;
+            }
+            // The streams stopped before a resumed device started: it is
+            // ready, and the resume is done.
+            if !suspended && std::mem::take(&mut resume_ack) {
+                shared.set_state(EngineState::Ready);
+                let _ = event_stash.push_or_stash(RtEvent::Resumed, &mut rt_to_ctrl_tx, &ctrl_efd);
             }
             let mut fds = [libc::pollfd {
                 fd: cmd_efd.as_raw_fd(),
@@ -4307,17 +6368,20 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
             pacer.reset();
             clock_state.reset();
 
-            let default_q = (params.period_frames / active_ratio).max(32) as u64;
+            let default_q = active_ratio.scale_to_input(params.period_frames).max(32) as u64;
             let (cur_rate, cur_q) = read_target_clock(&shared.io, active_graph_rate, default_q);
             shared.graph_rate.store(cur_rate, Ordering::Release);
             shared.quantum.store(cur_q as u32, Ordering::Release);
+            note_landing(&shared, &mut landed, cur_rate, active_graph_rate);
 
             // Check if sink switch (e.g. Direct ratio 1 vs DSP resolved ratio),
-            // updated DesiredDspConfig, or rate change requires ALSA reopen.
+            // updated DesiredDspConfig, or rate change requires ALSA reopen;
+            // so does a switch to a sink whose chain is not there (only a
+            // negotiation builds it).
             if alsa_opt.is_some()
-                && decide_rt_reopen(
+                && (decide_rt_reopen(
                     rt_dsp_cfg,
-                    last_negotiated_key,
+                    live_key,
                     active_sink,
                     target_sink,
                     active_graph_rate,
@@ -4325,8 +6389,11 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                     active_ratio,
                 )
                 .is_some()
+                    || (target_sink != active_sink
+                        && !processor.has_chain_for(target_sink, active_ratio)))
                 && reopen_gate.rt_try_begin_reopen()
-                && let Some(mut old_alsa) = alsa_opt.take()
+                && let Some(mut old_alsa) =
+                    take_counted(&mut alsa_opt, |a| a.xruns(), &shared, &mut handle_xruns)
             {
                 let _ = old_alsa.drop_frames();
                 let old_fds = std::mem::take(&mut alsa_fds);
@@ -4338,6 +6405,7 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                         target_sink,
                         old_alsa: Some(old_alsa),
                         old_fds,
+                        device_failed: false,
                     },
                     &mut rt_to_ctrl_tx,
                     &ctrl_efd,
@@ -4352,7 +6420,34 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
             let Some(alsa) = alsa_opt.as_mut() else {
                 continue;
             };
-            if alsa.prepare().is_err() {
+            let unplugged = shared.device_gone.load(Ordering::Relaxed);
+            if unplugged || alsa.prepare().is_err() {
+                // Gone (usually unplugged): the control thread opens it
+                // again, or waits for it with the graph on our own clock.
+                if hand_back_failed_device(
+                    &mut alsa_opt,
+                    &mut alsa_fds,
+                    &shared,
+                    &mut handle_xruns,
+                    &mut reopen_gate,
+                    &mut event_stash,
+                    &mut rt_to_ctrl_tx,
+                    &ctrl_efd,
+                    (
+                        active_graph_rate,
+                        scaled_quantum(config.quantum, active_graph_rate),
+                    ),
+                    active_sink,
+                ) {
+                    inflight_reopen = Some((active_graph_rate, active_sink));
+                    aborted_reopen = None;
+                    suspended = true;
+                    awaiting_chain_for_resume = None;
+                    pending_reopen = None;
+                    vs.stop();
+                    vs.publish(&shared.varispeed);
+                    continue;
+                }
                 let _ = event_stash.push_or_stash(
                     RtEvent::FatalError {
                         msg: "ALSA prepare failed",
@@ -4362,11 +6457,13 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                 );
                 break;
             }
+            processor.stream_prepared();
 
-            let period_out = params.period_frames.max(active_ratio);
-            let period_in = (period_out / active_ratio).max(1);
-            let aligned_period_out = period_in * active_ratio;
-            let n_prefill_periods = (params.buffer_frames / aligned_period_out).max(2);
+            let period_out = params.period_frames.max(1);
+            // Nominal input frames per period (the exact count varies by
+            // one on a rational frame grid; see `PeriodPlanner`).
+            let period_in = planner.plan(active_ratio, period_out).0 as u32;
+            let n_prefill_periods = prefill_periods(params.buffer_frames, period_out);
             // Prime at the nominal graph rate instead of as fast as the graph
             // can complete: consuming several quanta in a burst outruns the
             // source client's converter, which then fills a cycle with silence
@@ -4375,6 +6472,41 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
             let cycle_ns = (cur_q.max(1) * 1_000_000_000) / u64::from(cur_rate.max(8_000));
             let prime_start_ns = mono_now_ns();
             let mut prime_deadline_ns = prime_start_ns;
+            // The clock delay's geometry is this open's, also when the
+            // stage only starts later (a live handover).
+            vs_delay.set_geometry(active_ratio, active_graph_rate);
+            // Varispeed primes on its own schedule: the ring flushed, the
+            // scheduler reset, cycles paced at the target speed until each
+            // prime period's pull and then the watermark are in.
+            let vs_prime = cur_rate == active_graph_rate
+                && match processor.varispeed(active_sink, active_ratio, active_graph_rate, channels)
+                {
+                    Some(port) => {
+                        let timing = Timing::new(
+                            active_graph_rate,
+                            vs_period_frames(active_ratio, period_out),
+                            cur_q as u32,
+                        );
+                        // The latest command and the new cap first: the
+                        // stage resets at the capped target, so the first
+                        // prime block plays at it.
+                        vs.start_priming(timing, port, &shared.varispeed_cmd);
+                        vs_delay = VsDelay::new(active_ratio, active_graph_rate);
+                        vs_delay.dac_read(mono_now_ns(), 0, false);
+                        vs_wake = None;
+                        pace_q = cur_q;
+                        pace_rate = cur_rate;
+                        true
+                    }
+                    None => {
+                        vs.stop();
+                        false
+                    }
+                };
+            if vs_prime {
+                vs_delay.set_latency(processor.latency_out_frames(active_sink));
+            }
+            vs.publish(&shared.varispeed);
             let pace_until = |deadline_ns: u64| {
                 loop {
                     let now = mono_now_ns();
@@ -4398,13 +6530,90 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                 if shared.stop.load(Ordering::Acquire) {
                     break;
                 }
-                pace_until(prime_deadline_ns);
-                let sample_len_in = (period_in as usize) * channels;
+                // A prefill with the source already buffered runs period
+                // after period without the RT loop's own checkpoint.
+                rt_guard.on_iteration(&shared.rt, processor.running_generation(), vs.hold_seq());
+                if !vs_prime {
+                    pace_until(prime_deadline_ns);
+                }
+                let (prime_in, prime_out) = planner.plan(active_ratio, period_out);
                 let prime_timeout_ms = if first_prime_after_reopen && p == 0 {
                     80
                 } else {
                     60
                 };
+                if vs_prime {
+                    // Varispeed: each stage call's planned source frames,
+                    // on the schedule's priming pace.
+                    let out_slice = &mut out_buf[..prime_out * channels];
+                    let ran = {
+                        let mut graph = RtGraph {
+                            clock_state: &mut clock_state,
+                            shared: &shared,
+                            raw_stream,
+                            data_efd: &data_efd,
+                            other: Some(&mut direct_cons),
+                            channels,
+                            guard: &mut rt_guard,
+                            mark: (processor.running_generation(), vs.hold_seq()),
+                        };
+                        vsl::run_period(
+                            &mut vs,
+                            &mut graph,
+                            &mut processor,
+                            PeriodBufs {
+                                ring: &mut dsp_cons,
+                                dsp_in: &mut dsp_in_buf,
+                                direct_in: &direct_in_buf,
+                                out: out_slice,
+                            },
+                            &shared.varispeed_cmd,
+                            PeriodPlan {
+                                sink: active_sink,
+                                ratio: active_ratio,
+                                graph_rate: active_graph_rate,
+                                channels,
+                                pos: planner.pos,
+                                n_in: prime_in,
+                                n_out: prime_out,
+                                kind: PullKind::Play,
+                                prime_wait_ns: Some(prime_timeout_ms as u64 * 1_000_000),
+                                poll: false,
+                                quantum: cur_q,
+                            },
+                            &mut vs_delay,
+                        )
+                    };
+                    match ran {
+                        Some(run) => {
+                            shared
+                                .dsp_popped_frames
+                                .fetch_add(run.taken as u64, Ordering::Relaxed);
+                            planner.commit(prime_in, prime_out, period_out);
+                            fade_ramp.apply_interleaved(out_slice, channels);
+                            let (w, _) =
+                                carry.prime_write(&mut **alsa, out_slice, channels, &|| {
+                                    shared.stop.load(Ordering::Acquire)
+                                        || shared.release_requested.load(Ordering::Acquire)
+                                });
+                            shared.frames_out.fetch_add(w as u64, Ordering::Relaxed);
+                            vs_delay.wrote(w, prime_in);
+                        }
+                        None => {
+                            vs_delay.clear_pending();
+                            if carry.is_empty()
+                                && let Some(w) =
+                                    prime_silence(&mut **alsa, &mut planner, prime_out, period_out)
+                            {
+                                shared.prime_silence_periods.fetch_add(1, Ordering::Relaxed);
+                                shared.frames_out.fetch_add(w as u64, Ordering::Relaxed);
+                                vs_delay.wrote(w, 0);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let sample_len_in = prime_in * channels;
                 let cons_slots = match active_sink {
                     SinkChoice::Direct => direct_cons.slots(),
                     _ => dsp_cons.slots(),
@@ -4415,7 +6624,7 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                     // A period may need more than one graph cycle when the
                     // quantum PipeWire runs is smaller than the period; space
                     // them like the steady loop does.
-                    let max_cycles = period_in.div_ceil(cur_q.max(1) as u32).max(1);
+                    let max_cycles = (prime_in as u32).div_ceil(cur_q.max(1) as u32).max(1);
                     for c in 0..max_cycles {
                         if c > 0 {
                             let slots = match active_sink {
@@ -4480,7 +6689,7 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                                 .fetch_add((n / channels) as u64, Ordering::Relaxed);
                         }
                     }
-                    let out_slice = &mut out_buf[..(aligned_period_out as usize) * channels];
+                    let out_slice = &mut out_buf[..prime_out * channels];
                     processor.process_block(
                         active_sink,
                         &dsp_in_buf[..sample_len_in],
@@ -4489,15 +6698,20 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                         channels,
                         active_ratio,
                         active_graph_rate,
+                        planner.pos,
                     );
+                    planner.commit(prime_in, prime_out, period_out);
                     fade_ramp.apply_interleaved(out_slice, channels);
-                    if let Ok(w) = alsa.write_i32_all_until(out_slice, || {
+                    // Auto-start is off: a write that does not fit would
+                    // wait for room that only `start()` frees.
+                    let (w, _) = carry.prime_write(&mut **alsa, out_slice, channels, &|| {
                         shared.stop.load(Ordering::Acquire)
                             || shared.release_requested.load(Ordering::Acquire)
-                    }) {
-                        shared.frames_out.fetch_add(w as u64, Ordering::Relaxed);
-                    }
-                } else if let Ok(w) = alsa.write_silence(aligned_period_out) {
+                    });
+                    shared.frames_out.fetch_add(w as u64, Ordering::Relaxed);
+                } else if carry.is_empty()
+                    && let Some(w) = prime_silence(&mut **alsa, &mut planner, prime_out, period_out)
+                {
                     shared.prime_silence_periods.fetch_add(1, Ordering::Relaxed);
                     shared.frames_out.fetch_add(w as u64, Ordering::Relaxed);
                 }
@@ -4515,8 +6729,37 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
             let ring_frames = dsp_cons.buffer().capacity() / channels;
             let cushion_slots =
                 start_cushion_frames(period_in, cur_q as u32, ring_frames) * channels;
-            let max_cushion_cycles = (cushion_slots / channels).div_ceil(cur_q.max(1) as usize);
-            for c in 0..max_cushion_cycles.max(1) {
+            let max_cushion_cycles = if vs_prime {
+                // Varispeed's start cushion is the low watermark,
+                // on the scheduler's priming pace.
+                let want = vs.scheduler().watermark();
+                let speed = processor
+                    .varispeed(active_sink, active_ratio, active_graph_rate, channels)
+                    .map_or(1.0, |port| port.speed());
+                let cycles = want.div_ceil(cur_q.max(1) as usize) as u64 + 2;
+                let timeout_ns = cycles * cycle_ns.max(1_000_000) * 2 + 60_000_000;
+                let mut graph = RtGraph {
+                    clock_state: &mut clock_state,
+                    shared: &shared,
+                    raw_stream,
+                    data_efd: &data_efd,
+                    other: Some(&mut direct_cons),
+                    channels,
+                    guard: &mut rt_guard,
+                    mark: (processor.running_generation(), vs.hold_seq()),
+                };
+                vsl::fill_until(
+                    &mut vs, &mut graph, &dsp_cons, channels, cur_rate, cur_q, &vs_delay, speed,
+                    want, timeout_ns,
+                );
+                0
+            } else {
+                (cushion_slots / channels)
+                    .div_ceil(cur_q.max(1) as usize)
+                    .max(1)
+            };
+            for c in 0..max_cushion_cycles {
+                rt_guard.on_iteration(&shared.rt, processor.running_generation(), vs.hold_seq());
                 let have_cushion = match active_sink {
                     SinkChoice::Direct => direct_cons.slots() >= cushion_slots,
                     _ => dsp_cons.slots() >= cushion_slots,
@@ -4535,7 +6778,7 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                     raw_stream,
                     cur_rate,
                     cur_q,
-                    (params.buffer_frames / active_ratio) as i64,
+                    i64::from(active_ratio.scale_to_input(params.buffer_frames)),
                     60,
                     completed,
                 );
@@ -4556,6 +6799,32 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                 }
             }
             if alsa.start().is_err() {
+                if hand_back_failed_device(
+                    &mut alsa_opt,
+                    &mut alsa_fds,
+                    &shared,
+                    &mut handle_xruns,
+                    &mut reopen_gate,
+                    &mut event_stash,
+                    &mut rt_to_ctrl_tx,
+                    &ctrl_efd,
+                    (
+                        active_graph_rate,
+                        scaled_quantum(config.quantum, active_graph_rate),
+                    ),
+                    active_sink,
+                ) {
+                    inflight_reopen = Some((active_graph_rate, active_sink));
+                    aborted_reopen = None;
+                    suspended = true;
+                    awaiting_chain_for_resume = None;
+                    pending_reopen = None;
+                    planner.reset();
+                    carry.clear();
+                    vs.stop();
+                    vs.publish(&shared.varispeed);
+                    continue;
+                }
                 let _ = event_stash.push_or_stash(
                     RtEvent::FatalError {
                         msg: "ALSA start failed",
@@ -4566,7 +6835,19 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                 break;
             }
             alsa_running = true;
-            shared.set_state(EngineState::Playing);
+            if vs_prime {
+                vs.finish_priming();
+                vs.publish(&shared.varispeed);
+                let queued = alsa.delay().unwrap_or(0);
+                vs_delay.dac_read(mono_now_ns(), queued, true);
+            }
+            on_device_started(
+                &shared,
+                &mut resume_ack,
+                &mut event_stash,
+                &mut rt_to_ctrl_tx,
+                &ctrl_efd,
+            );
             if let Ok(d) = alsa.delay() {
                 shared.alsa_delay_frames.store(d, Ordering::Relaxed);
             }
@@ -4582,9 +6863,23 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
             events: libc::POLLIN,
             revents: 0,
         });
-        // Wake for an owed graph cycle (period/quantum mismatch) as well as
-        // for the DAC.
-        let timeout_ns = pacer.next_due_ns().map_or(200_000_000, |due| {
+        // Varispeed also wakes on each cycle completion (`data_efd`).
+        let data_idx = vs.is_active().then(|| {
+            pollfds.push(libc::pollfd {
+                fd: data_efd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            pollfds.len() - 1
+        });
+        // Wake for an owed graph cycle (period/quantum mismatch, or the
+        // varispeed schedule's next slot) as well as for the DAC.
+        let next_due = if vs.is_active() {
+            vs_wake
+        } else {
+            pacer.next_due_ns()
+        };
+        let timeout_ns = next_due.map_or(200_000_000, |due| {
             due.saturating_sub(mono_now_ns()).min(200_000_000)
         });
         let timeout = libc::timespec {
@@ -4599,7 +6894,35 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                 std::ptr::null(),
             )
         };
-        if rc >= 0 && pacer.take_due(mono_now_ns(), pace_q, pace_rate) {
+        vs.sync_hold(&shared.varispeed_cmd, &shared.varispeed);
+        rt_guard.on_iteration(&shared.rt, processor.running_generation(), vs.hold_seq());
+        if rc >= 0 && vs.is_active() {
+            // A completion or the slot time: the schedule may trigger the
+            // next cycle. The ALSA fds ready in the same ppoll are handled
+            // below as usual.
+            let completed = data_idx.is_some_and(|i| pollfds[i].revents != 0);
+            if completed {
+                data_efd.drain();
+            }
+            if completed || vs_wake.is_some_and(|w| mono_now_ns() >= w) {
+                let speed = processor
+                    .varispeed(active_sink, active_ratio, active_graph_rate, channels)
+                    .map_or(1.0, |port| port.speed());
+                let mut graph = RtGraph {
+                    clock_state: &mut clock_state,
+                    shared: &shared,
+                    raw_stream,
+                    data_efd: &data_efd,
+                    other: None,
+                    channels,
+                    guard: &mut rt_guard,
+                    mark: (processor.running_generation(), vs.hold_seq()),
+                };
+                vs_wake = vsl::poll_trigger(
+                    &mut vs, &mut graph, &dsp_cons, channels, pace_rate, pace_q, &vs_delay, speed,
+                );
+            }
+        } else if rc >= 0 && pacer.take_due(mono_now_ns(), pace_q, pace_rate) {
             clock_state.advance_and_trigger(
                 &shared.io,
                 raw_stream.0.as_ptr(),
@@ -4629,6 +6952,10 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
         if rc == 0 {
             continue;
         }
+        if data_idx.is_some() && pollfds[..cmd_idx].iter().all(|p| p.revents == 0) {
+            // Only a cycle completion: nothing for the DAC yet.
+            continue;
+        }
 
         let Some(alsa) = alsa_opt.as_mut() else {
             continue;
@@ -4638,35 +6965,42 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
         let (avail, delay) = match alsa.avail_and_delay() {
             Ok(v) => v,
             Err(_) => {
-                shared.xruns.store(alsa.xruns(), Ordering::Relaxed);
+                note_xruns(&shared, alsa.xruns(), &mut handle_xruns);
                 alsa_running = false;
                 continue;
             }
         };
         shared.alsa_delay_frames.store(delay, Ordering::Relaxed);
-        shared.xruns.store(alsa.xruns(), Ordering::Relaxed);
+        note_xruns(&shared, alsa.xruns(), &mut handle_xruns);
+        // The clock delay's DAC term, tracked from here to each trigger.
+        vs_delay.dac_read(mono_now_ns(), delay, true);
+        vs_delay.clear_pending();
+        processor.dac_read(delay, mono_raw_now_ns());
 
-        if alsa.needs_restart() || !alsa.is_running() {
+        if alsa.needs_restart() || !alsa.is_running() || shared.device_gone.load(Ordering::Relaxed)
+        {
             alsa_running = false;
             continue;
         }
 
-        let default_q = (params.period_frames / active_ratio).max(32) as u64;
+        let default_q = active_ratio.scale_to_input(params.period_frames).max(32) as u64;
         let (cur_rate, cur_q) = read_target_clock(&shared.io, active_graph_rate, default_q);
         shared.graph_rate.store(cur_rate, Ordering::Release);
         shared.quantum.store(cur_q as u32, Ordering::Release);
+        note_landing(&shared, &mut landed, cur_rate, active_graph_rate);
 
         // Check if active sink switch, updated DesiredDspConfig, or rate switch requires ALSA reopen.
         let need_reopen = decide_rt_reopen(
             rt_dsp_cfg,
-            last_negotiated_key,
+            live_key,
             active_sink,
             target_sink,
             active_graph_rate,
             cur_rate,
             active_ratio,
         )
-        .is_some();
+        .is_some()
+            || (target_sink != active_sink && !processor.has_chain_for(target_sink, active_ratio));
         if need_reopen && pending_reopen.is_none() {
             pending_reopen = Some((cur_rate, cur_q as u32, target_sink));
             let fade_out_frames = ((params.rate as usize) * FADE_MS) / 1000;
@@ -4677,39 +7011,195 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
             active_sink = target_sink;
         }
 
-        let period_out = params.period_frames.max(active_ratio);
-        let period_in = (period_out / active_ratio).max(1);
-        if avail < period_in * active_ratio {
+        let period_out = params.period_frames.max(1);
+        let (chunk_in, chunk_out) = planner.plan(active_ratio, period_out);
+        if (avail as usize) < chunk_out {
             continue;
         }
+        // Frames the prefill planned beyond the buffer go out first, before
+        // any input is taken for the next block.
+        match write_carry_ahead(&mut carry, &mut **alsa, channels, &shared) {
+            CarryNext::Block => {}
+            CarryNext::Wait => continue,
+            CarryNext::Restart => {
+                alsa_running = false;
+                continue;
+            }
+        }
 
-        let chunk_in = period_in as usize;
-        let chunk_out = (period_in * active_ratio) as usize;
-        let in_samples_len = chunk_in * channels;
+        // Varispeed: take the schedule over, retune it, or hand it back
+        // (once the ring holds the first raw pull). No stage runs while the
+        // graph moved to another rate (a reopen is fading out; the input is
+        // discarded then).
+        {
+            let vs_period = vs_period_frames(active_ratio, period_out);
+            let mark = (processor.running_generation(), vs.hold_seq());
+            let port = if cur_rate == active_graph_rate {
+                processor.varispeed(active_sink, active_ratio, active_graph_rate, channels)
+            } else {
+                None
+            };
+            let raw_pull = if active_sink == SinkChoice::Dsp {
+                chunk_in
+            } else {
+                0
+            };
+            let wait_ns =
+                (chunk_in as u64 * 1_000_000_000) / u64::from(active_graph_rate.max(1)) / 2;
+            let mut graph = RtGraph {
+                clock_state: &mut clock_state,
+                shared: &shared,
+                raw_stream,
+                data_efd: &data_efd,
+                other: None,
+                channels,
+                guard: &mut rt_guard,
+                mark,
+            };
+            let h = vsl::handover(
+                &mut vs,
+                &mut graph,
+                &dsp_cons,
+                port,
+                channels,
+                active_graph_rate,
+                vs_period,
+                cur_q as u32,
+                raw_pull,
+                &vs_delay,
+                wait_ns,
+            );
+            if matches!(h, Handover::Started | Handover::Restarted) {
+                vs_delay.set_geometry(active_ratio, active_graph_rate);
+            }
+            if let Handover::HandedBack { .. } = h {
+                pacer.reset();
+                if active_sink == SinkChoice::Dsp {
+                    // What the refill did not bring in yet: a period and a
+                    // quantum, so the raw path's next pull finds them.
+                    let q = cur_q.max(1) as usize;
+                    let want = chunk_in + q;
+                    let fill = vsl::ring_fill(&dsp_cons, channels);
+                    pacer.owe(want.saturating_sub(fill).div_ceil(q) as u32);
+                }
+            }
+            if h != Handover::Unchanged {
+                vs.publish(&shared.varispeed);
+            }
+        }
+        if vs.is_active() {
+            pace_q = cur_q;
+            pace_rate = cur_rate;
+        } else {
+            vs_wake = None;
+        }
+
         let out_samples_len = chunk_out * channels;
+        // Varispeed: the period's stage calls (split when the period is
+        // longer than one call takes), each planned, pulled and processed;
+        // the schedule is polled around each block.
+        let mut t0 = mono_now_ns();
+        let vs_ran = if vs.is_active()
+            && processor
+                .varispeed(active_sink, active_ratio, active_graph_rate, channels)
+                .is_some()
+        {
+            let nd = drain_ring(&mut direct_cons) / channels;
+            shared
+                .direct_drained_unused
+                .fetch_add(nd as u64, Ordering::Relaxed);
+            vs_delay.set_latency(processor.latency_out_frames(active_sink));
+            let mut graph = RtGraph {
+                clock_state: &mut clock_state,
+                shared: &shared,
+                raw_stream,
+                data_efd: &data_efd,
+                other: None,
+                channels,
+                guard: &mut rt_guard,
+                mark: (processor.running_generation(), vs.hold_seq()),
+            };
+            let run = vsl::run_period(
+                &mut vs,
+                &mut graph,
+                &mut processor,
+                PeriodBufs {
+                    ring: &mut dsp_cons,
+                    dsp_in: &mut dsp_in_buf,
+                    direct_in: &direct_in_buf,
+                    out: &mut out_buf[..out_samples_len],
+                },
+                &shared.varispeed_cmd,
+                PeriodPlan {
+                    sink: active_sink,
+                    ratio: active_ratio,
+                    graph_rate: active_graph_rate,
+                    channels,
+                    pos: planner.pos,
+                    n_in: chunk_in,
+                    n_out: chunk_out,
+                    kind: PullKind::Play,
+                    prime_wait_ns: None,
+                    poll: true,
+                    quantum: cur_q,
+                },
+                &mut vs_delay,
+            );
+            if let Some(run) = run {
+                shared
+                    .dsp_popped_frames
+                    .fetch_add(run.taken as u64, Ordering::Relaxed);
+            }
+            run
+        } else {
+            None
+        };
+        if let Some(run) = vs_ran {
+            vs_wake = run.wake_at_ns;
+        }
+        let in_samples_len = vs_ran.map_or(chunk_in * channels, |r| r.pulled * channels);
 
         let popped = match active_sink {
+            _ if vs_ran.is_some() => vs_ran.map_or(0, |r| r.taken * channels),
             SinkChoice::Direct => {
                 let nd = drain_ring(&mut dsp_cons) / channels;
                 shared
                     .dsp_drained_unused
                     .fetch_add(nd as u64, Ordering::Relaxed);
-                let n = pop_f32_zero_pad(&mut direct_cons, &mut direct_in_buf[..in_samples_len]);
+                let (n, gone) = take_block_input(
+                    &mut direct_cons,
+                    &mut direct_in_buf[..in_samples_len],
+                    cur_rate,
+                    active_graph_rate,
+                );
                 shared
                     .direct_popped_frames
                     .fetch_add((n / channels) as u64, Ordering::Relaxed);
-                n
+                shared
+                    .direct_drained_unused
+                    .fetch_add((gone / channels) as u64, Ordering::Relaxed);
+                // Discarded input is no underrun.
+                if gone > 0 { in_samples_len } else { n }
             }
             _ => {
                 let nd = drain_ring(&mut direct_cons) / channels;
                 shared
                     .direct_drained_unused
                     .fetch_add(nd as u64, Ordering::Relaxed);
-                let n = pop_f32_zero_pad(&mut dsp_cons, &mut dsp_in_buf[..in_samples_len]);
+                let (n, gone) = take_block_input(
+                    &mut dsp_cons,
+                    &mut dsp_in_buf[..in_samples_len],
+                    cur_rate,
+                    active_graph_rate,
+                );
                 shared
                     .dsp_popped_frames
                     .fetch_add((n / channels) as u64, Ordering::Relaxed);
-                n
+                shared
+                    .dsp_drained_unused
+                    .fetch_add((gone / channels) as u64, Ordering::Relaxed);
+                // Discarded input is no underrun.
+                if gone > 0 { in_samples_len } else { n }
             }
         };
         if popped < in_samples_len {
@@ -4739,16 +7229,20 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
             thread::sleep(Duration::from_millis(stall.stall_ms));
         }
 
-        let t0 = mono_now_ns();
-        processor.process_block(
-            active_sink,
-            &dsp_in_buf[..in_samples_len],
-            &direct_in_buf[..in_samples_len],
-            &mut out_buf[..out_samples_len],
-            channels,
-            active_ratio,
-            active_graph_rate,
-        );
+        if vs_ran.is_none() {
+            t0 = mono_now_ns();
+            processor.process_block(
+                active_sink,
+                &dsp_in_buf[..in_samples_len],
+                &direct_in_buf[..in_samples_len],
+                &mut out_buf[..out_samples_len],
+                channels,
+                active_ratio,
+                active_graph_rate,
+                planner.pos,
+            );
+        }
+        planner.commit(chunk_in, chunk_out, period_out);
         let dt_ns = mono_now_ns().saturating_sub(t0);
         let cycle_ns = (chunk_in as f64) * 1_000_000_000.0 / (active_graph_rate.max(1) as f64);
         let inst_load = if cycle_ns > 0.0 {
@@ -4760,21 +7254,36 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
         shared
             .dsp_load_bits
             .store(dsp_load_ewma.to_bits(), Ordering::Relaxed);
+        // `rt_load_max`, and the processing budget varispeed's cap is
+        // derated for.
+        vs.note_load(
+            mono_now_ns(),
+            inst_load,
+            processor.varispeed(active_sink, active_ratio, active_graph_rate, channels),
+        );
+        shared
+            .rt_load_max_bits
+            .store(vs.load().peak().to_bits(), Ordering::Relaxed);
 
         fade_ramp.apply_interleaved(&mut out_buf[..out_samples_len], channels);
 
-        let write_res = alsa.write_i32_all_until(&out_buf[..out_samples_len], || {
+        let stop_write = || {
             shared.stop.load(Ordering::Acquire) || shared.release_requested.load(Ordering::Acquire)
-        });
-        shared.xruns.store(alsa.xruns(), Ordering::Relaxed);
+        };
+        let write_res = alsa
+            .write_i32_all_until(&out_buf[..out_samples_len], stop_write)
+            .ok();
+        note_xruns(&shared, alsa.xruns(), &mut handle_xruns);
+        rt_guard.period_done(&shared.rt);
 
         match write_res {
-            Ok(written) => {
+            Some(written) => {
                 shared
                     .frames_out
                     .fetch_add(written as u64, Ordering::Relaxed);
+                vs_delay.wrote(written, chunk_in);
             }
-            Err(_) => {
+            None => {
                 alsa_running = false;
                 continue;
             }
@@ -4791,7 +7300,8 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
             let _ = alsa.drop_frames();
             if alsa_opt.is_some()
                 && reopen_gate.rt_try_begin_reopen()
-                && let Some(old_alsa) = alsa_opt.take()
+                && let Some(old_alsa) =
+                    take_counted(&mut alsa_opt, |a| a.xruns(), &shared, &mut handle_xruns)
             {
                 let old_fds = std::mem::take(&mut alsa_fds);
                 inflight_reopen = Some((target_rate, reopen_sink));
@@ -4802,6 +7312,7 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
                         target_sink: reopen_sink,
                         old_alsa: Some(old_alsa),
                         old_fds,
+                        device_failed: false,
                     },
                     &mut rt_to_ctrl_tx,
                     &ctrl_efd,
@@ -4819,10 +7330,18 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
         // the first are fired from the poll above, spaced (never back to
         // back: the source clients could not keep up and PipeWire would
         // fill those cycles with silence).
+        if vs.is_active() {
+            vs.publish(&shared.varispeed);
+            continue;
+        }
         pacer.consumed(chunk_in as u64, cur_q);
         pace_q = cur_q;
         pace_rate = cur_rate;
-        pace_delay_graph = delay / (active_ratio as i64);
+        // The DAC's queue, and the alignment delay ahead of the chain
+        // (multi-device; zero without followers).
+        pace_delay_graph =
+            i64::from(active_ratio.scale_to_input(delay.clamp(0, i64::from(u32::MAX)) as u32))
+                + processor.alignment_frames(active_sink) as i64;
         if pacer.take_due(mono_now_ns(), cur_q, cur_rate) {
             clock_state.advance_and_trigger(
                 &shared.io,
@@ -4835,7 +7354,7 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
     }
 
     event_stash.flush(&mut rt_to_ctrl_tx, &ctrl_efd);
-    if let Some(mut alsa) = alsa_opt.take() {
+    if let Some(mut alsa) = take_counted(&mut alsa_opt, |a| a.xruns(), &shared, &mut handle_xruns) {
         if alsa_running {
             let _ = alsa.drop_frames();
         }
@@ -4849,6 +7368,160 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
             &ctrl_efd,
         );
     }
+}
+
+// ------------------------------------------------- varispeed in the RT loop
+//
+// The RT loop's varispeed steps live here, apart from the loop, so the loop
+// itself only calls them.
+
+/// The largest nominal period, graph frames, the planner asks for at
+/// `ratio` (a rational grid varies by a frame): the scheduler's `P`.
+/// How early the free-running clock (no device) may fire a cycle: the
+/// wait before it is a timed `ppoll`, which can wake a little late but
+/// never much early.
+const FREE_RUN_EARLY_NS: u64 = 250_000;
+
+/// The RT thread's device failed in a way a restart of the stream cannot
+/// fix (usually it was unplugged): hand it to the control thread for a
+/// reopen ([`RtEvent::NeedReopen`] with `device_failed`). A failed reopen
+/// then waits for the device while the graph runs on the RT thread's own
+/// clock. `false` when a reopen is already in flight (the caller then ends
+/// the thread).
+#[allow(clippy::too_many_arguments)]
+fn hand_back_failed_device<const N: usize>(
+    alsa_opt: &mut Option<Box<AlsaOutput>>,
+    alsa_fds: &mut Vec<libc::pollfd>,
+    shared: &SharedEngineState,
+    handle_xruns: &mut u64,
+    reopen_gate: &mut ReopenGate,
+    event_stash: &mut BoundedEventStash<RtEvent, N>,
+    rt_to_ctrl_tx: &mut rtrb::Producer<RtEvent>,
+    ctrl_efd: &EventFd,
+    (rate, quantum): (u32, u32),
+    sink: SinkChoice,
+) -> bool {
+    if !reopen_gate.rt_try_begin_reopen() {
+        return false;
+    }
+    let old_alsa = take_counted(alsa_opt, |a| a.xruns(), shared, handle_xruns);
+    let old_fds = std::mem::take(alsa_fds);
+    let _ = event_stash.push_or_stash(
+        RtEvent::NeedReopen {
+            target_rate: rate,
+            target_quantum: quantum,
+            target_sink: sink,
+            old_alsa,
+            old_fds,
+            device_failed: true,
+        },
+        rt_to_ctrl_tx,
+        ctrl_efd,
+    );
+    shared.reopens.fetch_add(1, Ordering::Relaxed);
+    shared.alsa_delay_frames.store(0, Ordering::Relaxed);
+    shared.set_state(EngineState::Switching);
+    true
+}
+
+fn vs_period_frames(ratio: RateRatio, period_out: u32) -> u32 {
+    let period_out = period_out.max(1);
+    if ratio.is_integer() {
+        (period_out / ratio.up.max(1)).max(1)
+    } else {
+        (u64::from(period_out) * u64::from(ratio.down)).div_ceil(u64::from(ratio.up)) as u32 + 1
+    }
+}
+
+/// The PipeWire graph as the varispeed steps see it
+/// ([`crate::varispeed_loop::VsGraph`]).
+struct RtGraph<'a> {
+    clock_state: &'a mut DriverClockState,
+    shared: &'a SharedEngineState,
+    raw_stream: SendRawStream,
+    data_efd: &'a EventFd,
+    /// The other sink's ring, drained while priming.
+    other: Option<&'a mut rtrb::Consumer<f32>>,
+    channels: usize,
+    /// The overload guard, run at each [`VsGraph::checkpoint`] with the
+    /// chain generation and the varispeed hold's sequence that run
+    /// (`(generation, hold_seq)`, read when the graph is built).
+    guard: &'a mut crate::rt_overload::RtLoopGuard,
+    mark: (u64, u64),
+}
+
+impl VsGraph for RtGraph<'_> {
+    fn now_ns(&self) -> u64 {
+        mono_now_ns()
+    }
+
+    fn completed(&self) -> u64 {
+        self.shared.cycle_counter(false).load(Ordering::Acquire)
+    }
+
+    fn trigger(&mut self, rate: u32, quantum: u64, delay: i64, speed: f64) {
+        self.clock_state.advance_and_trigger_at(
+            &self.shared.io,
+            self.raw_stream.0.as_ptr(),
+            rate,
+            quantum,
+            delay,
+            speed,
+        );
+    }
+
+    fn wait_until(&mut self, until_ns: u64) {
+        let wait_ns = until_ns.saturating_sub(mono_now_ns()).max(50_000);
+        let ts = libc::timespec {
+            tv_sec: (wait_ns / 1_000_000_000) as libc::time_t,
+            tv_nsec: (wait_ns % 1_000_000_000) as libc::c_long,
+        };
+        let mut pfd = [libc::pollfd {
+            fd: self.data_efd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        unsafe {
+            libc::ppoll(pfd.as_mut_ptr(), 1, &ts, std::ptr::null());
+        }
+        self.data_efd.drain();
+    }
+
+    fn stopping(&self) -> bool {
+        self.shared.stop.load(Ordering::Acquire)
+    }
+
+    fn checkpoint(&mut self) {
+        self.guard
+            .on_iteration(&self.shared.rt, self.mark.0, self.mark.1);
+    }
+
+    fn drain_other(&mut self) {
+        if let Some(other) = self.other.as_mut() {
+            let n = drain_ring(other) / self.channels.max(1);
+            self.shared
+                .direct_drained_unused
+                .fetch_add(n as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The graph for the tail drain: the source has ended, so no cycle is
+/// triggered; only the clock is read.
+struct NoCycles;
+
+impl VsGraph for NoCycles {
+    fn now_ns(&self) -> u64 {
+        mono_now_ns()
+    }
+
+    fn completed(&self) -> u64 {
+        0
+    }
+
+    fn trigger(&mut self, _rate: u32, _quantum: u64, _delay: i64, _speed: f64) {}
+
+    fn wait_until(&mut self, _until_ns: u64) {}
 }
 
 /// Read one buffer from a sink stream into its ring. Returns nothing; the
@@ -4893,6 +7566,14 @@ fn process_sink_buffer(stream: &pw::stream::Stream, data: &mut StreamSideData) {
         }
         return;
     }
+    // Varispeed counts the cycles that deliver less than a quantum (the
+    // watermark refills from the ring either way).
+    if !data.is_direct
+        && data.shared.varispeed.is_active()
+        && frames < data.shared.quantum.load(Ordering::Relaxed) as usize
+    {
+        data.shared.varispeed.note_short_cycle();
+    }
     let samples_needed = frames * ch;
     let payload = &valid[..samples_needed * 4];
     if has_links && payload.iter().all(|&b| b == 0) {
@@ -4920,52 +7601,152 @@ fn drain_alsa_tail<P: EngineAudioProcessor>(
     out_buf: &mut [i32],
     params: NegotiatedParams,
     channels: usize,
-    ratio: u32,
+    ratio: RateRatio,
     graph_rate: u32,
+    planner: &mut PeriodPlanner,
+    carry: &mut OutCarry,
+    vs: &mut VarispeedDriver,
     stop: &AtomicBool,
     shared: &SharedEngineState,
+    rt_guard: &mut crate::rt_overload::RtLoopGuard,
 ) {
-    let period_out = params.period_frames.max(ratio);
-    let period_in = (period_out / ratio).max(1);
-    let chunk_in = period_in as usize;
-    let chunk_out = (period_in * ratio) as usize;
-    let in_samples_len = chunk_in * channels;
-    let out_samples_len = chunk_out * channels;
+    let period_out = params.period_frames.max(1);
 
-    let deadline = Instant::now() + Duration::from_millis(250);
+    // Varispeed: the stage's whole tail is pulled as padding once the ring
+    // is empty (`VsDrain`). No cycles are triggered here: the source has
+    // ended. The deadline covers what is queued: the ring at the applied
+    // speed, the tail, and the device's own delay.
+    let vs_tail = if vs.is_active() {
+        processor
+            .varispeed(active_sink, ratio, graph_rate, channels)
+            .map(|port| (port.tail_frames(), port.drain_speed()))
+    } else {
+        None
+    };
+    let queued = match active_sink {
+        SinkChoice::Direct => direct_cons.slots(),
+        _ => dsp_cons.slots(),
+    } / channels.max(1);
+    let device_delay = alsa.delay().unwrap_or(0);
+    let (tail, speed) = vs_tail.unwrap_or((0, 1.0));
+    // The alignment line (multi-device) holds source ahead of the stage or
+    // the chain: zeros push it out too, at the drain speed.
+    let align_tail =
+        (processor.alignment_max_frames(active_sink) as f64 / speed.max(0.5)).ceil() as usize;
+    let mut align_left = align_tail;
+    let deadline = Instant::now()
+        + Duration::from_nanos(vsl::drain_deadline_ns(
+            queued,
+            speed,
+            tail + align_tail,
+            device_delay,
+            ratio,
+            graph_rate,
+            period_out,
+        ));
+    let mut vs_drain = VsDrain::default();
+    let mut no_delay = VsDelay::new(ratio, graph_rate);
     loop {
+        // The drain can write for a while (the device has room) without
+        // returning to the RT loop: the overload guard runs here too.
+        rt_guard.on_iteration(&shared.rt, processor.running_generation(), vs.hold_seq());
+        // The carried frames go ahead of the tail (with or without one),
+        // never after it.
+        match write_carry_ahead(carry, alsa, channels, shared) {
+            CarryNext::Block => {}
+            CarryNext::Wait if Instant::now() < deadline && !stop.load(Ordering::Acquire) => {
+                let _ = alsa.wait_for_period(40);
+                continue;
+            }
+            CarryNext::Wait | CarryNext::Restart => break,
+        }
         let rem = match active_sink {
             SinkChoice::Direct => direct_cons.slots(),
             _ => dsp_cons.slots(),
         };
-        if rem == 0 || Instant::now() >= deadline || stop.load(Ordering::Acquire) {
+        let vs_tail = if vs.is_active() {
+            processor
+                .varispeed(active_sink, ratio, graph_rate, channels)
+                .map(|port| port.tail_frames())
+        } else {
+            None
+        };
+        match vs_tail {
+            Some(tail) if !vs_drain.more(rem / channels.max(1), tail + align_tail) => break,
+            Some(_) => {}
+            None if rem == 0 && align_left == 0 => break,
+            None => {}
+        }
+        if Instant::now() >= deadline || stop.load(Ordering::Acquire) {
             break;
         }
         let Ok(avail) = alsa.avail() else { break };
         if alsa.needs_restart() {
             break;
         }
+        let (chunk_in, chunk_out) = planner.plan(ratio, period_out);
+        let in_samples_len = chunk_in * channels;
+        let out_samples_len = chunk_out * channels;
         if avail < chunk_out as u32 {
             let _ = alsa.wait_for_period(40);
             continue;
         }
-        match active_sink {
-            SinkChoice::Direct => {
-                pop_f32_zero_pad(direct_cons, &mut direct_in_buf[..in_samples_len]);
+        let vs_ran = if vs_tail.is_some() {
+            let run = vsl::run_period(
+                vs,
+                &mut NoCycles,
+                processor,
+                PeriodBufs {
+                    ring: dsp_cons,
+                    dsp_in: dsp_in_buf,
+                    direct_in: direct_in_buf,
+                    out: &mut out_buf[..out_samples_len],
+                },
+                &shared.varispeed_cmd,
+                PeriodPlan {
+                    sink: active_sink,
+                    ratio,
+                    graph_rate,
+                    channels,
+                    pos: planner.pos,
+                    n_in: chunk_in,
+                    n_out: chunk_out,
+                    kind: PullKind::Drain,
+                    prime_wait_ns: None,
+                    poll: false,
+                    quantum: 0,
+                },
+                &mut no_delay,
+            );
+            vs_drain.pulled(chunk_in);
+            run.is_some()
+        } else {
+            false
+        };
+        if !vs_ran {
+            if rem == 0 {
+                align_left = align_left.saturating_sub(chunk_in);
             }
-            _ => {
-                pop_f32_zero_pad(dsp_cons, &mut dsp_in_buf[..in_samples_len]);
+            match active_sink {
+                SinkChoice::Direct => {
+                    pop_f32_zero_pad(direct_cons, &mut direct_in_buf[..in_samples_len]);
+                }
+                _ => {
+                    pop_f32_zero_pad(dsp_cons, &mut dsp_in_buf[..in_samples_len]);
+                }
             }
+            processor.process_block(
+                active_sink,
+                &dsp_in_buf[..in_samples_len],
+                &direct_in_buf[..in_samples_len],
+                &mut out_buf[..out_samples_len],
+                channels,
+                ratio,
+                graph_rate,
+                planner.pos,
+            );
         }
-        processor.process_block(
-            active_sink,
-            &dsp_in_buf[..in_samples_len],
-            &direct_in_buf[..in_samples_len],
-            &mut out_buf[..out_samples_len],
-            channels,
-            ratio,
-            graph_rate,
-        );
+        planner.commit(chunk_in, chunk_out, period_out);
         fade_ramp.apply_interleaved(&mut out_buf[..out_samples_len], channels);
         if alsa
             .write_i32_all_until(&out_buf[..out_samples_len], || stop.load(Ordering::Acquire))
@@ -4983,6 +7764,7 @@ fn drain_alsa_tail<P: EngineAudioProcessor>(
         && Instant::now() < deadline
         && !stop.load(Ordering::Acquire)
     {
+        rt_guard.on_iteration(&shared.rt, processor.running_generation(), vs.hold_seq());
         let Ok((avail, delay)) = alsa.avail_and_delay() else {
             break;
         };
@@ -5050,6 +7832,25 @@ fn pop_f32_zero_pad(cons: &mut rtrb::Consumer<f32>, dst: &mut [f32]) -> usize {
 }
 
 #[inline]
+/// The active sink's input for the next block: `(popped samples, samples
+/// discarded)`. While the graph runs at another rate than the device was
+/// opened for (a reopen for the new rate is fading out), what the ring
+/// delivers belongs to the new rate: through the old chain it would play at
+/// the wrong speed. It is discarded and the block gets silence, so the fade
+/// only carries what the chain already holds for the old open.
+fn take_block_input(
+    cons: &mut rtrb::Consumer<f32>,
+    dst: &mut [f32],
+    graph_rate: u32,
+    opened_rate: u32,
+) -> (usize, usize) {
+    if graph_rate != opened_rate {
+        dst.fill(0.0);
+        return (0, drain_ring(cons));
+    }
+    (pop_f32_zero_pad(cons, dst), 0)
+}
+
 fn drain_ring(cons: &mut rtrb::Consumer<f32>) -> usize {
     let avail = cons.slots();
     if avail > 0
@@ -5093,6 +7894,12 @@ impl CyclePacer {
         let n = self.credit / q;
         self.credit -= n * q;
         self.owed = (self.owed + n as u32).min(Self::MAX_OWED);
+    }
+
+    /// Owe `cycles` more (a handover from the varispeed schedule tops the
+    /// ring up to a period and a quantum).
+    pub(crate) fn owe(&mut self, cycles: u32) {
+        self.owed = (self.owed + cycles).min(Self::MAX_OWED);
     }
 
     /// Minimum spacing between two cycles, ns.
@@ -5156,7 +7963,695 @@ fn next_prime_deadline_ns(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn turning_dsp_off_reaches_the_arbiter_although_the_published_rates_stay() {
+        use crate::lifecycle::{BypassLeg, DesiredDspConfig, RatePairMask};
+        use crate::rate_arbiter::{RateArbiter, RateClient, RateInputs, Verdict};
+        use audivane_protocol::RateTarget;
+        use audivane_protocol::ipc::{FormatCapability, RateCapability};
+        // 44.1 kHz through the DSP sink, upsampling off, a 48 kHz-only DAC.
+        let caps = DeviceCapabilities {
+            device: "hw:CARD=USB,DEV=0".into(),
+            channels: 2,
+            channels_min: 2,
+            channels_max: 2,
+            rates: vec![RateCapability {
+                rate: 48_000,
+                formats: vec![FormatCapability {
+                    format: SampleFormat::S32,
+                    sbits: Some(32),
+                }],
+            }],
+            rate_min: 48_000,
+            rate_max: 48_000,
+            formats: vec![SampleFormat::S32],
+        };
+        let formats = [SampleFormat::S32];
+        let configured = RatePolicy::default();
+        let desired = |dsp_enabled| DesiredDspConfig {
+            dsp_enabled,
+            rate_target: RateTarget::Off,
+            bypass: BypassLeg {
+                engine: true,
+                buildable: RatePairMask::ALL,
+                allowed: BypassLeg::allowed_bits(&configured.allowed_rates),
+            },
+            ..DesiredDspConfig::default()
+        };
+        let policies = |dsp_enabled| {
+            let d = desired(dsp_enabled);
+            let eff = effective_rate_policy(&configured, &caps, d, &formats, ALLOWED_RATES)
+                .unwrap()
+                .policy;
+            crate::rate_caps::rate_policies(eff, Some(&caps), &formats, d)
+        };
+        let (on, off) = (policies(true), policies(false));
+        // The published union is the same (Direct already converted 44.1
+        // kHz); only the DSP sink's own policy gains it.
+        assert_eq!(on.published, off.published);
+        assert!(!on.dsp.allowed_rates.contains(&44_100));
+        assert!(off.dsp.allowed_rates.contains(&44_100));
+        let sent = SentRatePolicies {
+            published: on.published.clone(),
+            sinks: Some(on.clone()),
+        };
+        assert!(!sent.due(&on.published, &Some(on.clone())));
+        assert!(sent.due(&off.published, &Some(off.clone())));
+        // And the arbiter, told, moves the graph to the source rate (the
+        // engine converts it then; PipeWire no longer does).
+        let clients = [RateClient {
+            id: 1,
+            name: "app".into(),
+            native_rate: 44_100,
+            since: 0,
+        }];
+        let decide = |p: &crate::rate_caps::RatePolicies| {
+            RateArbiter::default().decide(
+                &RateInputs {
+                    policy: &p.published,
+                    current: 48_000,
+                    direct_active: false,
+                    direct: &[],
+                    dsp: &clients,
+                    direct_policy: Some(&p.direct),
+                    dsp_policy: Some(&p.dsp),
+                    direct_native: Some(&p.direct_native),
+                    dsp_native: Some(&p.dsp_native),
+                },
+                Instant::now(),
+                false,
+            )
+        };
+        assert!(matches!(decide(&on), Verdict::Keep(c) if c.rate == 48_000));
+        assert!(matches!(decide(&off), Verdict::Switch(c) if c.rate == 44_100));
+    }
+
+    /// A device buffer of `capacity` frames with auto-start off: before
+    /// `start` nothing frees room; afterwards each `play` frees frames, and
+    /// a write waits while the device plays.
+    struct FakePcm {
+        capacity: usize,
+        filled: usize,
+        channels: usize,
+        running: bool,
+        received: Vec<i32>,
+        timeouts: usize,
+        /// The next write underruns: recovery prepares the device and
+        /// the write returns 0.
+        underrun_next: bool,
+        restart: bool,
+    }
+
+    impl FakePcm {
+        fn play(&mut self, frames: usize) {
+            self.filled = self.filled.saturating_sub(frames);
+        }
+    }
+
+    impl PcmSink for FakePcm {
+        fn room(&mut self) -> Option<usize> {
+            Some(self.capacity - self.filled)
+        }
+
+        fn needs_restart(&self) -> bool {
+            self.restart
+        }
+
+        fn write_silence(&mut self, frames: usize) -> Option<usize> {
+            self.write_all(&vec![0; frames * self.channels], &|| false)
+        }
+
+        fn write_all(&mut self, samples: &[i32], _stop: &dyn Fn() -> bool) -> Option<usize> {
+            if self.underrun_next {
+                self.underrun_next = false;
+                self.restart = true;
+                self.running = false;
+                self.filled = 0;
+                return Some(0);
+            }
+            let frames = samples.len() / self.channels;
+            if self.running {
+                // Waiting while the device plays frees what is missing.
+                self.play((self.filled + frames).saturating_sub(self.capacity));
+            }
+            let n = frames.min(self.capacity - self.filled);
+            self.received
+                .extend_from_slice(&samples[..n * self.channels]);
+            self.filled += n;
+            if n < frames {
+                // `write_i32_all_until` waits for room that never comes
+                // (about 200 ms) and gives up: the rest is lost.
+                self.timeouts += 1;
+                return None;
+            }
+            Some(n)
+        }
+    }
+
+    #[test]
+    fn input_across_a_rate_change_never_reaches_the_old_chain() {
+        // Playing 44.1 kHz at 160/147; the graph switched to 48 kHz and the
+        // reopen fades out. The ring now holds 48 kHz samples: none of them
+        // may go through the 44.1 kHz open (a 1 kHz tone would play at
+        // 918.75 Hz). They are discarded and the block is silence.
+        let (mut prod, mut cons) = rtrb::RingBuffer::<f32>::new(64);
+        for i in 0..32 {
+            prod.push(1.0 + i as f32).unwrap();
+        }
+        let mut dst = [7.0_f32; 16];
+        assert_eq!(
+            take_block_input(&mut cons, &mut dst, 48_000, 44_100),
+            (0, 32)
+        );
+        assert!(dst.iter().all(|&v| v == 0.0));
+        assert_eq!(cons.slots(), 0);
+        // At the opened rate the samples play.
+        for i in 0..8 {
+            prod.push(1.0 + i as f32).unwrap();
+        }
+        assert_eq!(
+            take_block_input(&mut cons, &mut dst, 44_100, 44_100),
+            (8, 0)
+        );
+        assert_eq!(dst[..8], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert!(dst[8..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn a_failed_open_of_a_missing_device_leaves_no_earlier_probe_in_the_status() {
+        // The status had capabilities of an earlier probe of the device;
+        // the open failed and the device does not answer the probe after
+        // it: no capabilities, and no probe counted (the overload fallback
+        // waits instead of blaming its step).
+        let device = "hw:CARD=AudivaneNoSuchCard,DEV=0";
+        let config = EngineDriverConfig {
+            device: device.into(),
+            ..EngineDriverConfig::default()
+        };
+        let shared = Arc::new(SharedEngineState::new(&config));
+        shared.set_device_caps(Some(DeviceCapabilities {
+            device: device.into(),
+            ..DeviceCapabilities::default()
+        }));
+        let mut backend = RealDeviceBackend {
+            formats: config.formats.clone(),
+            channels: 2,
+            buffer_periods: 3,
+            ctrl_efd: Arc::new(EventFd::new().unwrap()),
+            shared: Arc::clone(&shared),
+            config: config.clone(),
+            probed_device: Some(device.into()),
+            caps: None,
+            probe_handle: None,
+            effective: None,
+            moves: None,
+        };
+        backend.reprobe_after_failure(device);
+        assert!(shared.device_caps.lock().unwrap().is_none());
+        assert_eq!(shared.probes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn a_paused_direct_client_never_silences_a_playing_dsp_one() {
+        // A player paused on Direct but still linked, a second one playing
+        // on the DSP sink; the driver group runs both nodes. The DSP sink
+        // drives the DAC (and a failed open recovers onto it).
+        let shared = SharedEngineState::new(&EngineDriverConfig::default());
+        let set = |flag: &AtomicBool, on| flag.store(on, Ordering::Release);
+        set(&shared.direct_streaming, true);
+        set(&shared.direct_has_links, true);
+        set(&shared.dsp_streaming, true);
+        set(&shared.dsp_has_links, true);
+        set(&shared.dsp_client_running, true);
+        assert_eq!(shared.pick_sink(), Some(SinkChoice::Dsp));
+        // The Direct player resumes: Direct takes the DAC.
+        set(&shared.direct_client_running, true);
+        assert_eq!(shared.pick_sink(), Some(SinkChoice::Direct));
+        // Nothing streams.
+        for f in [&shared.direct_streaming, &shared.dsp_streaming] {
+            set(f, false);
+        }
+        assert_eq!(shared.pick_sink(), None);
+    }
+
+    #[test]
+    fn a_paused_client_resuming_starts_a_session() {
+        // Direct drives both nodes; a DSP client is linked but paused. Its
+        // link is no stream: when it really resumes, a session starts.
+        let shared = SharedEngineState::new(&EngineDriverConfig::default());
+        let mut sessions = PlaybackSessions::default();
+        let set = |flag: &AtomicBool, on| flag.store(on, Ordering::Release);
+        set(&shared.direct_streaming, true);
+        set(&shared.direct_client_running, true);
+        set(&shared.direct_has_links, true);
+        set(&shared.dsp_streaming, true);
+        set(&shared.dsp_has_links, true);
+        let (dsp, direct) = shared.session_streams();
+        assert!(!dsp, "a paused client is no stream");
+        let s = sessions.observe(dsp, direct);
+        set(&shared.dsp_client_running, true);
+        let (dsp, direct) = shared.session_streams();
+        assert_eq!(sessions.observe(dsp, direct), s + 1);
+        // The Direct client pauses and resumes, still linked: another one.
+        set(&shared.direct_client_running, false);
+        let (dsp, direct) = shared.session_streams();
+        assert_eq!(sessions.observe(dsp, direct), s + 1);
+        set(&shared.direct_client_running, true);
+        let (dsp, direct) = shared.session_streams();
+        assert_eq!(sessions.observe(dsp, direct), s + 2);
+    }
+
+    #[test]
+    fn a_dsp_stream_starting_while_direct_drives_starts_a_session() {
+        // Direct plays, so the driver group runs and the DSP node's
+        // streaming flag is set without any client of its own. A stream
+        // that then starts on the DSP sink is a new playback session.
+        let shared = SharedEngineState::new(&EngineDriverConfig::default());
+        let mut sessions = PlaybackSessions::default();
+        let set = |flag: &AtomicBool, on| flag.store(on, Ordering::Release);
+        set(&shared.direct_streaming, true);
+        set(&shared.direct_client_running, true);
+        set(&shared.dsp_streaming, true);
+        let (dsp, direct) = shared.session_streams();
+        let s = sessions.observe(dsp, direct);
+        assert!(!dsp, "the group's flag is not a DSP stream");
+        set(&shared.dsp_has_links, true);
+        set(&shared.dsp_client_running, true);
+        let (dsp, direct) = shared.session_streams();
+        assert_eq!(sessions.observe(dsp, direct), s + 1);
+        // It stops (its node may keep running with the group): a later
+        // start is another session.
+        set(&shared.dsp_has_links, false);
+        set(&shared.dsp_client_running, false);
+        let (dsp, direct) = shared.session_streams();
+        assert_eq!(sessions.observe(dsp, direct), s + 1);
+        set(&shared.dsp_client_running, true);
+        let (dsp, direct) = shared.session_streams();
+        assert_eq!(sessions.observe(dsp, direct), s + 2);
+    }
+
+    #[test]
+    fn rational_prefill_fits_the_buffer_and_loses_no_frame() {
+        // 44.1 -> 96 kHz, 512-frame periods, a 1536-frame buffer: the three
+        // prefill periods plan 512 + 512 + 513 frames.
+        let ratio = RateRatio::from_rates(44_100, 96_000);
+        let (period_out, ch) = (512u32, 2usize);
+        let mut pcm = FakePcm {
+            capacity: 1536,
+            filled: 0,
+            channels: ch,
+            running: false,
+            received: Vec::new(),
+            timeouts: 0,
+            underrun_next: false,
+            restart: false,
+        };
+        let mut carry = OutCarry::with_capacity(ratio.max_frames_out(4096) * ch);
+        let mut planner = PeriodPlanner::default();
+        let mut sent = Vec::new();
+        let mut frame = 0i32;
+        let mut period = |planner: &mut PeriodPlanner, sent: &mut Vec<i32>| {
+            let (n_in, n_out) = planner.plan(ratio, period_out);
+            let out: Vec<i32> = (0..n_out)
+                .flat_map(|_| {
+                    frame += 1;
+                    [frame, -frame]
+                })
+                .collect();
+            planner.commit(n_in, n_out, period_out);
+            sent.extend_from_slice(&out);
+            out
+        };
+        let stop = || false;
+        let mut planned = 0;
+        for _ in 0..3 {
+            let out = period(&mut planner, &mut sent);
+            planned += out.len() / ch;
+            carry.prime_write(&mut pcm, &out, ch, &stop);
+        }
+        assert_eq!(planned, 1537);
+        assert_eq!(pcm.timeouts, 0, "a prefill write waited for room");
+        assert_eq!(pcm.filled, 1536);
+        // Started: each period played frees room; the carried frame goes
+        // out first.
+        pcm.running = true;
+        for _ in 0..4 {
+            pcm.play(period_out as usize);
+            let out = period(&mut planner, &mut sent);
+            assert_eq!(carry.write_ahead(&mut pcm, ch, &stop).1, CarryNext::Block);
+            pcm.write_all(&out, &stop).unwrap();
+        }
+        assert_eq!(pcm.timeouts, 0);
+        assert!(carry.is_empty());
+        assert_eq!(pcm.received, sent, "frames lost or reordered");
+    }
+
+    /// Prefill `periods` periods of `period_out` planned frames at `ratio`
+    /// into a stopped device of `buffer` frames through a carry of the
+    /// RT thread's size, then run it: `(frames dropped, whether the
+    /// prefill left frames carried, whether every frame played in order)`.
+    fn prefill_and_run(ratio: RateRatio, period_out: u32, buffer: usize) -> (usize, bool, bool) {
+        prefill_and_run_after_silence(ratio, period_out, buffer, 0)
+    }
+
+    /// [`prefill_and_run`] whose first `silent` primes find no source data
+    /// and write silence, as the RT thread does ([`prime_silence`]).
+    fn prefill_and_run_after_silence(
+        ratio: RateRatio,
+        period_out: u32,
+        buffer: usize,
+        silent: usize,
+    ) -> (usize, bool, bool) {
+        let ch = 2usize;
+        let mut pcm = FakePcm {
+            capacity: buffer,
+            filled: 0,
+            channels: ch,
+            running: false,
+            received: Vec::new(),
+            timeouts: 0,
+            underrun_next: false,
+            restart: false,
+        };
+        let mut carry = OutCarry::with_capacity(CARRY_MAX_FRAMES * ch);
+        let mut planner = PeriodPlanner::default();
+        let mut sent = Vec::new();
+        let mut frame = 0i32;
+        let mut period = |planner: &mut PeriodPlanner, sent: &mut Vec<i32>| {
+            let (n_in, n_out) = planner.plan(ratio, period_out);
+            let out: Vec<i32> = (0..n_out)
+                .flat_map(|_| {
+                    frame += 1;
+                    [frame, -frame]
+                })
+                .collect();
+            planner.commit(n_in, n_out, period_out);
+            sent.extend_from_slice(&out);
+            out
+        };
+        let stop = || false;
+        let mut dropped = 0;
+        for p in 0..prefill_periods(buffer as u32, period_out) as usize {
+            if p < silent {
+                let (_, prime_out) = planner.plan(ratio, period_out);
+                assert!(carry.is_empty());
+                let n = prime_silence(&mut pcm, &mut planner, prime_out, period_out).unwrap();
+                sent.extend(std::iter::repeat_n(0, n * ch));
+                continue;
+            }
+            let out = period(&mut planner, &mut sent);
+            dropped += carry.prime_write(&mut pcm, &out, ch, &stop).1;
+        }
+        assert_eq!(pcm.timeouts, 0, "a prefill write waited for room");
+        assert!(pcm.filled <= buffer);
+        let carried = !carry.is_empty();
+        pcm.running = true;
+        for _ in 0..4 {
+            pcm.play(period_out as usize);
+            let out = period(&mut planner, &mut sent);
+            assert_eq!(carry.write_ahead(&mut pcm, ch, &stop).1, CarryNext::Block);
+            pcm.write_all(&out, &stop).unwrap();
+        }
+        (dropped, carried, pcm.received == sent)
+    }
+
+    #[test]
+    fn alsa_lib_errors_are_logged_once_from_the_control_thread() {
+        let mut logged = 2;
+        assert_eq!(log_new_alsa_lib_errors(2, &mut logged), 0);
+        assert_eq!(log_new_alsa_lib_errors(5, &mut logged), 3);
+        assert_eq!(log_new_alsa_lib_errors(5, &mut logged), 0);
+    }
+
+    #[test]
+    fn a_closed_handle_s_last_xruns_are_counted() {
+        // An underrun in the tail drain, then the handle closes before
+        // another steady iteration: the close counts it.
+        let shared = SharedEngineState::new(&EngineDriverConfig::default());
+        let mut seen = 0;
+        let mut logged = 0;
+        note_xruns(&shared, 1, &mut seen);
+        let mut handle = Some(3u64);
+        assert_eq!(
+            take_counted(&mut handle, |h| *h, &shared, &mut seen),
+            Some(3)
+        );
+        assert_eq!(handle, None);
+        assert_eq!(log_new_xruns(&shared, &mut logged), 3);
+        assert_eq!(take_counted(&mut handle, |h| *h, &shared, &mut seen), None);
+        assert_eq!(log_new_xruns(&shared, &mut logged), 0);
+    }
+
+    #[test]
+    fn xruns_are_counted_on_the_rt_thread_and_logged_on_the_control_thread() {
+        let shared = SharedEngineState::new(&EngineDriverConfig::default());
+        let mut seen = 0;
+        let mut logged = 0;
+        assert_eq!(log_new_xruns(&shared, &mut logged), 0);
+        note_xruns(&shared, 1, &mut seen);
+        note_xruns(&shared, 1, &mut seen);
+        note_xruns(&shared, 3, &mut seen);
+        assert_eq!(shared.xruns.load(Ordering::Relaxed), 3);
+        assert_eq!(log_new_xruns(&shared, &mut logged), 3);
+        assert_eq!(log_new_xruns(&shared, &mut logged), 0, "logged once");
+        // A reopen: the new handle counts from 0; the total keeps going.
+        seen = 0;
+        note_xruns(&shared, 0, &mut seen);
+        note_xruns(&shared, 2, &mut seen);
+        assert_eq!(shared.xruns.load(Ordering::Relaxed), 2);
+        assert_eq!(shared.xrun_events.load(Ordering::Relaxed), 5);
+        assert_eq!(log_new_xruns(&shared, &mut logged), 2);
+    }
+
+    #[test]
+    fn a_prefill_never_writes_more_periods_than_the_buffer_holds() {
+        // x64: a 65,536-frame period in a 98,304-frame buffer (1.5
+        // periods, as a byte-capped USB buffer gives at 3.072 MHz). Two
+        // prefill periods lost 32,704 frames to the carry; one fits.
+        let x64 = RateRatio::integer(64);
+        assert_eq!(prefill_periods(98_304, 65_536), 1);
+        assert_eq!(prefill_and_run(x64, 65_536, 98_304), (0, false, true));
+        // The same short buffer at any rate (44.1 -> 96 kHz, 512-frame
+        // periods, a 928-frame buffer), and a rational x64-range pair.
+        let r96 = RateRatio::from_rates(44_100, 96_000);
+        assert_eq!(prefill_and_run(r96, 512, 928).0, 0);
+        let r2822 = RateRatio::from_rates(48_000, 2_822_400);
+        assert_eq!(prefill_and_run(r2822, 60_211, 98_304).0, 0);
+        // Buffers of whole periods keep their prefill depth: as many
+        // periods as fit, the rational overshoot carried, never dropped.
+        assert_eq!(prefill_periods(3 * 512, 512), 3);
+        assert_eq!(prefill_periods(2 * 65_536, 65_536), 2);
+        assert_eq!(prefill_periods(65_536, 65_536), 1);
+        assert_eq!(prefill_and_run(r96, 512, 1536).0, 0);
+        assert_eq!(prefill_and_run(r2822, 60_211, 2 * 60_211).0, 0);
+    }
+
+    #[test]
+    fn silent_primes_are_credited_like_audio() {
+        // 48 -> 2822.4 kHz (294/5) with 60,160-frame periods in a
+        // 180,480-frame buffer: two silent primes, then audio. Each prime
+        // overshoots its period by a few frames; uncredited, the silence's
+        // overshoot pushed the audio prime past the buffer and the carry.
+        let r = RateRatio::from_rates(48_000, 2_822_400);
+        assert_eq!(prefill_periods(180_480, 60_160), 3);
+        for silent in 0..=3 {
+            let (dropped, _, in_order) = prefill_and_run_after_silence(r, 60_160, 180_480, silent);
+            assert_eq!(dropped, 0, "{silent} silent primes");
+            assert!(in_order, "{silent} silent primes");
+        }
+    }
+
+    #[test]
+    fn a_short_carry_write_keeps_the_rest() {
+        let ch = 2;
+        let new_pcm = || FakePcm {
+            capacity: 8,
+            filled: 8,
+            channels: ch,
+            running: true,
+            received: Vec::new(),
+            timeouts: 0,
+            underrun_next: false,
+            restart: false,
+        };
+        let stop = || false;
+        // Room for one frame: it goes, the other waits, and no block may
+        // follow yet.
+        let mut pcm = new_pcm();
+        let mut carry = OutCarry::with_capacity(16);
+        carry.prime_write(&mut pcm, &[1, 1, 2, 2], ch, &stop);
+        pcm.filled = 7;
+        assert_eq!(carry.write_ahead(&mut pcm, ch, &stop), (1, CarryNext::Wait));
+        assert!(!carry.is_empty());
+        pcm.filled = 0;
+        assert_eq!(
+            carry.write_ahead(&mut pcm, ch, &stop),
+            (1, CarryNext::Block)
+        );
+        assert_eq!(pcm.received, [1, 1, 2, 2]);
+        // The first carry write underruns (recovery prepares the device,
+        // the write returns 0): the frames stay for the prefill that
+        // follows, which writes them first.
+        let mut pcm = new_pcm();
+        let mut carry = OutCarry::with_capacity(16);
+        carry.prime_write(&mut pcm, &[1, 1, 2, 2], ch, &stop);
+        pcm.filled = 0;
+        pcm.underrun_next = true;
+        assert_eq!(
+            carry.write_ahead(&mut pcm, ch, &stop),
+            (0, CarryNext::Restart)
+        );
+        assert!(!carry.is_empty());
+        pcm.restart = false;
+        assert_eq!(carry.prime_write(&mut pcm, &[3, 3], ch, &stop), (3, 0));
+        assert_eq!(pcm.received, [1, 1, 2, 2, 3, 3]);
+    }
+
+    #[test]
+    fn the_carry_bound_covers_every_rational_pair() {
+        // The prefill carries fewer than ceil(up / down) frames, for any
+        // graph rate and any output rate the driver opens: at most 59
+        // (48 kHz -> 2.8224 MHz is 294/5).
+        let mut worst = 0;
+        for &from in audivane_protocol::ALLOWED_RATES {
+            for to in crate::lifecycle::MASK_OUTPUT_RATES {
+                let r = RateRatio::from_rates(from, to);
+                let limit = crate::lifecycle::MAX_RATIONAL_TERM;
+                // Pairs past the term limit (44.1 kHz -> 3.072 MHz is
+                // 10240/147) are never opened.
+                if !r.is_integer() && r.up <= limit && r.down <= limit {
+                    let bound = (r.up as usize).div_ceil(r.down as usize);
+                    assert!(bound <= CARRY_MAX_FRAMES, "{from} -> {to}: {bound}");
+                    worst = worst.max(bound);
+                    // Silent primes (no source data yet) followed by audio
+                    // stay within it too, in whole and short buffers.
+                    for buffer in [3 * 4096, 4096 * 3 / 2] {
+                        for silent in 0..=3 {
+                            let (dropped, _, in_order) =
+                                prefill_and_run_after_silence(r, 4096, buffer, silent);
+                            assert!(
+                                dropped == 0 && in_order,
+                                "{from} -> {to}, buffer {buffer}, {silent} silent: {dropped} dropped"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(worst, 59);
+    }
+
+    #[test]
+    fn a_reprime_writes_the_carried_frames_first() {
+        // An xrun before the first steady write: the device is prepared
+        // again (empty) with a frame still carried; it goes out before the
+        // new prefill, and silence never jumps ahead of it.
+        let ch = 2;
+        let mut pcm = FakePcm {
+            capacity: 4,
+            filled: 0,
+            channels: ch,
+            running: false,
+            received: Vec::new(),
+            timeouts: 0,
+            underrun_next: false,
+            restart: false,
+        };
+        let mut carry = OutCarry::with_capacity(16);
+        let stop = || false;
+        assert_eq!(
+            carry.prime_write(&mut pcm, &[1, 1, 2, 2, 3, 3, 4, 4, 5, 5], ch, &stop),
+            (4, 0)
+        );
+        assert!(!carry.is_empty());
+        pcm.filled = 0;
+        pcm.received.clear();
+        assert_eq!(
+            carry.prime_write(&mut pcm, &[6, 6, 7, 7], ch, &stop),
+            (3, 0)
+        );
+        assert_eq!(pcm.received, [5, 5, 6, 6, 7, 7]);
+        assert!(carry.is_empty());
+        // Full: what does not fit the carry is dropped and counted.
+        pcm.filled = 4;
+        let mut small = OutCarry::with_capacity(2);
+        assert_eq!(
+            small.prime_write(&mut pcm, &[8, 8, 9, 9], ch, &stop),
+            (0, 1)
+        );
+    }
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn a_held_device_counts_as_gone_only_after_it_was_seen() {
+        let t0 = Instant::now();
+        let mut watch = PresenceWatch::new(t0);
+        // A name the watch cannot resolve never takes the device away.
+        assert_eq!(watch.look(t0, || false), Some(false));
+        assert_eq!(watch.look(t0, || false), None, "one look per poll");
+        let t1 = t0 + DEVICE_POLL;
+        assert_eq!(watch.look(t1, || true), Some(false));
+        // Unplugged between tracks.
+        let t2 = t1 + DEVICE_POLL;
+        assert_eq!(watch.look(t2, || false), Some(true));
+        // A new output: seen again before it can count as gone.
+        watch.reset();
+        assert_eq!(watch.look(t2 + DEVICE_POLL, || false), Some(false));
+    }
+
+    #[test]
+    fn a_release_or_reopen_ends_the_wait() {
+        let shared = SharedEngineState::new(&EngineDriverConfig::default());
+        let device = "hw:CARD=USB,DEV=0";
+        shared.device_missing.store(true, Ordering::Release);
+        shared.device_gone.store(true, Ordering::Release);
+        shared.set_error(waiting_text(device));
+        let mut lost = Some(LostDevice::new(false, Instant::now()));
+        end_waiting(&shared, &mut lost, device);
+        assert!(lost.is_none());
+        assert!(!shared.device_missing.load(Ordering::Acquire));
+        assert!(!shared.device_gone.load(Ordering::Acquire));
+        assert_eq!(shared.effective_error(), None);
+        // Another error stays.
+        shared.set_error("ALSA open/prepare failed");
+        end_waiting(&shared, &mut lost, device);
+        assert!(shared.effective_error().is_some());
+    }
+
+    #[test]
+    fn a_lost_device_is_opened_when_it_appears_and_retried_with_backoff() {
+        let t0 = Instant::now();
+        let mut lost = LostDevice::new(false, t0);
+        // Not due before the next look, and not while it is missing.
+        assert!(!lost.due(true, t0));
+        let t1 = t0 + DEVICE_POLL;
+        assert!(!lost.due(false, t1));
+        // It appears: open at once.
+        let t2 = t1 + DEVICE_POLL;
+        assert!(lost.due(true, t2));
+        // The open failed and it is still there: retried after a growing
+        // pause, never faster than the first retry.
+        assert!(!lost.due(true, t2 + DEVICE_RETRY_FIRST / 2));
+        let t3 = t2 + DEVICE_RETRY_FIRST;
+        assert!(lost.due(true, t3));
+        assert_eq!(lost.backoff, DEVICE_RETRY_FIRST * 2);
+        assert!(!lost.due(true, t3 + DEVICE_RETRY_FIRST));
+        let mut t = t3 + DEVICE_RETRY_FIRST * 2;
+        assert!(lost.due(true, t));
+        for _ in 0..10 {
+            t += lost.backoff;
+            assert!(lost.due(true, t));
+        }
+        assert_eq!(lost.backoff, DEVICE_RETRY_MAX);
+        // Gone again, then back: opened at once, the pause starts over.
+        t += lost.backoff;
+        assert!(!lost.due(false, t));
+        t += DEVICE_POLL;
+        assert!(lost.due(true, t));
+        assert_eq!(lost.backoff, DEVICE_RETRY_FIRST);
+    }
 
     #[test]
     fn quantum_scales_across_rate_families() {
@@ -5167,9 +8662,8 @@ mod tests {
         assert_eq!(scaled_quantum(256, 44_100), 128);
     }
 
-    /// Regression (88.2 kHz zero-fill): the quantum must be the one PipeWire
-    /// runs, a power of two, at every rate, or the ALSA period does not
-    /// match the graph cycle.
+    /// The quantum must be the one PipeWire runs, a power of two, at every
+    /// rate, or the ALSA period does not match the graph cycle.
     #[test]
     fn quantum_matches_pipewire_at_44k_family_rates() {
         assert_eq!(scaled_quantum(1024, 88_200), 1024);
@@ -5238,9 +8732,9 @@ mod tests {
         (zero_frames, silent_cycles)
     }
 
-    /// Regression (88.2 kHz zero-fill): even when the DAC period and the
-    /// graph quantum differ, every period is filled with real data and no
-    /// cycle fires so soon after another that the client cannot follow.
+    /// A DAC period that differs from the graph quantum must still be filled
+    /// with real data: no cycle may fire so soon after another that the
+    /// client cannot follow.
     #[test]
     fn period_quantum_mismatch_never_zero_fills() {
         for (rate, period_in, quantum) in [
@@ -5423,6 +8917,10 @@ mod tests {
                 error: Some("failed to open IR 'room.wav'".into()),
                 fatal: false,
                 generation: 3,
+                superseded: false,
+                bypass_unbuildable: false,
+                bypass_pending: false,
+                bypass_epoch: 0,
             },
             &shared,
             &mut Vec::new(),
@@ -5456,6 +8954,10 @@ mod tests {
                 error: Some("newer IR failure".into()),
                 fatal: false,
                 generation: 4,
+                superseded: false,
+                bypass_unbuildable: false,
+                bypass_pending: false,
+                bypass_epoch: 0,
             },
             &shared,
             &mut Vec::new(),
@@ -5491,6 +8993,10 @@ mod tests {
                 error: Some("late IR failure".into()),
                 fatal: false,
                 generation: 4,
+                superseded: false,
+                bypass_unbuildable: false,
+                bypass_pending: false,
+                bypass_epoch: 0,
             },
             &shared,
             &mut Vec::new(),
@@ -5507,6 +9013,10 @@ mod tests {
                 error: Some("new IR failure".into()),
                 fatal: false,
                 generation: 6,
+                superseded: false,
+                bypass_unbuildable: false,
+                bypass_pending: false,
+                bypass_epoch: 0,
             },
             &shared,
             &mut Vec::new(),
@@ -5539,6 +9049,11 @@ mod tests {
     struct StubBackend {
         released_reservations: usize,
         closed_outputs: usize,
+        /// Release hook runs so far, and what it was at the close and at
+        /// the reservation release.
+        hook_runs: Arc<AtomicUsize>,
+        runs_at_close: Option<usize>,
+        runs_at_release: Option<usize>,
     }
 
     impl DeviceBackend for StubBackend {
@@ -5564,26 +9079,31 @@ mod tests {
 
         fn release_reservation(&mut self, _res: Self::Reservation) {
             self.released_reservations += 1;
+            self.runs_at_release = Some(self.hook_runs.load(Ordering::SeqCst));
         }
 
         fn open_and_prepare(
             &mut self,
             _device: &str,
             _graph_rate: u32,
-            desired_ratio: u32,
+            ladder: &[RateRatio],
             _quantum: u32,
         ) -> std::result::Result<OpenedDevice<Self::Output>, String> {
+            let desired_ratio = ladder.first().copied().unwrap_or(RateRatio::ONE);
             Ok(OpenedDevice {
                 output: (),
                 actual_ratio: desired_ratio,
-                output_rate: 48_000 * desired_ratio,
+                output_rate: desired_ratio.output_rate(48_000).unwrap_or(48_000),
                 graph_rate: 48_000,
                 quantum: 1024,
+                plan: audivane_io_alsa::RatioOpen::at(desired_ratio),
+                session: 0,
             })
         }
 
         fn close_output(&mut self, _out: Self::Output) {
             self.closed_outputs += 1;
+            self.runs_at_close = Some(self.hook_runs.load(Ordering::SeqCst));
         }
     }
 
@@ -5603,6 +9123,10 @@ mod tests {
                 error: Some("failed to open IR 'room.wav'".into()),
                 fatal: false,
                 generation: 1,
+                superseded: false,
+                bypass_unbuildable: false,
+                bypass_pending: false,
+                bypass_epoch: 0,
             },
             &shared,
             &mut waiters,
@@ -5629,6 +9153,10 @@ mod tests {
                 error: Some("no chain could be built".into()),
                 fatal: true,
                 generation: 2,
+                superseded: false,
+                bypass_unbuildable: false,
+                bypass_pending: false,
+                bypass_epoch: 0,
             },
             &shared,
             &mut waiters,
@@ -5651,6 +9179,10 @@ mod tests {
                 error: None,
                 fatal: false,
                 generation: 3,
+                superseded: false,
+                bypass_unbuildable: false,
+                bypass_pending: false,
+                bypass_epoch: 0,
             },
             &shared,
             &mut Vec::new(),
@@ -5660,6 +9192,192 @@ mod tests {
         assert!(shared.effective_error().is_none());
     }
 
+    /// The latency a staged hardware raise waits for includes one period:
+    /// the ALSA delay is read before the output thread writes the next one.
+    #[test]
+    fn output_latency_counts_the_period_about_to_be_written() {
+        let cfg = EngineDriverConfig::default();
+        let shared = Arc::new(SharedEngineState::new(&cfg));
+        shared.set_state(EngineState::Playing);
+        shared.output_rate.store(96_000, Ordering::Relaxed);
+        shared.graph_rate.store(48_000, Ordering::Relaxed);
+        shared.quantum.store(1024, Ordering::Relaxed);
+        shared.alsa_delay_frames.store(9_600, Ordering::Relaxed);
+        shared.dsp_latency_out.store(0, Ordering::Relaxed);
+        let probe = test_driver_handle(Arc::clone(&shared)).output_latency_probe();
+        let got = probe().unwrap().as_secs_f64();
+        let want = 0.1 + 1024.0 / 48_000.0;
+        assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+        shared.set_state(EngineState::Idle);
+        assert_eq!(probe(), None);
+    }
+
+    /// The release hook (the engine's safe hardware volume) runs before the
+    /// ALSA output is closed and the reservation handed over, on an
+    /// external ReserveDevice1 release as on an explicit one.
+    #[test]
+    fn release_hook_runs_before_the_device_is_handed_over() {
+        for external in [true, false] {
+            let cfg = EngineDriverConfig::default();
+            let shared = SharedEngineState::new(&cfg);
+            let ran = Arc::new(AtomicUsize::new(0));
+            let ran_cb = Arc::clone(&ran);
+            *shared.before_release.lock().unwrap() = Some(Arc::new(move |kind, device: &str| {
+                assert_eq!(kind, ReleaseKind::HandOver);
+                assert_eq!(device, "hw:Loopback,0,0", "the card let go of");
+                ran_cb.fetch_add(1, Ordering::SeqCst);
+            }));
+            let mut backend = StubBackend {
+                released_reservations: 0,
+                closed_outputs: 0,
+                hook_runs: Arc::clone(&ran),
+                runs_at_close: None,
+                runs_at_release: None,
+            };
+            let mut lifecycle = DeviceLifecycle {
+                state: EngineState::Switching,
+                last_error: None,
+                reservation: Some((0, ())),
+                active_device: Some("hw:Loopback,0,0".into()),
+                active_graph_rate: 48_000,
+                active_ratio: RateRatio::ONE,
+                active_sink: SinkChoice::Dsp,
+                output_held: true,
+            };
+            let mut awaiting = true;
+            let mut release_waiters = Vec::new();
+            let mut acquire_waiters = Vec::new();
+            complete_release_teardown(
+                &mut backend,
+                &mut lifecycle,
+                &shared,
+                Some(()),
+                &mut awaiting,
+                external,
+                &mut release_waiters,
+                &mut acquire_waiters,
+                || Ok(()),
+            );
+            assert_eq!(ran.load(Ordering::SeqCst), 1, "external={external}");
+            assert_eq!(backend.runs_at_close, Some(1), "hook after the close");
+            assert_eq!(backend.runs_at_release, Some(1), "hook after the handover");
+            assert_eq!(backend.closed_outputs, 1);
+            assert_eq!(backend.released_reservations, 1);
+            assert_eq!(shared.state(), EngineState::Idle);
+        }
+    }
+
+    /// A start-up failing after the first negotiation (PipeWire
+    /// registration, say) hands the card over once, with its device; a
+    /// start-up that succeeded leaves it to the driver.
+    #[test]
+    fn a_failed_start_up_hands_the_card_over_once() {
+        let cfg = EngineDriverConfig::default();
+        let shared = Arc::new(SharedEngineState::new(&cfg));
+        let ran = Arc::new(Mutex::new(Vec::<(ReleaseKind, String)>::new()));
+        let ran_cb = Arc::clone(&ran);
+        *shared.before_release.lock().unwrap() = Some(Arc::new(move |kind, device: &str| {
+            ran_cb.lock().unwrap().push((kind, device.to_string()));
+        }));
+        {
+            let mut guard = InitHandOver::new(Arc::clone(&shared), "hw:CARD=A,DEV=0".into());
+            guard.run();
+        }
+        {
+            // An early `?` return: dropped while armed.
+            let _guard = InitHandOver::new(Arc::clone(&shared), "hw:CARD=B,DEV=0".into());
+        }
+        {
+            let mut guard = InitHandOver::new(Arc::clone(&shared), "hw:CARD=C,DEV=0".into());
+            guard.disarm();
+        }
+        assert_eq!(
+            *ran.lock().unwrap(),
+            [
+                (ReleaseKind::HandOver, "hw:CARD=A,DEV=0".to_string()),
+                (ReleaseKind::HandOver, "hw:CARD=B,DEV=0".to_string()),
+            ]
+        );
+    }
+
+    /// The driver stopping (engine shutdown) hands the DAC over like a
+    /// release: the hook runs before the reservation is released.
+    #[test]
+    fn stopping_runs_the_release_hook_before_the_reservation_goes() {
+        let cfg = EngineDriverConfig::default();
+        let shared = SharedEngineState::new(&cfg);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_cb = Arc::clone(&ran);
+        *shared.before_release.lock().unwrap() = Some(Arc::new(move |kind, device: &str| {
+            assert_eq!(kind, ReleaseKind::HandOver);
+            assert_eq!(device, "hw:Loopback,0,0", "the card let go of");
+            ran_cb.fetch_add(1, Ordering::SeqCst);
+        }));
+        let mut backend = StubBackend {
+            released_reservations: 0,
+            closed_outputs: 0,
+            hook_runs: Arc::clone(&ran),
+            runs_at_close: None,
+            runs_at_release: None,
+        };
+        let mut lifecycle = DeviceLifecycle {
+            state: EngineState::Playing,
+            last_error: None,
+            reservation: Some((0, ())),
+            active_device: Some("hw:Loopback,0,0".into()),
+            active_graph_rate: 48_000,
+            active_ratio: RateRatio::ONE,
+            active_sink: SinkChoice::Dsp,
+            output_held: false,
+        };
+        release_on_stop(&mut backend, &mut lifecycle, &shared);
+        assert_eq!(backend.runs_at_release, Some(1));
+        // Nothing held (already released): no hook.
+        release_on_stop(&mut backend, &mut lifecycle, &shared);
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    /// A release that completes after `release_device` stopped waiting
+    /// clears the timeout error; any other error stays.
+    #[test]
+    fn a_late_release_clears_the_timeout_error() {
+        for (earlier, cleared) in [(RELEASE_TIMEOUT_MSG, true), ("device unplugged", false)] {
+            let cfg = EngineDriverConfig::default();
+            let shared = SharedEngineState::new(&cfg);
+            shared.set_error(earlier);
+            let mut backend = StubBackend {
+                released_reservations: 0,
+                closed_outputs: 0,
+                hook_runs: Arc::default(),
+                runs_at_close: None,
+                runs_at_release: None,
+            };
+            let mut lifecycle = DeviceLifecycle {
+                state: EngineState::Switching,
+                last_error: None,
+                reservation: Some((0, ())),
+                active_device: Some("hw:Loopback,0,0".into()),
+                active_graph_rate: 48_000,
+                active_ratio: RateRatio::ONE,
+                active_sink: SinkChoice::Dsp,
+                output_held: true,
+            };
+            complete_release_teardown(
+                &mut backend,
+                &mut lifecycle,
+                &shared,
+                Some(()),
+                &mut true,
+                false,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                || Ok(()),
+            );
+            assert_eq!(shared.state(), EngineState::Idle);
+            assert_eq!(shared.effective_error().is_none(), cleared, "{earlier}");
+        }
+    }
+
     #[test]
     fn release_teardown_timeout_releases_resources_sets_error_and_fails_waiters() {
         let cfg = EngineDriverConfig::default();
@@ -5667,6 +9385,9 @@ mod tests {
         let mut backend = StubBackend {
             released_reservations: 0,
             closed_outputs: 0,
+            hook_runs: Arc::default(),
+            runs_at_close: None,
+            runs_at_release: None,
         };
         let mut lifecycle = DeviceLifecycle {
             state: EngineState::Switching,
@@ -5674,7 +9395,7 @@ mod tests {
             reservation: Some((0, ())),
             active_device: Some("hw:Loopback,0,0".into()),
             active_graph_rate: 48_000,
-            active_ratio: 1,
+            active_ratio: RateRatio::ONE,
             active_sink: SinkChoice::Dsp,
             output_held: true,
         };
@@ -5772,7 +9493,7 @@ mod tests {
 
     struct ReadyMockProcessor {
         ready_seq: u64,
-        installed_ratio: u32,
+        installed_ratio: RateRatio,
     }
 
     impl EngineAudioProcessor for ReadyMockProcessor {
@@ -5783,8 +9504,9 @@ mod tests {
             _direct_in: &[f32],
             out: &mut [i32],
             _channels: usize,
-            _ratio: u32,
+            _ratio: RateRatio,
             _graph_rate: u32,
+            _in_pos: u64,
         ) {
             out.fill(0);
         }
@@ -5797,7 +9519,7 @@ mod tests {
             &mut self,
             _active_sink: SinkChoice,
             _graph_rate: u32,
-            _actual_ratio: u32,
+            _actual_ratio: RateRatio,
             _is_streaming: bool,
         ) {
         }
@@ -5811,7 +9533,7 @@ mod tests {
         fn is_chain_ready(
             &self,
             active_sink: SinkChoice,
-            actual_ratio: u32,
+            actual_ratio: RateRatio,
             required_seq: Option<u64>,
         ) -> bool {
             if active_sink == SinkChoice::Direct {
@@ -5820,6 +9542,46 @@ mod tests {
             self.installed_ratio == actual_ratio
                 && required_seq.is_none_or(|req| self.ready_seq >= req)
         }
+    }
+
+    #[test]
+    fn a_resume_is_playing_only_once_the_device_started() {
+        // Streams play and the chain is ready: the device still has to be
+        // primed and started (and the live graph checked first). Until then
+        // nothing reaches the DAC, so not Playing, and no ack yet.
+        let shared = SharedEngineState::new(&EngineDriverConfig::default());
+        shared.dsp_streaming.store(true, Ordering::Release);
+        let (mut rt_tx, mut rt_rx) = rtrb::RingBuffer::<RtEvent>::new(8);
+        let mut stash: BoundedEventStash<RtEvent, 16> = BoundedEventStash::new();
+        let ctrl_efd = EventFd::new().unwrap();
+        let mut proc = ReadyMockProcessor {
+            ready_seq: 2,
+            installed_ratio: RateRatio::ONE,
+        };
+        let mut awaiting = Some(Some(2));
+        let mut suspended = true;
+        let mut ack = false;
+        assert!(try_complete_resume_gate(
+            &mut proc,
+            &shared,
+            &mut awaiting,
+            &mut suspended,
+            &mut ack,
+            SinkChoice::Dsp,
+            RateRatio::ONE,
+            &mut stash,
+            &mut rt_tx,
+            &ctrl_efd,
+        ));
+        assert!(!suspended && awaiting.is_none());
+        assert_eq!(shared.state(), EngineState::Switching);
+        assert!(rt_rx.pop().is_err(), "acknowledged before the start");
+        on_device_started(&shared, &mut ack, &mut stash, &mut rt_tx, &ctrl_efd);
+        assert_eq!(shared.state(), EngineState::Playing);
+        assert!(matches!(rt_rx.pop(), Ok(RtEvent::Resumed)));
+        // Only once.
+        on_device_started(&shared, &mut ack, &mut stash, &mut rt_tx, &ctrl_efd);
+        assert!(rt_rx.pop().is_err());
     }
 
     #[test]
@@ -5832,10 +9594,11 @@ mod tests {
 
         let mut proc = ReadyMockProcessor {
             ready_seq: 1,
-            installed_ratio: 1,
+            installed_ratio: RateRatio::ONE,
         };
         let mut awaiting = Some(Some(2));
         let mut suspended = false;
+        let mut ack = false;
 
         // Ratio changed to 4x and chain seq=2 is not yet installed.
         let resumed = try_complete_resume_gate(
@@ -5843,8 +9606,9 @@ mod tests {
             &shared,
             &mut awaiting,
             &mut suspended,
+            &mut ack,
             SinkChoice::Dsp,
-            4,
+            RateRatio::integer(4),
             &mut stash,
             &mut rt_tx,
             &ctrl_efd,
@@ -5862,14 +9626,15 @@ mod tests {
 
         // Now builder/reaper publishes seq=2 with 4x chain and RT installs it.
         proc.ready_seq = 2;
-        proc.installed_ratio = 4;
+        proc.installed_ratio = RateRatio::integer(4);
         let resumed = try_complete_resume_gate(
             &mut proc,
             &shared,
             &mut awaiting,
             &mut suspended,
+            &mut ack,
             SinkChoice::Dsp,
-            4,
+            RateRatio::integer(4),
             &mut stash,
             &mut rt_tx,
             &ctrl_efd,
@@ -5879,5 +9644,59 @@ mod tests {
         assert!(awaiting.is_none());
         assert_eq!(shared.state(), EngineState::Ready);
         assert!(matches!(rt_rx.pop(), Ok(RtEvent::Resumed)));
+    }
+
+    #[test]
+    fn period_planner_fills_every_period_at_the_exact_rate() {
+        for (ratio, period) in [
+            (RateRatio::from_rates(44_100, 48_000), 1024u32),
+            (RateRatio::from_rates(48_000, 44_100), 1024),
+            (RateRatio::from_rates(96_000, 48_000), 512),
+            (RateRatio::from_rates(192_000, 44_100), 441),
+            (RateRatio::from_rates(44_100, 192_000), 4096),
+            (RateRatio::integer(4), 4096),
+        ] {
+            let mut p = PeriodPlanner::default();
+            let (mut total_in, mut total_out) = (0u64, 0u64);
+            for _ in 0..2_000 {
+                let (n_in, n_out) = p.plan(ratio, period);
+                assert_eq!(n_out, ratio.frames_out(p.pos, n_in), "{ratio}");
+                // Each period is filled; the overshoot stays below one
+                // input frame's worth of output frames.
+                assert!(p.credit + n_out >= period as usize, "{ratio} underrun");
+                p.commit(n_in, n_out, period);
+                assert!(
+                    p.credit < (ratio.up as usize).div_ceil(ratio.down as usize).max(1),
+                    "{ratio} credit {}",
+                    p.credit
+                );
+                total_in += n_in as u64;
+                total_out += n_out as u64;
+            }
+            assert_eq!(total_out, ratio.frames_out_total(total_in), "{ratio}");
+            if ratio.is_integer() {
+                assert_eq!(p.credit, 0);
+            }
+            p.reset();
+            assert_eq!(p, PeriodPlanner::default());
+        }
+    }
+
+    /// A ratio change restarts the planner: no position or carried frames
+    /// from the old ratio's grid leak into the new one.
+    #[test]
+    fn period_planner_restarts_when_the_ratio_changes() {
+        let a = RateRatio::from_rates(44_100, 48_000);
+        let b = RateRatio::from_rates(48_000, 44_100);
+        let mut p = PeriodPlanner::default();
+        for _ in 0..7 {
+            let (n_in, n_out) = p.plan(a, 1000);
+            p.commit(n_in, n_out, 1000);
+        }
+        assert!(p.pos > 0);
+        let mut fresh = PeriodPlanner::default();
+        assert_eq!(p.plan(b, 1000), fresh.plan(b, 1000));
+        assert_eq!(p, fresh);
+        assert_eq!((p.pos, p.credit, p.ratio), (0, 0, b));
     }
 }

@@ -221,6 +221,87 @@ impl StereoGainRamp {
     }
 }
 
+impl StereoGainRamp {
+    /// Interleaved `f32` to left-justified `i32` with integer frame repeat
+    /// (`ratio`), for the Direct / bypass paths when the master volume has a
+    /// digital part: those paths must never play louder than requested.
+    /// Bit-exact with [`f32_to_i32`] while settled at unity.
+    ///
+    /// `dither`: the noise source and the DAC's bit depth. Below 32 bits a
+    /// scaled sample is quantized to that depth with TPDF dither (instead of
+    /// being truncated by the DAC); at unity nothing is added.
+    pub fn process_f32_to_i32_repeat(
+        &mut self,
+        input: &[f32],
+        out: &mut [i32],
+        channels: usize,
+        ratio: u32,
+        dither: Option<(&mut crate::dither::TpdfDither, u32)>,
+    ) {
+        let r = ratio.max(1) as usize;
+        if let Some((tpdf, bits)) = dither
+            && (1..32).contains(&bits)
+            && !self.is_unity_settled()
+        {
+            let scale = 2f64.powi(bits as i32 - 1);
+            let max_q = (1i64 << (bits - 1)) - 1;
+            let min_q = -(1i64 << (bits - 1));
+            let shift = 32 - bits;
+            let frames = input.len().checked_div(channels).unwrap_or(0);
+            // Digital silence stays digital silence (a DAC's auto-mute or
+            // standby must still see it): a channel whose gain is exactly 0
+            // (a settled mute) gets no noise, and a channel is dithered only
+            // from a non-zero sample on until ~100 ms after its last one
+            // (per channel, so a silent channel next to music stays silent
+            // and sparse clicks do not switch the noise at the block rate).
+            let hold_frames = self.sample_rate / 10;
+            for f in 0..frames {
+                let s_base = f * channels;
+                for k in 0..r {
+                    let g = self.next_frame();
+                    let d_base = (f * r + k) * channels;
+                    for c in 0..channels {
+                        let gain = g[c.min(2)];
+                        let x = input[s_base + c];
+                        let dithered = tpdf.keep_dithering(c, x != 0.0, hold_frames);
+                        if gain == 0.0 || !dithered {
+                            out[d_base + c] = 0;
+                            continue;
+                        }
+                        let v = f64::from(x) * gain * scale + tpdf.next_lsb();
+                        let q = if v.is_nan() {
+                            0
+                        } else {
+                            (v.round_ties_even() as i64).clamp(min_q, max_q)
+                        };
+                        out[d_base + c] = (q << shift) as i32;
+                    }
+                }
+            }
+            return;
+        }
+        if r == 1 {
+            self.process_interleaved_f32_to_i32(input, out, channels);
+            return;
+        }
+        let frames = input.len().checked_div(channels).unwrap_or(0);
+        for f in 0..frames {
+            let s_base = f * channels;
+            for k in 0..r {
+                let g = self.next_frame();
+                let d_base = (f * r + k) * channels;
+                for c in 0..channels {
+                    let scaled = f64::from(input[s_base + c]) * g[c.min(2)];
+                    out[d_base + c] = (scaled * 2_147_483_648.0)
+                        .round()
+                        .clamp(-2_147_483_648.0, 2_147_483_647.0)
+                        as i32;
+                }
+            }
+        }
+    }
+}
+
 /// Ramped digital mute for the Direct / bypass path (never scales by volume or
 /// balance; passes samples bit-exactly when unmuted and settled).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -449,6 +530,131 @@ mod tests {
         // Hardware volume + digital mute (no playback switch) -> muted (0.0).
         ramp.set_volume_targets(-18.0, 0.0, true, true, false, false);
         assert_eq!(ramp.current(), [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn repeat_path_attenuates_and_is_exact_at_unity() {
+        let input: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) / 64.0).collect();
+        let mut ramp = StereoGainRamp::unity(48_000);
+        let mut exact = vec![0_i32; 64 * 2];
+        let mut out = vec![0_i32; 64 * 2];
+        ramp.process_f32_to_i32_repeat(&input, &mut out, 2, 2, None);
+        for f in 0..32 {
+            for k in 0..2 {
+                crate::bypass::f32_to_i32(
+                    &input[f * 2..f * 2 + 2],
+                    &mut exact[(f * 2 + k) * 2..(f * 2 + k) * 2 + 2],
+                );
+            }
+        }
+        assert_eq!(out, exact);
+        ramp.set_volume_targets(-20.0, 0.0, false, false, false, false);
+        ramp.process_f32_to_i32_repeat(&input, &mut out, 2, 2, None);
+        for (o, e) in out.iter().zip(&exact) {
+            assert!((f64::from(*o) - f64::from(*e) * 0.1).abs() <= 1.0);
+        }
+    }
+
+    /// Non-unity gain on a 16-bit DAC: quantized to 16 bits with TPDF
+    /// dither (a constant input gives varying codes around the scaled
+    /// value, not one truncated code); unity stays bit-exact, no noise.
+    #[test]
+    fn repeat_path_dithers_below_32_bits_only_when_scaling() {
+        let mut tpdf = crate::dither::TpdfDither::new(7);
+        let input = vec![0.3_f32; 4096 * 2];
+        let mut out = vec![0_i32; 4096 * 2];
+        let mut ramp = StereoGainRamp::unity(48_000);
+        ramp.process_f32_to_i32_repeat(&input, &mut out, 2, 1, Some((&mut tpdf, 16)));
+        let mut exact = vec![0_i32; 4096 * 2];
+        crate::bypass::f32_to_i32(&input, &mut exact);
+        assert_eq!(out, exact, "unity must stay bit-exact");
+
+        ramp.set_volume_targets(-6.0, 0.0, false, false, false, false);
+        // Past the ramp.
+        for _ in 0..4 {
+            ramp.process_f32_to_i32_repeat(&input, &mut out, 2, 1, Some((&mut tpdf, 16)));
+        }
+        let want = 0.3 * 10f64.powf(-6.0 / 20.0) * 32768.0;
+        let codes: Vec<i64> = out.iter().map(|&v| i64::from(v >> 16)).collect();
+        assert!(out.iter().all(|&v| v & 0xffff == 0), "16-bit codes only");
+        let distinct: std::collections::BTreeSet<_> = codes.iter().collect();
+        assert!(distinct.len() >= 2, "no dither noise");
+        assert!(codes.iter().all(|&q| (q as f64 - want).abs() < 2.0));
+        let mean = codes.iter().sum::<i64>() as f64 / codes.len() as f64;
+        assert!((mean - want).abs() < 0.05, "mean {mean} vs {want}");
+        // 32-bit DAC: no dither.
+        ramp.process_f32_to_i32_repeat(&input, &mut out, 2, 1, Some((&mut tpdf, 32)));
+        let distinct: std::collections::BTreeSet<_> = out.iter().collect();
+        assert_eq!(distinct.len(), 1);
+    }
+
+    /// A settled digital mute and an all-zero block stay exact zeros on the
+    /// dithered path (no ±1 LSB noise for a DAC's auto-mute to see).
+    #[test]
+    fn dithered_repeat_path_keeps_digital_silence() {
+        let mut tpdf = crate::dither::TpdfDither::new(3);
+        let mut ramp = StereoGainRamp::unity(48_000);
+        ramp.set_volume_targets(-20.0, 0.0, false, false, false, false);
+        let zeros = vec![0.0_f32; 512 * 2];
+        let mut out = vec![1_i32; 512 * 4];
+        ramp.process_f32_to_i32_repeat(&zeros, &mut out, 2, 2, Some((&mut tpdf, 16)));
+        assert!(out.iter().all(|&v| v == 0), "silence got noise");
+        // Muted (settled at 0 gain), with signal in.
+        ramp.set_volume_targets(-20.0, 0.0, true, false, false, false);
+        let tone = vec![0.25_f32; 512 * 2];
+        for _ in 0..8 {
+            ramp.process_f32_to_i32_repeat(&tone, &mut out, 2, 2, Some((&mut tpdf, 24)));
+        }
+        assert!(!ramp.is_unity_settled());
+        assert!(out.iter().all(|&v| v == 0), "mute got noise");
+    }
+
+    /// Sparse clicks (one every 50 ms, inside the 100 ms hold): the
+    /// dither noise does not switch off between them at block edges; it
+    /// stops (exact zeros) only once 100 ms have passed after the last.
+    #[test]
+    fn dither_holds_through_sparse_clicks_then_stops() {
+        let rate = 48_000;
+        let mut tpdf = crate::dither::TpdfDither::new(9);
+        let mut ramp = StereoGainRamp::unity(rate);
+        ramp.set_volume_targets(-20.0, 0.0, false, false, false, false);
+        let block = 1024;
+        let total = rate as usize; // one second
+        let mut input = vec![0.0_f32; total];
+        for i in (0..rate as usize / 2).step_by(rate as usize / 20) {
+            input[i] = 0.5;
+        }
+        let mut out = vec![0_i32; total];
+        for (i, o) in input.chunks(block).zip(out.chunks_mut(block)) {
+            ramp.process_f32_to_i32_repeat(i, o, 1, 1, Some((&mut tpdf, 16)));
+        }
+        let last_click = input.iter().rposition(|&x| x != 0.0).unwrap();
+        let hold_end = last_click + rate as usize / 10;
+        // Inside the hold every block has noise (no silent block edges).
+        for b in out[..hold_end - block].chunks(block) {
+            assert!(
+                b.iter().any(|&v| v != 0),
+                "noise switched off inside the hold"
+            );
+        }
+        // After it: exact digital silence.
+        assert!(out[hold_end + 1..].iter().all(|&v| v == 0));
+    }
+
+    /// A silent channel next to music stays exact zeros on the dithered
+    /// path.
+    #[test]
+    fn a_silent_channel_beside_music_gets_no_dither() {
+        let mut tpdf = crate::dither::TpdfDither::new(5);
+        let mut ramp = StereoGainRamp::unity(48_000);
+        ramp.set_volume_targets(-6.0, 0.0, false, false, false, false);
+        let input: Vec<f32> = (0..4096)
+            .flat_map(|i| [((i as f32) * 0.01).sin() * 0.5, 0.0])
+            .collect();
+        let mut out = vec![0_i32; input.len()];
+        ramp.process_f32_to_i32_repeat(&input, &mut out, 2, 1, Some((&mut tpdf, 24)));
+        assert!(out.chunks(2).all(|f| f[1] == 0), "silent channel got noise");
+        assert!(out.chunks(2).any(|f| f[0] != 0));
     }
 
     #[test]

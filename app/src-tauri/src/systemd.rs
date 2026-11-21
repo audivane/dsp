@@ -50,6 +50,82 @@ fn last_error_line(journal: &str) -> Option<String> {
         .filter(|reason| !reason.is_empty())
 }
 
+/// Whether the engine starts at login (the unit file is enabled).
+pub fn engine_at_login() -> Result<bool, String> {
+    zbus::block_on(async {
+        let conn = Connection::session()
+            .await
+            .map_err(|e| format!("Cannot reach the session bus: {e}"))?;
+        let reply = conn
+            .call_method(
+                Some("org.freedesktop.systemd1"),
+                "/org/freedesktop/systemd1",
+                Some("org.freedesktop.systemd1.Manager"),
+                "GetUnitFileState",
+                &(UNIT,),
+            )
+            .await
+            .map_err(describe)?;
+        let state: String = reply
+            .body()
+            .deserialize()
+            .map_err(|e| format!("Unexpected reply from systemd: {e}"))?;
+        Ok(state == "enabled")
+    })
+}
+
+/// Enable or disable the unit for the user's logins (`systemctl --user
+/// enable|disable audivane-dsp`); it does not start or stop it.
+pub fn set_engine_at_login(on: bool) -> Result<(), String> {
+    zbus::block_on(async {
+        let conn = Connection::session()
+            .await
+            .map_err(|e| format!("Cannot reach the session bus: {e}"))?;
+        let mgr = |method: &'static str| {
+            let conn = conn.clone();
+            async move {
+                let files = vec![UNIT];
+                let r = if method == "EnableUnitFiles" {
+                    conn.call_method(
+                        Some("org.freedesktop.systemd1"),
+                        "/org/freedesktop/systemd1",
+                        Some("org.freedesktop.systemd1.Manager"),
+                        method,
+                        &(files, false, true),
+                    )
+                    .await
+                } else {
+                    conn.call_method(
+                        Some("org.freedesktop.systemd1"),
+                        "/org/freedesktop/systemd1",
+                        Some("org.freedesktop.systemd1.Manager"),
+                        method,
+                        &(files, false),
+                    )
+                    .await
+                };
+                r.map(|_| ()).map_err(describe)
+            }
+        };
+        mgr(if on {
+            "EnableUnitFiles"
+        } else {
+            "DisableUnitFiles"
+        })
+        .await?;
+        conn.call_method(
+            Some("org.freedesktop.systemd1"),
+            "/org/freedesktop/systemd1",
+            Some("org.freedesktop.systemd1.Manager"),
+            "Reload",
+            &(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(describe)
+    })
+}
+
 /// Restart the unit (start it when stopped), e.g. after a package upgrade
 /// left the old engine running.
 pub fn restart_engine() -> Result<String, String> {

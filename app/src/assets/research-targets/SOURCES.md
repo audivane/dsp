@@ -1,8 +1,6 @@
 # Research target sources and redistribution notices
 
-Prepared/retrieved **2026-11-14** for Audivane. Findings, research
-citations, coordinate-system limitations and selection recommendations:
-[targets.md](../../../../docs/research/targets.md).
+Prepared/retrieved **2026-11-14** for Audivane.
 
 These assets are data for the overlay implementation, not registration code.
 All JSON files have exactly the contract's ten fields. `derived: false` means

@@ -4,6 +4,7 @@
 // runs. `eqmath.test.ts` checks this against values produced by dsp-core.
 
 import type { Band, EqProfile, FilterType } from "../api/types";
+import { effectiveEndHz, tiltSections, tiltStageDb, tiltStageOn } from "./tilt";
 
 export interface Coeffs {
   b0: number;
@@ -116,7 +117,7 @@ export function responseDb(bands: readonly Band[], preampDb: number, fs: number,
   });
 }
 
-function channelLayers(eq: EqProfile, ch: number): { sectionPreampDb: number; bands: Band[] } {
+function channelLayers(eq: EqProfile, ch: number): { sectionPreampDb: number; bands: Band[]; tilt: EqProfile } {
   const bands: Band[] = (eq.linked_enabled ?? true) ? [...eq.bands] : [];
   const extra = ch === 0 ? eq.left : ch === 1 ? eq.right : null;
   let sectionPreampDb = 0;
@@ -124,19 +125,26 @@ function channelLayers(eq: EqProfile, ch: number): { sectionPreampDb: number; ba
     sectionPreampDb = extra.preamp_db;
     bands.push(...extra.bands);
   }
-  return { sectionPreampDb, bands };
+  return { sectionPreampDb, bands, tilt: eq };
+}
+
+/** `a + tilt` at each frequency (the tilt is linked: every channel has it; both sections of a two-section tilt). */
+function withTilt(db: number[], tilt: EqProfile | null, fs: number, freqs: readonly number[]): number[] {
+  if (!tiltStageOn(tilt)) return db;
+  const t = tiltStageDb(tilt, fs, freqs);
+  return db.map((v, i) => v + t[i]);
 }
 
 /** Effective filter shape of one channel in dB (omitting global `eq.preamp_db`, including enabled section preamp). */
 export function channelShapeDb(eq: EqProfile, ch: number, fs: number, freqs: readonly number[]): number[] {
-  const { sectionPreampDb, bands } = channelLayers(eq, ch);
-  return responseDb(bands, sectionPreampDb, fs, freqs);
+  const { sectionPreampDb, bands, tilt } = channelLayers(eq, ch);
+  return withTilt(responseDb(bands, sectionPreampDb, fs, freqs), tilt, fs, freqs);
 }
 
 /** Combined response of one channel in dB (global preamp + enabled linked + enabled channel section). */
 export function profileChannelResponseDb(eq: EqProfile, ch: number, fs: number, freqs: readonly number[]): number[] {
-  const { sectionPreampDb, bands } = channelLayers(eq, ch);
-  return responseDb(bands, eq.preamp_db + sectionPreampDb, fs, freqs);
+  const { sectionPreampDb, bands, tilt } = channelLayers(eq, ch);
+  return withTilt(responseDb(bands, eq.preamp_db + sectionPreampDb, fs, freqs), tilt, fs, freqs);
 }
 
 /** Filter shape of a single section in dB (omits global `eq.preamp_db`; includes section `preamp_db` for L/R). */
@@ -148,11 +156,12 @@ export function sectionShapeDb(eq: EqProfile, section: "linked" | "left" | "righ
 }
 
 /** Auto preamp for one band list + optional section preamp offset (matches `Eq::channel_auto_preamp_db`). */
-function channelAutoPreampDb(bands: readonly Band[], sectionPreampDb: number, fs: number): number {
+function channelAutoPreampDb(bands: readonly Band[], sectionPreampDb: number, fs: number, tilt: EqProfile | null = null): number {
   const nyquist = 0.5 * fs;
   if (!Number.isFinite(fs) || nyquist <= 10) return 0;
   const ks = bands.map((b) => design(b, fs)).filter((k) => !isIdentity(k));
-  if (ks.length === 0) {
+  const tilted = tiltStageOn(tilt);
+  if (ks.length === 0 && !tilted) {
     const pre = Math.min(0, -sectionPreampDb);
     return !Number.isFinite(pre) || pre > -1e-9 ? 0 : pre;
   }
@@ -161,10 +170,17 @@ function channelAutoPreampDb(bands: readonly Band[], sectionPreampDb: number, fs
   const uEnd = Math.log(nyquist / 10);
   for (let i = 0; i < GRID; i++) freqs.push(10 * Math.exp((uEnd * i) / (GRID - 1)));
   for (const b of bands) if (b.enabled && b.freq_hz > 10 && b.freq_hz < nyquist) freqs.push(b.freq_hz);
+  for (const s of tilted ? tiltSections(tilt).filter((s) => s.enabled) : []) {
+    // Each section's corners, and its flat bass below 10 Hz.
+    freqs.push(Math.max(1, Math.min(10, s.start_hz / 8)), s.start_hz, effectiveEndHz(s, fs));
+  }
+  const t = tilted ? tiltStageDb(tilt, fs, freqs) : null;
   let peakSq = 0;
-  for (const f of freqs) {
+  for (let i = 0; i < freqs.length; i++) {
+    const f = freqs[i];
     let m = 1;
     for (const k of ks) m *= magSq(k, f, fs);
+    if (t) m *= Math.pow(10, t[i] / 10);
     if (Number.isFinite(m) && m > peakSq) peakSq = m;
   }
   if (!(peakSq > 0) || !Number.isFinite(peakSq)) return 0;
@@ -189,8 +205,8 @@ export function profileAutoPreampDb(eq: EqProfile, fs: number): number {
   const left = channelLayers(eq, 0);
   const right = channelLayers(eq, 1);
   return Math.min(
-    channelAutoPreampDb(left.bands, left.sectionPreampDb, fs),
-    channelAutoPreampDb(right.bands, right.sectionPreampDb, fs),
+    channelAutoPreampDb(left.bands, left.sectionPreampDb, fs, left.tilt),
+    channelAutoPreampDb(right.bands, right.sectionPreampDb, fs, right.tilt),
   );
 }
 
