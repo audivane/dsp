@@ -61,7 +61,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/upsampling-dark.webp">
-    <img src="docs/images/upsampling-light.webp" alt="The upsampling view: the measured Nyquist transition of the real filter" width="760">
+    <img src="docs/images/upsampling-light.webp" alt="The Custom upsampling editor: a Kaiser windowed sinc with automatic length, a band flat to 0.908 and stopped at 1.000 of the source Nyquist, linear phase and a cost table per source rate; below it, the measured Nyquist transition with its level crossings and the impulse response" width="760">
   </picture>
 </p>
 
