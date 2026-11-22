@@ -68,6 +68,11 @@ select.plain { height: 32px; border-radius: 8px; border: 1px solid var(--line); 
 }
 .seg button:hover:not(:disabled):not([aria-disabled="true"]) { color: var(--fg); }
 .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg); }
+/* Focus inside a segmented control: an inset ring in the text colour. The
+   global accent ring, offset outwards, overlaps the neighbour and reads as a
+   second pick next to the pressed button. */
+.seg button:focus-visible { outline: 1.5px solid var(--fg); outline-offset: -2px; }
+.seg button[aria-pressed="true"]:focus-visible { outline-color: var(--accent-fg); }
 .seg button:disabled { opacity: .45; }
 .seg button[aria-disabled="true"] { opacity: .45; cursor: default; }
 .seg button[aria-disabled="true"]:focus-visible { opacity: .8; }
@@ -428,7 +433,8 @@ input[type="range"]:disabled { opacity: .45; }
 .rate-chip[aria-pressed="true"] { background: var(--accent-soft); color: var(--fg); border-color: color-mix(in srgb, var(--accent) 45%, var(--line-strong)); }
 .rate-chip.playing { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
 .rate-chip.unsupported { color: var(--faint); border-style: dashed; }
-.rate-chip.unsupported[aria-pressed="true"] { text-decoration: line-through; background: transparent; }
+/* Allowed, but the device does not play it: kept (accent outline), inactive (no fill). */
+.rate-chip.unsupported[aria-pressed="true"] { background: transparent; color: var(--muted); border-color: color-mix(in srgb, var(--accent) 45%, var(--line-strong)); }
 .rate-chip:disabled { cursor: default; opacity: .55; }
 .rate-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .rate-chip .def-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none; }
@@ -446,6 +452,8 @@ input[type="range"]:disabled { opacity: .45; }
 .preview-at { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; min-width: 0; }
 .preview-label { color: var(--muted); font-size: 12px; cursor: help; }
 .preview-seg button { padding: 0 7px; font-size: 12px; }
+/* A source rate PipeWire converts before the engine on this device. */
+.preview-seg button.converted { color: var(--faint); text-decoration: underline dotted; text-underline-offset: 3px; }
 .preview-playing {
   height: 24px; padding: 0 8px; border: 1px solid var(--line); border-radius: 6px; background: transparent;
   color: var(--muted); font-size: 12px; white-space: nowrap;
@@ -548,6 +556,9 @@ table.streams .muted { color: var(--muted); }
 .crossing[aria-pressed="true"] { border-color: var(--warn); }
 .crossing .lvl { color: var(--muted); }
 .ups-err { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+/* Upsampling: why the previewed rate does not upsample on this device. */
+.ups-device-note { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; font-size: 12.5px; }
+.ups-device-note .hint { color: var(--muted); }
 /* The engine does not measure this ratio: a plain note, not an error. */
 .ups-unmeasured { margin: 6px 2px 0; color: var(--muted); font-size: 12px; max-width: 72ch; }
 .ups-caption { font-size: 12px; color: var(--muted); margin: 0; }

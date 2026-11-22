@@ -814,11 +814,12 @@ function PlanReadout({ design: d, check, readoutRate, measured, target, off }: C
   const here = check.check?.plans.find((p) => p.source_rate === readoutRate);
   const measuredHere = measured && measured.source_rate === readoutRate ? measured : null;
   const lat = measuredHere ? (measuredHere.latency_samples / measuredHere.output_rate) * 1000 : here ? planLatencyMs(d, here.plan, readoutRate) : null;
-  const ratio = resolveRateRatio(target, readoutRate);
+  // The engine plans each rate where it would open this device.
+  const ratio = here?.ratio ?? resolveRateRatio(target, readoutRate);
   return (
     <div className={"ups-plan" + (check.pending ? " pending" : "")} aria-live="polite" aria-busy={check.pending}>
       <div className="ups-plan-head">
-        <span className="ups-plan-title" title="What the engine would build at each allowed source rate: from its design check, before anything is designed">
+        <span className="ups-plan-title" title="What the engine would build at each allowed source rate on this device: from its design check, before anything is designed">
           Cost per rate
         </span>
         {check.pending && <span className="hint">Checking…</span>}

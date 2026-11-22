@@ -732,6 +732,49 @@ pub fn predicted_dsp_landings(
         .collect())
 }
 
+/// Where the DSP sink plays a `source_rate` stream ([`predicted_dsp_landing`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DspLanding {
+    /// The engine runs the graph at the source rate and opens the device
+    /// at this ratio.
+    Opens(RateRatio),
+    /// The engine does not offer the source rate on this device: the graph
+    /// runs at this rate instead, PipeWire converting the stream into it.
+    Converted(u32),
+}
+
+/// Where the DSP sink plays a `source_rate` stream for `config` on a device
+/// with `caps`, as a fresh open decides it: the driver's rate policies move
+/// the graph off a rate they do not offer ([`crate::rate_caps::plan_graph_rate`]),
+/// else the first ladder entry the device plays
+/// ([`DesiredDspConfig::open_landing`]). `Err`: the device plays none of
+/// the engine's rates.
+pub fn predicted_dsp_landing(
+    config: &EngineDriverConfig,
+    caps: Option<&DeviceCapabilities>,
+    source_rate: u32,
+) -> std::result::Result<DspLanding, String> {
+    let desired = config.desired_dsp(0);
+    let policy = compute_effective_policy(config, desired, caps)?;
+    let policies = crate::rate_caps::rate_policies(policy, caps, &config.formats, desired);
+    match crate::rate_caps::plan_graph_rate(&policies, source_rate, SinkChoice::Dsp) {
+        GraphRate::Move(to) if to != source_rate => return Ok(DspLanding::Converted(to)),
+        _ => {}
+    }
+    let rates = DeviceRates::playable(caps, &config.formats);
+    Ok(desired
+        .open_landing(
+            SinkChoice::Dsp,
+            source_rate,
+            rates,
+            &crate::lifecycle::Rungs::EMPTY,
+        )
+        .map_or(
+            DspLanding::Converted(policies.dsp.default_rate),
+            DspLanding::Opens,
+        ))
+}
+
 /// The rate policy the driver runs with for `caps`: the configured one
 /// restricted to rates the device can play. Without a probe result
 /// (probe failed) the configured policy is used as is.
@@ -1012,6 +1055,10 @@ pub struct EngineDriverSnapshot {
     /// Graph rates the Direct sink plays bit-perfect (native x1 rates among
     /// the effective ones). Empty while no device is open.
     pub direct_rates: Vec<u32>,
+    /// Every engine rate the device plays with the current settings,
+    /// allowed or not ([`crate::rate_caps::RatePolicies::playable`]).
+    /// Empty while no device is open or without a probe.
+    pub playable_rates: Vec<u32>,
     /// Varispeed scheduling: cap, hold, underfeed and cycle counters.
     pub varispeed: VarispeedDriverSnapshot,
     /// The largest processing time of one period over the period's length,
@@ -1883,15 +1930,29 @@ impl EngineDriverHandle {
         // A device that is not there (unplugged, a card that is not plugged
         // in) does not stop the start: the sinks come up and run on the
         // engine's own clock, and the control thread opens the device once
-        // it appears.
+        // it appears. A device that is listed but fails to open starts the
+        // same way and is retried: at boot a card shows in `/proc/asound`
+        // before its control device can be opened (ENODEV), and a manual
+        // restart must not be the only way out.
         let started = if device_present(&config.device) {
-            startup_open(
+            match startup_open(
                 &config,
                 init_desired,
                 &shared,
                 &ctrl_efd,
                 on_negotiated.as_ref(),
-            )?
+            ) {
+                Ok(started) => started,
+                Err(e) => {
+                    log::warn!(
+                        "opening '{}' failed ({e}); starting without it and retrying",
+                        config.device
+                    );
+                    let started = startup_missing(&config, init_desired, &shared)?;
+                    shared.set_error(format!("{e} (retrying)"));
+                    started
+                }
+            }
         } else {
             log::warn!(
                 "output device '{}' not found; starting without it and waiting for it",
@@ -2189,6 +2250,11 @@ impl EngineDriverHandle {
                 .shared
                 .direct_policy()
                 .map(|p| p.allowed_rates)
+                .unwrap_or_default(),
+            playable_rates: self
+                .shared
+                .sink_policies()
+                .map(|p| p.playable)
                 .unwrap_or_default(),
             varispeed: self.shared.varispeed.snapshot(),
             rt_load_max: f64::from_bits(self.shared.rt_load_max_bits.load(Ordering::Relaxed)),

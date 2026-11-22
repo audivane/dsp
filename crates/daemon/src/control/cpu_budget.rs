@@ -811,6 +811,74 @@ mod tests {
         }
     }
 
+    /// The Upsampling preview on a 48 kHz-only DAC with "Highest, same
+    /// family, up to 768 kHz": 48 kHz lands 1:1, 44.1 and 96 kHz are
+    /// converted by PipeWire, and "Best for DAC" would play them in the
+    /// engine. The cost table follows the same landings.
+    #[test]
+    fn previews_resolve_where_the_device_lands() {
+        let mut cfg = EngineConfig::default();
+        cfg.rate.allowed_rates = vec![44_100, 48_000, 96_000];
+        let up = UpsamplerConfig {
+            target: RateTarget::MaxRate(768_000),
+            preset: Some("recommended".into()),
+            design: None,
+        };
+        let caps = s32_caps(&[48_000]);
+        let l = crate::engine::source_landings(&cfg, &up, Some(&caps), &[44_100, 48_000, 96_000]);
+        let at = |rate: u32| l.iter().find(|x| x.source_rate == rate).unwrap();
+        assert_eq!(at(44_100).converted_to, Some(48_000));
+        assert_eq!(at(44_100).requested, RateRatio::integer(16));
+        let best = at(44_100).best_for_dac.unwrap();
+        assert_eq!(best.target, RateTarget::MaxRateAny(768_000));
+        assert_eq!(best.ratio, RateRatio::new(160, 147));
+        assert_eq!(at(48_000).converted_to, None);
+        assert_eq!(at(48_000).ratio, RateRatio::ONE);
+        assert_eq!(at(48_000).best_for_dac, None);
+        assert_eq!(at(96_000).converted_to, Some(48_000));
+        assert_eq!(
+            at(96_000).best_for_dac.map(|b| b.ratio),
+            Some(RateRatio::new(1, 2))
+        );
+        // Best for DAC itself: 44.1 kHz plays at 160/147, no hint.
+        let any = UpsamplerConfig {
+            target: RateTarget::MaxRateAny(768_000),
+            ..up.clone()
+        };
+        let l = crate::engine::source_landings(&cfg, &any, Some(&caps), &[44_100]);
+        assert_eq!(l[0].ratio, RateRatio::new(160, 147));
+        assert_eq!((l[0].converted_to, l[0].best_for_dac), (None, None));
+        // No probe: nothing device-aware.
+        assert!(crate::engine::source_landings(&cfg, &up, None, &[44_100]).is_empty());
+        assert!(crate::engine::preview_landings(&cfg, &up, None).is_none());
+
+        // The cost table: no x16 row anywhere, since nothing upsamples here.
+        let design = audivane_protocol::StoredDesign::based_on(
+            "recommended",
+            audivane_dsp_core::design::catalogue::by_name("recommended").unwrap(),
+        );
+        let output = cfg.chain.output;
+        let check = |landings: Option<&[(u32, RateRatio)]>| {
+            super::super::config::check_design(
+                &design,
+                Some(up.target),
+                None,
+                &cfg,
+                &output,
+                &slow_machine(),
+                landings,
+            )
+        };
+        let landings = crate::engine::preview_landings(&cfg, &up, Some(&caps)).unwrap();
+        assert_eq!(landings, vec![(48_000, RateRatio::ONE)]);
+        let device = check(Some(&landings));
+        assert!(device.errors.is_empty(), "{:?}", device.errors);
+        assert!(device.plans.is_empty(), "{:?}", device.plans);
+        // Without a probe: every allowed rate at the target's own ratio.
+        let plain = check(None);
+        assert_eq!(plain.plans.len(), 3, "{:?}", plain.plans);
+    }
+
     #[test]
     fn it_is_judged_where_the_driver_lands() {
         let rates = slow_machine();

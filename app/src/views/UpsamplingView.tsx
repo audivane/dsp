@@ -2,7 +2,7 @@ import { Power } from "../components/Icons";
 import { RECOMMENDED_TARGET } from "../lib/upsamplerRecommended";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DaemonError, ErrorCode } from "../api/transport";
-import type { RateRatio, RateTarget, ResponseWindow, ResponseWindowRequest, UpsamplerConfig, UpsamplerResponse } from "../api/types";
+import type { RateTarget, ResponseWindow, ResponseWindowRequest, UpsamplerConfig, UpsamplerResponse } from "../api/types";
 import { ResizeHandle } from "../components/ResizeHandle";
 import { Seg } from "../components/Seg";
 import { fmtInt, fmtMs, fmtRate, fmtRateShort, minus } from "../lib/format";
@@ -27,8 +27,8 @@ import {
   type ViewRange,
 } from "../lib/plotView";
 import { cutoffTips, fmtHzStat, fmtRipple, nextWindowToFetch, responsePlotTop, windowRequestFor } from "../lib/upsamplerPlot";
-import { chosenPreviewRate, dacRates, deviceResampleNote, landsLowerNote, isUnmeasuredRatio, viewSourceRate } from "../lib/upsamplerRate";
-import { previewRates } from "../lib/rates";
+import { chosenPreviewRate, dacRates, deviceLandingNote, deviceResampleNote, landsLowerNote, isUnmeasuredRatio, viewSourceRate } from "../lib/upsamplerRate";
+import { convertedRates, previewRates } from "../lib/rates";
 import { buildEnvelope, fmtAmplitude, fmtSampleOffset, impulseFrame, rangeMinMax, type Envelope } from "../lib/impulsePlot";
 import { errorText, store, useApp } from "../store/store";
 import { cssVar } from "../theme";
@@ -105,13 +105,6 @@ function bandEdge(r: UpsamplerResponse): number {
 /** The top of the plots: the Nyquist the engine measures to (the
  *  intermediate grid's at a fractional ratio). */
 const plotTop = responsePlotTop;
-
-/** The target that makes the engine design exactly what it runs now. */
-function landingTarget(ratio: RateRatio, outputRate: number): RateTarget {
-  if (ratio.up === ratio.down) return "off";
-  if (ratio.down === 1) return { ratio: ratio.up };
-  return { rate: outputRate };
-}
 
 /** Home views and limits of the two zoomable plots for a response. */
 function plotFrames(r: UpsamplerResponse): Record<PlotId, { home: ViewRange; limits: ViewLimits }> {
@@ -320,20 +313,19 @@ export function UpsamplingView() {
   });
 
   const pipelines = useApp((s) => (s.config?.ab ? 4 : 2));
-  // At the rate playing now, measure what the engine runs: the landing in its
-  // status (it may have capped the ratio to what the DAC plays). Any other
-  // rate, or a stopped engine, shows a preview of the target instead.
+  // The engine resolves the target where it would open this device for the
+  // source rate (it may cap the ratio to what the DAC plays, or not offer
+  // the rate at all): at the rate playing now that is what runs.
   const engineLive = (statusState === "playing" || statusState === "ready") && activeSink !== "direct";
-  // With upsampling off the landing is 1:1, and that is what plays too.
   // During an overload fallback the engine runs a lighter setting than this
-  // one: the plots then show the saved setting, labelled as such, not the
-  // landing of what plays.
+  // one: the plots then show the saved setting, labelled as such.
   // Upsampling off: the plots preview the filter at the Recommended rate.
   const offPreview = u?.target === "off";
   const offTarget = useApp((s) => s.upsOffTarget);
-  const landing = u && !offPreview && engineLive && !overload && rawGraphRate === sourceRate && statusRateRatio && statusOutputRate ? landingTarget(statusRateRatio, statusOutputRate) : null;
-  const measuredU = u && landing ? { ...u, target: landing } : u && offPreview ? { ...u, target: offTarget ?? RECOMMENDED_TARGET } : (u ?? null);
-  const uKey = measuredU ? JSON.stringify(measuredU) : "";
+  const measuredU = u && offPreview ? { ...u, target: offTarget ?? RECOMMENDED_TARGET } : (u ?? null);
+  // The device's landings change with the device, its formats and the allowed rates.
+  const deviceKey = deviceCaps ? `${deviceCaps.device}:${deviceCaps.rates.map((c) => c.rate).join(",")}:${(formats ?? []).join(",")}:${(allowedRates ?? []).join(",")}` : "";
+  const uKey = measuredU ? JSON.stringify(measuredU) + deviceKey : "";
   const key = `${uKey}@${sourceRate}`;
   const measuredRef = useRef(measuredU);
   measuredRef.current = measuredU;
@@ -400,16 +392,26 @@ export function UpsamplingView() {
   const r = response;
   const ratioOff = r ? !isResampling(r.rate_ratio) : off;
   const current = r !== null && responseKey === key;
-  // The plots show the filter the engine runs, or only a preview of the
-  // target (the saved setting while an overload fallback runs instead).
-  const liveShown = current && landing !== null;
+  // The plots show the filter the engine runs (the rate and ratio playing
+  // now), or only a preview of the target on this device (the saved setting
+  // while an overload fallback runs instead).
+  const liveShown =
+    current && !offPreview && !overload && engineLive && rawGraphRate === r.source_rate && !!statusRateRatio && statusRateRatio.up === r.rate_ratio.up && statusRateRatio.down === r.rate_ratio.down;
+  const landings = r?.device_landings ?? [];
+  const converted = convertedRates(landings);
+  const landingNote = current ? deviceLandingNote(landings.find((l) => l.source_rate === sourceRate), measuredU?.target ?? "off") : null;
+  const applyBest = (target: RateTarget) => (offPreview ? st.setUpsOffTarget(target) : void set({ target }));
   const savedShown = overload !== null;
   const savedWhy = "not what plays now: after a DSP overload the engine runs a lighter setting until you change this one (see the notice above)";
   const previewWhy = !engineLive
     ? "the engine is not running the DSP path now"
     : rawGraphRate && rawGraphRate !== sourceRate
       ? `the engine plays ${fmtRate(rawGraphRate)} now`
-      : "the engine has not reported what it runs yet";
+      : offPreview
+        ? "upsampling is off"
+        : statusRateRatio
+          ? `the engine runs ${rateRatioText(statusRateRatio)} now`
+          : "the engine has not reported what it runs yet";
   const latMs = r ? upsamplingLatencyMs(measuredU ?? u, r.source_rate, r, r.plan ?? null) : null;
   const tips = cutoffTips(sourceRate, r && r.source_rate === sourceRate ? r : null, u.design?.kind === "windowed_sinc" ? u.design.cutoff.mode : undefined);
   const knownSourceRate = chosenRate ?? (statusState === "playing" && rawGraphRate && rawGraphRate > 0 ? rawGraphRate : recentPlayingRate);
@@ -458,7 +460,11 @@ export function UpsamplingView() {
             label="Preview at source rate"
             value={sourceRate}
             onChange={(rate) => setPickedRate(rate === playingNow ? null : rate)}
-            options={rates.map((rate) => [rate, fmtRateShort(rate), rate === playingNow ? "Playing now" : `Show the filter for a ${fmtRate(rate)} source`])}
+            options={rates.map((rate) => {
+              const to = converted.get(rate);
+              const title = rate === playingNow ? "Playing now" : to ? `PipeWire converts ${fmtRate(rate)} to ${fmtRate(to)} before Audivane on this DAC` : `Show the filter for a ${fmtRate(rate)} source`;
+              return [rate, fmtRateShort(rate), title, false, to ? "converted" : undefined];
+            })}
           />
           {playingNow !== null && sourceRate !== playingNow && (
             <button type="button" className="preview-playing" title="Follow the playing rate again" onClick={() => setPickedRate(null)}>
@@ -509,7 +515,21 @@ export function UpsamplingView() {
         </div>
       )}
 
-      {r && frames && (
+      {landingNote && (
+        <div className="notice ups-device-note" role="status">
+          <span>{landingNote.text}</span>
+          {landingNote.best && (
+            <>
+              <span className="hint">{landingNote.best.text}</span>
+              <button type="button" className="btn small" title="Highest rate the DAC plays, crossing to the other rate family when that plays higher" onClick={() => applyBest(landingNote.best!.target)}>
+                Use Best for DAC
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
+      {r && frames && !landingNote?.converted && (
         <>
           <div className="ups-plots">
             <div className="ups-plot-card resizable">
@@ -522,7 +542,7 @@ export function UpsamplingView() {
                       ? "Measured from what the engine runs now, as its status reports it"
                       : savedShown
                         ? `Saved setting: what this setting designs for a ${fmtRate(r.source_rate)} source; ${savedWhy}`
-                        : `Target preview: what this setting designs for a ${fmtRate(r.source_rate)} source; ${previewWhy}`
+                        : `Target preview: what this setting runs for a ${fmtRate(r.source_rate)} source${landings.length > 0 ? " on this DAC" : ""}; ${previewWhy}`
                   }
                 >
                   {liveShown ? "Playing now" : savedShown ? "Saved setting" : "Target preview"}

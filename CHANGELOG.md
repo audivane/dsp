@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.10.1
+
+- Engine: a DAC that is listed but not ready yet when the engine starts
+  (at boot, a USB DAC can show up before it accepts connections) no longer
+  stops the engine. It starts without the DAC, says why, and retries until
+  the DAC opens. Before, the service failed, Audivane's outputs never
+  appeared and the desktop could switch to another device until the engine
+  was restarted by hand.
+- Engine, App: the "Engine accepts" rate chips on the Device page follow the
+  DAC in use. A rate it cannot play with the current settings stays allowed
+  but is drawn inactive instead of lit, and every chip can be switched back
+  on (only the last allowed rate is locked). Before, after a move to a DAC
+  with fewer rates, the higher rates stayed lit and could not be re-enabled
+  once switched off.
+- Engine, App: the Upsampling preview shows what the DAC really gets at each
+  source rate. A rate the DAC cannot take at the chosen setting is marked:
+  PipeWire converts it first, so the page says so instead of plotting a
+  filter that would not run, and a source rate that lands at 1:1 says
+  upsampling does nothing there. When "Best for DAC" would do better, the
+  page offers it in one click. The cost table follows the same rates.
+- App: the PEQ filter-type buttons no longer look as if two were selected
+  after clicking around (the keyboard focus ring is drawn inside the
+  button).
+
 ## 0.10.0
 
 ### Highlights

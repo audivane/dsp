@@ -3143,6 +3143,7 @@ impl Engine for RealEngine {
                 .unwrap_or_default(),
             effective_default_rate: drv.effective_policy.as_ref().map(|p| p.default_rate),
             direct_rates: drv.direct_rates,
+            playable_rates: drv.playable_rates,
             device_caps: drv.device_caps,
             bypass_resampler,
             rt_load_max: drv.rt_load_max,
@@ -3629,6 +3630,95 @@ pub fn predicted_landings(
 ) -> Result<Vec<(u32, RateRatio)>, String> {
     let caps = caps.filter(|c| c.device == cfg.device);
     audivane_io_pw::predicted_dsp_landings(&to_driver_config(cfg), caps)
+}
+
+/// `cfg` previewing upsampler `up` with DSP on, and the probe of its
+/// device; `None` without a usable probe of the configured device (the
+/// previews then resolve the target as `resolve_rate_ratio` does).
+fn preview_config<'a>(
+    cfg: &EngineConfig,
+    up: &UpsamplerConfig,
+    caps: Option<&'a audivane_protocol::ipc::DeviceCapabilities>,
+) -> Option<(EngineConfig, &'a audivane_protocol::ipc::DeviceCapabilities)> {
+    let caps = caps.filter(|c| c.device == cfg.device)?;
+    audivane_io_pw::lifecycle::DeviceRates::playable(Some(caps), &cfg.formats)?;
+    let mut cfg = cfg.clone();
+    cfg.dsp_enabled = true;
+    cfg.chain.upsampler = up.clone();
+    Some((cfg, caps))
+}
+
+/// [`predicted_landings`] for upsampler `up` in place of chain A's, DSP on:
+/// where the engine would land each offered source rate on the probed
+/// device. `None` without a probe (or when nothing would play).
+pub fn preview_landings(
+    cfg: &EngineConfig,
+    up: &UpsamplerConfig,
+    caps: Option<&audivane_protocol::ipc::DeviceCapabilities>,
+) -> Option<Vec<(u32, RateRatio)>> {
+    let (cfg, caps) = preview_config(cfg, up, caps)?;
+    predicted_landings(&cfg, Some(caps)).ok()
+}
+
+/// Cap of the "Best for DAC" alternative for a `ratio` target.
+const BEST_FOR_DAC_CAP: u32 = 768_000;
+
+/// Where the engine plays a stream at each of `rates` with upsampler `up`
+/// (DSP on) on the probed device ([`audivane_io_pw::predicted_dsp_landing`]),
+/// with a "Best for DAC" alternative where `up`'s target lands 1:1 or is
+/// converted and that one would upsample. Empty without a probe.
+pub fn source_landings(
+    cfg: &EngineConfig,
+    up: &UpsamplerConfig,
+    caps: Option<&audivane_protocol::ipc::DeviceCapabilities>,
+    rates: &[u32],
+) -> Vec<audivane_protocol::ipc::SourceLanding> {
+    use audivane_io_pw::DspLanding;
+    use audivane_protocol::ipc::{BestForDac, SourceLanding};
+    let Some((preview, caps)) = preview_config(cfg, up, caps) else {
+        return Vec::new();
+    };
+    let driver = to_driver_config(&preview);
+    let best = match up.target {
+        RateTarget::Off | RateTarget::Rate(_) | RateTarget::MaxRateAny(_) => None,
+        RateTarget::MaxRate(cap) => Some(RateTarget::MaxRateAny(cap)),
+        RateTarget::Ratio(_) => Some(RateTarget::MaxRateAny(BEST_FOR_DAC_CAP)),
+    }
+    .map(|target| {
+        let mut alt = preview.clone();
+        alt.chain.upsampler.target = target;
+        (target, to_driver_config(&alt))
+    });
+    let mut out = Vec::new();
+    for &rate in rates {
+        let Ok(landing) = audivane_io_pw::predicted_dsp_landing(&driver, Some(caps), rate) else {
+            return Vec::new();
+        };
+        let (ratio, converted_to) = match landing {
+            DspLanding::Opens(r) => (r, None),
+            DspLanding::Converted(to) => (RateRatio::ONE, Some(to)),
+        };
+        let best_for_dac = best
+            .as_ref()
+            .filter(|_| ratio.is_unity())
+            .and_then(|(target, alt)| {
+                match audivane_io_pw::predicted_dsp_landing(alt, Some(caps), rate) {
+                    Ok(DspLanding::Opens(r)) if !r.is_unity() => Some(BestForDac {
+                        target: *target,
+                        ratio: r,
+                    }),
+                    _ => None,
+                }
+            });
+        out.push(SourceLanding {
+            source_rate: rate,
+            ratio,
+            requested: resolve_rate_ratio(up.target, rate),
+            converted_to,
+            best_for_dac,
+        });
+    }
+    out
 }
 
 fn to_driver_config(cfg: &EngineConfig) -> EngineDriverConfig {

@@ -1267,7 +1267,10 @@ pub fn check_rational_at(
 /// `output` (chain A's, dither bits capped at the negotiated format) resolves
 /// `match_output`; the rate policy's rates (or only `source_rate`); the A/B
 /// pipeline count; the engine block at each rate. `target` defaults to chain
-/// A's. Plans are priced with `rates`.
+/// A's. Plans are priced with `rates`. With `landings` (the device was
+/// probed: [`crate::engine::preview_landings`]), each rate's plan is for
+/// the ratio the engine would open the device at, and a rate it does not
+/// offer there gets none; the refusals stay at the target's own ratio.
 pub fn check_design(
     stored: &StoredDesign,
     target: Option<RateTarget>,
@@ -1275,6 +1278,7 @@ pub fn check_design(
     cfg: &EngineConfig,
     output: &OutputConfig,
     rates: &audivane_dsp_core::cpu_bench::KernelRates,
+    landings: Option<&[(u32, RateRatio)]>,
 ) -> audivane_protocol::ipc::DesignCheck {
     use audivane_protocol::design::FieldError;
     use audivane_protocol::ipc::{DesignCheck, RatePlan};
@@ -1319,64 +1323,79 @@ pub fn check_design(
     let pipelines = rational_pipelines(cfg.ab.is_some());
     // One refusal per field and message, at the first rate it happens.
     let mut seen: Vec<(String, String)> = Vec::new();
+    let preserves = matches!(&d, FilterDesign::Kernel(k) if k.preserve_samples);
     for &rate in checked {
         let r = resolve_rate_ratio(target, rate);
         let plays = planned.contains(&rate);
-        // Integer ratios are checked at every engine rate (as the config
-        // validation does), rational ones only where the graph can run.
-        if r.is_unity() || (!r.is_integer() && !plays) {
-            continue;
-        }
-        let at = format!("at {rate} Hz ({r})");
-        if let FilterDesign::Kernel(k) = &d
-            && k.preserve_samples
-            && r.is_decimating()
-        {
-            let message = "needs an output rate at or above the input rate".to_string();
-            if !seen
-                .iter()
-                .any(|s| s.0 == "design.preserve_samples" && s.1 == message)
-            {
-                seen.push(("design.preserve_samples".into(), message.clone()));
-                fail(
-                    &mut out,
-                    "design.preserve_samples",
-                    format!("{at}, {message}"),
-                );
-            }
-            continue;
-        }
+        // On a probed device each rate is planned where the engine opens it
+        // (`None`: it does not offer the rate there, PipeWire converts it).
+        let landing = match landings {
+            Some(l) => l.iter().find(|x| x.0 == rate).map(|x| x.1),
+            None => Some(r),
+        };
         let max_block = audivane_io_pw::scaled_quantum(cfg.quantum, rate).clamp(512, 8192) as usize;
-        let cx = BuildContext {
+        let context = |ratio: RateRatio| BuildContext {
             source_rate: rate,
-            ratio: r,
+            ratio,
             channels: 2,
             max_block,
             pipelines,
             output: *output,
             workspace: design::budget::design_workspace(),
         };
-        match design::feasibility(&d, &cx) {
-            Ok(plan) if plays => {
-                let load = plan
-                    .callback
-                    .seconds(rates, rate, max_block)
-                    .ok()
-                    .map(|secs| secs * cx.channels as f64);
-                out.plans.push(RatePlan {
-                    source_rate: rate,
-                    ratio: r,
-                    plan: plan.wire(load, None),
-                });
-            }
-            Ok(_) => {}
-            Err(e) => {
-                let f = design::check::refusal(&e, &d);
-                if !seen.iter().any(|s| s.0 == f.path && s.1 == f.message) {
-                    seen.push((f.path.clone(), f.message.clone()));
-                    fail(&mut out, &f.path, format!("{at}, {}", f.message));
+        let push_plan = |out: &mut DesignCheck, ratio: RateRatio, plan: design::Plan| {
+            let load = plan
+                .callback
+                .seconds(rates, rate, max_block)
+                .ok()
+                .map(|secs| secs * 2.0);
+            out.plans.push(RatePlan {
+                source_rate: rate,
+                ratio,
+                plan: plan.wire(load, None),
+            });
+        };
+        // Integer ratios are checked at every engine rate (as the config
+        // validation does), rational ones only where the graph can run.
+        if !(r.is_unity() || (!r.is_integer() && !plays)) {
+            let at = format!("at {rate} Hz ({r})");
+            if preserves && r.is_decimating() {
+                let message = "needs an output rate at or above the input rate".to_string();
+                if !seen
+                    .iter()
+                    .any(|s| s.0 == "design.preserve_samples" && s.1 == message)
+                {
+                    seen.push(("design.preserve_samples".into(), message.clone()));
+                    fail(
+                        &mut out,
+                        "design.preserve_samples",
+                        format!("{at}, {message}"),
+                    );
+                }
+            } else {
+                match design::feasibility(&d, &context(r)) {
+                    Ok(plan) if plays && landing == Some(r) => push_plan(&mut out, r, plan),
+                    Ok(_) => {}
+                    Err(e) => {
+                        let f = design::check::refusal(&e, &d);
+                        if !seen.iter().any(|s| s.0 == f.path && s.1 == f.message) {
+                            seen.push((f.path.clone(), f.message.clone()));
+                            fail(&mut out, &f.path, format!("{at}, {}", f.message));
+                        }
+                    }
                 }
             }
+        }
+        // The device lands elsewhere: plan that ratio (the driver's ladder
+        // only holds ratios the chain can be built for).
+        if let Some(q) = landing
+            && plays
+            && q != r
+            && !q.is_unity()
+            && !(preserves && q.is_decimating())
+            && let Ok(plan) = design::feasibility(&d, &context(q))
+        {
+            push_plan(&mut out, q, plan);
         }
     }
     out

@@ -76,6 +76,8 @@ pub struct EngineSnapshot {
     pub effective_rates: Vec<u32>,
     /// Effective rates the device plays natively (Direct runs only at these).
     pub direct_rates: Vec<u32>,
+    /// Every engine rate the device plays with the current settings.
+    pub playable_rates: Vec<u32>,
     pub effective_default_rate: Option<u32>,
     /// `chain.output.bits` capped at the negotiated format's width.
     pub dither_bits: Option<u32>,

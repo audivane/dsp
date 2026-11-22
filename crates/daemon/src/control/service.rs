@@ -661,9 +661,11 @@ impl Service {
                 let config = config.unwrap_or_else(|| active.chain.upsampler.clone());
                 let output = self.effective_output(&active);
                 let config = config::resolve_upsampler_for_output(&config, &output);
-                let source_rate = source_rate.unwrap_or_else(|| {
-                    let graph = self.engine.snapshot().graph_rate;
-                    if graph > 0 { graph } else { 44_100 }
+                let snap = self.engine.snapshot();
+                let source_rate = source_rate.unwrap_or(if snap.graph_rate > 0 {
+                    snap.graph_rate
+                } else {
+                    44_100
                 });
                 let top = audivane_protocol::MAX_OUTPUT_RATE;
                 if !(8_000..=top).contains(&source_rate) {
@@ -681,6 +683,28 @@ impl Service {
                     config::rational_pipelines(active.ab.is_some()),
                 )
                 .map_err(invalid_params)?;
+                // On a probed device, measure where the engine would open it
+                // for this source rate (1:1 when PipeWire converts it first).
+                let mut rates = active.rate.allowed_rates.clone();
+                rates.push(source_rate);
+                rates.sort_unstable();
+                rates.dedup();
+                let device_landings = crate::engine::source_landings(
+                    &active,
+                    &config,
+                    snap.device_caps.as_ref(),
+                    &rates,
+                );
+                let config = match device_landings
+                    .iter()
+                    .find(|l| l.source_rate == source_rate)
+                {
+                    Some(l) => UpsamplerConfig {
+                        target: landing_target(l.ratio, source_rate),
+                        ..config
+                    },
+                    None => config,
+                };
                 let ratio = resolve_rate_ratio(config.target, source_rate);
                 let integer_ok = ratio
                     .as_integer()
@@ -719,6 +743,7 @@ impl Service {
                         .map(|secs| 2.0 * secs)
                         .filter(|l| l.is_finite());
                 }
+                response.device_landings = device_landings;
                 to_value(&response)
             }
             Call::ResolveDesign { preset } => {
@@ -734,6 +759,18 @@ impl Service {
                 // Cheap (no kernel designed): runs without the mutation lock.
                 let active = self.config();
                 let output = self.effective_output(&active);
+                // On a probed device, plan each rate where the engine would
+                // open it, not at the target's own ratio.
+                let up = UpsamplerConfig {
+                    target: target.unwrap_or(active.chain.upsampler.target),
+                    preset: None,
+                    design: Some(design.clone()),
+                };
+                let landings = crate::engine::preview_landings(
+                    &active,
+                    &up,
+                    self.engine.snapshot().device_caps.as_ref(),
+                );
                 to_value(&config::check_design(
                     &design,
                     target,
@@ -741,6 +778,7 @@ impl Service {
                     &active,
                     &output,
                     super::cpu_budget::machine(),
+                    landings.as_deref(),
                 ))
             }
             Call::Meters => to_value(&self.meters()),
@@ -2003,6 +2041,7 @@ impl Service {
             device_caps: snap.device_caps.clone(),
             effective_rates: snap.effective_rates.clone(),
             direct_rates: snap.direct_rates.clone(),
+            playable_rates: snap.playable_rates.clone(),
             bypass_resampler: passthrough::bypass_resampler_status(
                 snap.bypass_resampler.clone(),
                 &cfg,
@@ -2522,6 +2561,21 @@ fn to_value<T: serde::Serialize>(value: &T) -> Result<Value, RpcError> {
     })
 }
 
+/// The target that resolves to exactly `ratio` at `source_rate`: off at
+/// 1:1, a multiple for an integer ratio, else the output rate.
+fn landing_target(ratio: RateRatio, source_rate: u32) -> audivane_protocol::RateTarget {
+    use audivane_protocol::RateTarget;
+    if ratio.is_unity() {
+        RateTarget::Off
+    } else if let Some(k) = ratio.as_integer() {
+        RateTarget::Ratio(k)
+    } else {
+        ratio
+            .output_rate(source_rate)
+            .map_or(RateTarget::Off, RateTarget::Rate)
+    }
+}
+
 /// A zoom window must be finite, inside 0 .. output Nyquist and non-empty.
 fn validate_response_window(
     window: &ResponseWindowRequest,
@@ -2684,6 +2738,7 @@ mod tests {
                 device_caps: None,
                 effective_rates: Vec::new(),
                 direct_rates: Vec::new(),
+                playable_rates: Vec::new(),
                 effective_default_rate: None,
                 dither_bits: None,
                 bypass_resampler: None,

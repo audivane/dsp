@@ -5,6 +5,7 @@ import {
   dacHighRateBlock,
   dacRateBlock,
   dacRates,
+  deviceLandingNote,
   deviceResampleNote,
   highRatesFor,
   isTermLimitMessage,
@@ -80,8 +81,9 @@ describe("upsampling view source rate", () => {
 });
 
 describe("preview rate list", () => {
-  it("uses the effective rates, else the configured ones", () => {
-    expect(previewRates([48000], DEFAULT)).toEqual([48000]);
+  it("lists the configured rates with the effective ones", () => {
+    // A 48k-only DAC keeps the configured rates in the list (marked as converted).
+    expect(previewRates([48000], DEFAULT)).toEqual(DEFAULT);
     expect(previewRates([], [192000, 44100, 352800])).toEqual([44100, 192000, 352800]);
     expect(previewRates(null, null)).toEqual([44100, 48000]);
   });
@@ -221,6 +223,31 @@ describe("fixed rates past the rational term limit", () => {
   it("recognises the engine's refusal", () => {
     expect(isTermLimitMessage("chain.upsampler.target: at 44100 Hz the ratio 10240/147 has a term above 4096")).toBe(true);
     expect(isTermLimitMessage("chain.upsampler.taps must be between 1 and 4194304 (got 0)")).toBe(false);
+  });
+});
+
+describe("device landings in the preview (48k-only DAC)", () => {
+  const one = { up: 1, down: 1 };
+  const x16 = { up: 16, down: 1 };
+  const same = { max_rate: 768000 };
+  const best = { target: { max_rate_any: 768000 }, ratio: { up: 160, down: 147 } };
+  it("says PipeWire converts a rate the engine does not offer, with the Best for DAC hint", () => {
+    const n = deviceLandingNote({ source_rate: 44100, ratio: one, requested: x16, converted_to: 48000, best_for_dac: best }, same)!;
+    expect(n.converted).toBe(true);
+    expect(n.text).toBe("PipeWire converts 44.1 kHz to 48 kHz before Audivane on this DAC.");
+    expect(n.best).toEqual({ target: { max_rate_any: 768000 }, text: "Best for DAC would play it as 48 kHz (160/147)." });
+  });
+  it("explains a 1:1 landing the device forces", () => {
+    const n = deviceLandingNote({ source_rate: 48000, ratio: one, requested: x16 }, same)!;
+    expect(n).toEqual({ converted: false, text: "Your DAC plays nothing above 48 kHz in this family; upsampling does nothing here.", best: null });
+    expect(deviceLandingNote({ source_rate: 48000, ratio: one, requested: { up: 4, down: 1 } }, { ratio: 4 })!.text).toBe(
+      "Your DAC plays no multiple of 48 kHz up to ×4; upsampling does nothing here.",
+    );
+  });
+  it("says nothing when the target plays as asked, is off, or has no landing", () => {
+    expect(deviceLandingNote({ source_rate: 48000, ratio: x16, requested: x16 }, same)).toBeNull();
+    expect(deviceLandingNote({ source_rate: 48000, ratio: one, requested: one }, "off")).toBeNull();
+    expect(deviceLandingNote(undefined, same)).toBeNull();
   });
 });
 

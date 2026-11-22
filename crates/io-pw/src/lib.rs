@@ -20,10 +20,10 @@ pub use driver::{
     PassthroughProcessor, f32_to_left_justified_i32,
 };
 pub use engine_driver::{
-    BypassNotifier, DriverGapCounters, DriverWaker, EngineAudioProcessor, EngineDriverConfig,
-    EngineDriverHandle, EngineDriverSnapshot, NegotiatedChain, RatioNegotiator, ReleaseHook,
-    ReleaseKind, SinkVolumePort, device_present, predicted_dsp_landings, scaled_quantum,
-    waiting_text,
+    BypassNotifier, DriverGapCounters, DriverWaker, DspLanding, EngineAudioProcessor,
+    EngineDriverConfig, EngineDriverHandle, EngineDriverSnapshot, NegotiatedChain, RatioNegotiator,
+    ReleaseHook, ReleaseKind, SinkVolumePort, device_present, predicted_dsp_landing,
+    predicted_dsp_landings, scaled_quantum, waiting_text,
 };
 pub use error::{PwError, Result};
 pub use lifecycle::{

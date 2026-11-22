@@ -986,6 +986,7 @@ mod tests {
                 device_caps: None,
                 effective_rates: Vec::new(),
                 direct_rates: Vec::new(),
+                playable_rates: Vec::new(),
                 effective_default_rate: None,
                 dither_bits: None,
                 bypass_resampler: None,

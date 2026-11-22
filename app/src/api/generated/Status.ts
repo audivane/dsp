@@ -97,6 +97,15 @@ effective_rates: Array<number>,
  */
 direct_rates: Array<number>, 
 /**
+ * Every engine graph rate ([`crate::ALLOWED_RATES`], allowed or not)
+ * the device plays with the current settings: natively, through the
+ * DSP chain's ratio ladder (decimation and fractional ratios
+ * included), or with the engine bypass resampler. A rate in
+ * `rate.allowed_rates` but not here is resampled by PipeWire on this
+ * device. Empty while no device is open, or without a probe.
+ */
+playable_rates: Array<number>, 
+/**
  * Rate used when idle / when following is off, after the same
  * restriction (`rate.default_rate` when the device supports it).
  */

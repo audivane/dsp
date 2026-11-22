@@ -72,15 +72,15 @@
 
 ```sh
 # Arch Linux
-curl -fLO https://github.com/audivane/dsp/releases/download/0.10.0/audivane-dsp-0.10.0-1-x86_64.pkg.tar.zst
-sudo pacman -U ./audivane-dsp-0.10.0-1-x86_64.pkg.tar.zst
+curl -fLO https://github.com/audivane/dsp/releases/download/0.10.1/audivane-dsp-0.10.1-1-x86_64.pkg.tar.zst
+sudo pacman -U ./audivane-dsp-0.10.1-1-x86_64.pkg.tar.zst
 
 # Ubuntu 24.04+ / Debian 13+
-curl -fLO https://github.com/audivane/dsp/releases/download/0.10.0/audivane-dsp_0.10.0-1_amd64.deb
-sudo apt install ./audivane-dsp_0.10.0-1_amd64.deb
+curl -fLO https://github.com/audivane/dsp/releases/download/0.10.1/audivane-dsp_0.10.1-1_amd64.deb
+sudo apt install ./audivane-dsp_0.10.1-1_amd64.deb
 
 # Fedora 40+
-sudo dnf install https://github.com/audivane/dsp/releases/download/0.10.0/audivane-dsp-0.10.0-1.x86_64.rpm
+sudo dnf install https://github.com/audivane/dsp/releases/download/0.10.1/audivane-dsp-0.10.1-1.x86_64.rpm
 ```
 
 Then start the engine for your user and open **Audivane DSP** from your app menu:

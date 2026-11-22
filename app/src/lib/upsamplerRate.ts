@@ -1,6 +1,6 @@
 // Which source rate the Upsampling view designs, plots and measures for.
 
-import type { DeviceCapabilities, EngineState, RateRatio, RateTarget, SampleFormat } from "../api/types";
+import type { DeviceCapabilities, EngineState, RateRatio, RateTarget, SampleFormat, SourceLanding } from "../api/types";
 import { fmtSampleFormat } from "./format";
 
 export interface ViewRateInputs {
@@ -270,6 +270,39 @@ const ratioStr = (r: RateRatio) => (r.down === 1 ? `×${r.up}` : `${r.up}/${r.do
 /** "44.1 kHz → 48 kHz (160/147)", or "48 kHz (×1)" when the rate is not changed. */
 export function landingText(input: number, output: number, ratio: RateRatio): string {
   return ratio.up === ratio.down ? `${khz(input)} (×1, not resampled)` : `${khz(input)} → ${khz(output)} (${ratioStr(ratio)})`;
+}
+
+/** Why the preview at a source rate shows no upsampling on this device, from the response's `device_landings`. */
+export interface DeviceLandingNote {
+  /** PipeWire converts the source before the engine: nothing of this setting runs at that rate. */
+  converted: boolean;
+  text: string;
+  /** "Best for DAC" would upsample here: its target and a short line saying what it does. */
+  best: { target: RateTarget; text: string } | null;
+}
+
+/**
+ * The note for `landing` (the entry for the previewed source rate) under
+ * `target`: PipeWire converts the rate first, or the engine lands 1:1
+ * because the DAC plays nothing higher the target reaches. Null otherwise.
+ */
+export function deviceLandingNote(landing: SourceLanding | null | undefined, target: RateTarget): DeviceLandingNote | null {
+  if (!landing || target === "off" || "rate" in target) return null;
+  const src = landing.source_rate;
+  const b = landing.best_for_dac;
+  const best = b ? { target: b.target, text: `Best for DAC would play it as ${khz(Math.round((src * b.ratio.up) / b.ratio.down))} (${ratioStr(b.ratio)}).` } : null;
+  if (landing.converted_to) {
+    return { converted: true, text: `PipeWire converts ${khz(src)} to ${khz(landing.converted_to)} before Audivane on this DAC.`, best };
+  }
+  const unity = (r: RateRatio) => r.up === r.down;
+  if (!unity(landing.ratio) || unity(landing.requested)) return null;
+  const text =
+    "ratio" in target
+      ? `Your DAC plays no multiple of ${khz(src)} up to ×${target.ratio}; upsampling does nothing here.`
+      : "max_rate" in target
+        ? `Your DAC plays nothing above ${khz(src)} in this family; upsampling does nothing here.`
+        : `Your DAC plays nothing above ${khz(src)}; upsampling does nothing here.`;
+  return { converted: false, text, best };
 }
 
 /**

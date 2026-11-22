@@ -124,12 +124,12 @@ fn run(args: Args) -> anyhow::Result<()> {
         }
     }
 
-    // A device that is not there (unplugged) does not stop the engine: its
-    // sinks come up on the engine's own clock and it opens the device when
-    // it appears. A device that is there but cannot be opened still leaves
-    // the daemon running: the app and `avdsp ctl` then show why and can pick
-    // another device, instead of systemd restarting a failing service until
-    // it gives up.
+    // A device that is not there (unplugged), or there but failing to open,
+    // does not stop the engine: its sinks come up on the engine's own clock
+    // and it opens the device when it can. Any other start failure still
+    // leaves the daemon running: the app and `avdsp ctl` then show why and
+    // can pick another device, instead of systemd restarting a failing
+    // service until it gives up.
     let mut waiting = None;
     let engine: Arc<dyn Engine> = match RealEngine::start(&config) {
         Ok(engine) => engine,

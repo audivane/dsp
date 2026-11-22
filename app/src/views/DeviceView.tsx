@@ -58,13 +58,9 @@ function RateChips() {
   const listRef = useRef<HTMLSpanElement>(null);
   const [menu, setMenu] = useState<{ rate: number; x: number; y: number } | null>(null);
   if (!cfg) return null;
-  const up = cfg.chain.upsampler.target;
-  const maxRatio = !cfg.dsp_enabled || up === "off" ? 1 : "ratio" in up ? up.ratio : 16;
   const chips = rateChips({
     policy: cfg.rate,
-    effective: status?.effective_rates,
-    caps: status?.device_caps,
-    maxRatio,
+    playable: status?.playable_rates,
     state: status?.state,
     graphRate: status?.graph_rate,
   });
@@ -85,7 +81,7 @@ function RateChips() {
           className={"rate-chip" + (c.unsupported ? " unsupported" : "") + (c.playing ? " playing" : "")}
           aria-pressed={c.enabled}
           aria-haspopup={c.enabled ? "menu" : undefined}
-          aria-label={`${fmtRate(c.rate)}${c.isDefault ? ", default" : ""}${c.playing ? ", playing" : ""}${c.unsupported ? ", not supported by this device" : ""}`}
+          aria-label={`${fmtRate(c.rate)}${c.isDefault ? ", default" : ""}${c.playing ? ", playing" : ""}${c.unsupported ? (c.enabled ? ", kept, converted by PipeWire on this device" : ", not played by this device") : ""}`}
           title={c.title}
           disabled={!c.canToggle}
           onClick={() => c.canToggle && st.toggleAllowedRate(c.rate)}

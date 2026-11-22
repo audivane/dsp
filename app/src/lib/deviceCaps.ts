@@ -1,6 +1,6 @@
 // What the output device accepts (status.device_caps, probed by the engine
 // when it opens the device) and the UI hints built on it. Mirrors the
-// daemon's rules: io-alsa `ratio_ladder` / `plan_open` and io-pw `rate_caps`.
+// daemon's rules: io-alsa `plan_open` and io-pw `rate_caps`.
 
 import type { DeviceCapabilities, SampleFormat } from "../api/types";
 import { fmtRate, fmtSampleFormat } from "./format";
@@ -15,18 +15,6 @@ export function formatBits(f: SampleFormat): number {
 /** Dither target after the format cap (the daemon's `effective_dither_bits`). */
 export function effectiveDitherBits(configured: number, format: SampleFormat | null | undefined): number {
   return format ? Math.min(configured, formatBits(format)) : configured;
-}
-
-/** Ratios the engine tries when the device rejects source × desired. */
-export function ratioLadder(desired: number): number[] {
-  const out: number[] = [];
-  let r = Math.max(1, Math.floor(desired));
-  for (;;) {
-    out.push(r);
-    if (r === 1) break;
-    r = (r & (r - 1)) === 0 ? r / 2 : r - 1;
-  }
-  return out;
 }
 
 export function formatsAt(caps: DeviceCapabilities, rate: number): SampleFormat[] {

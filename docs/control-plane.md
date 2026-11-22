@@ -1711,6 +1711,13 @@ All `#[serde(default)]`:
   rates the device plays natively, plus, with `bypass_resampler: "engine"`,
   the ones the engine converts to a native rate ("The engine bypass
   resampler"); empty when no device is open or none is native.
+- `playable_rates: number[]`: every engine graph rate (allowed or not) the
+  device plays with the current settings: natively, through the DSP
+  chain's ratio ladder (decimation and fractional ratios included), or with
+  the engine bypass resampler. The same rule as `effective_rates`, as if
+  every engine rate were allowed: an allowed rate missing here is resampled
+  by PipeWire on this device, and a rate here that is not allowed would be
+  offered once allowed. Empty while no device is open, or without a probe.
 - `bypass_resampler: { mode, active, reason } | null`: the engine bypass
   resampler. `mode` is the configured `"engine"` or `"pipewire"`; `active`
   is true while it converts (Direct or DSP off away from ×1, its chain
@@ -2257,7 +2264,11 @@ the config.
   the first rate). When a bound fails, no rate is checked.
 
   `plans: [{ source_rate, ratio, plan }]`, one per allowed rate where the
-  design upsamples and passes. A `plan` (`DesignPlan`) holds `grid_up` (L)
+  design upsamples and passes. With a probe of the device, `ratio` is where
+  the engine would open it for that source rate with this target (the
+  driver's rate policy and ratio ladder, as `upsampler_response` resolves
+  it), and a rate it does not offer there, or lands 1:1, has no plan; the
+  refusals stay at the target's own ratio. A `plan` (`DesignPlan`) holds `grid_up` (L)
   and `grid_down` (M), `grid_taps` with `grid_taps_exact` (false for an
   upper bound, such as a reflected intermediate phase, or an automatic
   length's estimate before its search), `workspace_bytes` (peak memory
@@ -2315,6 +2326,20 @@ levels deeper than the stopband attenuation minus 3 dB are omitted).
   searched), with `bounded_peak_db` and `cpu_load` at the engine block for
   `source_rate`. Both are omitted at x1.
 - With upsampling off the reply is flat (`ratio 1`, impulse `[1.0]`).
+- With a probe of the device, the target is resolved the way the engine
+  would open the device for `source_rate` (DSP on, the driver's rate
+  policy and ratio ladder; a fresh open), and that ratio is measured.
+  `device_landings: [{ source_rate, ratio, requested, converted_to?,
+  best_for_dac? }]` lists it for every allowed rate and `source_rate`:
+  `ratio` where the engine opens the device, `requested` the target's own
+  ratio (`resolve_rate_ratio`), `converted_to` the graph rate PipeWire
+  converts a stream at a rate the engine does not offer on this device
+  into (`ratio` is 1 then, and so is the measurement), and `best_for_dac:
+  { target, ratio }` the `max_rate_any` target (the same cap, or 768 kHz
+  for a `ratio` target) and where it would open, when this target lands
+  1:1 or converted there and that one would not (never for `off`, `rate`
+  or `max_rate_any`). Empty without a probe: the target's own ratio is
+  measured.
 - `rate_ratio` is the measured ratio. At a fractional or decimating ratio
   `ratio` is `0`, the response is the kernel's on the intermediate grid
   (`source_rate × up`; every output phase samples it), so `freqs_hz` and the

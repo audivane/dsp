@@ -342,6 +342,10 @@ pub struct RatePolicies {
     pub dsp_native: RatePolicy,
     /// Direct's native base: the rates it plays at x1.
     pub direct_native: RatePolicy,
+    /// Every engine rate ([`audivane_protocol::ALLOWED_RATES`]) the device
+    /// plays with the current settings, configured or not
+    /// ([`playable_rates`]). Empty without a probe.
+    pub playable: Vec<u32>,
 }
 
 /// The [`RatePolicies`] for the DSP sink's effective policy `dsp` on a
@@ -350,6 +354,49 @@ pub struct RatePolicies {
 /// DSP sink cannot play (the rate arbiter keeps the DSP sink's clients on
 /// `dsp`, [`crate::rate_arbiter::RateInputs::dsp_policy`]).
 pub fn rate_policies(
+    dsp: RatePolicy,
+    caps: Option<&DeviceCapabilities>,
+    formats: &[SampleFormat],
+    desired: DesiredDspConfig,
+) -> RatePolicies {
+    let playable = playable_rates(&dsp, caps, formats, desired);
+    RatePolicies {
+        playable,
+        ..sink_policies(dsp, caps, formats, desired)
+    }
+}
+
+/// Every engine rate the device plays with `desired`, whether
+/// `rate.allowed_rates` has it or not: the rates the driver would publish
+/// ([`RatePolicies::published`]) if every engine rate were allowed, the
+/// engine bypass resampler's rates included. `base` gives the other policy
+/// fields. Empty without a probe or when the device plays none.
+pub fn playable_rates(
+    base: &RatePolicy,
+    caps: Option<&DeviceCapabilities>,
+    formats: &[SampleFormat],
+    desired: DesiredDspConfig,
+) -> Vec<u32> {
+    use audivane_protocol::ALLOWED_RATES;
+    let Some(caps) = caps else {
+        return Vec::new();
+    };
+    let all = RatePolicy {
+        allowed_rates: ALLOWED_RATES.to_vec(),
+        ..base.clone()
+    };
+    match effective_rate_policy(&all, caps, desired, formats, ALLOWED_RATES) {
+        Ok(eff) => {
+            sink_policies(eff.policy, Some(caps), formats, desired)
+                .published
+                .allowed_rates
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// [`rate_policies`] without [`RatePolicies::playable`].
+fn sink_policies(
     dsp: RatePolicy,
     caps: Option<&DeviceCapabilities>,
     formats: &[SampleFormat],
@@ -395,6 +442,7 @@ pub fn rate_policies(
         direct,
         dsp_native,
         direct_native,
+        playable: Vec::new(),
     }
 }
 
@@ -781,6 +829,53 @@ mod tests {
             plan_graph_rate(&policies(on), 44_100, SinkChoice::Dsp),
             GraphRate::Keep
         );
+    }
+
+    /// The rates a 48 kHz-only device plays, configured or not: Same family
+    /// only plays 48 kHz; Best for DAC reaches every engine rate (44.1 kHz by
+    /// 160/147, the others by decimation); DSP off plays 48 kHz natively and,
+    /// with the engine bypass resampler, the rates it converts.
+    #[test]
+    fn playable_rates_on_a_48k_only_device() {
+        let c = caps(&[(48_000, &[SampleFormat::S32])]);
+        // Only 48 kHz configured: the list still covers every engine rate.
+        let configured = RatePolicy {
+            allowed_rates: vec![48_000],
+            default_rate: 48_000,
+            ..RatePolicy::default()
+        };
+        let playable = |desired: DesiredDspConfig| {
+            let eff = effective_rate_policy(&configured, &c, desired, &ALL, ALLOWED_RATES)
+                .unwrap()
+                .policy;
+            let p = rate_policies(eff, Some(&c), &ALL, desired);
+            assert_eq!(
+                p.playable,
+                playable_rates(&configured, Some(&c), &ALL, desired)
+            );
+            p.playable
+        };
+        assert_eq!(playable(dsp(RateTarget::MaxRate(768_000))), vec![48_000]);
+        assert_eq!(
+            playable(dsp(RateTarget::MaxRateAny(768_000))),
+            ALLOWED_RATES.to_vec()
+        );
+        let off = DesiredDspConfig {
+            dsp_enabled: false,
+            ..dsp(RateTarget::MaxRate(768_000))
+        };
+        assert_eq!(playable(off), vec![48_000]);
+        let off_engine = DesiredDspConfig {
+            bypass: crate::lifecycle::BypassLeg {
+                engine: true,
+                buildable: RatePairMask::ALL,
+                allowed: crate::lifecycle::BypassLeg::allowed_bits(&configured.allowed_rates),
+            },
+            ..off
+        };
+        assert_eq!(playable(off_engine), ALLOWED_RATES.to_vec());
+        // No probe: nothing known.
+        assert!(playable_rates(&configured, None, &ALL, off).is_empty());
     }
 
     #[test]

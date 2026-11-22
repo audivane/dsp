@@ -6,6 +6,7 @@ import type { FilterPreset } from "./FilterPreset";
 import type { RateRatio } from "./RateRatio";
 import type { ResponseCrossing } from "./ResponseCrossing";
 import type { ResponseWindow } from "./ResponseWindow";
+import type { SourceLanding } from "./SourceLanding";
 import type { WindowKind } from "./WindowKind";
 
 /**
@@ -115,4 +116,13 @@ design?: FilterDesign,
  * Its plan once designed (an automatic length searched), with the
  * bounded-input peak. Absent at x1.
  */
-plan?: DesignPlan, };
+plan?: DesignPlan, 
+/**
+ * Where the engine plays each `rate.allowed_rates` source rate (and
+ * [`Self::source_rate`]) with this design's target on the open device,
+ * as a fresh open decides it. The response is measured at the entry
+ * for [`Self::source_rate`]: 1:1 when it is converted. Empty without a
+ * device probe (the target's ratio is measured, as
+ * `resolve_rate_ratio` gives it).
+ */
+device_landings: Array<SourceLanding>, };

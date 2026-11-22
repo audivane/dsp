@@ -881,6 +881,21 @@ export class MockDaemon {
     return { allowed, defaultRate, native };
   }
 
+  /**
+   * Like io-pw `rate_caps::playable_rates`: every engine rate the device
+   * plays with the current settings, allowed or not (the DSP sink's rule
+   * and the engine bypass resampler's). Empty without a probe.
+   */
+  playableRates(): number[] {
+    const caps = capsFor(this.config.device);
+    if (!caps) return [];
+    const formats = this.openFormats();
+    const chain = this.chainOn();
+    const engineRates = [...RATES_44, ...RATES_48].sort((a, b) => a - b);
+    const dsp = (r: number) => planOpen(caps, r, this.config.dsp_enabled ? ratioCandidates(chain, r, caps, formats) : [ONE], formats) !== null;
+    return engineRates.filter((r) => dsp(r) || this.bypassLanding(r) !== null);
+  }
+
   /** The formats the open plan tries (empty: the driver's preference). */
   private openFormats(): SampleFormat[] {
     return this.config.formats.length ? this.config.formats : (["s32", "s24", "s24_3", "s16"] as SampleFormat[]);
@@ -1073,6 +1088,7 @@ export class MockDaemon {
       device_caps: this.released ? null : caps,
       effective_rates: this.released ? [] : [...new Set([...eff.allowed, ...directRates])].sort((a, b) => a - b),
       direct_rates: this.released ? [] : directRates,
+      playable_rates: this.released ? [] : this.playableRates(),
       bypass_resampler: this.released ? null : this.bypassStatus(sink, rate, rateRatio, feeding),
       effective_default_rate: this.released ? null : eff.defaultRate,
       dither_bits: format ? Math.min(this.config.chain.output.bits, format === "s16" ? 16 : format === "s32" ? 32 : 24) : null,
@@ -1688,6 +1704,7 @@ export class MockDaemon {
     if (rate_ratio.up === rate_ratio.down) {
       return {
         source_rate,
+        device_landings: [],
         output_rate,
         ratio: 1,
         rate_ratio: { up: 1, down: 1 },
@@ -1784,6 +1801,7 @@ export class MockDaemon {
     const namedPreset = isNamedPreset ? (cfg.preset as FilterPreset) : null;
     return {
       source_rate,
+      device_landings: [],
       output_rate,
       ratio,
       rate_ratio,

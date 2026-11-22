@@ -1,21 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { DeviceCapabilities } from "../api/types";
-import { ENGINE_RATES, devicePlays, nearestRate, normalizeRatePolicy, previewRates, rateChips, toggleRate, withDefaultRate } from "./rates";
+import { ENGINE_RATES, convertedRates, nearestRate, normalizeRatePolicy, previewRates, rateChips, toggleRate, withDefaultRate } from "./rates";
 
 const DEFAULT = { allowed_rates: [44100, 48000, 88200, 96000, 176400, 192000], default_rate: 48000 };
-
-function caps(rates: number[]): DeviceCapabilities {
-  return {
-    device: "hw:X",
-    channels: 2,
-    channels_min: 2,
-    channels_max: 2,
-    rates: rates.map((rate) => ({ rate, formats: [{ format: "s32", sbits: 24 }] })),
-    rate_min: rates[0],
-    rate_max: rates[rates.length - 1],
-    formats: ["s32"],
-  } as DeviceCapabilities;
-}
 
 describe("nearestRate (io-pw nearest_rate)", () => {
   it("prefers the same family, then the closest, then 48k", () => {
@@ -64,7 +50,7 @@ describe("withDefaultRate / normalizeRatePolicy", () => {
 });
 
 describe("rateChips", () => {
-  const base = { policy: DEFAULT, effective: DEFAULT.allowed_rates, caps: caps(ENGINE_RATES as number[]), maxRatio: 4, state: "playing" as const, graphRate: 44100 };
+  const base = { policy: DEFAULT, playable: ENGINE_RATES, state: "playing" as const, graphRate: 44100 };
 
   it("shows all engine rates with the high ones off by default", () => {
     const chips = rateChips(base);
@@ -80,13 +66,22 @@ describe("rateChips", () => {
     expect(rateChips({ ...base, state: "ready" }).some((c) => c.playing)).toBe(false);
   });
 
-  it("greys rates a 48k-only device cannot play; enabled ones can still be turned off", () => {
-    const chips = rateChips({ ...base, effective: [48000], caps: caps([48000]), maxRatio: 1, graphRate: 48000 });
+  it("marks what the engine says a 48k-only device does not play; every chip stays editable", () => {
+    // Same family on a 48 kHz-only DAC: the engine plays 48 kHz only.
+    const chips = rateChips({ ...base, playable: [48000], graphRate: 48000 });
     const at = (r: number) => chips.find((c) => c.rate === r)!;
     expect(at(48000)).toMatchObject({ unsupported: false, canToggle: true });
-    expect(at(44100)).toMatchObject({ enabled: true, unsupported: true, canToggle: true });
-    expect(at(44100).title).toContain("Not supported by this device");
-    expect(at(352800)).toMatchObject({ enabled: false, unsupported: true, canToggle: false });
+    expect(at(96000)).toMatchObject({ enabled: true, unsupported: true, canToggle: true });
+    expect(at(96000).title).toContain("PipeWire converts it");
+    expect(at(96000).title).toContain("Click to stop using");
+    expect(at(352800)).toMatchObject({ enabled: false, unsupported: true, canToggle: true });
+    expect(at(352800).title).toContain("Click to allow");
+  });
+
+  it("follows the engine's list, not integer multiples", () => {
+    // Best for DAC on the same DAC: decimation and 160/147 reach every rate.
+    const chips = rateChips({ ...base, playable: ENGINE_RATES, graphRate: 48000 });
+    expect(chips.some((c) => c.unsupported)).toBe(false);
   });
 
   it("the last allowed rate cannot be turned off", () => {
@@ -96,22 +91,28 @@ describe("rateChips", () => {
     expect(c.title).toContain("only allowed rate");
   });
 
-  it("an unknown device does not grey anything", () => {
-    expect(rateChips({ ...base, effective: [], caps: null }).some((c) => c.unsupported)).toBe(false);
-  });
-});
-
-describe("devicePlays", () => {
-  it("counts upsampled rates when upsampling can reach them", () => {
-    const c = caps([96000, 192000]);
-    expect(devicePlays(c, 48000, 4)).toBe(true);
-    expect(devicePlays(c, 48000, 1)).toBe(false);
-    expect(devicePlays(c, 44100, 4)).toBe(false);
+  it("an unknown device does not mark anything", () => {
+    expect(rateChips({ ...base, playable: [] }).some((c) => c.unsupported)).toBe(false);
+    expect(rateChips({ ...base, playable: undefined }).some((c) => c.unsupported)).toBe(false);
   });
 });
 
 describe("previewRates", () => {
-  it("follows the effective list", () => {
-    expect(previewRates([48000, 352800, 44100], DEFAULT.allowed_rates)).toEqual([44100, 48000, 352800]);
+  it("lists the allowed rates and the effective ones", () => {
+    expect(previewRates([48000, 352800, 44100], DEFAULT.allowed_rates)).toEqual([44100, 48000, 88200, 96000, 176400, 192000, 352800]);
+    expect(previewRates([48000], [44100, 48000])).toEqual([44100, 48000]);
+    expect(previewRates([], [])).toEqual([44100, 48000]);
+  });
+});
+
+describe("convertedRates", () => {
+  it("lists the rates PipeWire converts first", () => {
+    const one = { up: 1, down: 1 };
+    const landings = [
+      { source_rate: 44100, ratio: one, requested: { up: 16, down: 1 }, converted_to: 48000 },
+      { source_rate: 48000, ratio: one, requested: { up: 16, down: 1 } },
+    ];
+    expect(convertedRates(landings)).toEqual(new Map([[44100, 48000]]));
+    expect(convertedRates(undefined).size).toBe(0);
   });
 });

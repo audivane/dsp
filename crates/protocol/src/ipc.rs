@@ -576,6 +576,47 @@ pub struct UpsamplerResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub plan: Option<crate::design::DesignPlan>,
+    /// Where the engine plays each `rate.allowed_rates` source rate (and
+    /// [`Self::source_rate`]) with this design's target on the open device,
+    /// as a fresh open decides it. The response is measured at the entry
+    /// for [`Self::source_rate`]: 1:1 when it is converted. Empty without a
+    /// device probe (the target's ratio is measured, as
+    /// `resolve_rate_ratio` gives it).
+    #[serde(default)]
+    pub device_landings: Vec<SourceLanding>,
+}
+
+/// One entry of [`UpsamplerResponse::device_landings`].
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct SourceLanding {
+    pub source_rate: u32,
+    /// The ratio the engine opens the device at for a stream at this rate
+    /// (1:1 when [`Self::converted_to`] is set).
+    pub ratio: crate::RateRatio,
+    /// The ratio the target asks for without the device
+    /// (`resolve_rate_ratio`).
+    pub requested: crate::RateRatio,
+    /// The engine does not offer this rate on the device: PipeWire converts
+    /// the stream to this graph rate before the engine sees it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub converted_to: Option<u32>,
+    /// A "Best for DAC" target (`max_rate_any`, the same cap or 768 kHz)
+    /// and the ratio it would open at here, when the target lands 1:1 or
+    /// converted here and that one would upsample. Absent for `off`,
+    /// `rate` and `max_rate_any` targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub best_for_dac: Option<BestForDac>,
+}
+
+/// [`SourceLanding::best_for_dac`].
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct BestForDac {
+    pub target: crate::RateTarget,
+    pub ratio: crate::RateRatio,
 }
 
 /// The result of [`Call::CheckDesign`]: empty `errors` means the design
@@ -1825,6 +1866,14 @@ pub struct Status {
     /// no device is open, or when no effective rate is native.
     #[serde(default)]
     pub direct_rates: Vec<u32>,
+    /// Every engine graph rate ([`crate::ALLOWED_RATES`], allowed or not)
+    /// the device plays with the current settings: natively, through the
+    /// DSP chain's ratio ladder (decimation and fractional ratios
+    /// included), or with the engine bypass resampler. A rate in
+    /// `rate.allowed_rates` but not here is resampled by PipeWire on this
+    /// device. Empty while no device is open, or without a probe.
+    #[serde(default)]
+    pub playable_rates: Vec<u32>,
     /// Rate used when idle / when following is off, after the same
     /// restriction (`rate.default_rate` when the device supports it).
     #[serde(default)]
@@ -2555,6 +2604,7 @@ mod tests {
             device_caps: None,
             effective_rates: Vec::new(),
             direct_rates: Vec::new(),
+            playable_rates: Vec::new(),
             effective_default_rate: None,
             dither_bits: None,
             limiter_held_db: 0.0,
@@ -2860,6 +2910,16 @@ mod tests {
                 cpu_load: Some(0.01),
                 bounded_peak_db: Some(3.5),
             }),
+            device_landings: vec![SourceLanding {
+                source_rate: 44_100,
+                ratio: crate::RateRatio::ONE,
+                requested: crate::RateRatio::integer(4),
+                converted_to: Some(48_000),
+                best_for_dac: Some(BestForDac {
+                    target: crate::RateTarget::MaxRateAny(768_000),
+                    ratio: crate::RateRatio::new(160, 147),
+                }),
+            }],
         };
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(value["ratio"], 4);

@@ -2,9 +2,8 @@
 // allowed and which one is the default. Mirrors the daemon: io-pw
 // `nearest_rate` and `control::config::normalize_rates`.
 
-import type { DeviceCapabilities, EngineState, RatePolicy } from "../api/types";
+import type { EngineState, RatePolicy, SourceLanding } from "../api/types";
 import { fmtRate } from "./format";
-import { ratioLadder } from "./deviceCaps";
 import { ALLOWED_SOURCE_RATES } from "./upsamplerLimits";
 
 /** Every graph rate the engine can run at, ascending (daemon `ALLOWED_RATES`). */
@@ -61,16 +60,6 @@ export function withDefaultRate<P extends Policy>(p: P, rate: number): P {
   return normalizeRatePolicy({ ...p, allowed_rates: p.allowed_rates.includes(rate) ? p.allowed_rates : [...p.allowed_rates, rate], default_rate: rate });
 }
 
-/**
- * Whether the device can run a graph at `rate`: it takes `rate × k` for a
- * ratio on the ladder from `maxRatio` down to 1 (io-pw `graph_rate_playable`,
- * format aside). Unknown device: assume yes.
- */
-export function devicePlays(caps: DeviceCapabilities | null | undefined, rate: number, maxRatio: number): boolean {
-  if (!caps || caps.rates.length === 0) return true;
-  return ratioLadder(maxRatio).some((k) => caps.rates.some((c) => c.rate === rate * k && c.formats.length > 0));
-}
-
 export interface RateChip {
   rate: number;
   /** In `allowed_rates`. */
@@ -79,39 +68,36 @@ export interface RateChip {
   isDefault: boolean;
   /** The graph runs at it right now (something is playing). */
   playing: boolean;
-  /** The device cannot play it (greyed). */
+  /** The device does not play it with the current settings (an allowed one is kept, inactive). */
   unsupported: boolean;
-  /** Clicking toggles it. */
+  /** Clicking toggles it: always, except the last allowed rate. */
   canToggle: boolean;
   title: string;
 }
 
 export interface RateChipInputs {
   policy: Policy;
-  /** `status.effective_rates`: what the engine offers on this device (empty when unknown). */
-  effective: readonly number[] | null | undefined;
-  caps: DeviceCapabilities | null | undefined;
-  /** Largest upsampling ratio in use (1 when upsampling or DSP is off). */
-  maxRatio: number;
+  /** `status.playable_rates`: every engine rate the device plays with the current settings (empty when unknown). */
+  playable: readonly number[] | null | undefined;
   state: EngineState | null | undefined;
   graphRate: number | null | undefined;
 }
 
-export function rateChips({ policy, effective, caps, maxRatio, state, graphRate }: RateChipInputs): RateChip[] {
-  const known = !!effective && effective.length > 0;
+export function rateChips({ policy, playable, state, graphRate }: RateChipInputs): RateChip[] {
+  const known = !!playable && playable.length > 0;
   return ENGINE_RATES.map((rate) => {
     const enabled = policy.allowed_rates.includes(rate);
     const isDefault = enabled && policy.default_rate === rate;
     const playing = state === "playing" && graphRate === rate;
-    // Enabled rates: what the engine reports. Others: the probed capabilities.
-    const unsupported = enabled && known ? !effective!.includes(rate) : !devicePlays(caps, rate, maxRatio);
+    const unsupported = known && !playable!.includes(rate);
+    // `allowed_rates` is a preference kept across devices: always editable.
     const last = enabled && policy.allowed_rates.length === 1;
-    const canToggle = !last && (enabled || !unsupported);
+    const canToggle = !last;
     const name = fmtRate(rate);
     const parts: string[] = [];
-    if (unsupported) parts.push("Not supported by this device.");
+    if (unsupported) parts.push(enabled ? "Kept, but not used on this device: PipeWire converts it to a rate the device plays." : "This device does not play it with the current settings: PipeWire would convert it.");
     if (last) parts.push(`${name} is the only allowed rate; allow another one first.`);
-    else if (canToggle) parts.push(enabled ? `Allowed. Click to stop using ${name}${unsupported ? "" : "; streams at it are then resampled by PipeWire"}.` : `Not allowed. Click to allow ${name}.`);
+    else parts.push(enabled ? `Allowed. Click to stop using ${name}${unsupported ? "" : "; streams at it are then resampled by PipeWire"}.` : `Not allowed. Click to allow ${name}.`);
     if (isDefault) parts.push("Default rate: used while idle and when rate following is off.");
     if (playing) parts.push("Playing at this rate now.");
     if (rate >= HIGH_RATE && !unsupported)
@@ -122,11 +108,19 @@ export function rateChips({ policy, effective, caps, maxRatio, state, graphRate 
 }
 
 /**
- * The source rates the Upsampling view previews: the engine's effective
- * graph rates, else the configured ones (ascending).
+ * The source rates the Upsampling view previews: the configured ones and
+ * the engine's effective graph rates (ascending). A configured rate the
+ * engine does not offer on this device is marked from the response's
+ * `device_landings` ([`convertedRates`]).
  */
 export function previewRates(effective: readonly number[] | null | undefined, allowed: readonly number[] | null | undefined): number[] {
-  const list = effective && effective.length > 0 ? effective : (allowed ?? []);
-  const out = [...new Set(list)].sort((a, b) => a - b);
+  const out = [...new Set([...(allowed ?? []), ...(effective ?? [])])].sort((a, b) => a - b);
   return out.length > 0 ? out : [44100, 48000];
+}
+
+/** Source rate → the rate PipeWire converts it to before the engine, from `device_landings`. */
+export function convertedRates(landings: readonly SourceLanding[] | null | undefined): Map<number, number> {
+  const out = new Map<number, number>();
+  for (const l of landings ?? []) if (l.converted_to) out.set(l.source_rate, l.converted_to);
+  return out;
 }

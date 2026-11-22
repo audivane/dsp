@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { MockDaemon } from "../api/mock";
 import type { DeviceCapabilities } from "../api/types";
-import { directRateNote, directResamples, ditherAdvice, effectiveDitherBits, formatUnavailableReason, rateSupportNote, ratioLadder, sbitsAt, suggestedDitherBits, supportsFormat, usedBits } from "./deviceCaps";
+import { directRateNote, directResamples, ditherAdvice, effectiveDitherBits, formatUnavailableReason, rateSupportNote, sbitsAt, suggestedDitherBits, supportsFormat, usedBits } from "./deviceCaps";
 
 /** A USB speaker that plays S16_LE, 2 channels, 48000 Hz only. */
 const SPK48: DeviceCapabilities = {
@@ -91,11 +91,6 @@ describe("device capabilities", () => {
     expect(rateSupportNote([44100, 48000, 96000], [48000, 96000])?.text).toBe("This device cannot play 44.1 kHz; those streams are resampled by PipeWire.");
     expect(rateSupportNote([44100, 48000], [44100, 48000])).toBeNull();
     expect(rateSupportNote([44100, 48000], [])).toBeNull();
-  });
-
-  it("walks the ratio ladder like the engine", () => {
-    expect(ratioLadder(8)).toEqual([8, 4, 2, 1]);
-    expect(ratioLadder(6)).toEqual([6, 5, 4, 2, 1]);
   });
 });
 

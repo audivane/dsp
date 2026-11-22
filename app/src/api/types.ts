@@ -118,6 +118,7 @@ export type {
   TiltPivot,
   TiltStatus,
   Topic,
+  SourceLanding,
   UpsamplerConfig,
   UpsamplerResponse,
   VarispeedConfig,
