@@ -1007,7 +1007,7 @@ try {
   await p.waitForSelector(".ctl.bit-perfect", { timeout: 2000 }).catch(() => fail("bit-perfect state did not appear on Bypass"));
   if ((await p.locator("#vol ~ output").textContent()) !== "on DAC") fail("volume readout should say the volume is on the DAC");
   await p
-    .waitForFunction(() => document.querySelector(".meters .headroom")?.textContent === "chain —", null, { timeout: 2000 })
+    .waitForFunction(() => document.querySelector(".meters .headroom")?.textContent === "chain -", null, { timeout: 2000 })
     .catch(() => fail("chain gain should be blank while the chain is bypassed"));
   if ((await p.locator("#vol").getAttribute("aria-disabled")) !== "true") fail("volume slider should be disabled while bit-perfect");
   if (!((await p.locator(".ctl.bit-perfect").getAttribute("title")) ?? "").includes("set the volume on the DAC")) fail("bit-perfect hint missing");
@@ -1185,26 +1185,14 @@ try {
   await p.getByRole("button", { name: "Chu Moy" }).click();
   await p.waitForFunction(() => window.avdsp.getState().config.chain.crossfeed?.mode === "bs2b_chu_moy", null, { timeout: 3000 }).catch(() => fail("crossfeed preset not applied"));
   if ((await subOf("Crossfeed")) !== "Chu Moy · 700 Hz, 6 dB") fail(`crossfeed summary: ${await subOf("Crossfeed")}`);
-  // Level: matched by default (gain near 0 dB plus the worst-case peak), peak-safe on a click.
+  // Level: always matched loudness (gain near 0 dB), with the worst-case peak shown.
   const xfFact = (k) => p.locator(".fact").filter({ has: p.locator(".k", { hasText: new RegExp(`^${k}$`) }) });
-  const xfLevel = p.getByRole("group", { name: "Crossfeed level" });
-  if ((await xfLevel.getByRole("button", { name: "Matched loudness" }).getAttribute("aria-pressed")) !== "true") fail("crossfeed level should default to Matched loudness");
-  if (!/same loudness|as loud/i.test((await xfLevel.getByRole("button", { name: "Matched loudness" }).getAttribute("title")) ?? "")) fail("matched level tooltip");
-  if ((await xfFact("Level").count()) !== 1 || (await xfFact("Worst-case peak").count()) !== 1) fail("matched crossfeed facts missing");
+  if ((await p.getByRole("group", { name: "Crossfeed level" }).count()) !== 0) fail("crossfeed should have no level choice");
+  if ((await xfFact("Level").count()) !== 1 || (await xfFact("Worst-case peak").count()) !== 1) fail("crossfeed facts missing");
   if (!(await xfFact("Worst-case peak").textContent()).includes("+")) fail(`worst-case peak: ${await xfFact("Worst-case peak").textContent()}`);
   await shot(p, "crossfeed-matched");
-  await xfLevel.getByRole("button", { name: "Peak-safe" }).click();
-  await p.waitForFunction(() => window.avdsp.getState().config.chain.crossfeed?.level === "peak_safe", null, { timeout: 3000 }).catch(() => fail("crossfeed peak-safe not applied"));
-  if ((await subOf("Crossfeed")) !== "Chu Moy · 700 Hz, 6 dB · peak-safe") fail(`crossfeed peak-safe summary: ${await subOf("Crossfeed")}`);
-  if (!(await xfFact("Level").textContent()).includes("−3.")) fail(`peak-safe level: ${await xfFact("Level").textContent()}`);
-  if ((await xfFact("Worst-case peak").count()) !== 0) fail("peak-safe should not show a worst-case peak");
-  await shot(p, "crossfeed-peak-safe");
-  // A preset keeps the level policy.
   await p.getByRole("button", { name: "Jan Meier" }).click();
   await p.waitForFunction(() => window.avdsp.getState().config.chain.crossfeed?.mode === "bs2b_jan_meier", null, { timeout: 3000 });
-  if ((await p.evaluate(() => window.avdsp.getState().config.chain.crossfeed?.level)) !== "peak_safe") fail("changing the preset reset the crossfeed level");
-  await xfLevel.getByRole("button", { name: "Matched loudness" }).click();
-  await p.waitForFunction(() => window.avdsp.getState().config.chain.crossfeed?.level === "matched", null, { timeout: 3000 }).catch(() => fail("crossfeed matched not applied"));
   await p.getByRole("button", { name: "Chu Moy" }).click();
   await p.waitForFunction(() => window.avdsp.getState().config.chain.crossfeed?.mode === "bs2b_chu_moy", null, { timeout: 3000 });
   await p.locator("#xf-feed").focus();

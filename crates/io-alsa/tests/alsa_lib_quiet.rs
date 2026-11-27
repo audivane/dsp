@@ -8,6 +8,7 @@ fn open_missing() {
         device: "hw:CARD=NoSuchCardForThisTest,DEV=0".into(),
         rate: 48_000,
         channels: 2,
+        channel_map: Vec::new(),
         period_frames: 1024,
         buffer_periods: 2,
         preferred_format: None,

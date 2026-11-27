@@ -26,6 +26,7 @@ pub(crate) mod double_double;
 pub(crate) mod exact;
 pub mod fir;
 pub mod general;
+pub mod optimal;
 pub mod standard;
 
 use super::phase::cepstral::{self, Target};
@@ -61,6 +62,7 @@ pub(crate) fn recipe(
     }
     let mut taps = length::per_input(k, grid.up, source_rate)?;
     let (mut cutoff, window) = match &k.shape {
+        Shape::Optimal { .. } => return unsupported("an optimal design"),
         Shape::Lanczos { lobes } => (catalogue::FC_NYQUIST, fir::Window::Lanczos { a: *lobes }),
         Shape::WindowedSinc { window, cutoff, .. } => {
             let Cutoff::Fraction(fc) = cutoff else {

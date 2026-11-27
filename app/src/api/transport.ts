@@ -2,7 +2,7 @@
 // daemon over the Unix socket) or an in-memory mock for the plain browser.
 
 import type { ShellTransport } from "./shell";
-import type { DaemonEvent, ResponseWindowRequest, UpsamplerConfig, UpsamplerResponse } from "./types";
+import type { DaemonEvent, EngineConfig, ResponseWindowRequest, UpsamplerConfig, UpsamplerResponse } from "./types";
 
 export class DaemonError extends Error {
   constructor(
@@ -30,11 +30,22 @@ export const ErrorCode = {
   DISCONNECTED: -1,
   /** Client side: no reply in time. */
   TIMEOUT: -2,
-  /** Client side: superseded by a newer analysis request. */
+  /** Superseded by a newer analysis request (client side, or the daemon's code 5, mapped to this by the Tauri client). */
   SUPERSEDED: -3,
 } as const;
 
 export type ConnState = "connecting" | "up" | "down";
+
+/** See `Transport.appImageSetup`. */
+export interface AppImageSetup {
+  /** A system package is installed: the app uses its engine, no setup. */
+  systemPackage: boolean;
+  /** The user install's version, if there is one. */
+  installed: string | null;
+}
+
+/** See `Transport.appUpdatePending`. */
+export type AppUpdateState = "ready" | "failed";
 
 export interface TransportHandlers {
   onEvent(e: DaemonEvent): void;
@@ -55,6 +66,10 @@ export interface Transport extends ShellTransport {
   start(handlers: TransportHandlers): () => void;
   /** Subscribe or unsubscribe from live `spectrum` events on the daemon. */
   setSpectrumEnabled(enabled: boolean): void;
+  /** The config once the engine is done with every `set_upsampler` sent so
+   *  far (a `get_config` behind them on their connection): how a change
+   *  whose call timed out turned out, without sending it again. */
+  afterUpsamplerBuild(): Promise<EngineConfig>;
   /** Measure the engine's own upsampler filter response (optionally with a zoom window evaluated from the cached measurement). */
   upsamplerResponse(config: UpsamplerConfig | null, sourceRate: number | null, window?: ResponseWindowRequest): Promise<UpsamplerResponse>;
   /** Start the systemd user unit `audivane-dsp.service`. */
@@ -71,8 +86,20 @@ export interface Transport extends ShellTransport {
   appVersion(): Promise<string | null>;
   /** Relaunch the app process (it then runs the newly installed code). */
   restartApp(): Promise<void>;
+  /** Where an upgrade of the app stands: "ready" (it relaunches itself once
+   *  the user leaves the window), "failed" (it could not: restart by hand),
+   *  null (nothing pending). */
+  appUpdatePending(): Promise<AppUpdateState | null>;
+  /** Running from the AppImage: what its per-user setup offer needs
+   *  (null when not an AppImage). */
+  appImageSetup(): Promise<AppImageSetup | null>;
+  /** The AppImage's per-user setup (it starts the engine), then a relaunch
+   *  into the installed app: resolves only if that relaunch failed. */
+  installAppImage(loginStart: boolean): Promise<void>;
   /** Native file picker for an impulse response; null when cancelled. */
   pickImpulseResponse(): Promise<string | null>;
+  /** Native file picker for a room-calibration bundle manifest; null when cancelled. */
+  pickCalibrationBundle(): Promise<string | null>;
   /** WAV header facts of an impulse response, if readable by the UI process. */
   irInfo(path: string): Promise<IrInfo | null>;
   copyText(text: string): Promise<void>;

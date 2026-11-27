@@ -52,6 +52,10 @@ pub struct EngineSnapshot {
     pub latency_ms: f64,
     /// Filter delay part of `latency_ms`.
     pub filter_latency_ms: f64,
+    /// The convolution's own delay (its IRs' bulk delay plus the
+    /// convolver's block) at the graph rate, ms; part of
+    /// `filter_latency_ms`. 0 without convolution.
+    pub conv_latency_ms: f64,
     pub xruns: u64,
     pub dsp_load: f64,
     /// Something processes the samples: the DSP chain (enabled and not
@@ -148,6 +152,21 @@ pub trait Engine: Send + Sync + 'static {
     fn volume_state(&self) -> (Option<VolumeStatus>, u64) {
         (self.snapshot().volume, 0)
     }
+    /// The convolution guards' warnings of the config applied last
+    /// ([`audivane_protocol::ipc::Status::conv_warnings`]). None by default.
+    fn conv_warnings(&self) -> Vec<audivane_protocol::ipc::ConvWarning> {
+        Vec::new()
+    }
+    /// The enabled convolution items of `convs`, loaded at `rate` as a
+    /// chain build loads them (through the engine's IR cache, resampled,
+    /// shapes checked), for the response plot. Default: a cache of its own.
+    fn load_conv(
+        &self,
+        convs: &[audivane_protocol::ConvolutionConfig],
+        rate: u32,
+    ) -> Result<Vec<audivane_dsp_core::matrix::LoadedConv>, EngineError> {
+        crate::engine::load_conv_items(convs, &mut crate::engine::ir::IrCache::new(), rate)
+    }
     /// Meters since the previous call (peak window resets on read).
     fn meters(&self) -> Meters;
     /// The limiter's held automatic headroom (dB) the audio thread last
@@ -163,6 +182,15 @@ pub trait Engine: Send + Sync + 'static {
     fn spectrum_generation(&self) -> u64 {
         0
     }
+    /// The harmonics stage's live view: the latest frame, and the analysis
+    /// kept on for a few seconds ([`audivane_protocol::ipc::Call::HarmonicsLive`]).
+    /// `None`: this engine has none.
+    fn harmonics_live(&self) -> Option<audivane_protocol::ipc::HarmonicsLive> {
+        None
+    }
+    /// Stop the live view and forget what it holds (a blind test starts
+    /// or ends): the next poll starts afresh.
+    fn harmonics_live_suspend(&self) {}
     /// Start/stop copying samples into the spectrum rings. The event pump
     /// calls this from its subscriber set.
     fn set_spectrum_enabled(&self, _enabled: bool) {}
@@ -214,10 +242,42 @@ pub trait Engine: Send + Sync + 'static {
         0
     }
 
+    /// The per-rate upsampler plan ([`RatePlan`]): which source rates
+    /// build another upsampler than the config's. The engine uses it for
+    /// the chains it builds from now on (an edit, a reopen at a new rate);
+    /// the chain playing now changes with the next [`Self::apply`]. No-op
+    /// by default.
+    fn set_rate_plan(&self, _plan: RatePlan) {}
+
     /// Varispeed's request and whether its stage runs, for the overload
     /// fallback. Default: not requested.
     fn varispeed_request(&self) -> VarispeedRequest {
         VarispeedRequest::default()
+    }
+
+    /// Measurement playback (`measure_play`): hand `job` to the master's
+    /// audio thread and to every follower it routes to (by
+    /// [`crate::engine::measure::MeasureDevice::follower`]), or take it
+    /// back from all of them (`None`). Default: no engine to play it.
+    fn measure_post(
+        &self,
+        _job: Option<std::sync::Arc<crate::engine::measure::MeasureJob>>,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::new(
+            audivane_protocol::ipc::RpcError::BAD_STATE,
+            "measurements need the audio engine",
+        ))
+    }
+
+    /// Free what the audio threads handed back from earlier measurement
+    /// posts (their references to old jobs). Default: nothing to free.
+    fn measure_reclaim(&self) {}
+
+    /// Keep an old measurement job an audio thread still holds, and drop it
+    /// off the audio threads once that thread handed it back. Default: no
+    /// audio threads, so it can go now.
+    fn measure_retire(&self, job: std::sync::Arc<crate::engine::measure::MeasureJob>) {
+        drop(job);
     }
 
     /// Enable or disable varispeed and set its target speed, ramp and Keep
@@ -229,5 +289,57 @@ pub trait Engine: Send + Sync + 'static {
         _cfg: audivane_protocol::ipc::VarispeedConfig,
     ) -> Result<(), EngineError> {
         Ok(())
+    }
+}
+
+/// Chain A's upsampler per source rate: at the rates listed, the engine
+/// builds the plan's upsampler in place of the requested one, at the same
+/// target (so the device lands where the requested one would). Made by the
+/// control plane for one requested upsampler and output section
+/// ([`crate::control::cpu_budget::plan_rates`]); it applies only while the
+/// config the engine runs carries exactly those, with DSP on.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RatePlan {
+    /// The requested chain A upsampler and output section it was made for.
+    pub made_for: Option<(
+        audivane_protocol::UpsamplerConfig,
+        audivane_protocol::OutputConfig,
+    )>,
+    /// Source (graph) rate and the upsampler built there instead.
+    pub rates: Vec<(u32, audivane_protocol::UpsamplerConfig)>,
+}
+
+impl RatePlan {
+    /// The upsampler built at `graph_rate` for `cfg` in place of its own,
+    /// if the plan replaces it there.
+    pub fn substitute(
+        &self,
+        cfg: &EngineConfig,
+        graph_rate: u32,
+    ) -> Option<&audivane_protocol::UpsamplerConfig> {
+        let (up, out) = self.made_for.as_ref()?;
+        if !cfg.dsp_enabled || cfg.chain.upsampler != *up || cfg.chain.output != *out {
+            return None;
+        }
+        self.rates
+            .iter()
+            .find(|(r, _)| *r == graph_rate)
+            .map(|(_, u)| u)
+    }
+
+    /// `cfg` as the engine builds it at `graph_rate`.
+    pub fn apply<'a>(
+        &self,
+        cfg: &'a EngineConfig,
+        graph_rate: u32,
+    ) -> std::borrow::Cow<'a, EngineConfig> {
+        match self.substitute(cfg, graph_rate) {
+            Some(up) => {
+                let mut c = cfg.clone();
+                c.chain.upsampler = up.clone();
+                std::borrow::Cow::Owned(c)
+            }
+            None => std::borrow::Cow::Borrowed(cfg),
+        }
     }
 }

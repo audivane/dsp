@@ -5,7 +5,7 @@
 // the release, key-up, wheel pause or a typed value reports "commit", which
 // always goes out.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { parseNumber } from "../lib/format";
 import {
   WHEEL_HINT,
@@ -35,6 +35,10 @@ export interface ValueSliderProps {
   title?: string;
   /** Wider track for wide ranges (pitch). */
   wide?: boolean;
+  /** Named points under the track (linear scale only): a drag within
+   *  `snap` of one lands on it, and clicking a name sets it. */
+  detents?: { value: number; label: string }[];
+  snap?: number;
   onChange: (v: number, mode: "drag" | "commit") => void;
   /** Ends a drag, arrow-key or wheel gesture: flush any pending write and
    *  settle the draft without replaying the edit. */
@@ -56,6 +60,13 @@ export function ValueSlider(p: ValueSliderProps) {
   const quant = (v: number) => clampV(Number((Math.round(v / step) * step).toFixed(6)));
   const toPos = (v: number) => (log ? Math.round((Math.log(clampV(v) / min) / Math.log(max / min)) * STEPS) : clampV(v));
   const fromPos = (pos: number) => quant(log ? min * Math.pow(max / min, pos / STEPS) : pos);
+
+  // A pointer drag lands on a detent when near one (keys and the wheel
+  // step freely, or they could never leave it).
+  const snapTo = (v: number) => {
+    const near = p.detents?.find((d) => Math.abs(d.value - v) <= (p.snap ?? 0));
+    return near ? near.value : v;
+  };
 
   const clearWheelTimer = () => {
     if (wheelTimer.current) {
@@ -143,45 +154,64 @@ export function ValueSlider(p: ValueSliderProps) {
 
   return (
     <div className={"vslider" + (p.wide ? " wide" : "")}>
-      <input
-        ref={inputRef}
-        id={p.id}
-        type="range"
-        min={log ? 0 : min}
-        max={log ? STEPS : max}
-        step={log ? 1 : step}
-        value={toPos(p.value)}
-        disabled={p.disabled}
-        aria-label={p.label}
-        aria-valuetext={p.format(p.value)}
-        title={p.disabled ? p.title : p.title ? `${p.title} ${WHEEL_HINT}` : WHEEL_HINT}
-        onPointerDown={(e) => {
-          if (!p.disabled) e.currentTarget.focus();
-        }}
-        onChange={(e) => {
-          clearWheelTimer();
-          const v = fromPos(Number(e.target.value));
-          if (v === p.value && last.current === null) return;
-          last.current = v;
-          p.onChange(v, "drag");
-        }}
-        onKeyDown={(e) => {
-          // Arrows move one displayed step, also on a log scale (the native
-          // step there is a fraction of a step and would snap back). Page
-          // Up/Down and Home/End keep the native jumps.
-          if (!e.key.startsWith("Arrow")) return;
-          const v = keyStepValue(e.key, last.current ?? p.value, { min, max, step });
-          if (v === null) return;
-          e.preventDefault();
-          clearWheelTimer();
-          if (v === (last.current ?? p.value)) return;
-          last.current = v;
-          p.onChange(v, "drag");
-        }}
-        onPointerUp={endGesture}
-        onKeyUp={endGesture}
-        onBlur={endGesture}
-      />
+      <span className="vslider-track">
+        <input
+          ref={inputRef}
+          id={p.id}
+          type="range"
+          min={log ? 0 : min}
+          max={log ? STEPS : max}
+          step={log ? 1 : step}
+          value={toPos(p.value)}
+          disabled={p.disabled}
+          aria-label={p.label}
+          aria-valuetext={p.format(p.value)}
+          title={p.disabled ? p.title : p.title ? `${p.title} ${WHEEL_HINT}` : WHEEL_HINT}
+          onPointerDown={(e) => {
+            if (!p.disabled) e.currentTarget.focus();
+          }}
+          onChange={(e) => {
+            clearWheelTimer();
+            const v = snapTo(fromPos(Number(e.target.value)));
+            if (v === p.value && last.current === null) return;
+            last.current = v;
+            p.onChange(v, "drag");
+          }}
+          onKeyDown={(e) => {
+            // Arrows move one displayed step, also on a log scale (the native
+            // step there is a fraction of a step and would snap back). Page
+            // Up/Down and Home/End keep the native jumps.
+            if (!e.key.startsWith("Arrow")) return;
+            const v = keyStepValue(e.key, last.current ?? p.value, { min, max, step });
+            if (v === null) return;
+            e.preventDefault();
+            clearWheelTimer();
+            if (v === (last.current ?? p.value)) return;
+            last.current = v;
+            p.onChange(v, "drag");
+          }}
+          onPointerUp={endGesture}
+          onKeyUp={endGesture}
+          onBlur={endGesture}
+        />
+        {p.detents && !log && (
+          <span className="vslider-detents">
+            {p.detents.map((d) => (
+              <button
+                key={d.value}
+                type="button"
+                tabIndex={-1}
+                disabled={p.disabled}
+                className={Math.abs(d.value - p.value) < 1e-9 ? "on" : undefined}
+                style={{ "--at": (d.value - min) / (max - min) } as CSSProperties}
+                onClick={() => d.value !== p.value && p.onChange(d.value, "commit")}
+              >
+                {d.label}
+              </button>
+            ))}
+          </span>
+        )}
+      </span>
       {typing === null ? (
         <output
           htmlFor={p.id}

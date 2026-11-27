@@ -10,8 +10,8 @@ use audivane_dsp_daemon::control::daemon::{Daemon, DaemonOptions};
 use audivane_protocol::SampleFormat;
 use audivane_protocol::ipc::{
     AbB, AbConfig, AbSide, AbStatus, AppRule, Call, DeviceInfo, EngineConfig, EngineState,
-    LevelMatch, PassthroughBreak, Preset, PresetInfo, PresetState, RouteTarget, RoutingMode,
-    RpcError, SinkChoice, Spectrum, Status, StreamInfo, Topic, VolumeStatus,
+    LevelMatch, PassthroughBreak, Preset, PresetInfo, PresetPart, PresetState, RouteTarget,
+    RoutingMode, RpcError, SinkChoice, Spectrum, Status, StreamInfo, Topic, VolumeStatus,
 };
 use audivane_protocol::{
     Band, ChainConfig, DitherKind, EqProfile, FilterType, OutputConfig, RateTarget, UpsamplerConfig,
@@ -29,6 +29,7 @@ fn quiet_options(socket: &Path) -> DaemonOptions {
         graph: false,
         mpris: false,
         mpris_interval: Duration::from_millis(100),
+        device_identity: false,
     }
 }
 
@@ -117,10 +118,168 @@ fn every_call_round_trips() {
 
     // set_harmonics
     client.ok(Call::SetHarmonics(Some(
-        audivane_protocol::HarmonicsConfig::default(),
+        audivane_protocol::HarmonicsConfig::from_preset("triode").unwrap(),
     )));
     let config: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
     assert!(config.chain.harmonics.as_ref().is_some_and(|h| h.enabled));
+    // Readouts of the active stage, and of a config passed in.
+    let readout: audivane_protocol::ipc::HarmonicsReadout =
+        serde_json::from_value(client.ok(Call::HarmonicsReadout {
+            config: None,
+            sweep: false,
+            sweep_freq_hz: None,
+            sweep_level_dbfs: None,
+        }))
+        .unwrap();
+    assert_eq!(readout.points.len(), 4);
+    assert!((readout.points[0].thd_db + 39.9).abs() < 0.2, "{readout:?}");
+    // The spectrum of the active stage at 1 kHz, 0 dBFS: H2 where the
+    // readout puts it, the output word's floor below it.
+    let spectrum: audivane_protocol::ipc::HarmonicsSpectrum =
+        serde_json::from_value(client.ok(Call::HarmonicsSpectrum {
+            config: None,
+            freq_hz: 1_000.0,
+            level_dbfs: 0.0,
+            traces: Vec::new(),
+        }))
+        .unwrap();
+    assert_eq!(spectrum.lines.len(), 1);
+    let line = &spectrum.lines[0];
+    let h2 = line.peaks.iter().find(|p| p.order == 2).unwrap();
+    assert!((h2.level_db - readout.points[0].harmonics_db[0]).abs() < 0.05);
+    assert!(line.floor_db < h2.level_db);
+    assert!(matches!(
+        client.call(Call::HarmonicsSpectrum {
+            config: None,
+            freq_hz: 1_000.0,
+            level_dbfs: 0.0,
+            traces: vec![audivane_protocol::ipc::HarmonicsSpectrumTrace::Layer { layer: 9 }],
+        }),
+        common::Reply::Error(e) if e.code == RpcError::INVALID_PARAMS
+    ));
+    let presets: Vec<audivane_protocol::HarmonicsPreset> =
+        serde_json::from_value(client.ok(Call::HarmonicsPresets)).unwrap();
+    let tape = presets.iter().find(|p| p.id == "tape").unwrap().to_layer();
+    let systems: Vec<audivane_protocol::HarmonicsSystem> =
+        serde_json::from_value(client.ok(Call::HarmonicsSystems)).unwrap();
+    assert_eq!(systems, audivane_protocol::harmonics_systems());
+    let readout: audivane_protocol::ipc::HarmonicsReadout =
+        serde_json::from_value(client.ok(Call::HarmonicsReadout {
+            config: Some(audivane_protocol::HarmonicsConfig {
+                system: None,
+                enabled: true,
+                layers: vec![tape],
+                dc_block: true,
+                routing: Default::default(),
+            }),
+            sweep: true,
+            sweep_freq_hz: None,
+            sweep_level_dbfs: None,
+        }))
+        .unwrap();
+    assert!(readout.peak_gain_db > 0.0, "{readout:?}");
+    assert_eq!(readout.sweep.len(), 42);
+    assert!(readout.below_clean_rate.is_empty());
+    assert!(readout.under_load.is_empty());
+    // The sweeps at one tone and one level, as the app's sliders ask.
+    let moved: audivane_protocol::ipc::HarmonicsReadout =
+        serde_json::from_value(client.ok(Call::HarmonicsReadout {
+            config: Some(audivane_protocol::HarmonicsConfig {
+                system: None,
+                enabled: true,
+                layers: vec![presets.iter().find(|p| p.id == "tape").unwrap().to_layer()],
+                dc_block: true,
+                routing: Default::default(),
+            }),
+            sweep: true,
+            sweep_freq_hz: Some(100.0),
+            sweep_level_dbfs: Some(-6.0),
+        }))
+        .unwrap();
+    assert_eq!(moved.sweep.len(), 21);
+    assert!(moved.sweep.iter().all(|p| p.freq_hz == 100.0));
+    assert!(!moved.freq_sweep.is_empty());
+    assert!(moved.freq_sweep.iter().all(|p| p.input_dbfs == -6.0));
+    assert_eq!(moved.points, readout.points);
+    let studio = presets
+        .iter()
+        .find(|p| p.id == "tape_studio")
+        .unwrap()
+        .to_layer();
+    let hyst_readout: audivane_protocol::ipc::HarmonicsReadout =
+        serde_json::from_value(client.ok(Call::HarmonicsReadout {
+            config: Some(audivane_protocol::HarmonicsConfig {
+                system: None,
+                enabled: true,
+                layers: vec![studio],
+                dc_block: true,
+                routing: Default::default(),
+            }),
+            sweep: false,
+            sweep_freq_hz: None,
+            sweep_level_dbfs: None,
+        }))
+        .unwrap();
+    assert!(hyst_readout.peak_gain_db > 0.5, "{hyst_readout:?}");
+    assert_eq!(hyst_readout.below_clean_rate.len(), 1);
+    assert_eq!(hyst_readout.below_clean_rate[0].layer, 0);
+    // A layer with sag: the under-load sweep next to the static one.
+    let mut sagging = presets
+        .iter()
+        .find(|p| p.id == "se_triode_high_mu")
+        .unwrap()
+        .to_layer();
+    if let audivane_protocol::HarmonicsLayer::Chebyshev(l) = &mut sagging {
+        l.sag = Some(audivane_protocol::HarmonicsSag::default());
+    }
+    let sag_readout: audivane_protocol::ipc::HarmonicsReadout =
+        serde_json::from_value(client.ok(Call::HarmonicsReadout {
+            config: Some(audivane_protocol::HarmonicsConfig {
+                system: None,
+                enabled: true,
+                layers: vec![sagging],
+                dc_block: true,
+                routing: Default::default(),
+            }),
+            sweep: true,
+            sweep_freq_hz: None,
+            sweep_level_dbfs: None,
+        }))
+        .unwrap();
+    assert_eq!(sag_readout.under_load.len(), sag_readout.sweep.len());
+    assert!(sag_readout.bias_limited.is_empty());
+    // Series: a curve into a tape layer, set, read back and read out.
+    let curve = presets
+        .iter()
+        .find(|p| p.id == "se_triode_high_mu")
+        .unwrap()
+        .to_layer();
+    let chained = audivane_protocol::HarmonicsConfig {
+        system: None,
+        enabled: true,
+        layers: vec![curve, studio_layer(&presets)],
+        dc_block: true,
+        routing: audivane_protocol::HarmonicsRouting::Series,
+    };
+    client.ok(Call::SetHarmonics(Some(chained.clone())));
+    let raw = client.ok(Call::GetConfig);
+    assert_eq!(raw["chain"]["harmonics"]["routing"], "series");
+    let config: EngineConfig = serde_json::from_value(raw).unwrap();
+    assert_eq!(config.chain.harmonics.as_ref(), Some(&chained));
+    let series_readout: audivane_protocol::ipc::HarmonicsReadout =
+        serde_json::from_value(client.ok(Call::HarmonicsReadout {
+            config: None,
+            sweep: false,
+            sweep_freq_hz: None,
+            sweep_level_dbfs: None,
+        }))
+        .unwrap();
+    // The peak bounds compose: the curve's and the tape layer's.
+    assert!(
+        series_readout.peak_gain_db > hyst_readout.peak_gain_db + 0.1,
+        "{series_readout:?}"
+    );
+    assert_eq!(series_readout.points.len(), 4);
     client.ok(Call::SetHarmonics(None));
     let config: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
     assert!(config.chain.harmonics.is_none());
@@ -141,6 +300,8 @@ fn every_call_round_trips() {
             enabled: true,
             ir_path: ir.clone(),
             gain_db: -1.5,
+            matrix: None,
+            calibration: false,
         },
     ]));
     let config: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
@@ -179,13 +340,13 @@ fn every_call_round_trips() {
     }))))
     .unwrap();
     assert!(ab.enabled);
-    assert_eq!(ab.current, AbSide::A);
+    assert_eq!(ab.current, Some(AbSide::A));
     let ab: AbStatus = serde_json::from_value(client.ok(Call::AbSelect {
         side: AbSide::B,
         crossfade_ms: 25.0,
     }))
     .unwrap();
-    assert_eq!(ab.current, AbSide::B);
+    assert_eq!(ab.current, Some(AbSide::B));
     assert_eq!(ab.offset_db, -2.5);
     assert_eq!(
         harness
@@ -398,6 +559,8 @@ fn error_paths() {
             enabled: true,
             ir_path: "/nonexistent/t5b-ir.wav".into(),
             gain_db: 0.0,
+            matrix: None,
+            calibration: false,
         },
     ])) {
         Reply::Error(error) => {
@@ -1255,6 +1418,8 @@ fn presets_round_trip_and_track_the_active_one() {
     let info: PresetInfo = serde_json::from_value(client.ok(Call::SavePreset {
         name: "  Bass  ".into(),
         overwrite: false,
+        part: None,
+        parts: None,
     }))
     .unwrap();
     assert_eq!(info.name, "Bass");
@@ -1292,6 +1457,7 @@ fn presets_round_trip_and_track_the_active_one() {
     assert_eq!(list[0].name, "Bass");
     let preset: Preset = serde_json::from_value(client.ok(Call::GetPreset {
         name: "Bass".into(),
+        part: None,
     }))
     .unwrap();
     assert_eq!(preset.chain, config.chain);
@@ -1301,6 +1467,8 @@ fn presets_round_trip_and_track_the_active_one() {
     match client.call(Call::SavePreset {
         name: "Bass".into(),
         overwrite: false,
+        part: None,
+        parts: None,
     }) {
         Reply::Error(error) => {
             assert_eq!(error.code, RpcError::BAD_STATE);
@@ -1314,6 +1482,7 @@ fn presets_round_trip_and_track_the_active_one() {
     }
     let again: Preset = serde_json::from_value(client.ok(Call::GetPreset {
         name: "Bass".into(),
+        part: None,
     }))
     .unwrap();
     assert_eq!(again.chain, preset.chain);
@@ -1326,7 +1495,8 @@ fn presets_round_trip_and_track_the_active_one() {
     // Loading restores the saved chain and clears the flag.
     assert_eq!(
         client.ok(Call::LoadPreset {
-            name: "Bass".into()
+            name: "Bass".into(),
+            part: None,
         }),
         Value::Null
     );
@@ -1342,6 +1512,8 @@ fn presets_round_trip_and_track_the_active_one() {
     let info: PresetInfo = serde_json::from_value(client.ok(Call::SavePreset {
         name: "Bass".into(),
         overwrite: true,
+        part: None,
+        parts: None,
     }))
     .unwrap();
     assert_eq!(info.name, "Bass");
@@ -1364,6 +1536,7 @@ fn presets_round_trip_and_track_the_active_one() {
     }));
     client.ok(Call::LoadPreset {
         name: "Bass".into(),
+        part: None,
     });
     let config: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
     assert_eq!(config.chain.upsampler.target, RateTarget::Ratio(4));
@@ -1376,6 +1549,7 @@ fn presets_round_trip_and_track_the_active_one() {
     let info: PresetInfo = serde_json::from_value(client.ok(Call::RenamePreset {
         from: "Bass".into(),
         to: "Bass boost".into(),
+        part: None,
     }))
     .unwrap();
     assert_eq!(info.name, "Bass boost");
@@ -1385,6 +1559,7 @@ fn presets_round_trip_and_track_the_active_one() {
     assert_eq!(config.active_preset.as_deref(), Some("Bass boost"));
     match client.call(Call::GetPreset {
         name: "Bass".into(),
+        part: None,
     }) {
         Reply::Error(error) => assert_eq!(error.code, RpcError::INVALID_PARAMS),
         other => panic!("the old name must be gone: {other:?}"),
@@ -1393,7 +1568,8 @@ fn presets_round_trip_and_track_the_active_one() {
     // Deleting the active preset clears the marker.
     assert_eq!(
         client.ok(Call::DeletePreset {
-            name: "Bass boost".into()
+            name: "Bass boost".into(),
+            part: None,
         }),
         Value::Null
     );
@@ -1408,12 +1584,14 @@ fn presets_round_trip_and_track_the_active_one() {
     // Unknown names are INVALID_PARAMS, not silent no-ops.
     match client.call(Call::LoadPreset {
         name: "nope".into(),
+        part: None,
     }) {
         Reply::Error(error) => assert_eq!(error.code, RpcError::INVALID_PARAMS),
         other => panic!("unexpected {other:?}"),
     }
     match client.call(Call::DeletePreset {
         name: "nope".into(),
+        part: None,
     }) {
         Reply::Error(error) => assert_eq!(error.code, RpcError::INVALID_PARAMS),
         other => panic!("unexpected {other:?}"),
@@ -1421,6 +1599,8 @@ fn presets_round_trip_and_track_the_active_one() {
     match client.call(Call::SavePreset {
         name: "  ".into(),
         overwrite: false,
+        part: None,
+        parts: None,
     }) {
         Reply::Error(error) => assert_eq!(error.code, RpcError::INVALID_PARAMS),
         other => panic!("unexpected {other:?}"),
@@ -1450,6 +1630,8 @@ fn import_apo_creates_a_preset_without_loading_it() {
         enabled: true,
         ir_path: ir,
         gain_db: -1.0,
+        matrix: None,
+        calibration: false,
     }];
     cfg.chain.eq = None;
     client.ok(Call::SetConfig(cfg));
@@ -1463,28 +1645,69 @@ fn import_apo_creates_a_preset_without_loading_it() {
     }))
     .unwrap();
     assert_eq!(info.name, "AutoEQ");
+    assert_eq!(info.part, Some(PresetPart::Eq));
+    assert_eq!(info.parts, vec![PresetPart::Eq]);
     assert_eq!(info.bands, 2);
     assert_eq!(info.convolution, 0);
 
+    // An EQ preset: not among the global ones.
+    assert!(matches!(
+        client.call(Call::GetPreset {
+            name: "AutoEQ".into(),
+            part: None,
+        }),
+        Reply::Error(_)
+    ));
     let preset: Preset = serde_json::from_value(client.ok(Call::GetPreset {
         name: "AutoEQ".into(),
+        part: Some(PresetPart::Eq),
     }))
     .unwrap();
-    let eq = preset.chain.eq.expect("EQ from the text");
+    assert_eq!(preset.covers(), vec![PresetPart::Eq]);
+    let eq = preset.chain.eq.clone().expect("EQ from the text");
     assert_eq!(eq.bands.len(), 2);
     assert!((eq.preamp_db + 6.0).abs() < 1e-9);
-    // Everything outside EQ starts from flat defaults, regardless of chain A.
-    let current: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
-    assert_eq!(preset.chain.upsampler, ChainConfig::default().upsampler);
-    assert_eq!(preset.chain.output, ChainConfig::default().output);
-    assert_ne!(preset.chain.upsampler, current.chain.upsampler);
-    assert_ne!(preset.chain.output, current.chain.output);
-    assert!(preset.chain.convolution.is_empty());
+    // The file holds the EQ only.
+    let file: Value = serde_json::from_str(
+        &std::fs::read_to_string(harness.dir.join("presets").join("eq").join("autoeq.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(file["part"], "eq");
+    assert_eq!(
+        file["chain"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["eq"]
+    );
 
     // Importing does not load the preset.
+    let current: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
     let status: Status = serde_json::from_value(client.ok(Call::Status)).unwrap();
     assert!(status.preset.is_none());
+    assert!(status.part_presets.is_empty());
     assert!(current.chain.eq.is_none());
+
+    // Loading it changes the EQ only: upsampling, convolution and output
+    // stay exactly as they were.
+    client.ok(Call::LoadPreset {
+        name: "AutoEQ".into(),
+        part: Some(PresetPart::Eq),
+    });
+    let after: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    assert_eq!(after.chain.eq, preset.chain.eq);
+    let mut expected = current.chain.clone();
+    expected.eq = preset.chain.eq.clone();
+    assert_eq!(after.chain, expected);
+    assert_eq!(
+        after
+            .active_part_presets
+            .get(&PresetPart::Eq)
+            .map(String::as_str),
+        Some("AutoEQ")
+    );
 
     // Bad text is a parameter error and creates nothing.
     match client.call(Call::ImportApo {
@@ -1498,6 +1721,14 @@ fn import_apo_creates_a_preset_without_loading_it() {
     assert_eq!(list.len(), 1);
 }
 
+fn eq_state(status: &Status) -> Option<(String, bool)> {
+    status
+        .part_presets
+        .iter()
+        .find(|state| state.part == PresetPart::Eq)
+        .map(|state| (state.name.clone(), state.modified))
+}
+
 #[test]
 fn import_apo_over_active_preset_marks_status_modified() {
     let harness = Harness::start("preset-import-active");
@@ -1507,15 +1738,12 @@ fn import_apo_over_active_preset_marks_status_modified() {
     client.ok(Call::SavePreset {
         name: "Live".into(),
         overwrite: false,
+        part: Some(PresetPart::Eq),
+        parts: None,
     });
     let status: Status = serde_json::from_value(client.ok(Call::Status)).unwrap();
-    assert_eq!(
-        status.preset,
-        Some(PresetState {
-            name: "Live".into(),
-            modified: false,
-        })
-    );
+    assert_eq!(eq_state(&status), Some(("Live".into(), false)));
+    assert!(status.preset.is_none());
 
     // Importing over the active preset updates the file & cached saved chain
     // without touching the live processing chain, so `modified` flips to true.
@@ -1529,13 +1757,7 @@ fn import_apo_over_active_preset_marks_status_modified() {
     assert_eq!(info.name, "Live");
 
     let status: Status = serde_json::from_value(client.ok(Call::Status)).unwrap();
-    assert_eq!(
-        status.preset,
-        Some(PresetState {
-            name: "Live".into(),
-            modified: true,
-        })
-    );
+    assert_eq!(eq_state(&status), Some(("Live".into(), true)));
 
     // Live processing chain is untouched.
     let cfg: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
@@ -1548,22 +1770,286 @@ fn import_apo_over_active_preset_marks_status_modified() {
     // Stored preset holds the imported EQ; loading it clears `modified`.
     let preset: Preset = serde_json::from_value(client.ok(Call::GetPreset {
         name: "Live".into(),
+        part: Some(PresetPart::Eq),
     }))
     .unwrap();
     assert_eq!(preset.chain.eq.as_ref().unwrap().bands[0].freq_hz, 250.0);
     client.ok(Call::LoadPreset {
         name: "Live".into(),
+        part: Some(PresetPart::Eq),
     });
+    let status: Status = serde_json::from_value(client.ok(Call::Status)).unwrap();
+    assert_eq!(eq_state(&status), Some(("Live".into(), false)));
+    let cfg: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    assert_eq!(cfg.chain.eq.as_ref().unwrap().bands[0].freq_hz, 250.0);
+}
+
+/// A chain with every part away from its default, so a stray copy shows.
+fn busy_chain(harness: &Harness) -> ChainConfig {
+    let ir = harness.dir.write("room.wav", "RIFF....WAVE");
+    let mut chain = ChainConfig {
+        eq: Some(profile()),
+        ..Default::default()
+    };
+    chain.upsampler = audivane_dsp_core::resample::ManualConfig {
+        target: RateTarget::Ratio(2),
+        taps: 8192,
+        ..Default::default()
+    }
+    .into_upsampler_config()
+    .unwrap();
+    chain.output = OutputConfig {
+        bits: 16,
+        dither: DitherKind::Shaped,
+        headroom_db: 1.5,
+    };
+    chain.convolution = vec![audivane_protocol::ConvolutionConfig {
+        name: Some("Room".into()),
+        enabled: true,
+        ir_path: ir,
+        gain_db: -1.0,
+        matrix: None,
+        calibration: false,
+    }];
+    chain
+}
+
+#[test]
+fn an_eq_preset_leaves_every_other_stage_alone() {
+    let harness = Harness::start("preset-part-eq");
+    let mut client = harness.client();
+    let mut cfg: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    cfg.chain = busy_chain(&harness);
+    client.ok(Call::SetConfig(cfg));
+
+    // Save the EQ as "Warm", then change the EQ and everything else.
+    client.ok(Call::SavePreset {
+        name: "Warm".into(),
+        overwrite: false,
+        part: Some(PresetPart::Eq),
+        parts: None,
+    });
+    let mut cfg: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    cfg.chain.eq.as_mut().unwrap().bands[0].gain_db = -5.0;
+    cfg.chain.upsampler = UpsamplerConfig::default();
+    cfg.chain.convolution.clear();
+    cfg.chain.output.bits = 24;
+    client.ok(Call::SetConfig(cfg));
+    let status: Status = serde_json::from_value(client.ok(Call::Status)).unwrap();
+    assert_eq!(eq_state(&status), Some(("Warm".into(), true)));
+    let before: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+
+    client.ok(Call::LoadPreset {
+        name: "Warm".into(),
+        part: Some(PresetPart::Eq),
+    });
+    let after: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    assert_eq!(after.chain.eq.as_ref().unwrap().bands[0].gain_db, 3.0);
+    let mut expected = before.chain.clone();
+    expected.eq = after.chain.eq.clone();
+    assert_eq!(after.chain, expected, "only the EQ changed");
+    let status: Status = serde_json::from_value(client.ok(Call::Status)).unwrap();
+    assert_eq!(eq_state(&status), Some(("Warm".into(), false)));
+
+    // Changing another stage does not mark the EQ preset modified.
+    let mut cfg = after.clone();
+    cfg.chain.output.bits = 20;
+    client.ok(Call::SetConfig(cfg));
+    let status: Status = serde_json::from_value(client.ok(Call::Status)).unwrap();
+    assert_eq!(eq_state(&status), Some(("Warm".into(), false)));
+
+    // Rename and delete follow the active name of that part only.
+    client.ok(Call::RenamePreset {
+        from: "Warm".into(),
+        to: "Warmer".into(),
+        part: Some(PresetPart::Eq),
+    });
+    let status: Status = serde_json::from_value(client.ok(Call::Status)).unwrap();
+    assert_eq!(eq_state(&status), Some(("Warmer".into(), false)));
+    client.ok(Call::DeletePreset {
+        name: "Warmer".into(),
+        part: Some(PresetPart::Eq),
+    });
+    let cfg: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    assert!(cfg.active_part_presets.is_empty());
+}
+
+#[test]
+fn a_blank_page_preset_resets_that_part_and_clears_its_name() {
+    let harness = Harness::start("preset-part-blank");
+    let mut client = harness.client();
+    let mut cfg: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    cfg.chain = busy_chain(&harness);
+    client.ok(Call::SetConfig(cfg));
+    client.ok(Call::SavePreset {
+        name: "Warm".into(),
+        overwrite: false,
+        part: Some(PresetPart::Eq),
+        parts: None,
+    });
+    let before: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+
+    client.ok(Call::BlankPreset {
+        part: PresetPart::Eq,
+    });
+    let after: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    let mut expected = before.chain.clone();
+    expected.eq = Some(audivane_protocol::EqProfile::default());
+    assert_eq!(after.chain, expected, "only the EQ changed");
+    assert!(after.active_part_presets.is_empty());
+    let status: Status = serde_json::from_value(client.ok(Call::Status)).unwrap();
+    assert_eq!(eq_state(&status), None);
+    // The saved preset is still there and loads back.
+    client.ok(Call::LoadPreset {
+        name: "Warm".into(),
+        part: Some(PresetPart::Eq),
+    });
+    let status: Status = serde_json::from_value(client.ok(Call::Status)).unwrap();
+    assert_eq!(eq_state(&status), Some(("Warm".into(), false)));
+}
+
+#[test]
+fn a_partial_global_preset_changes_only_its_parts() {
+    let harness = Harness::start("preset-partial-global");
+    let mut client = harness.client();
+    let mut cfg: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    cfg.chain = busy_chain(&harness);
+    client.ok(Call::SetConfig(cfg));
+
+    let info: PresetInfo = serde_json::from_value(client.ok(Call::SavePreset {
+        name: "Desk".into(),
+        overwrite: false,
+        part: None,
+        parts: Some(vec![PresetPart::Upsampling, PresetPart::Eq]),
+    }))
+    .unwrap();
+    assert_eq!(info.part, None);
+    assert_eq!(info.parts, vec![PresetPart::Eq, PresetPart::Upsampling]);
+    // The file holds those parts only.
+    let file: Value = serde_json::from_str(
+        &std::fs::read_to_string(harness.dir.join("presets").join("desk.json")).unwrap(),
+    )
+    .unwrap();
+    let mut keys: Vec<&String> = file["chain"].as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(keys, vec!["eq", "upsampler"]);
+
+    // Output and convolution changes do not mark it modified ...
+    let mut cfg: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    cfg.chain.output.bits = 24;
+    cfg.chain.convolution.clear();
+    client.ok(Call::SetConfig(cfg));
     let status: Status = serde_json::from_value(client.ok(Call::Status)).unwrap();
     assert_eq!(
         status.preset,
         Some(PresetState {
-            name: "Live".into(),
+            name: "Desk".into(),
             modified: false,
         })
     );
+    // ... an EQ change does.
+    let mut cfg: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    cfg.chain.eq = None;
+    cfg.chain.upsampler = UpsamplerConfig::default();
+    client.ok(Call::SetConfig(cfg));
+    let status: Status = serde_json::from_value(client.ok(Call::Status)).unwrap();
+    assert!(status.preset.unwrap().modified);
+
+    // Loading brings back EQ and upsampling, nothing else.
+    let before: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    client.ok(Call::LoadPreset {
+        name: "Desk".into(),
+        part: None,
+    });
+    let after: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    let saved = busy_chain(&harness);
+    let mut expected = before.chain.clone();
+    expected.eq = saved.eq.clone();
+    expected.upsampler = saved.upsampler.clone();
+    assert_eq!(after.chain, expected);
+    assert!(after.chain.convolution.is_empty());
+    assert_eq!(after.chain.output.bits, 24);
+}
+
+#[test]
+fn a_global_load_clears_the_page_presets_it_covers() {
+    let harness = Harness::start("preset-global-clears");
+    let mut client = harness.client();
+    let mut cfg: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    cfg.chain = busy_chain(&harness);
+    client.ok(Call::SetConfig(cfg));
+    for (name, part, parts) in [
+        (
+            "Desk",
+            None,
+            Some(vec![PresetPart::Eq, PresetPart::Upsampling]),
+        ),
+        ("Warm", Some(PresetPart::Eq), None),
+        ("Quiet", Some(PresetPart::Output), None),
+    ] {
+        client.ok(Call::SavePreset {
+            name: name.into(),
+            overwrite: false,
+            part,
+            parts,
+        });
+    }
     let cfg: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
-    assert_eq!(cfg.chain.eq.as_ref().unwrap().bands[0].freq_hz, 250.0);
+    assert_eq!(cfg.active_part_presets.len(), 2);
+
+    client.ok(Call::LoadPreset {
+        name: "Desk".into(),
+        part: None,
+    });
+    // The EQ page's name goes (Desk holds the EQ); the output page's stays.
+    let cfg: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    assert_eq!(
+        cfg.active_part_presets.into_iter().collect::<Vec<_>>(),
+        vec![(PresetPart::Output, "Quiet".to_string())]
+    );
+    let status: Status = serde_json::from_value(client.ok(Call::Status)).unwrap();
+    assert_eq!(eq_state(&status), None);
+    assert_eq!(status.part_presets.len(), 1);
+    assert_eq!(status.part_presets[0].name, "Quiet");
+    assert!(!status.part_presets[0].modified);
+}
+
+#[test]
+fn an_old_preset_file_loads_as_a_global_preset_with_every_part() {
+    let harness = Harness::start("preset-legacy");
+    let mut client = harness.client();
+    let presets = harness.dir.join("presets");
+    std::fs::create_dir_all(&presets).unwrap();
+    // Written before parts existed: no `part`, no `parts`, a whole chain.
+    let mut old = ChainConfig {
+        eq: Some(profile()),
+        ..Default::default()
+    };
+    old.output.bits = 16;
+    std::fs::write(
+        presets.join("old.json"),
+        serde_json::to_string(&serde_json::json!({
+            "version": 1, "name": "Old", "chain": old,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // A broken file is skipped, not fatal.
+    std::fs::write(presets.join("broken.json"), "{ not json").unwrap();
+
+    let list: Vec<PresetInfo> = serde_json::from_value(client.ok(Call::ListPresets)).unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].part, None);
+    assert_eq!(list[0].parts, PresetPart::ALL.to_vec());
+    client.ok(Call::LoadPreset {
+        name: "Old".into(),
+        part: None,
+    });
+    let cfg: EngineConfig = serde_json::from_value(client.ok(Call::GetConfig)).unwrap();
+    assert_eq!(cfg.chain.eq, old.eq);
+    assert_eq!(cfg.chain.output.bits, 16);
+    let status: Status = serde_json::from_value(client.ok(Call::Status)).unwrap();
+    assert!(!status.preset.unwrap().modified);
 }
 
 #[test]
@@ -1586,6 +2072,8 @@ fn config_and_preset_events_reach_subscribers() {
     other.ok(Call::SavePreset {
         name: "Live".into(),
         overwrite: false,
+        part: None,
+        parts: None,
     });
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -1648,6 +2136,7 @@ fn config_and_preset_events_reach_subscribers() {
     // Deleting pushes the new (empty) list.
     third.ok(Call::DeletePreset {
         name: "Live".into(),
+        part: None,
     });
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -2072,6 +2561,8 @@ fn concurrent_save_preset_serializes_collisions_and_same_slug_names() {
                 client.call(Call::SavePreset {
                     name: "Live".into(),
                     overwrite: false,
+                    part: None,
+                    parts: None,
                 })
             }));
         }
@@ -2110,6 +2601,8 @@ fn concurrent_save_preset_serializes_collisions_and_same_slug_names() {
                 client.ok(Call::SavePreset {
                     name: name.into(),
                     overwrite: false,
+                    part: None,
+                    parts: None,
                 })
             }));
         }
@@ -2130,6 +2623,7 @@ fn concurrent_save_preset_serializes_collisions_and_same_slug_names() {
         );
         let preset: Preset = serde_json::from_value(client.ok(Call::GetPreset {
             name: expected.into(),
+            part: None,
         }))
         .unwrap();
         assert_eq!(preset.name, expected);
@@ -2542,4 +3036,14 @@ fn set_varispeed_live_call_persists_without_chain_rebuild_and_reports_status() {
             .load(std::sync::atomic::Ordering::Relaxed),
         applies_before
     );
+}
+
+fn studio_layer(
+    presets: &[audivane_protocol::HarmonicsPreset],
+) -> audivane_protocol::HarmonicsLayer {
+    presets
+        .iter()
+        .find(|p| p.id == "tape_studio")
+        .unwrap()
+        .to_layer()
 }

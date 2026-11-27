@@ -1,12 +1,15 @@
 // A response plot with box zoom, wheel zoom, pan, double-click reset and a
 // crosshair readout. The view range is controlled by the parent so other
 // controls (the crossings list) can zoom it and so it can fetch denser data.
+// Over an axis gutter the wheel zooms that axis alone and a drag pans it;
+// clicking an axis end (its top/bottom or left/right limit) types a limit.
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   axisFrac,
   axisValue,
   boxZoom,
+  clampView,
   decimalsFor,
   fmtDbPrecise,
   fmtHzPrecise,
@@ -54,13 +57,47 @@ export interface ZoomPlotProps {
   drawCurve?: (ctx: CanvasRenderingContext2D, g: PlotGeom) => void;
   /** Hover readout at data x: the point to mark and its label (default: Hz and dB). */
   readout?: (x: number, g: PlotGeom) => { x: number; y: number | null; text: string };
+  /** Asked after each draw: true draws again on the next animation frame (an animated trace). */
+  animating?: () => boolean;
   /** X tick label for `v` with ticks `step` apart (default: Hz). */
   xTick?: (v: number, step: number) => string;
+  /** Y ticks for the view (default: linear, about one per 38 px). */
+  yTicks?: (y0: number, y1: number, target: number) => { ticks: number[]; step: number };
+  /** Y tick label for `v` with ticks `step` apart (default: the value). */
+  yTick?: (v: number, step: number) => string;
+  /** A y limit as typed text (default: dB), and its parser (default: `parseLimit`), e.g. for a % axis. */
+  yLimitText?: (v: number) => string;
+  parseY?: (text: string) => number | null;
   /** Smallest gap between x ticks (linear scale), e.g. 1 for whole samples. */
   xMinStep?: number;
   lineWidth?: number;
   pad?: { l: number; r: number; t: number; b: number };
   style?: React.CSSProperties;
+  /** Overlays inside the plot's box (e.g. a stats inset), positioned by the caller. */
+  children?: React.ReactNode;
+}
+
+type End = "x0" | "x1" | "y0" | "y1";
+type Zone = "plot" | "x" | "y" | null;
+
+/** A typed axis limit: "−160", "20k", "1.5 kHz" (unicode minus and a k suffix allowed). */
+export function parseLimit(text: string): number | null {
+  const m = text
+    .trim()
+    .replace(/[−–]/g, "-")
+    .replace(/\s*(hz|db|dbr|dbfs)$/i, "")
+    .match(/^([-+]?\d*\.?\d+(?:e[-+]?\d+)?)\s*(k)?$/i);
+  if (!m) return null;
+  const v = Number(m[1]) * (m[2] ? 1000 : 1);
+  return Number.isFinite(v) ? v : null;
+}
+
+/** The view with one end set to `v` (null: not a valid range). */
+export function withLimit(view: ViewRange, end: End, v: number, scale: XScale): ViewRange | null {
+  const next = { ...view, [end]: v };
+  if (next.x1 <= next.x0 || next.y1 <= next.y0) return null;
+  if (scale === "log" && next.x0 <= 0) return null;
+  return next;
 }
 
 interface Drag {
@@ -72,6 +109,9 @@ interface Drag {
   y1: number;
   start: ViewRange;
   pointer: number;
+  /** A gutter drag pans this axis only. */
+  lock?: "x" | "y";
+  zone: Zone;
 }
 
 const DEFAULT_PAD = { l: 64, r: 14, t: 22, b: 26 };
@@ -85,6 +125,10 @@ export function ZoomPlot(props: ZoomPlotProps) {
   const size = useRef({ w: 0, h: 0 });
   const raf = useRef(0);
   const skin = useSkin();
+  const [editing, setEditing] = useState<{ end: End; text: string; x: number; y: number } | null>(null);
+  // The edit still open (the blur after Enter or Escape unmounts the input must not apply it again).
+  const editingRef = useRef(editing);
+  editingRef.current = editing;
 
   const geom = (): PlotGeom => {
     const p = propsRef.current;
@@ -101,6 +145,38 @@ export function ZoomPlot(props: ZoomPlotProps) {
       xOf: (f) => pad.l + axisFrac(f, v.x0, v.x1, p.scale) * w,
       yOf: (db) => pad.t + (1 - (db - v.y0) / Math.max(1e-300, v.y1 - v.y0)) * h,
     };
+  };
+
+  /** Where a point is: the plot, an axis gutter, or neither. */
+  const zoneOf = (pt: { x: number; y: number }): Zone => {
+    const g = geom();
+    const inX = pt.x >= g.left - 6 && pt.x <= g.left + g.w + 6;
+    const inY = pt.y >= g.top - 8 && pt.y <= g.top + g.h + 8;
+    if (pt.x >= g.left && pt.x <= g.left + g.w && pt.y >= g.top && pt.y <= g.top + g.h) return "plot";
+    if (pt.x < g.left && inY) return "y";
+    if (pt.y > g.top + g.h && inX) return "x";
+    return null;
+  };
+  /** The axis end a gutter point is on (its limit's label), if any. */
+  const endOf = (pt: { x: number; y: number }, zone: Zone): End | null => {
+    const g = geom();
+    if (zone === "y") return pt.y <= g.top + 12 ? "y1" : pt.y >= g.top + g.h - 12 ? "y0" : null;
+    if (zone === "x") return pt.x <= g.left + 36 ? "x0" : pt.x >= g.left + g.w - 36 ? "x1" : null;
+    return null;
+  };
+  const endText = (end: End): string => {
+    const p = propsRef.current;
+    const v = p.view[end];
+    if (end === "x0" || end === "x1") return p.xTick ? p.xTick(v, Math.abs(p.view.x1 - p.view.x0) / 5) : fmtHzPrecise(v, Math.abs(p.view.x1 - p.view.x0));
+    return p.yLimitText ? p.yLimitText(v) : fmtDbPrecise(v, p.view.y1 - p.view.y0);
+  };
+  /** Where an end's chip sits (its anchor), in canvas pixels. */
+  const endAt = (end: End): { x: number; y: number } => {
+    const g = geom();
+    if (end === "y1") return { x: g.left - 6, y: g.top };
+    if (end === "y0") return { x: g.left - 6, y: g.top + g.h };
+    if (end === "x0") return { x: g.left, y: g.top + g.h + 13 };
+    return { x: g.left + g.w, y: g.top + g.h + 13 };
   };
 
   const render = () => {
@@ -125,7 +201,8 @@ export function ZoomPlot(props: ZoomPlotProps) {
     ctx.lineWidth = 1;
 
     // Y grid + labels.
-    const yt = linearTicks(v.y0, v.y1, Math.max(3, Math.round(g.h / 38)));
+    const yTarget = Math.max(3, Math.round(g.h / 38));
+    const yt = p.yTicks ? p.yTicks(v.y0, v.y1, yTarget) : linearTicks(v.y0, v.y1, yTarget);
     const yd = decimalsFor(yt.step);
     for (const d of yt.ticks) {
       const y = Math.round(g.yOf(d)) + 0.5;
@@ -136,7 +213,7 @@ export function ZoomPlot(props: ZoomPlotProps) {
       ctx.stroke();
       ctx.fillStyle = muted;
       ctx.textAlign = "right";
-      ctx.fillText(fmtTick(d, yd), g.left - 6, y);
+      ctx.fillText(p.yTick ? p.yTick(d, yt.step) : fmtTick(d, yd), g.left - 6, y);
     }
 
     // X grid + labels.
@@ -244,7 +321,7 @@ export function ZoomPlot(props: ZoomPlotProps) {
       } else {
         db = interpAt(p.freqs, p.mags, f);
         const spanHz = p.scale === "log" ? Math.max(1e-9, f * (Math.pow(v.x1 / v.x0, 1 / 200) - 1) * 200) : spanX;
-        text = `${fmtHzPrecise(f, spanHz)} Hz   ${db === null ? "—" : fmtDbPrecise(db, v.y1 - v.y0) + " dB"}`;
+        text = `${fmtHzPrecise(f, spanHz)} Hz   ${db === null ? "-" : fmtDbPrecise(db, v.y1 - v.y0) + " dB"}`;
       }
       ctx.save();
       ctx.strokeStyle = fg;
@@ -287,6 +364,30 @@ export function ZoomPlot(props: ZoomPlotProps) {
       ctx.fillText(text, bx + 5, by + 10);
       ctx.restore();
     }
+
+    // Over an axis end: its limit, to click and type.
+    if (hv && !d) {
+      const end = endOf(hv, zoneOf(hv));
+      if (end) {
+        const at = endAt(end);
+        const text = endText(end);
+        ctx.save();
+        ctx.font = "500 11px " + mono;
+        const tw = ctx.measureText(text).width;
+        const bw = tw + 10;
+        const bx = end === "x0" ? at.x - 4 : end === "x1" ? at.x - bw + 4 : Math.max(1, at.x - bw);
+        const by = Math.max(1, Math.min(H - 19, at.y - 9));
+        ctx.fillStyle = gbg;
+        ctx.fillRect(bx, by, bw, 18);
+        ctx.strokeStyle = accent;
+        ctx.strokeRect(bx + 0.5, by + 0.5, bw - 1, 17);
+        ctx.fillStyle = fg;
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+        ctx.fillText(text, bx + 5, by + 9.5);
+        ctx.restore();
+      }
+    }
   };
 
   const schedule = () => {
@@ -294,6 +395,7 @@ export function ZoomPlot(props: ZoomPlotProps) {
     raf.current = requestAnimationFrame(() => {
       raf.current = 0;
       render();
+      if (propsRef.current.animating?.()) schedule();
     });
   };
 
@@ -333,21 +435,33 @@ export function ZoomPlot(props: ZoomPlotProps) {
       e.preventDefault();
       const delta = e.deltaY !== 0 ? e.deltaY : e.deltaX;
       if (delta === 0) return;
+      // Proportional to the delta, so a trackpad's many small deltas zoom
+      // as finely as they come and a wheel notch (about 100) by about 14 %.
       const unit = e.deltaMode === 1 ? 33 : e.deltaMode === 2 ? 300 : 1;
       const factor = Math.exp(Math.max(-1, Math.min(1, delta * unit * 0.0015)));
-      const { fx, fy } = fracs(local(e));
-      p.onView(zoomAt(p.view, factor, clamp01(fx), clamp01(fy), e.shiftKey ? "y" : "x", p.limits, p.scale));
+      const pt = local(e);
+      const zone = zoneOf(pt);
+      const { fx, fy } = fracs(pt);
+      const axis = zone === "y" ? "y" : zone === "x" ? "x" : e.shiftKey ? "y" : "x";
+      p.onView(zoomAt(p.view, factor, clamp01(fx), clamp01(fy), axis, p.limits, p.scale));
     };
     const onDown = (e: PointerEvent) => {
       const p = propsRef.current;
       if (e.button !== 0 && e.button !== 1) return;
       const pt = local(e);
-      const g = geom();
-      if (pt.x < g.left || pt.x > g.left + g.w || pt.y < g.top || pt.y > g.top + g.h) return;
+      const zone = zoneOf(pt);
+      if (!zone) return;
       e.preventDefault();
+      if (zone !== "plot") {
+        // An axis gutter: pan that axis (a click on its end types a limit).
+        drag.current = { kind: "pan", axis: "x", x0: pt.x, y0: pt.y, x1: pt.x, y1: pt.y, start: p.view, pointer: e.pointerId, lock: zone, zone };
+        cv.setPointerCapture(e.pointerId);
+        cv.style.cursor = "grabbing";
+        return;
+      }
       const pan = e.button === 1 || e.ctrlKey || e.metaKey || e.altKey ? p.mode !== "pan" : p.mode === "pan";
       const axis: BoxAxis = e.shiftKey ? (p.boxAxis === "x" ? "xy" : "x") : p.boxAxis;
-      drag.current = { kind: pan ? "pan" : "box", axis, x0: pt.x, y0: pt.y, x1: pt.x, y1: pt.y, start: p.view, pointer: e.pointerId };
+      drag.current = { kind: pan ? "pan" : "box", axis, x0: pt.x, y0: pt.y, x1: pt.x, y1: pt.y, start: p.view, pointer: e.pointerId, zone };
       cv.setPointerCapture(e.pointerId);
       cv.style.cursor = pan ? "grabbing" : "crosshair";
     };
@@ -361,8 +475,13 @@ export function ZoomPlot(props: ZoomPlotProps) {
         if (d.kind === "pan") {
           const p = propsRef.current;
           const g = geom();
-          p.onView(panBy(d.start, (pt.x - d.x0) / Math.max(1, g.w), -(pt.y - d.y0) / Math.max(1, g.h), p.limits, p.scale));
+          const dx = d.lock === "y" ? 0 : (pt.x - d.x0) / Math.max(1, g.w);
+          const dy = d.lock === "x" ? 0 : -(pt.y - d.y0) / Math.max(1, g.h);
+          p.onView(panBy(d.start, dx, dy, p.limits, p.scale));
         }
+      } else {
+        const z = zoneOf(pt);
+        cv.style.cursor = endOf(pt, z) ? "text" : z === "y" ? "ns-resize" : z === "x" ? "ew-resize" : "";
       }
       schedule();
     };
@@ -372,6 +491,15 @@ export function ZoomPlot(props: ZoomPlotProps) {
       drag.current = null;
       cv.style.cursor = "";
       if (cv.hasPointerCapture(e.pointerId)) cv.releasePointerCapture(e.pointerId);
+      if (d.lock && Math.abs(d.x1 - d.x0) < 3 && Math.abs(d.y1 - d.y0) < 3) {
+        const end = endOf({ x: d.x0, y: d.y0 }, d.zone);
+        if (end) {
+          const at = endAt(end);
+          setEditing({ end, text: endText(end).replace(/[−–]/g, "-"), x: at.x, y: at.y });
+        }
+        schedule();
+        return;
+      }
       if (d.kind === "box" && Math.abs(d.x1 - d.x0) >= 4 && (d.axis === "x" || Math.abs(d.y1 - d.y0) >= 4)) {
         const p = propsRef.current;
         const g = geom();
@@ -413,9 +541,46 @@ export function ZoomPlot(props: ZoomPlotProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [skin]);
 
+  const commit = (ed: NonNullable<typeof editing>) => {
+    if (editingRef.current !== ed) return;
+    editingRef.current = null;
+    setEditing(null);
+    const p = propsRef.current;
+    const v = (ed.end === "y0" || ed.end === "y1") && p.parseY ? p.parseY(ed.text) : parseLimit(ed.text);
+    if (v === null) return;
+    const next = withLimit(p.view, ed.end, v, p.scale);
+    if (next) p.onView(clampView(next, p.limits, p.scale));
+  };
+  const endLabel: Record<End, string> = { x0: "Left limit", x1: "Right limit", y0: "Bottom limit", y1: "Top limit" };
+
   return (
     <div className={props.className ?? "ups-canvas-wrap"} style={props.style}>
       <canvas ref={canvasRef} role="img" aria-label={props.ariaLabel} className="zoom-canvas" />
+      {props.children}
+      {editing && (
+        <input
+          className="zoom-limit-input"
+          aria-label={endLabel[editing.end]}
+          autoFocus
+          value={editing.text}
+          style={{
+            left: editing.end === "x1" ? undefined : editing.end === "x0" ? editing.x - 4 : 2,
+            right: editing.end === "x1" ? Math.max(2, size.current.w - editing.x - 4) : undefined,
+            top: Math.max(1, editing.y - 11),
+            width: editing.end === "y0" || editing.end === "y1" ? Math.max(40, editing.x - 2) : 72,
+          }}
+          onFocus={(e) => e.currentTarget.select()}
+          onChange={(e) => setEditing({ ...editing, text: e.target.value })}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commit(editing);
+            else if (e.key === "Escape") {
+              editingRef.current = null;
+              setEditing(null);
+            }
+          }}
+          onBlur={() => commit(editing)}
+        />
+      )}
     </div>
   );
 }

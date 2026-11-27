@@ -34,11 +34,11 @@ afterEach(() => {
 describe("quick stage compare", () => {
   it("Compare sets B = A with the stage off, keeps the level, and stops on a second click", async () => {
     const { s, daemon } = await setup();
-    daemon.config.chain.crossfeed = { enabled: true, mode: "bs2b_default", cutoff_hz: 700, feed_db: 4.5, level: "matched" };
+    daemon.config.chain.crossfeed = { enabled: true, mode: "bs2b_default", cutoff_hz: 700, feed_db: 4.5, width: 1, width_shape: "flat", width_corner_hz: 700 };
     await s.compareStage("crossfeed");
     await s.whenIdle();
     expect(daemon.config.ab?.b).toEqual({ patch: { crossfeed: { enabled: false } } });
-    expect(daemon.config.ab?.label).toBe("Crossfeed off");
+    expect(daemon.config.ab?.label).toBe("Stereo image off");
     expect(daemon.config.ab?.chain_b?.crossfeed?.enabled).toBe(false);
     expect(s.getState().status?.ab?.enabled).toBe(true);
     // A manual level survives the next compare.
@@ -82,5 +82,21 @@ describe("quick stage compare", () => {
     await until(() => s.getState().status?.overload?.action === "ab_off");
     await s.compareStage("harmonics");
     await until(() => s.getState().status?.overload === null);
+  });
+
+  it("pins a custom filter design and compares output bits/dither", async () => {
+    const { s, daemon } = await setup();
+    const design = { kind: "interpolator" as const, method: "nos" as const };
+    await s.compareFilterDesign(design);
+    await s.whenIdle();
+    expect(daemon.config.ab?.b).toEqual({ patch: { upsampler: { preset: null, design } } });
+    await s.compareOutput(16, "tpdf");
+    await s.whenIdle();
+    expect(daemon.config.ab?.b).toEqual({ patch: { output: { bits: 16, dither: "tpdf" } } });
+    expect(daemon.config.ab?.label).toBe("Output: 16-bit TPDF");
+    // Clicking the same output compare again turns A/B off.
+    await s.compareOutput(16, "tpdf");
+    await s.whenIdle();
+    expect(daemon.config.ab).toBeNull();
   });
 });

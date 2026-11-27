@@ -1,5 +1,4 @@
-//! Multi-device step 4: the follower output. Each follower DAC plays the
-//! master's source on its
+//! The follower output: each follower DAC plays the master's source on its
 //! own clock, held in sync with the master at the DAC.
 //!
 //! ```text
@@ -35,7 +34,13 @@
 //!   fades out over [`FADE_MS`] (raised cosine) before the stage, and back in.
 //! - **Loss.** An xrun re-primes and the loop sees a phase jump (a skip). An
 //!   unplug or another device error closes the device, marks the follower
-//!   lost and reopens it once the device is back, with a fresh acquisition.
+//!   lost and reopens it once the device is back.
+//! - **Placement.** Once a follower has locked, its loop's rate state is
+//!   remembered ([`FollowerControls::remembered_rate`], per rate family) and
+//!   kept through a pause: a new master stream (a new position epoch), a
+//!   reopen (seeded from the memory) or a phase jump from lock places it
+//!   from its first readings (`DriftLoop::realign`), heard within the
+//!   placement floor in a fraction of a second, instead of an acquisition.
 //!   The master never waits on any of it: the tee drops what a follower's
 //!   ring cannot take.
 //!
@@ -49,18 +54,21 @@
 //! Followers are added through the engine's internal API
 //! (`RealEngine::add_follower`); nothing reaches the protocol yet.
 
-use super::processor::{ActiveChain, DspIn, MAX_METER_CHANNELS};
+use super::measure::{FollowerMeasure, MeasureFault, MeasureSlot};
+use super::processor::{
+    ActiveChain, DspIn, MAX_METER_CHANNELS, VolumeTarget, handover_budget, warm_ring_cap,
+};
 use super::tee::{
-    LogRead, LoggedCommand, MAX_FOLLOWERS, MAX_GRAPH_RATE, TeeHost, TeeReader, TeeShared,
-    VsCommand, step_frames,
+    F64Cell, LogRead, LoggedCommand, MAX_COMP_MS, MAX_FOLLOWERS, MAX_GRAPH_RATE, TeeHost,
+    TeeReader, TeeShared, VsCommand, max_comp_frames, step_frames,
 };
 use audivane_dsp_core::drift::{
-    DriftLoop, EPS_MAX, FRAME, LoopConfig, PhaseDetector, PositionMap, RateEstimator, Reading,
-    hermite,
+    BiasTracker, DriftLoop, EPS_MAX, FRAME, LoopConfig, PhaseDetector, PositionMap, RateEstimator,
+    Reading, hermite,
 };
 use audivane_dsp_core::gain::StereoGainRamp;
 use audivane_dsp_core::varispeed::{MAX_SPEED, Varispeed, VarispeedSpec};
-use audivane_protocol::ipc::{self, EngineConfig, FollowerConfig};
+use audivane_protocol::ipc::{self, EngineConfig, FollowerConfig, MeasureChain};
 use audivane_protocol::{RateRatio, SampleFormat};
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
@@ -77,6 +85,11 @@ pub const MAX_TRIM_MS: f64 = 50.0;
 pub const MAX_LAG_MS: f64 = super::tee::MAX_LAG_MS;
 /// The source fade around muting, ms.
 pub const FADE_MS: f64 = 5.0;
+/// The quietest level a follower that follows the master's plays at, dB;
+/// the loudest is 0 dB (a master raised past the level its own was set at
+/// stops it there, and its offset holds again on the way down).
+const FOLLOW_SPAN_DB: f64 = -ipc::VOLUME_MIN_DB;
+const FOLLOW_FLOOR_DB: f64 = -2.0 * FOLLOW_SPAN_DB;
 /// The follower thread's real-time priority: one below the master's (20).
 pub const FOLLOWER_RT_PRIORITY: u32 = 19;
 /// The largest stage call, graph frames.
@@ -107,8 +120,11 @@ const LOG_STEPS: usize = 2 * super::tee::LOG_LEN;
 const DEFER_MAX_S: f64 = 1.0;
 /// How long a follower stays shut after it ran short of source, seconds.
 const STARVED_S: f64 = 0.1;
-/// The window the source slack is the minimum over, seconds.
+/// The window the source slack is the minimum over, seconds, and the
+/// first one of a stream (the alignment it sets comes within a fraction of
+/// a second: a follower is heard from the first second).
 const SLACK_WINDOW_S: f64 = 1.0;
+const FIRST_SLACK_WINDOW_S: f64 = 0.25;
 /// The master's command lead before any follower has measured its own,
 /// ms, and the margin over the largest measured one.
 pub const DEFAULT_LEAD_MS: f64 = 30.0;
@@ -123,6 +139,17 @@ const SWAP_FADE_HALF_MS: f64 = 5.0;
 /// Readings held after a chain latency change on either side, seconds: the
 /// other side's swap lands within it, and the loop never sees the step.
 const CHAIN_HOLD_S: f64 = 3.0;
+/// How long a follower's compensation target holds still before its pad
+/// follows it, seconds: a chain edit that reaches both sides swaps them a
+/// little apart, and the target comes back by itself. Longer than the
+/// master's ([`COMP_SETTLE_S`]), so a change the master's compensation
+/// takes up never moves the pad.
+const PAD_SETTLE_S: f64 = 0.5;
+/// How long the followers' need for the master's compensation holds still
+/// before it applies, seconds.
+pub const COMP_SETTLE_S: f64 = 0.25;
+/// The pad's fade out and in around a change of its length, ms.
+const PAD_FADE_MS: f64 = 5.0;
 
 /// `x` source frames in 64.64.
 fn fixed(x: f64) -> i128 {
@@ -206,10 +233,23 @@ pub struct FollowerStatus {
     refused_plans: AtomicU64,
     latency_ms: AtomicU64,
     slack_ms: AtomicU64,
+    slack_low_ms: AtomicU64,
+    slack_speed: AtomicU64,
     lead_ms: AtomicU64,
     device_rate: AtomicU64,
     period: AtomicU64,
+    device_channels: AtomicU64,
+    device_channels_max: AtomicU64,
     reopens: AtomicU64,
+    /// Its chain's latency as installed, without the pad: graph frames
+    /// (`NaN` while closed) and device frames; the pad, device frames.
+    chain_graph: F64Cell,
+    chain_frames: AtomicU64,
+    pad_frames: AtomicU64,
+    /// What its compensation cannot cover, ms (positive: late).
+    comp_late_ms: AtomicU64,
+    /// The level it plays at, dB (`NaN` before its first block).
+    level_db: F64Cell,
     error: Mutex<Option<String>>,
 }
 
@@ -248,6 +288,16 @@ pub struct FollowerSnapshot {
     /// second, ms of playback (negative: it ran out, the master's
     /// alignment needs that much more). `NaN` before any.
     pub slack_ms: f64,
+    /// The least of the lower bounds the slack's windows gave since the
+    /// last change the follower cannot account for (as [`Self::slack_ms`]
+    /// starts again), ms: what the follower had ahead at its worst, at any
+    /// phase of the clocks. The master's alignment less this is what the
+    /// follower needs. `NaN` before a window, and while the master does
+    /// not play.
+    pub slack_low_ms: f64,
+    /// The speed its slack is playback time of (the stage's: source frames
+    /// over the graph rate times it; 1 by default).
+    pub slack_speed: f64,
     /// How far its stage ran ahead of the master's over the last second,
     /// ms of playback (the most): the master holds speed commands back by
     /// more, so the follower reads each before it gets there. `NaN` before
@@ -255,7 +305,23 @@ pub struct FollowerSnapshot {
     pub lead_ms: f64,
     pub device_rate: u32,
     pub period: u32,
+    /// The channel count its device opened at, and the most it takes (0
+    /// before an open).
+    pub device_channels: u32,
+    pub device_channels_max: u32,
     pub reopens: u64,
+    /// Its chain's latency as it plays, without its compensation pad:
+    /// graph frames (`NaN` while closed) and device frames.
+    pub chain_graph: f64,
+    pub chain_frames: u64,
+    /// Its compensation pad after the chain, device frames.
+    pub pad_frames: u64,
+    /// What the compensation cannot cover, ms: positive, it plays that
+    /// much later than the master (its chain is longer than the master's
+    /// compensation can cover); negative, earlier (its pad is at its most).
+    pub comp_late_ms: f64,
+    /// The level it plays at, dB (`NaN` before its first block).
+    pub level_db: f64,
     pub error: Option<String>,
 }
 
@@ -293,10 +359,22 @@ impl FollowerStatus {
             refused_plans: self.refused_plans.load(r),
             latency_ms: unbits(self.latency_ms.load(r)),
             slack_ms: unbits(self.slack_ms.load(r)),
+            slack_low_ms: unbits(self.slack_low_ms.load(r)),
+            slack_speed: {
+                let v = unbits(self.slack_speed.load(r));
+                if v.is_finite() && v > 0.0 { v } else { 1.0 }
+            },
             lead_ms: unbits(self.lead_ms.load(r)),
             device_rate: self.device_rate.load(r) as u32,
             period: self.period.load(r) as u32,
+            device_channels: self.device_channels.load(r) as u32,
+            device_channels_max: self.device_channels_max.load(r) as u32,
             reopens: self.reopens.load(r),
+            chain_graph: self.chain_graph.get(),
+            chain_frames: self.chain_frames.load(r),
+            pad_frames: self.pad_frames.load(r),
+            comp_late_ms: unbits(self.comp_late_ms.load(r)),
+            level_db: self.level_db.get(),
             error: self.error.lock().ok().and_then(|g| g.clone()),
         }
     }
@@ -310,8 +388,12 @@ pub fn view(
     snap: Option<&FollowerSnapshot>,
     lag_ms: f64,
     failure: Option<&str>,
+    own: Option<(Vec<String>, audivane_protocol::ChainConfig)>,
 ) -> ipc::FollowerStatus {
     use ipc::FollowerState as W;
+    let finite = |x: f64| if x.is_finite() { x } else { 0.0 };
+    // What its compensation cannot cover counts as unaligned too.
+    let off_ms = lag_ms + snap.map_or(0.0, |s| finite(s.comp_late_ms));
     let state = match snap {
         None => W::Off,
         Some(s) => match s.state {
@@ -320,18 +402,23 @@ pub fn view(
             FollowerState::Acquiring => W::Locking,
             FollowerState::Lost => W::Lost,
             FollowerState::Locked if !s.audible => W::Muted,
-            FollowerState::Locked if lag_ms > 0.0 => W::Unaligned,
+            FollowerState::Locked if off_ms != 0.0 => W::Unaligned,
             FollowerState::Locked => W::Locked,
         },
     };
-    let finite = |x: f64| if x.is_finite() { x } else { 0.0 };
     ipc::FollowerStatus {
         device: f.device.clone(),
         enabled: f.enabled,
         trim_ms: f.trim_ms,
         volume_db: f.volume_db,
+        follow_volume: f.follow_volume,
+        level_db: Some(
+            snap.map(|s| s.level_db)
+                .filter(|l| l.is_finite())
+                .unwrap_or(f.volume_db),
+        ),
         state,
-        offset_ms: lag_ms,
+        offset_ms: off_ms,
         ppm: snap.map_or(0.0, |s| finite(s.ppm)),
         phase_error_frames: snap.map_or(0.0, |s| finite(s.phase_error_frames)),
         bandwidth_hz: snap.map_or(0.0, |s| finite(s.bandwidth_hz)),
@@ -340,9 +427,78 @@ pub fn view(
         latency_ms: snap.map_or(0.0, |s| finite(s.latency_ms)),
         device_rate: snap.map_or(0, |s| s.device_rate),
         period: snap.map_or(0, |s| s.period),
+        period_ms: f.period_ms,
+        need_ms: None,
+        output_channels: f.output_channels,
+        device_channels: snap.map_or(0, |s| s.device_channels),
+        device_channels_max: snap.map_or(0, |s| s.device_channels_max),
         error: snap
             .and_then(|s| s.error.clone())
             .or_else(|| failure.map(str::to_string)),
+        own_chain: own.as_ref().map(|o| o.0.clone()).unwrap_or_default(),
+        chain: own.map(|o| Box::new(o.1)),
+        latency: match snap {
+            Some(s) if s.device_rate > 0 && s.chain_graph.is_finite() => {
+                ipc::PathLatency::from_frames(
+                    s.device_rate,
+                    s.chain_frames as f64,
+                    s.pad_frames as f64,
+                    0.0,
+                )
+            }
+            _ => ipc::PathLatency::default(),
+        },
+    }
+}
+
+/// A follower's level state packed in one `u64`: its own volume (high
+/// half) and its offset to the master's level (low half, `NaN`: it does not
+/// follow), each an `f32` in dB (exact for whole and half dB, within 1e-5
+/// dB otherwise).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LevelWord(u64);
+
+impl LevelWord {
+    fn new(volume_db: f64, follow_offset_db: Option<f64>) -> Self {
+        let own = if volume_db.is_finite() {
+            volume_db.clamp(ipc::VOLUME_MIN_DB, 0.0)
+        } else {
+            0.0
+        };
+        let offset = follow_offset_db
+            .filter(|o| o.is_finite())
+            .map_or(f32::NAN, |o| {
+                o.clamp(-2.0 * FOLLOW_SPAN_DB, 2.0 * FOLLOW_SPAN_DB) as f32
+            });
+        Self((u64::from((own as f32).to_bits()) << 32) | u64::from(offset.to_bits()))
+    }
+
+    fn get(self) -> (f64, Option<f64>) {
+        let own = f64::from(f32::from_bits((self.0 >> 32) as u32));
+        let offset = f64::from(f32::from_bits(self.0 as u32));
+        (own, offset.is_finite().then_some(offset))
+    }
+}
+
+/// The level a follower plays at (dB), the balance on its inputs and its
+/// mute: its own volume alone, or, following, the master's level plus its
+/// offset (at most 0 dB) with the master's balance and mute.
+pub(crate) fn heard_level(
+    own_db: f64,
+    follow_offset_db: Option<f64>,
+    m: &VolumeTarget,
+) -> (f64, f64, bool) {
+    match follow_offset_db {
+        Some(offset) if m.volume_db.is_finite() => {
+            let balance = if m.balance_db.is_finite() {
+                m.balance_db
+            } else {
+                0.0
+            };
+            let db = (offset + m.volume_db).clamp(FOLLOW_FLOOR_DB, 0.0);
+            (db, balance, m.muted)
+        }
+        _ => (own_db, 0.0, false),
     }
 }
 
@@ -353,9 +509,77 @@ pub struct FollowerControls {
     /// Its lateness beyond the trim when the master's alignment is at its
     /// cap (it plays unaligned), ms.
     lag_ms: AtomicU64,
-    volume_db: AtomicU64,
+    /// Its level state in one word ([`LevelWord`]): its own volume and,
+    /// while it follows, its offset to the master's level. One load reads
+    /// both, so the audio thread never pairs one's new value with the
+    /// other's old one (an untick heard for a block at the old level).
+    level: AtomicU64,
     enabled: AtomicBool,
     stop: AtomicBool,
+    /// Its path is padded to the master's chain latency
+    /// ([`TeeShared::master_chain_graph`]); set by [`FollowerHost`].
+    compensate: AtomicBool,
+    /// Reopen the device (its config wants another ratio).
+    reopen: AtomicBool,
+    /// Its device period, ms (`f64` bits; `NaN`: the default), read at
+    /// each open.
+    period_ms: AtomicU64,
+    /// Measurement jobs for this follower (`measure_play`).
+    measure: Arc<MeasureSlot>,
+    /// What its loop has learnt about it with the current master, per
+    /// device rate family (48 and 44.1 kHz: a DAC may have a crystal for
+    /// each): the last locked rate state (ε, `NaN` before any) and both
+    /// devices' short-window reading bias (RMS, seconds). A (re)open starts
+    /// from it; [`FollowerHost`] keeps it per pair, on disk.
+    memory: [[AtomicU64; 3]; 2],
+    /// Bumped when the memory is replaced (another master): the loop
+    /// starts again from the new pair's.
+    pair_gen: AtomicU64,
+}
+
+/// What a follower's loop learnt about a master and follower pair at one
+/// rate family.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ClockMemory {
+    /// The follower's clock against the master's, ε units (`None`: never
+    /// locked).
+    pub eps: Option<f64>,
+    /// The master's and the follower's short-window reading bias, RMS,
+    /// seconds.
+    pub master_bias_s: f64,
+    pub follower_bias_s: f64,
+}
+
+/// The standard deviations of the devices' short-window reading bias a
+/// placement allows for, where it is not taken out of the readings.
+const BIAS_SIGMAS: f64 = 2.0;
+
+/// How far a point of the master's off its line is held back for a period
+/// (seconds): past a coarse 1 ms grid's step and its async packets. A late
+/// reading spans a whole master period of the follower's readings (seven
+/// at 128-frame periods against the master's 1024): read as a jump, it
+/// would place the follower out and back.
+const MASTER_ODD_S: f64 = 1.5e-3;
+
+/// A tracker's short-window bias RMS, seconds, where it is known (0: not).
+fn known_rms(t: &BiasTracker) -> f64 {
+    if t.rms_known() { t.rms_s() } else { 0.0 }
+}
+
+/// Start a loop from what is remembered of its pair: placed from its first
+/// readings at the remembered rate, or at the nominal one for a pair never
+/// seen (heard at once either way).
+fn seed_loop(lp: &mut DriftLoop, mem: ClockMemory) {
+    match mem.eps {
+        Some(eps) => lp.seed(eps),
+        None => lp.seed_nominal(),
+    }
+}
+
+/// The rate family of a device rate: 0 for multiples of 8 kHz, 1 for
+/// those of 11.025 kHz.
+fn rate_family(rate: u32) -> usize {
+    usize::from(!rate.is_multiple_of(8000) && rate.is_multiple_of(11_025))
 }
 
 impl FollowerControls {
@@ -363,10 +587,100 @@ impl FollowerControls {
         Self {
             trim_ms: AtomicU64::new(bits(trim_ms)),
             lag_ms: AtomicU64::new(bits(0.0)),
-            volume_db: AtomicU64::new(bits(volume_db)),
+            level: AtomicU64::new(LevelWord::new(volume_db, None).0),
             enabled: AtomicBool::new(true),
             stop: AtomicBool::new(false),
+            compensate: AtomicBool::new(false),
+            reopen: AtomicBool::new(false),
+            period_ms: AtomicU64::new(bits(f64::NAN)),
+            measure: Arc::new(MeasureSlot::default()),
+            memory: std::array::from_fn(|_| {
+                [
+                    AtomicU64::new(bits(f64::NAN)),
+                    AtomicU64::new(bits(0.0)),
+                    AtomicU64::new(bits(0.0)),
+                ]
+            }),
+            pair_gen: AtomicU64::new(0),
         }
+    }
+
+    /// The loop's last locked rate state at `device_rate`'s family.
+    pub fn remembered_rate(&self, device_rate: u32) -> Option<f64> {
+        self.memory_at(rate_family(device_rate)).eps
+    }
+
+    fn remember_rate(&self, device_rate: u32, eps: f64) {
+        self.memory[rate_family(device_rate)][0].store(bits(eps), Ordering::Relaxed);
+    }
+
+    fn remember_bias(&self, device_rate: u32, master_s: f64, follower_s: f64) {
+        let m = &self.memory[rate_family(device_rate)];
+        m[1].store(bits(master_s), Ordering::Relaxed);
+        m[2].store(bits(follower_s), Ordering::Relaxed);
+    }
+
+    /// What is remembered at family `family` (0: 48 kHz, 1: 44.1 kHz).
+    pub fn memory_at(&self, family: usize) -> ClockMemory {
+        let m = &self.memory[family.min(1)];
+        let r = |i: usize| unbits(m[i].load(Ordering::Relaxed));
+        let finite = |x: f64| if x.is_finite() && x >= 0.0 { x } else { 0.0 };
+        ClockMemory {
+            eps: Some(r(0)).filter(|e| e.is_finite()),
+            master_bias_s: finite(r(1)),
+            follower_bias_s: finite(r(2)),
+        }
+    }
+
+    /// Install the memory of a pair (both families): another master, or
+    /// what the disk had. The running loop starts again from it.
+    pub fn install_memory(&self, mem: [ClockMemory; 2]) {
+        for (m, x) in self.memory.iter().zip(mem) {
+            m[0].store(bits(x.eps.unwrap_or(f64::NAN)), Ordering::Relaxed);
+            m[1].store(bits(x.master_bias_s), Ordering::Relaxed);
+            m[2].store(bits(x.follower_bias_s), Ordering::Relaxed);
+        }
+        self.pair_gen.fetch_add(1, Ordering::Release);
+    }
+
+    /// Its device period from the next open on, ms (`None`: the default,
+    /// [`ipc::FOLLOWER_DEFAULT_PERIOD_MS`]). Returns whether it changed.
+    pub fn set_period_ms(&self, ms: Option<f64>) -> bool {
+        let new = bits(ms.filter(|m| m.is_finite() && *m > 0.0).unwrap_or(f64::NAN));
+        self.period_ms.swap(new, Ordering::Relaxed) != new
+    }
+
+    /// Its device period, ms (the default when none is set).
+    pub fn period_ms(&self) -> f64 {
+        let ms = unbits(self.period_ms.load(Ordering::Relaxed));
+        if ms.is_finite() {
+            ms
+        } else {
+            ipc::FOLLOWER_DEFAULT_PERIOD_MS
+        }
+    }
+
+    /// Pad its path to the master's chain latency (on with the host).
+    pub fn set_compensate(&self, on: bool) {
+        self.compensate.store(on, Ordering::Relaxed);
+    }
+
+    pub fn compensate(&self) -> bool {
+        self.compensate.load(Ordering::Relaxed)
+    }
+
+    /// Ask the follower to reopen its device (taken once).
+    pub fn request_reopen(&self) {
+        self.reopen.store(true, Ordering::Release);
+    }
+
+    fn take_reopen(&self) -> bool {
+        self.reopen.swap(false, Ordering::AcqRel)
+    }
+
+    /// Where a measurement job for this follower is posted.
+    pub fn measure_slot(&self) -> &Arc<MeasureSlot> {
+        &self.measure
     }
 
     /// The follower's delay behind the master, ms (±[`MAX_TRIM_MS`]).
@@ -387,7 +701,8 @@ impl FollowerControls {
     /// lateness above 0: the alignment is at its cap), it cannot play
     /// earlier than it does, so a trim that moves it earlier goes into the
     /// lateness instead (the follower stays where it is, and the status
-    /// says how late it is); a later one is taken as it is.
+    /// says how late it is); a later one takes the lateness back first
+    /// (down to 0: aligned again), and only the rest moves the follower.
     pub fn retrim(&self, ms: f64) {
         let before = self.trim_ms();
         self.set_trim_ms(ms);
@@ -395,6 +710,8 @@ impl FollowerControls {
         let lag = self.lag_ms();
         if lag > 0.0 && earlier > 0.0 {
             self.set_lag_ms(lag + earlier);
+        } else if lag > 0.0 && earlier < 0.0 {
+            self.set_lag_ms((lag + earlier).max(0.0));
         }
     }
 
@@ -412,18 +729,40 @@ impl FollowerControls {
         unbits(self.lag_ms.load(Ordering::Relaxed))
     }
 
-    /// Its digital volume, dB (at most 0).
+    /// Its level, in one store: its own digital volume `volume_db` (dB, at
+    /// most 0) and, to follow the master's level
+    /// ([`TeeShared::master_level`]), its offset to it (its `volume_db`
+    /// minus the master's level that was set at): the master's changes move
+    /// it by as much, and its balance (on the first two inputs) and mute
+    /// reach it. `None`: it plays at `volume_db` alone.
+    pub fn set_level(&self, volume_db: f64, follow_offset_db: Option<f64>) {
+        self.level.store(
+            LevelWord::new(volume_db, follow_offset_db).0,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Its own volume and its offset to the master's, read together.
+    pub fn level(&self) -> (f64, Option<f64>) {
+        LevelWord(self.level.load(Ordering::Relaxed)).get()
+    }
+
+    /// Its own volume alone (its following unchanged).
     pub fn set_volume_db(&self, db: f64) {
-        let db = if db.is_finite() {
-            db.clamp(-120.0, 0.0)
-        } else {
-            0.0
-        };
-        self.volume_db.store(bits(db), Ordering::Relaxed);
+        let _ = self
+            .level
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |w| {
+                Some(LevelWord::new(db, LevelWord(w).get().1).0)
+            });
     }
 
     pub fn volume_db(&self) -> f64 {
-        unbits(self.volume_db.load(Ordering::Relaxed))
+        self.level().0
+    }
+
+    /// Its offset to the master's level, while it follows.
+    pub fn follow_offset_db(&self) -> Option<f64> {
+        self.level().1
     }
 
     /// Enabled: it may be heard (disabled, it keeps its lock, muted).
@@ -633,6 +972,149 @@ impl SourceFade {
 }
 
 // ---------------------------------------------------------------------------
+// The compensation pad.
+
+/// What a follower's pad does about a need of `want` device frames (the
+/// master's chain and compensation less its own chain; negative: its own
+/// is longer).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PadPlan {
+    /// The pad's length: the need, within `0..=max`.
+    pub target: usize,
+    /// The master's compensation still grows to cover the follower's
+    /// longer chain: shut until it has.
+    pub short: bool,
+    /// What neither covers, device frames: later than the master
+    /// (positive: its chain is longer than the master's compensation can
+    /// cover) or earlier (negative: the pad is at its most).
+    pub late_frames: f64,
+}
+
+/// [`PadPlan`] for a need of `want` frames, a pad of at most `max` frames,
+/// and whether the master's compensation can still grow.
+pub fn pad_plan(want: f64, max: usize, comp_can_grow: bool) -> PadPlan {
+    if want < -0.5 {
+        PadPlan {
+            target: 0,
+            short: comp_can_grow,
+            late_frames: if comp_can_grow { 0.0 } else { -want },
+        }
+    } else if want > max as f64 + 0.5 {
+        PadPlan {
+            target: max,
+            short: false,
+            late_frames: -(want - max as f64),
+        }
+    } else {
+        PadPlan {
+            target: want.round().max(0.0) as usize,
+            short: false,
+            late_frames: 0.0,
+        }
+    }
+}
+
+/// A delay of whole device frames after the follower's chain (interleaved
+/// `i32`, exact), which pads its path to the master's chain latency.
+///
+/// The ring always keeps its whole capacity of history, so a new length
+/// reads frames already there: a change fades the output out
+/// (`PAD_FADE_MS`), switches at silence, and fades back in, as a chain
+/// swap of another latency does. Muted, it fades out and stays shut. Open
+/// at length 0 it passes the samples unchanged.
+pub struct OutPad {
+    ch: usize,
+    cap: usize,
+    buf: Vec<i32>,
+    w: usize,
+    len: usize,
+    target: usize,
+    muted: bool,
+    /// The fade's position (`fade_len`: open) and length.
+    g: usize,
+    fade_len: usize,
+}
+
+impl OutPad {
+    /// For `ch` channels, up to `max` frames of delay, fading over
+    /// `fade_len` frames (allocates).
+    pub fn new(ch: usize, max: usize, fade_len: usize) -> Self {
+        let cap = max + 1;
+        Self {
+            ch: ch.max(1),
+            cap,
+            buf: vec![0; cap * ch.max(1)],
+            w: 0,
+            len: 0,
+            target: 0,
+            muted: false,
+            g: fade_len.max(1),
+            fade_len: fade_len.max(1),
+        }
+    }
+
+    /// Its delay now, frames.
+    pub fn delay(&self) -> usize {
+        self.len
+    }
+
+    pub fn max(&self) -> usize {
+        self.cap - 1
+    }
+
+    /// The length it moves to (through a fade), and whether it stays shut.
+    pub fn set(&mut self, target: usize, muted: bool) {
+        self.target = target.min(self.max());
+        self.muted = muted;
+    }
+
+    /// Set the length at once (before it plays: no fade).
+    pub fn jump(&mut self, len: usize) {
+        self.len = len.min(self.max());
+        self.target = self.len;
+    }
+
+    /// Fully open (no fade running, not muted).
+    pub fn open(&self) -> bool {
+        self.g == self.fade_len && !self.muted && self.len == self.target
+    }
+
+    /// Delay `out` (interleaved frames) in place. Returns whether the
+    /// length changed in it.
+    pub fn process(&mut self, out: &mut [i32]) -> bool {
+        let ch = self.ch;
+        let mut switched = false;
+        for frame in out.chunks_exact_mut(ch) {
+            let at = self.w * ch;
+            self.buf[at..at + ch].copy_from_slice(frame);
+            let closing = self.muted || self.len != self.target;
+            if closing {
+                self.g = self.g.saturating_sub(1);
+                if self.g == 0 && self.len != self.target {
+                    self.len = self.target;
+                    switched = true;
+                }
+            } else if self.g < self.fade_len {
+                self.g += 1;
+            }
+            let r = (self.w + self.cap - self.len) % self.cap * ch;
+            if self.g == self.fade_len {
+                if self.len != 0 {
+                    frame.copy_from_slice(&self.buf[r..r + ch]);
+                }
+            } else {
+                let w = 0.5 - 0.5 * (PI * self.g as f64 / self.fade_len as f64).cos();
+                for (c, x) in frame.iter_mut().enumerate() {
+                    *x = (f64::from(self.buf[r + c]) * w).round() as i32;
+                }
+            }
+            self.w = (self.w + 1) % self.cap;
+        }
+        switched
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The follower's audio path.
 
 /// The queues a follower's chains come and go by: new chains from the
@@ -646,16 +1128,46 @@ pub struct ChainSwaps {
 pub struct ChainSwapHost {
     pub incoming: rtrb::Producer<ActiveChain>,
     pub retired: rtrb::Consumer<ActiveChain>,
+    /// The newest chain built that the queue had no room for: it goes in
+    /// at the next [`ChainSwapHost::reap`] (a newer one replaces it, the
+    /// older dropped here), so the last edit always lands.
+    pending: Option<ActiveChain>,
 }
+
+impl ChainSwapHost {
+    /// Drop the chains handed back; queue a pending one.
+    pub fn reap(&mut self) {
+        while let Ok(c) = self.retired.pop() {
+            drop(c);
+        }
+        if let Some(c) = self.pending.take()
+            && let Err(rtrb::PushError::Full(c)) = self.incoming.push(c)
+        {
+            self.pending = Some(c);
+        }
+    }
+
+    /// A chain built for the follower: queued, or pending (the newest
+    /// only) while the queue is full.
+    pub fn offer(&mut self, chain: ActiveChain) {
+        drop(self.pending.replace(chain));
+        self.reap();
+    }
+}
+
+/// How many new chains a follower's queue holds (the control side keeps
+/// the newest beyond it pending).
+const CHAIN_QUEUE: usize = 2;
 
 /// A pair of chain queues.
 pub fn chain_swaps() -> (ChainSwapHost, ChainSwaps) {
-    let (in_tx, in_rx) = rtrb::RingBuffer::new(2);
+    let (in_tx, in_rx) = rtrb::RingBuffer::new(CHAIN_QUEUE);
     let (out_tx, out_rx) = rtrb::RingBuffer::new(4);
     (
         ChainSwapHost {
             incoming: in_tx,
             retired: out_rx,
+            pending: None,
         },
         ChainSwaps {
             incoming: in_rx,
@@ -689,6 +1201,40 @@ enum Swap {
         pos: usize,
         len: usize,
     },
+}
+
+/// Ready `next` to warm up beside `playing` from the next call on, whose
+/// first input frame is `next_pos` (graph frames into the chain): onto the
+/// grid first (an align after the handover would clear what it took),
+/// its limiter muted, then the handover ([`ActiveChain::inherit_filter_state`],
+/// at most `budget` bytes). Returns the warm-up target, device frames: as
+/// the master's, a convolution the edit keeps plays on from `playing`'s
+/// state, one it does not (or one too large to copy in a period) warms up
+/// for its ring too (at most `ring_cap`).
+pub(crate) fn ready_incoming(
+    next: &mut ActiveChain,
+    playing: &mut ActiveChain,
+    next_pos: u64,
+    budget: usize,
+    ring_cap: usize,
+    out_rate: u32,
+) -> usize {
+    next.align_to(next_pos);
+    next.set_limiter_audible(false);
+    let lat = next.latency_out_frames();
+    let ring = if next.inherit_filter_state(playing, budget) {
+        0
+    } else {
+        next.conv_ring_frames().min(ring_cap)
+    };
+    // With a convolution, the fresh EQ sections settle too (as the
+    // master's), capped.
+    let ring = ring.max(next.settle_out_frames(out_rate));
+    if lat == 0 && ring == 0 {
+        0
+    } else {
+        lat + ring + SWAP_WARM_MARGIN
+    }
 }
 
 /// The raised cosine from 0 to 1 at frame `pos` of `len`.
@@ -725,8 +1271,20 @@ pub struct FollowerRt {
     controls: Arc<FollowerControls>,
     stage: Box<Varispeed>,
     chain: ActiveChain,
+    /// Its volume and mute, ramped in the chain before its limiter (as the
+    /// master's), at the device rate.
     gain: StereoGainRamp,
-    volume_db: f64,
+    /// The master's balance on its inputs (the chain's input: a sub's
+    /// matrix sums them), ramped at the graph rate.
+    in_gain: StereoGainRamp,
+    /// The master's level last read ([`TeeShared::master_level`]) and its
+    /// generation; the level set on the ramps (volume dB, balance dB,
+    /// muted; `None` before the first block: it snaps); its own volume,
+    /// linear (a `bypass` measurement's tap: no master level).
+    master_gen: u64,
+    master_level: VolumeTarget,
+    level: Option<(f64, f64, bool)>,
+    own_lin: f64,
     src: SourceQueue,
     stage_in: Vec<Vec<f64>>,
     stage_out: Vec<Vec<f64>>,
@@ -766,6 +1324,13 @@ pub struct FollowerRt {
     deferred_ms: f64,
     deferred_since: u64,
     deferred: bool,
+    /// Where the master's output jumped at the waiting step (source
+    /// frames, the old mapping): the skip waits until the read point is
+    /// there, shut from before it, so the step lands at both DACs
+    /// together. And an alignment change the master has announced, not
+    /// made yet (where it jumps at the earliest): shut from before it.
+    deferred_at: Option<i64>,
+    announced: Option<i64>,
     /// The known steps in the pending skip, as they were before it (frames,
     /// ms, the remainder, the skip, since when they wait): a skip sent back
     /// to waiting takes its lateness at the speed of the moment it lands,
@@ -779,7 +1344,30 @@ pub struct FollowerRt {
     log_cursor: Option<u64>,
     locked: bool,
     master_valid: bool,
+    /// The master's position epoch last seen: a new one is a new stream
+    /// (a pause, a reopen), and the loop places the follower anew.
+    master_epoch: Option<u64>,
     master_ramping: bool,
+    /// Both devices' readings against their own clocks (the reading bias,
+    /// [`BiasTracker`]); the master's last reading taken (its time, known
+    /// steps, speed) and its deviation (source frames, `NaN`: not taken
+    /// out); the pair memory's generation the loop started from.
+    bias_m: BiasTracker,
+    bias_f: BiasTracker,
+    bias_m_seen: (i64, i64, f64),
+    bias_m_dev: f64,
+    /// The master's last point on its line (position, time, epoch, known
+    /// steps), and whether the newest is held back: off that line by more
+    /// than [`MASTER_ODD_S`] without a step, a new stream or a ramp (a late
+    /// reading at its DAC). It counts once the next agrees with it.
+    master_line: Option<(i128, i64, u64, i64)>,
+    master_odd: bool,
+    /// Which devices' deviations were taken out at the last reading.
+    bias_out: (bool, bool),
+    pair_gen: u64,
+    /// Device frames whose output is silenced from here (after a signalled
+    /// xrun: what the chain and the pad held belongs to the old timeline).
+    out_mute: usize,
     master_speed: f64,
     loop_rate: f64,
     /// The trim and the lateness (ms) the detector's offset was set for,
@@ -792,17 +1380,31 @@ pub struct FollowerRt {
     step_seen: i64,
     step_rest: f64,
     /// The least source slack over the window, frames, and the window's
-    /// age, seconds.
+    /// age, seconds; the slack published, ms.
     slack_min: f64,
     slack_age: f64,
+    /// The stream's first slack window is not out yet (it is shorter, so
+    /// the master's alignment is set within a fraction of a second).
+    slack_first: bool,
     slack_last: f64,
+    /// The best lower bound of the slack at the clocks' worst phase since
+    /// the last change the follower cannot account for (ms, `NaN`: none),
+    /// shifted by its own known steps; and the last window's phase
+    /// allowance, frames.
+    slack_best: f64,
+    /// The least of the windows' lower bounds since the same changes, ms
+    /// (`NaN`: none): the worst the follower had, for the alignment's
+    /// shrink.
+    slack_low: f64,
+    spacing_prev: f64,
+    /// The window saw the master gone (its position invalid: a rate
+    /// change, a reopen, Direct): it publishes nothing.
+    slack_void: bool,
     /// The ring's known end at the last call, and the largest step it made
     /// between two calls over the window (the master's write size: the
     /// slack is counted at the worst phase of the two clocks).
     known_last: u64,
     known_jump: u64,
-    /// The loop's bandwidth before its alignment (it narrows from there).
-    bw0: f64,
     /// Graph frames the follower stays shut after it ran short of source
     /// (no flutter of the fade on a marginal look-ahead).
     starved: usize,
@@ -818,8 +1420,20 @@ pub struct FollowerRt {
     swap: Swap,
     swap_buf: Vec<i32>,
     retire_stash: Option<ActiveChain>,
+    /// The newest chain that arrived while a swap was in flight, taken off
+    /// the queue (latest wins, an older one retired) so the queue never
+    /// fills and the last edit always lands; it starts once the swap ends.
+    held: Option<ActiveChain>,
     /// The master's chain latency changes seen ([`TeeShared::chain_seq`]).
     chain_seq: u64,
+    /// The compensation pad after the chain, the length it should have
+    /// (device frames) and since when (device frames rendered).
+    pad: OutPad,
+    pad_want: usize,
+    pad_since: u64,
+    /// Measurement playback: the file at the stage input, and (`bypass`)
+    /// the stage output around the chain.
+    measure: FollowerMeasure,
     /// Chain swaps done (tests and the status).
     pub swaps_done: u64,
 }
@@ -863,11 +1477,15 @@ impl FollowerRt {
         let period_s = period_seconds(&p);
         // The loop's own delay: the device buffer and a period.
         let delay_s = (p.buffer + p.period) as f64 / f64::from(p.device_rate);
-        let lp = DriftLoop::new(LoopConfig::default(), g, delay_s).map_err(|e| e.to_string())?;
-        let bw0 = lp.bandwidth();
+        let mut lp =
+            DriftLoop::new(LoopConfig::default(), g, delay_s).map_err(|e| e.to_string())?;
+        let pair_gen = controls.pair_gen.load(Ordering::Acquire);
+        let mem = controls.memory_at(rate_family(p.device_rate));
+        seed_loop(&mut lp, mem);
         let max_out = p.ratio.frames_out(0, STAGE_FRAMES) + p.ratio.up as usize + 1;
         let fade_len = ((FADE_MS * 1e-3 * g).round() as usize).clamp(1, MAX_FADE);
         let ch = p.channels;
+        let measure = FollowerMeasure::new(Arc::clone(controls.measure_slot()), ch, STAGE_FRAMES);
         let mut rt = Self {
             reader,
             shared,
@@ -876,7 +1494,11 @@ impl FollowerRt {
             stage,
             chain,
             gain: StereoGainRamp::unity(p.device_rate),
-            volume_db: 0.0,
+            in_gain: StereoGainRamp::unity(p.graph_rate),
+            master_gen: 0,
+            master_level: VolumeTarget::default(),
+            level: None,
+            own_lin: 1.0,
             src: SourceQueue::new(ch, history_frames(p.graph_rate)),
             stage_in: vec![vec![0.0; 2 * STAGE_FRAMES + 2]; ch],
             stage_out: vec![vec![0.0; STAGE_FRAMES]; ch],
@@ -903,6 +1525,8 @@ impl FollowerRt {
             deferred_ms: 0.0,
             deferred_since: 0,
             deferred: false,
+            deferred_at: None,
+            announced: None,
             committed: None,
             last_cmd_at: i128::MIN,
             pending_reset: None,
@@ -910,7 +1534,17 @@ impl FollowerRt {
             log_cursor: None,
             locked: false,
             master_valid: false,
+            master_epoch: None,
             master_ramping: false,
+            bias_m: BiasTracker::new(),
+            bias_f: BiasTracker::new(),
+            bias_m_seen: (i64::MIN, i64::MIN, f64::NAN),
+            master_line: None,
+            master_odd: false,
+            bias_m_dev: f64::NAN,
+            bias_out: (false, false),
+            pair_gen: 0,
+            out_mute: 0,
             master_speed: 1.0,
             loop_rate: g,
             lateness_ms: f64::NAN,
@@ -919,10 +1553,14 @@ impl FollowerRt {
             step_rest: 0.0,
             slack_min: f64::INFINITY,
             slack_age: 0.0,
+            slack_first: true,
             slack_last: f64::NAN,
+            slack_best: f64::NAN,
+            slack_low: f64::NAN,
+            spacing_prev: f64::NAN,
+            slack_void: false,
             known_last: 0,
             known_jump: 0,
-            bw0,
             starved: 0,
             lead_max: f64::NEG_INFINITY,
             lead_last: f64::NAN,
@@ -931,11 +1569,23 @@ impl FollowerRt {
             swap: Swap::Idle,
             swap_buf: vec![0; max_out * ch],
             retire_stash: None,
+            held: None,
             chain_seq: 0,
+            pad: OutPad::new(
+                ch,
+                max_comp_frames(p.device_rate),
+                ((PAD_FADE_MS * 1e-3 * f64::from(p.device_rate)).round() as usize).max(1),
+            ),
+            pad_want: 0,
+            pad_since: 0,
+            measure,
             swaps_done: 0,
             p,
         };
         rt.chain_seq = rt.shared.chain_seq.load(Ordering::Relaxed);
+        rt.pair_gen = pair_gen;
+        rt.bias_m.remember_rms_s(mem.master_bias_s);
+        rt.bias_f.remember_rms_s(mem.follower_bias_s);
         rt.step_seen = rt.shared.steps.load(Ordering::Relaxed) as i64;
         // What the ring held before (the follower was away): the read
         // point starts at what comes next.
@@ -948,6 +1598,14 @@ impl FollowerRt {
                 break;
             }
         }
+        // A new stream (a rate change, a reopen) plays from aligned: what
+        // it needs late at this rate and period its slack shows again (muted
+        // until it locks). The last stream's slack is not this one's.
+        rt.controls.set_lag_ms(0.0);
+        rt.status.slack_ms.store(bits(f64::NAN), Ordering::Relaxed);
+        rt.status
+            .slack_low_ms
+            .store(bits(f64::NAN), Ordering::Relaxed);
         rt.status
             .device_rate
             .store(u64::from(p.device_rate), Ordering::Relaxed);
@@ -994,6 +1652,23 @@ impl FollowerRt {
     /// what was written before is gone, the loop sees the jump.
     pub fn xrun(&mut self) {
         self.status.xruns.fetch_add(1, Ordering::Relaxed);
+        self.measure.interrupted();
+        self.slack_best = f64::NAN;
+        // Shut at once, before the prime renders: the device dropped what
+        // it held, so what plays next is out of place until the loop has
+        // placed it again (what the fifo, the chain and the pad still hold
+        // is silenced too: the chain's whole tail, a convolution's ring
+        // included, so nothing from before the xrun comes out of it).
+        self.lp.realign();
+        self.locked = false;
+        self.fade.pos = 0;
+        let ch = self.p.channels;
+        self.fifo[..self.fifo_frames * ch].fill(0);
+        self.out_mute = self.chain.tail_out_frames() + self.pad.delay() + self.p.period;
+        self.hold_until = self.hold_until.max(self.rendered);
+        self.bias_f.rebase();
+        self.publish_audible(false);
+        self.slack_low = f64::NAN;
     }
 
     fn publish_audible(&self, on: bool) {
@@ -1005,10 +1680,82 @@ impl FollowerRt {
         self.origin + (self.stage.core().accumulator().position() >> 1) as i128
     }
 
-    /// The chain's delay in graph frames.
+    /// The chain's delay in graph frames, its compensation pad included.
     fn chain_graph(&self) -> f64 {
+        self.out_graph(self.chain_out_frames())
+    }
+
+    /// The chain's delay and the pad's, device frames.
+    fn chain_out_frames(&self) -> usize {
+        self.chain.latency_out_frames() + self.pad.delay()
+    }
+
+    /// Device frames in graph frames.
+    fn out_graph(&self, frames: usize) -> f64 {
         let r = self.p.ratio;
-        self.chain.latency_out_frames() as f64 * f64::from(r.down) / f64::from(r.up.max(1))
+        frames as f64 * f64::from(r.down) / f64::from(r.up.max(1))
+    }
+
+    /// The pad's length the master's chain latency and compensation ask for
+    /// (device frames), and whether the master's compensation still falls
+    /// short of this follower's chain (it would play late). `None` without
+    /// compensation or before the master has mapped a block.
+    fn pad_target(&self) -> Option<PadPlan> {
+        if !self.controls.compensate() {
+            return None;
+        }
+        let master = self.shared.master_chain_graph.get();
+        if !master.is_finite() {
+            return None;
+        }
+        let comp = self.shared.comp_frames.load(Ordering::Relaxed) as f64;
+        let own = self.out_graph(self.chain.latency_out_frames());
+        let r = self.p.ratio;
+        let want = (master + comp - own) * f64::from(r.up) / f64::from(r.down.max(1));
+        let can_grow = comp < max_comp_frames(self.p.graph_rate) as f64
+            && own - master <= MAX_COMP_MS * 1e-3 * f64::from(self.p.graph_rate);
+        Some(pad_plan(want, self.pad.max(), can_grow))
+    }
+
+    /// Once a period: the pad follows its target once that has held still
+    /// for [`PAD_SETTLE_S`] with no chain of its own on the way (a chain
+    /// edit swaps both sides a little apart); until then, and while the
+    /// master's compensation is short, the follower is shut (it would play
+    /// out of place). Before the loop has placed it, at once.
+    fn update_pad(&mut self) {
+        let Some(plan) = self.pad_target() else {
+            self.pad.set(0, false);
+            self.status.comp_late_ms.store(bits(0.0), Ordering::Relaxed);
+            return;
+        };
+        let (want, short) = (plan.target, plan.short);
+        self.status.comp_late_ms.store(
+            bits(plan.late_frames / f64::from(self.p.device_rate) * 1e3),
+            Ordering::Relaxed,
+        );
+        if want != self.pad_want {
+            self.pad_want = want;
+            self.pad_since = self.rendered;
+        }
+        if !self.lp.aligned() {
+            if want != self.pad.delay() {
+                self.pad.jump(want);
+            }
+            self.pad.set(want, false);
+            return;
+        }
+        let in_flight = !matches!(self.swap, Swap::Idle)
+            || self.swaps.as_ref().is_some_and(|s| s.incoming.slots() > 0);
+        let settled = self.rendered.saturating_sub(self.pad_since) as f64
+            >= PAD_SETTLE_S * f64::from(self.p.device_rate);
+        // (A frame of rounding is the loop's.)
+        let off = want.abs_diff(self.pad.delay()) > 1;
+        let target = if settled && !in_flight && off {
+            want
+        } else {
+            self.pad.delay()
+        };
+        self.pad.set(target, short || off);
     }
 
     /// The source position at the DAC of the stage's next output (the
@@ -1085,6 +1832,10 @@ impl FollowerRt {
                 s += (s as f64 * (v_end - v) / v).round() as i64;
             }
         }
+        // The slack moves by the skip (a skip of the loop's has started it
+        // again already).
+        self.slack_best -= s as f64 / self.loop_rate * 1e3;
+        self.slack_low -= s as f64 / self.loop_rate * 1e3;
         let from = self.want;
         self.want = self.want.saturating_add_signed(s);
         self.origin += (i128::from(self.want) - i128::from(from)) * FRAME;
@@ -1095,6 +1846,10 @@ impl FollowerRt {
             self.starved = self
                 .starved
                 .max((STARVED_S * f64::from(self.p.graph_rate)) as usize);
+        } else {
+            // What it ran short of was at the read point it left (ahead of
+            // the source, through a pause).
+            self.starved = 0;
         }
     }
 
@@ -1287,7 +2042,19 @@ impl FollowerRt {
         if self.deferred {
             let frames = self.deferred_step();
             let k = (frames + self.step_rest).round() as i64;
-            if self.skip_clear(k) || overdue(self.deferred_since, self.graph_out) {
+            // A step of the master's waits for the read point to reach
+            // where the master's output jumped (shut before it, below), so
+            // the follower's DAC jumps when the master's does: not earlier
+            // (a follower that queues less), and a later one is shut over
+            // the difference.
+            // (Its trim and lateness: it plays the master's position that
+            // much later, so it jumps that much earlier in the source.)
+            // (Both count what is heard: the master's position as its DAC
+            // carries it, the source the read point takes in, which the
+            // follower's DAC plays its delay later.)
+            let off = self.offset.round() as i64;
+            let there = self.deferred_at.is_none_or(|p| self.want as i64 + off >= p);
+            if (there && self.skip_clear(k)) || overdue(self.deferred_since, self.graph_out) {
                 self.commit_step(frames);
             }
         }
@@ -1361,9 +2128,13 @@ impl FollowerRt {
             }
         };
         // The source, faded; is there enough ahead for the fade?
+        // (Never the newest history the ring gave: a read point that ran
+        // on ahead of the source, through a pause, finds it after its skip
+        // back.)
+        let keep = self.want.min(self.src.end_seen);
         self.src.fill(
             &mut self.reader,
-            self.want.saturating_sub(self.src.history as u64),
+            keep.saturating_sub(self.src.history as u64),
         );
         let known = self.src.known_end(&self.reader);
         if self.known_last > 0 && known > self.known_last {
@@ -1373,7 +2144,12 @@ impl FollowerRt {
         let ahead = self.want + n_src as u64 + self.fade.len as u64;
         // Counted once the loop has aligned the read point (before, it is
         // anywhere).
-        if self.lp.bandwidth() < self.bw0 && self.pending_skip == 0 && !self.deferred {
+        if self.lp.aligned()
+            && self.master_valid
+            && self.pending_skip == 0
+            && !self.deferred
+            && !self.lp.skip_pending()
+        {
             let slack = known as f64 - ahead as f64;
             self.slack_min = self.slack_min.min(slack);
         }
@@ -1387,13 +2163,26 @@ impl FollowerRt {
         }
         // (A repeat further back than the history reads silence: it stays
         // shut until the source is held again.)
+        // (After a signalled xrun, not before the output's mute has run
+        // out: the chain has then heard silence for its whole tail, so its
+        // output fades in from zero rather than stepping where the mute
+        // lifts.)
+        // Shut before a step of the master's position, from the frame its
+        // fade must end by: an announced alignment change, or a step that
+        // waits for the read point (until it is taken).
+        let off = self.offset.round() as i64;
+        let step_ahead = |p: Option<i64>| p.is_some_and(|p| ahead as i64 + off >= p);
+        let stepping =
+            step_ahead(self.announced) || (self.deferred && step_ahead(self.deferred_at));
         let open = self.locked
             && self.master_valid
             && self.controls.enabled()
             && held == n_src
             && self.starved == 0
             && self.pending_skip == 0
-            && self.pending_reset.is_none();
+            && self.pending_reset.is_none()
+            && self.out_mute == 0
+            && !stepping;
         self.starved = self.starved.saturating_sub(m);
         for i in 0..n_src {
             let gain = self.fade.step(open);
@@ -1401,6 +2190,18 @@ impl FollowerRt {
             for (c, chan) in self.stage_in.iter_mut().enumerate().take(ch) {
                 chan[i] = gain * self.src.at(c, idx);
             }
+        }
+        // A measurement: the file on the routed channels by source index,
+        // before the stage (so the drift loop's correction applies).
+        self.measure.poll();
+        let measuring = self
+            .measure
+            .inject_s0(self.p.graph_rate, self.p.device_rate, self.p.ratio);
+        if let Some((_, s0)) = measuring {
+            let k0 = self.want as i64 - s0 as i64;
+            self.measure
+                .inj
+                .fill_planar(&mut self.stage_in, n_src, k0, open);
         }
         self.want += n_src as u64;
         {
@@ -1414,7 +2215,21 @@ impl FollowerRt {
             }
             self.stage.process(&ins[..ch], &mut outs[..ch]);
         }
-        self.publish_audible(open && self.fade.open());
+        // `bypass`: the routed channels go around the chain (which hears
+        // silence on them), crossfaded at both ends, until the stage has
+        // passed the file's last frame (its resampler's tail included).
+        if self.measure.begin_tap(self.p.graph_rate) && self.p.ratio.is_unity() {
+            for c in 0..ch {
+                if self.measure.routed(c) {
+                    self.measure.tap[c][..m].copy_from_slice(&self.stage_out[c][..m]);
+                    for f in 0..m {
+                        self.stage_out[c][f] *= 1.0 - self.measure.tap_weight(f);
+                    }
+                }
+            }
+            self.measure.tapped = m;
+        }
+        self.publish_audible(open && self.fade.open() && self.pad.open());
         self.chain_out(m, Some(v0));
     }
 
@@ -1488,15 +2303,48 @@ impl FollowerRt {
             true
         };
         let out = at..at + n_out * ch;
+        let ring_cap = warm_ring_cap(self.p.graph_rate, self.p.ratio);
+        // Coalesce: every chain that has come waits in `held`, the newest
+        // only (an older one retired), until the swap in flight ends. At
+        // most a queue's worth a call (the rest the next).
+        for _ in 0..CHAIN_QUEUE {
+            let Some(c) = self.take_chain() else { break };
+            if let Some(old) = self.held.replace(c) {
+                self.retire_chain(old);
+            }
+        }
         self.swap = match phase {
-            Swap::Idle => match self.take_chain() {
+            // An upstream edit's fade still running: the next chain waits.
+            Swap::Idle if self.chain.upstream_fading() => Swap::Idle,
+            Swap::Idle => match self.held.take() {
                 Some(mut next) => {
-                    let lat = next.latency_out_frames();
-                    next.set_limiter_audible(false);
+                    // As the master's: an edit before an unchanged
+                    // convolution takes the playing chain over in place
+                    // (on the grid first: a chain that has not run clears
+                    // nothing there) and plays at once.
+                    next.align_to(grid + m as u64);
+                    if next.take_over_upstream(&mut self.chain) {
+                        // A swap all the same: a run through this chain
+                        // faults (the file would cross the fade).
+                        self.measure.chain_swapped(false);
+                        let old = std::mem::replace(&mut self.chain, next);
+                        self.retire_chain(old);
+                        self.swaps_done += 1;
+                        return;
+                    }
+                    let budget = handover_budget(self.p.period, self.p.device_rate);
+                    let target = ready_incoming(
+                        &mut next,
+                        &mut self.chain,
+                        grid + m as u64,
+                        budget,
+                        ring_cap,
+                        self.p.device_rate,
+                    );
                     Swap::Warming {
                         next,
                         warmed: 0,
-                        target: if lat == 0 { 0 } else { lat + SWAP_WARM_MARGIN },
+                        target,
                     }
                 }
                 None => Swap::Idle,
@@ -1504,8 +2352,13 @@ impl FollowerRt {
             Swap::Warming {
                 mut next,
                 mut warmed,
-                target,
+                mut target,
             } => {
+                if next.align_to(grid) {
+                    // Off the grid after all (not reached): its state is
+                    // gone; it warms up from here as a cold chain.
+                    target = target.max(warmed + next.cold_warm_frames(ring_cap, SWAP_WARM_MARGIN));
+                }
                 if !other(&mut next, &mut self.swap_buf, &self.stage_out) {
                     self.retire_chain(next);
                     Swap::Idle
@@ -1518,6 +2371,7 @@ impl FollowerRt {
                             target,
                         }
                     } else if next.latency_out_frames() == self.chain.latency_out_frames() {
+                        self.measure.chain_swapped(false);
                         let old = self.install(next);
                         Swap::Crossfade {
                             old,
@@ -1525,6 +2379,7 @@ impl FollowerRt {
                             len: self.out_ms(SWAP_CROSSFADE_MS),
                         }
                     } else {
+                        self.measure.chain_swapped(true);
                         Swap::FadeOut {
                             next,
                             pos: 0,
@@ -1645,6 +2500,9 @@ impl FollowerRt {
     fn hold_chain(&mut self) {
         let hold = (CHAIN_HOLD_S * f64::from(self.p.device_rate)) as u64;
         self.hold_until = self.hold_until.max(self.rendered + hold);
+        // Either path's length moved: the slack with it.
+        self.slack_best = f64::NAN;
+        self.slack_low = f64::NAN;
     }
 
     /// ε (and its slope) kept where `v·(1 + ε)` stays within the stage's
@@ -1685,6 +2543,36 @@ impl FollowerRt {
         self.lead_max = self.lead_max.max((end - st.at) as f64 / FRAME as f64);
     }
 
+    /// The level it plays at: when it follows, the master's
+    /// ([`TeeShared::master_level`], read without blocking) plus its offset
+    /// to it (at most 0 dB), with the master's balance and mute; its own
+    /// volume alone otherwise. Set on the ramps when it changes (the first
+    /// block snaps: nothing has played yet). Never allocates.
+    fn update_level(&mut self) {
+        if let Some(t) = self
+            .shared
+            .master_level
+            .read_if_changed(&mut self.master_gen)
+        {
+            self.master_level = t;
+        }
+        // One load: its own volume and its following together.
+        let (own, offset) = self.controls.level();
+        let level = heard_level(own, offset, &self.master_level);
+        self.own_lin = audivane_dsp_core::db_to_lin(own);
+        if self.level == Some(level) {
+            return;
+        }
+        let ramp = self.level.is_some();
+        self.level = Some(level);
+        let (volume, balance, muted) = level;
+        self.status.level_db.set(volume);
+        self.gain
+            .set_volume_targets(volume, 0.0, muted, false, false, ramp);
+        self.in_gain
+            .set_volume_targets(0.0, balance, false, false, false, ramp);
+    }
+
     /// Run `m` stage output frames through the chain into the fifo, and
     /// map them (`v0`: the first one's source position; `None` maps
     /// nothing).
@@ -1698,12 +2586,8 @@ impl FollowerRt {
             debug_assert!(false, "follower fifo full");
             return;
         }
-        let volume = self.controls.volume_db();
-        if volume != self.volume_db {
-            self.volume_db = volume;
-            self.gain
-                .set_volume_targets(volume, 0.0, false, false, false, true);
-        }
+        self.update_level();
+        self.in_gain.process_planar(&mut self.stage_out, m);
         let gain_before = self.gain;
         let input = DspIn::planar(&self.stage_out, m);
         let _ = self.chain.process_in_with_gain(
@@ -1715,7 +2599,37 @@ impl FollowerRt {
             None,
         );
         self.run_swap(m, at, n_out, gain_before);
+        if self
+            .pad
+            .process(&mut self.fifo[at..at + n_out * self.p.channels])
+        {
+            // Its path's length moved: the loop never sees it as a step.
+            self.hold_chain();
+        }
+        if self.out_mute > 0 {
+            let k = self.out_mute.min(n_out);
+            self.fifo[at..at + k * ch].fill(0);
+            self.out_mute -= k;
+        }
         let first = self.rendered;
+        if self.measure.tapped == m && n_out == m {
+            // The tapped stage output, at the follower's own volume (never
+            // the master's level) and the measurement's ceiling,
+            // crossfaded with the chain's output.
+            let g = self.own_lin;
+            let out = &mut self.fifo[at..at + n_out * ch];
+            for c in 0..ch {
+                if self.measure.routed(c) {
+                    for f in 0..n_out {
+                        let w = self.measure.tap_weight(f);
+                        let t = self.measure.ceiling(self.measure.tap[c][f] * g);
+                        let x = f64::from(out[f * ch + c]) * (1.0 - w) + t * w * 2_147_483_648.0;
+                        out[f * ch + c] = x.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+                    }
+                }
+            }
+            self.measure.end_tap(m, first);
+        }
         self.fifo_frames += n_out;
         self.rendered += n_out as u64;
         self.chain_in += m as u64;
@@ -1737,24 +2651,238 @@ impl FollowerRt {
                 let last = p0 + (p1 - p0) * (n_out as i128 - 1) / n_out as i128;
                 self.map.push(first + n_out as u64 - 1, last);
             }
+            self.note_measure_span(first, n_out, p0, p1);
+        } else if v0.is_none() && n_out > 0 {
+            // No map (the path shut): what the stage held is gone.
+            self.note_measure_unmapped(first, n_out);
         }
+        // `active`: the keepalive after the chain (a low-pass chain would
+        // take one at its input down), once the call's spans above have
+        // told where the measurement ends: nothing of it after that frame.
+        let bits = self.chain.output_bits();
+        self.measure.post_keepalive(
+            &mut self.fifo[at..at + n_out * ch],
+            ch,
+            first,
+            self.p.device_rate,
+            bits,
+        );
+        if self.measure.clamps_output() {
+            // `active`: the file goes through the pad; shut, it would
+            // leave a silent capture that looks like a clean run.
+            if !self.pad.open()
+                && self
+                    .measure
+                    .tracking()
+                    .is_some_and(|(c, _)| c == MeasureChain::Active)
+            {
+                self.measure.fault(MeasureFault::Muted);
+            }
+            // While the measurement runs here: the whole output at the
+            // ceiling, whatever the chain's limiter does.
+            self.measure
+                .clamp_output(&mut self.fifo[at..at + n_out * ch]);
+        }
+    }
+
+    /// A measurement: the device frames that carry the file's first frame
+    /// and, once the injection is over, its last trace, from a call's span
+    /// (source positions at the DAC, `p0..p1` over `n_out` frames from
+    /// `first`).
+    fn note_measure_span(&mut self, first: u64, n_out: usize, p0: i128, p1: i128) {
+        let Some((chain, s0)) = self.measure.tracking() else {
+            return;
+        };
+        let s = self.stage.speed();
+        let stage = (self.stage.latency_frames() - 0.5).max(0.0) * s;
+        let ratio = self.p.ratio.as_f64();
+        // The tap skips the chain: its frames sit the chain's delay ahead.
+        let (shift, chain_frames) = match chain {
+            MeasureChain::Bypass => (fixed(self.chain_graph() * s), stage * ratio),
+            MeasureChain::Active => (0, stage * ratio + self.chain_out_frames() as f64),
+        };
+        let (a, b) = (p0 + shift, p1 + shift);
+        if b <= a {
+            return;
+        }
+        // The fraction of the span before `target` (source frames).
+        let frac = |target: i128| ((target - a).max(0)) as f64 / (b - a) as f64;
+        let Some(d) = self.measure.device() else {
+            return;
+        };
+        let target = i128::from(s0) * FRAME;
+        if d.start_frame().is_none() && target < b {
+            let at = first as f64 + frac(target) * n_out as f64;
+            d.start_frame.store(at.to_bits(), Ordering::Release);
+            d.chain_frames
+                .store(chain_frames.to_bits(), Ordering::Release);
+        }
+        if d.tail() == 0.0 {
+            // The stage's filter and, in `active`, the chain's whole tail.
+            let tail = match chain {
+                MeasureChain::Bypass => stage * ratio,
+                MeasureChain::Active => {
+                    stage * ratio + (self.chain.tail_out_frames() + self.pad.delay()) as f64
+                }
+            };
+            d.tail_frames.store(tail.to_bits(), Ordering::Release);
+        }
+        let Some(end) = self.measure.fed_end() else {
+            return;
+        };
+        // Past the stimulus: the stage's filter rings about its latency
+        // after it; an active chain rings its tail after its latency.
+        let mut margin = (self.stage.latency_frames() + 1.0) * s;
+        if chain == MeasureChain::Active {
+            let tail = self
+                .chain
+                .tail_out_frames()
+                .saturating_sub(self.chain.latency_out_frames());
+            margin += tail as f64 / ratio.max(f64::MIN_POSITIVE);
+        }
+        let target = (i128::from(s0) + i128::from(end)) * FRAME + fixed(margin);
+        if target >= b {
+            return;
+        }
+        if chain == MeasureChain::Bypass && self.measure.tapped > 0 {
+            self.measure.note_tap_drained();
+        } else {
+            // (A bypass that cannot tap, away from x1, faulted: its stage
+            // output went through the chain.)
+            let at = first as f64 + (frac(target) * n_out as f64).ceil();
+            d.set_last_frame(at);
+        }
+    }
+
+    /// A measurement: a call without a map (the path shut, the stage
+    /// reset): nothing of an injection that is over stays in the stage.
+    fn note_measure_unmapped(&mut self, first: u64, n_out: usize) {
+        let Some((chain, _)) = self.measure.tracking() else {
+            return;
+        };
+        if self.measure.fed_end().is_none() {
+            return;
+        }
+        if chain == MeasureChain::Bypass && self.measure.tapped > 0 {
+            self.measure.note_tap_drained();
+        } else if let Some(d) = self.measure.device() {
+            d.set_last_frame((first + n_out as u64) as f64);
+        }
+    }
+
+    /// A measurement: when the file's first frame leaves the queue, from a
+    /// reading.
+    fn note_measure_time(&self, reading: &Reading) {
+        let Some(d) = self.measure.device() else {
+            return;
+        };
+        d.note_reading(
+            reading.written as i64 - reading.delay,
+            reading.time_ns.max(0) as u64,
+        );
+        let Some(sf) = d.start_frame() else {
+            return;
+        };
+        if d.start_time_ns.load(Ordering::Relaxed) != 0 || sf > reading.written as f64 {
+            return;
+        }
+        let at_dac = reading.written as f64 - reading.delay as f64;
+        let t = reading.time_ns as f64 + (sf - at_dac) * 1e9 / f64::from(self.p.device_rate);
+        d.start_time_ns
+            .store(t.max(1.0).round() as u64, Ordering::Release);
+        let queue = reading.delay as f64 + self.fifo_frames as f64;
+        d.queue_frames.store(queue.to_bits(), Ordering::Release);
     }
 
     /// One period's reading of the follower's device (`written` its frames
     /// written so far): the master's published position, the detector, the
     /// loop, ε for the coming period, skips and the status.
     pub fn on_reading(&mut self, reading: Reading) {
+        self.note_measure_time(&reading);
+        self.update_pad();
         let g = f64::from(self.p.graph_rate);
         let period_s = period_seconds(&self.p);
         let chain_seq = self.shared.chain_seq.load(Ordering::Relaxed);
         if chain_seq != self.chain_seq {
             self.chain_seq = chain_seq;
             self.hold_chain();
+            // (The master's position at its DAC moves with its chain.)
+            self.bias_m.rebase();
+        }
+        let pair_gen = self.controls.pair_gen.load(Ordering::Acquire);
+        if pair_gen != self.pair_gen {
+            // Another master (or the disk's memory for this pair): its
+            // clock ratio is not the last master's.
+            self.pair_gen = pair_gen;
+            let mem = self.controls.memory_at(rate_family(self.p.device_rate));
+            seed_loop(&mut self.lp, mem);
+            self.locked = false;
+            self.bias_m = BiasTracker::new();
+            self.bias_m.remember_rms_s(mem.master_bias_s);
+            self.bias_f.remember_rms_s(mem.follower_bias_s);
         }
         let point = self.shared.position.read();
         self.master_valid = point.is_some();
+        if !self.master_valid {
+            // The master stopped (or plays nothing to follow): the ring's
+            // end stops while the follower plays on, so what it has ahead
+            // falls without anything an alignment could cover (hundreds of
+            // ms before a rate change).
+            self.slack_min = f64::INFINITY;
+            self.known_jump = 0;
+            self.slack_best = f64::NAN;
+            self.slack_low = f64::NAN;
+            self.slack_void = true;
+        }
         if let Some(p) = point {
-            self.det.master_position(p.pos, p.time_ns);
+            if self.master_epoch.is_some_and(|e| e != p.epoch) && self.started {
+                // A new master stream: where it plays from is measured
+                // again (the follower played on, its read point ran on
+                // through a pause).
+                self.lp.realign();
+            }
+            if self.master_epoch != Some(p.epoch) {
+                self.bias_m.rebase();
+            }
+            self.master_epoch = Some(p.epoch);
+            // The master's reading against its clock: a new stream, a known
+            // step, a speed change or a ramp starts its fit again.
+            let (t_seen, shift_seen, speed_seen) = self.bias_m_seen;
+            if p.ramping || p.shift != shift_seen || p.speed != speed_seen {
+                self.bias_m.rebase();
+            }
+            if p.time_ns != t_seen {
+                self.bias_m_dev = if p.ramping {
+                    f64::NAN
+                } else {
+                    self.bias_m
+                        .push(
+                            p.pos as f64 / FRAME as f64,
+                            p.time_ns as f64 * 1e-9,
+                            g * p.speed,
+                        )
+                        .unwrap_or(f64::NAN)
+                };
+            }
+            if p.time_ns != t_seen {
+                let odd = !self.master_odd
+                    && !p.ramping
+                    && self.master_line.is_some_and(|(pos, t, epoch, shift)| {
+                        let line =
+                            pos as f64 / FRAME as f64 + (p.time_ns - t) as f64 * 1e-9 * g * p.speed;
+                        epoch == p.epoch
+                            && shift == p.shift
+                            && (p.pos as f64 / FRAME as f64 - line).abs() > MASTER_ODD_S * g
+                    });
+                self.master_odd = odd;
+                if !odd {
+                    self.master_line = Some((p.pos, p.time_ns, p.epoch, p.shift));
+                }
+            }
+            self.bias_m_seen = (p.time_ns, p.shift, p.speed);
+            if !self.master_odd {
+                self.det.master_position(p.pos, p.time_ns);
+            }
             if p.speed != self.master_speed && p.speed.is_finite() && p.speed > 0.0 {
                 self.master_speed = p.speed;
                 self.det.set_master_rate(g * p.speed);
@@ -1765,11 +2893,17 @@ impl FollowerRt {
         // installed or retired), stored before the point above was: the
         // same step here at once, and the readings held until the master's
         // DAC has played it too.
-        let steps = self.shared.steps.load(Ordering::Relaxed) as i64;
+        // (The announcement first: the master clears it only after the
+        // step it announced is in `steps`.)
+        self.announced = super::tee::decode_pos(self.shared.step_announce.load(Ordering::Acquire));
+        let steps = self.shared.steps.load(Ordering::Acquire) as i64;
         if steps != self.step_seen {
             let frames = step_frames(steps.wrapping_sub(self.step_seen));
             self.step_seen = steps;
-            self.known_step(frames, 0.0);
+            let at = self.shared.step_at.load(Ordering::Relaxed) as i64;
+            if self.known_step(frames, 0.0) {
+                self.deferred_at = Some(at);
+            }
         }
         // The trim and the lateness are playback time. A change of either is a
         // step the follower takes exactly (later: it repeats), in source frames
@@ -1796,11 +2930,15 @@ impl FollowerRt {
         if rate_now != self.loop_rate {
             self.loop_rate = rate_now;
             self.lp.set_rate(rate_now);
+            // (The slack in playback time moves with the speed.)
+            self.slack_best = f64::NAN;
+            self.slack_low = f64::NAN;
         }
         // The reading counts when the master is valid and steady, past its
         // known steps, and the frame at the DAC was written after the last
         // skip or restart (none pending).
         let usable = self.master_valid
+            && !self.master_odd
             && self.started
             && !self.master_ramping
             && point.is_some_and(|p| p.shift == self.step_seen)
@@ -1813,6 +2951,71 @@ impl FollowerRt {
             None
         };
         let e = e.unwrap_or(f64::NAN);
+        // Each device's reading bias against its long-run mean, taken out
+        // where its fit has run (both devices' reading noise goes with it);
+        // where it has not, what a short window's bias may be bounds the
+        // placement and the lock.
+        let dev_f = reading
+            .played()
+            .and_then(|f| {
+                self.bias_f.push(
+                    f as f64,
+                    reading.time_ns as f64 * 1e-9,
+                    f64::from(self.p.device_rate),
+                )
+            })
+            .unwrap_or(f64::NAN);
+        let r = self.p.ratio;
+        let src_per_device =
+            self.stage.envelope_step().to_f64() * f64::from(r.down) / f64::from(r.up.max(1));
+        let out = (self.bias_m.established(), self.bias_f.established());
+        if out != self.bias_out {
+            // The readings before do not compare with these (a device's
+            // bias was in them, or is now).
+            self.bias_out = out;
+            self.lp.forget_readings();
+        }
+        // (A device whose deviations are taken out, without one for this
+        // reading: an outlier, not used.)
+        let outlier = (out.0 && !self.bias_m_dev.is_finite()) || (out.1 && !dev_f.is_finite());
+        let mut e = if outlier { f64::NAN } else { e };
+        if out.0 && self.bias_m_dev.is_finite() {
+            e -= self.bias_m_dev;
+        }
+        if out.1 && dev_f.is_finite() {
+            e += dev_f * src_per_device;
+        }
+        // What each device's reading bias may still be (seconds), as a
+        // bound (placement and the lock wait for the floor less it) and a
+        // spread (how far the readings may stray without the follower being
+        // out of place): where it is taken out, what the line's offset may
+        // be off by (nothing once a whole fit has run); on a coarse grid not
+        // yet seen through a whole sweep, nothing to wait for but a step of
+        // spread (heard at once, up to about a packet off until the sweep
+        // has been seen: at a wrap the readings jump a whole packet from a
+        // follower that went along with them); its short-window RMS where that was
+        // measured (now or on an earlier run); unknown before its grid is
+        // told.
+        let left = |t: &BiasTracker| -> (f64, f64) {
+            if t.established() {
+                (BIAS_SIGMAS * t.left_s(), 0.0)
+            } else if let Some(q) = t.coarse_grid_s() {
+                (0.0, q)
+            } else if t.rms_known() {
+                (BIAS_SIGMAS * t.rms_s(), 0.0)
+            } else if !t.grid_known() {
+                // (Not placed before its grid is told, a fraction of a
+                // second once.)
+                (f64::INFINITY, 0.0)
+            } else {
+                (0.0, 0.0)
+            }
+        };
+        let (bm, sm) = left(&self.bias_m);
+        let (bf, sf) = left(&self.bias_f);
+        let bound = bm.hypot(bf) * self.loop_rate;
+        self.lp.set_spread(sm.hypot(sf) * self.loop_rate);
+        self.lp.set_bias_bound(bound);
         let c = self.lp.update(e, period_s);
         self.rate_est.push(e, self.loop_rate);
         if c.skip != 0 {
@@ -1821,14 +3024,18 @@ impl FollowerRt {
             self.pending_skip += c.skip;
             self.rate_est.skipped(c.skip as f64);
             self.status.skips.fetch_add(1, Ordering::Relaxed);
-            // A re-sync from lock (a stage change: the old read point at
-            // the new speed) moves the read point: the slack measured
-            // before it is not what the follower lacks, and would grow its
-            // lag.
-            if self.locked {
-                self.slack_min = f64::INFINITY;
-                self.known_jump = 0;
-            }
+        }
+        if c.skip != 0 || self.lp.skip_pending() || !self.lp.aligned() {
+            // The read point was not where it should be (a skip moves it:
+            // a re-sync from lock, or a second skip of the acquisition
+            // after a first alignment that was off): the slack measured
+            // against it is not what the follower lacks, and would grow
+            // the alignment or its lateness by as much (once by seconds,
+            // after a reopen).
+            self.slack_min = f64::INFINITY;
+            self.known_jump = 0;
+            self.slack_best = f64::NAN;
+            self.slack_low = f64::NAN;
         }
         self.locked = c.locked;
         // ε over the coming period, from where the stage is.
@@ -1838,22 +3045,56 @@ impl FollowerRt {
         self.seg_from = from;
         self.seg_to = (c.eps, c.eps_slope);
         self.seg_h = period_s;
-        // The source slack, as playback time.
-        // At the worst phase of the two clocks: the window's samples are a
-        // follower period apart, and the ring's end steps by a master
-        // write, so the least within the window can miss the worst by the
-        // shorter of the two.
+        // The source slack, as playback time, at the worst phase of the
+        // two clocks: the window's samples are a follower period apart, and
+        // the ring's end steps by a master write, so the least within the
+        // window can miss the worst by the shorter of the two (the
+        // spacing). The window's least less the spacing is a lower bound of
+        // the worst at any phase, and so is the best of them since the
+        // last change: the phase drifts (by ppm), and a bound taken at the
+        // worst phase itself would count the spacing twice, growing the
+        // alignment by it once per session. Its own known steps shift the
+        // best by what they move; anything else starts it again (a skip, an
+        // xrun, a chain or speed change, a new master write size), and so
+        // does a window that came within 1 ms of running out.
         self.slack_age += period_s;
-        if self.slack_age >= SLACK_WINDOW_S {
+        let window = if self.slack_first {
+            FIRST_SLACK_WINDOW_S
+        } else {
+            SLACK_WINDOW_S
+        };
+        if self.slack_age >= window {
             let spacing = (period_s * self.loop_rate).min(self.known_jump as f64);
-            self.slack_last = if self.slack_min.is_finite() {
-                (self.slack_min - spacing) / self.loop_rate * 1e3
+            self.slack_last = if self.slack_min.is_finite() && !self.slack_void {
+                let ms = |f: f64| f / self.loop_rate * 1e3;
+                let bound = ms(self.slack_min - spacing);
+                let moved = ms((spacing - self.spacing_prev).abs());
+                if ms(self.slack_min) < 1.0
+                    || moved.is_nan()
+                    || moved > 1.0
+                    || self.slack_best.is_nan()
+                {
+                    self.slack_best = bound;
+                } else {
+                    self.slack_best = self.slack_best.max(bound);
+                }
+                self.slack_low = if self.slack_low.is_nan() {
+                    bound
+                } else {
+                    self.slack_low.min(bound)
+                };
+                self.spacing_prev = spacing;
+                self.slack_best
             } else {
                 f64::NAN
             };
+            if self.slack_last.is_finite() {
+                self.slack_first = false;
+            }
             self.slack_min = f64::INFINITY;
             self.known_jump = 0;
             self.slack_age = 0.0;
+            self.slack_void = false;
             if self.lead_max.is_finite() {
                 self.lead_last = self.lead_max / self.loop_rate * 1e3;
             }
@@ -1870,14 +3111,21 @@ impl FollowerRt {
     /// rate state and filters), so the error carries on within half a frame.
     /// Before the loop's first alignment, that alignment takes it, from readings
     /// after the step only.
-    fn known_step(&mut self, frames: f64, ms: f64) {
+    /// Returns whether it waits as a skip (not taken by an alignment).
+    fn known_step(&mut self, frames: f64, ms: f64) -> bool {
         if !self.started || !frames.is_finite() || !ms.is_finite() {
-            return;
+            return false;
         }
         if !self.lp.aligned() {
-            self.lp.reset();
+            // (A loop placing keeps its rate state: only the readings
+            // before the step go.)
+            if self.lp.trusted() {
+                self.lp.realign();
+            } else {
+                self.lp.reset();
+            }
             self.step_rest = 0.0;
-            return;
+            return false;
         }
         self.status.known_steps.fetch_add(1, Ordering::Relaxed);
         if !self.deferred {
@@ -1886,6 +3134,7 @@ impl FollowerRt {
         self.deferred = true;
         self.deferred_frames += frames;
         self.deferred_ms += ms;
+        true
     }
 
     /// The waiting known steps in source frames now (the lateness at the
@@ -1906,6 +3155,7 @@ impl FollowerRt {
             self.deferred_since,
         );
         self.deferred = false;
+        self.deferred_at = None;
         self.deferred_frames = 0.0;
         self.deferred_ms = 0.0;
         let total = frames + self.step_rest;
@@ -1926,6 +3176,17 @@ impl FollowerRt {
     fn publish(&self, reading: Reading) {
         let s = &self.status;
         let r = Ordering::Relaxed;
+        if self.locked && !self.lp.placed() {
+            self.controls
+                .remember_rate(self.p.device_rate, self.lp.rate_eps());
+        }
+        if self.bias_m.rms_known() || self.bias_f.rms_known() {
+            self.controls.remember_bias(
+                self.p.device_rate,
+                known_rms(&self.bias_m),
+                known_rms(&self.bias_f),
+            );
+        }
         s.set_state(if self.locked {
             FollowerState::Locked
         } else {
@@ -1937,7 +3198,14 @@ impl FollowerRt {
         s.eps.store(bits(self.stage.epsilon().0), r);
         s.gated.store(self.lp.gated(), r);
         s.slack_ms.store(bits(self.slack_last), r);
+        s.slack_low_ms.store(bits(self.slack_low), r);
+        s.slack_speed
+            .store(bits(self.loop_rate / f64::from(self.p.graph_rate)), r);
         s.lead_ms.store(bits(self.lead_last), r);
+        let chain = self.chain.latency_out_frames();
+        s.chain_graph.set(self.out_graph(chain));
+        s.chain_frames.store(chain as u64, r);
+        s.pad_frames.store(self.pad.delay() as u64, r);
         // The path from the read point to the DAC.
         if let (Some(f), true) = (reading.played(), self.started) {
             let lat = self
@@ -1987,9 +3255,14 @@ pub trait FollowerPcm {
     /// Wait until a period can be written, or `timeout_ms`; false on a
     /// timeout.
     fn wait(&mut self, timeout_ms: u32) -> Result<bool, PcmFault>;
-    /// An xrun was recovered: the buffer is empty and the device stopped,
-    /// waiting for a prime and a start.
+    /// An xrun was recovered: the device stopped, waiting for a prime and
+    /// a start.
     fn needs_restart(&self) -> bool;
+    /// Drop whatever the device still holds and make it ready for a prime
+    /// (a recovery may leave it prepared with frames written after it).
+    fn discard(&mut self) -> Result<(), PcmFault> {
+        Ok(())
+    }
     /// The run should end (a stop, or the master's rate changed).
     fn interrupted(&self) -> bool {
         false
@@ -2036,7 +3309,7 @@ pub fn step_device<P: FollowerPcm>(
         if stop.stopping() || pcm.interrupted() {
             return Ok(Some(RunExit::Stopped));
         }
-        if rt.shared.graph_rate.load(Ordering::Relaxed) != p.graph_rate {
+        if rt.shared.graph_rate.load(Ordering::Relaxed) != p.graph_rate || stop.take_reopen() {
             return Ok(Some(RunExit::Rebuild));
         }
         let timeout = ((p.buffer as f64 / f64::from(p.device_rate) * 1e3) as u32).max(10) + 100;
@@ -2044,18 +3317,31 @@ pub fn step_device<P: FollowerPcm>(
             return Ok(None);
         }
         pcm.checkpoint();
-        if pcm.needs_restart() {
+        // A recovered xrun (here, or inside the status or room query):
+        // shut, the device's queue dropped, primed and started again;
+        // nothing rendered before it is written after it.
+        let restart = |pcm: &mut P, rt: &mut FollowerRt| -> Result<Option<RunExit>, PcmFault> {
             rt.xrun();
+            pcm.discard()?;
             prime_device(pcm, rt)?;
-            return Ok(None);
+            Ok(None)
+        };
+        if pcm.needs_restart() {
+            return restart(pcm, rt);
         }
         let (delay, time_ns) = pcm.status()?;
+        if pcm.needs_restart() {
+            return restart(pcm, rt);
+        }
         rt.on_reading(Reading {
             written: rt.written(),
             delay,
             time_ns,
         });
         let mut room = pcm.avail()?;
+        if pcm.needs_restart() {
+            return restart(pcm, rt);
+        }
         while room >= p.period {
             rt.fill(p.period);
             let n = pcm.write(rt.pending(p.period))?;
@@ -2110,18 +3396,21 @@ fn lost(e: audivane_io_alsa::AlsaError) -> PcmFault {
 impl AlsaFollowerPcm {
     /// Open `device` at `graph_rate × ratio` (the ratio's ladder from
     /// `desired`), `period_graph` graph frames per period and
-    /// `buffer_periods` periods (allocates; off the audio path).
+    /// `buffer_periods` periods, its left and right on `output_channels`
+    /// (`None`: the first two; allocates, off the audio path).
     pub fn open(
         device: &str,
         graph_rate: u32,
         desired: RateRatio,
         period_graph: u32,
         buffer_periods: u32,
+        output_channels: Option<audivane_protocol::ipc::OutputChannels>,
     ) -> Result<(Self, RateRatio, SampleFormat, u32, u32), String> {
         let cfg = audivane_io_alsa::AlsaConfig {
             device: device.to_string(),
             rate: graph_rate,
             channels: 2,
+            channel_map: output_channels.map(|p| p.0.to_vec()).unwrap_or_default(),
             period_frames: desired.scale_to_output(period_graph),
             buffer_periods: buffer_periods.max(2),
             preferred_format: None,
@@ -2192,6 +3481,11 @@ impl FollowerPcm for AlsaFollowerPcm {
         self.out.needs_restart()
     }
 
+    fn discard(&mut self) -> Result<(), PcmFault> {
+        self.out.drop_frames().map_err(lost)?;
+        self.out.prepare().map_err(lost)
+    }
+
     fn checkpoint(&mut self) {
         self.guard.check();
     }
@@ -2215,11 +3509,53 @@ pub type ChainBuilder = Arc<
         + Sync,
 >;
 
+/// A follower's period in graph frames for `period_ms` at `graph_rate` and
+/// the ratio it asks for: the power of two of device frames nearest
+/// `period_ms` at that device rate (5 ms: 4096 frames at 768 kHz, 256 at
+/// 48 kHz), in graph frames (the device's open scales it back by the ratio
+/// it lands at), within 32..=8192.
+pub fn period_graph_for(period_ms: f64, graph_rate: u32, desired: RateRatio) -> u32 {
+    let ms = if period_ms.is_finite() && period_ms > 0.0 {
+        period_ms
+    } else {
+        ipc::FOLLOWER_DEFAULT_PERIOD_MS
+    };
+    let out_rate = f64::from(desired.output_rate(graph_rate).unwrap_or(graph_rate));
+    let frames = (ms * 1e-3 * out_rate).max(1.0);
+    let pow2 = frames.log2().round().exp2();
+    let graph = (pow2 * f64::from(desired.down.max(1)) / f64::from(desired.up.max(1))).round();
+    graph.clamp(32.0, 8192.0) as u32
+}
+
 /// The rate ratio the engine would pick for a device at a graph rate.
 pub type RatioFn = Arc<dyn Fn(&EngineConfig, u32) -> RateRatio + Send + Sync>;
 
-/// The engine's period at a graph rate.
-pub type QuantumFn = Arc<dyn Fn(&EngineConfig, u32) -> u32 + Send + Sync>;
+/// Follower `f`'s offset to the master's level while it follows: its
+/// `volume_db` minus the master's volume it was set at (`follow_ref_db`;
+/// without one, the master's configured level now, as the config's
+/// normalization sets it).
+pub fn follow_offset_db(f: &FollowerConfig, master: &EngineConfig) -> Option<f64> {
+    f.follow_volume.then(|| {
+        let r = f
+            .follow_ref_db
+            .filter(|r| r.is_finite())
+            .unwrap_or_else(|| super::volume::target_db(&master.volume));
+        f.volume_db - r
+    })
+}
+
+/// The level follower `f` plays at while the master's level is
+/// `master_db` (the master's effective, played volume, as the follower
+/// tracks it): its `volume_db`, moved by the master's change since
+/// `follow_ref_db` when it follows, within `-120..=0` dB (what its
+/// `volume_db` can hold, so unticking or unloading keeps it).
+pub fn followed_level_db(f: &FollowerConfig, master_db: f64) -> f64 {
+    let level = match (f.follow_volume, f.follow_ref_db) {
+        (true, Some(r)) if r.is_finite() && master_db.is_finite() => f.volume_db + master_db - r,
+        _ => f.volume_db,
+    };
+    level.clamp(ipc::VOLUME_MIN_DB, 0.0)
+}
 
 /// How a follower is opened (internal: no protocol yet).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2228,8 +3564,15 @@ pub struct FollowerOptions {
     pub trim_ms: f64,
     /// Its digital volume, dB.
     pub volume_db: f64,
-    /// Its period in graph frames (`None`: the master's quantum).
+    /// Its offset to the master's level, while it follows
+    /// ([`follow_offset_db`]).
+    pub follow_offset_db: Option<f64>,
+    /// Its period in graph frames, fixed (tests; `None`: from its
+    /// `period_ms`, [`period_graph_for`]).
     pub period_graph: Option<u32>,
+    /// Its device period, ms ([`FollowerConfig::period_ms`]; `None`: the
+    /// default).
+    pub period_ms: Option<f64>,
     pub buffer_periods: u32,
 }
 
@@ -2238,7 +3581,9 @@ impl Default for FollowerOptions {
         Self {
             trim_ms: 0.0,
             volume_db: 0.0,
+            follow_offset_db: None,
             period_graph: None,
+            period_ms: None,
             buffer_periods: 3,
         }
     }
@@ -2255,6 +3600,8 @@ struct FollowerHandle {
     swaps: ChainSwapHost,
     thread: Option<JoinHandle<()>>,
     lag: LagControl,
+    /// It plays its own chain (a patch), as of the last config.
+    patched: bool,
 }
 
 /// A follower's open device, as its chain is built for it.
@@ -2267,9 +3614,7 @@ fn chain_inputs_differ(a: &EngineConfig, b: &EngineConfig) -> bool {
 
 impl FollowerHandle {
     fn reap(&mut self) {
-        while let Ok(c) = self.swaps.retired.pop() {
-            drop(c);
-        }
+        self.swaps.reap();
     }
 
     fn stop(&mut self) {
@@ -2291,7 +3636,6 @@ struct ThreadArgs {
     status: Arc<FollowerStatus>,
     controls: Arc<FollowerControls>,
     desired_ratio: RatioFn,
-    quantum: QuantumFn,
     opened: Arc<Mutex<Option<OpenedAt>>>,
     swaps: ChainSwaps,
 }
@@ -2321,7 +3665,6 @@ fn follower_thread(a: ThreadArgs) {
         status,
         controls,
         desired_ratio,
-        quantum,
         opened,
         swaps,
     } = a;
@@ -2349,18 +3692,33 @@ fn follower_thread(a: ThreadArgs) {
             Err(_) => break,
         };
         let desired = desired_ratio(&cfg, graph_rate);
+        // Its own period (about 5 ms by default), not the master's
+        // quantum: a short period needs little source ahead of the
+        // master's, so the master's alignment stays small. Its chain keeps
+        // the master's quantum (the same convolver blocks and latency).
         let period_graph = opts
             .period_graph
-            .unwrap_or_else(|| quantum(&cfg, graph_rate));
+            .unwrap_or_else(|| period_graph_for(controls.period_ms(), graph_rate, desired));
         let opened = AlsaFollowerPcm::open(
             &device,
             graph_rate,
             desired,
             period_graph,
             opts.buffer_periods,
+            cfg.output_channels,
         );
         let (mut pcm, ratio, format, period, buffer) = match opened {
-            Ok(x) => x,
+            Ok(x) => {
+                let p = x.0.out.params();
+                let r = Ordering::Relaxed;
+                status
+                    .device_channels
+                    .store(u64::from(p.device_channels), r);
+                status
+                    .device_channels_max
+                    .store(u64::from(p.device_channels_max), r);
+                x
+            }
             Err(e) => {
                 status.set_error(Some(e));
                 status.set_state(FollowerState::Lost);
@@ -2376,8 +3734,11 @@ fn follower_thread(a: ThreadArgs) {
         let chain = match build(&cfg, graph_rate, ratio, format) {
             Ok(c) => c,
             Err(e) => {
+                // Not played (a convolution over the boost cap, an IR gone):
+                // shut, with why, and tried again.
+                log::warn!("follower {device}: chain not built: {e}");
                 status.set_error(Some(format!("chain: {e}")));
-                status.set_state(FollowerState::Lost);
+                status.set_state(FollowerState::Off);
                 drop(pcm);
                 nap(&controls, Duration::from_secs(2));
                 continue;
@@ -2469,6 +3830,34 @@ pub fn next_lag_ms(current: f64, slack_ms: f64) -> Option<f64> {
     grow_ms(current, slack_ms, MAX_LAG_MS)
 }
 
+/// A follower's lateness from `current` (ms) when its source slack (a lower
+/// bound at the clocks' worst phase) is `slack_ms`: it steps back by the
+/// whole milliseconds over 2 ms of it, so it never runs short and the
+/// growth rule's 1 ms never comes back; all the way when it can (aligned
+/// again), else only by [`SHRINK_MIN_MS`] or more (each step is a fade: not
+/// one per millisecond the bound improves by as the phase drifts). `None`:
+/// leave it.
+pub fn shrunk_lag_ms(current: f64, slack_ms: f64) -> Option<f64> {
+    if current.is_nan() || current <= 0.0 || !slack_ms.is_finite() {
+        return None;
+    }
+    let spare = (slack_ms - 2.0).floor();
+    if spare >= current {
+        Some(0.0)
+    } else if spare >= SHRINK_MIN_MS {
+        Some(current - spare)
+    } else {
+        None
+    }
+}
+
+/// The least step back of a late follower that does not reach aligned, ms:
+/// more than [`expected_need_ms`] and its margin can be over what it
+/// measures (about 20 ms at 2048-frame periods in the sim), so the
+/// lateness a follower starts at is not stepped back from in play (a
+/// fade) for a few milliseconds of latency.
+pub const SHRINK_MIN_MS: f64 = 30.0;
+
 fn grow_ms(current: f64, slack_ms: f64, cap: f64) -> Option<f64> {
     if !slack_ms.is_finite() || slack_ms >= 1.0 {
         return None;
@@ -2477,23 +3866,112 @@ fn grow_ms(current: f64, slack_ms: f64, cap: f64) -> Option<f64> {
     (want > current).then_some(want)
 }
 
+/// The alignment a shrink leaves for followers that need `need_ms` (the
+/// most of them): the need plus [`SHRINK_MARGIN_MS`], whole ms, within the
+/// cap. `None`: the need is not known.
+pub fn shrunk_alignment_ms(need_ms: f64) -> Option<f64> {
+    need_ms.is_finite().then(|| {
+        (need_ms + SHRINK_MARGIN_MS)
+            .ceil()
+            .clamp(0.0, super::tee::MAX_ALIGN_MS)
+    })
+}
+
+/// What a shrink of the alignment leaves the followers at their worst
+/// beyond what they needed, ms: a millisecond more than the growth rule's
+/// 2 ms, so a shrink is never followed by a growth.
+pub const SHRINK_MARGIN_MS: f64 = 3.0;
+
+/// What a follower needs ahead beyond its queue and a wakeup, ms: its
+/// fade, its stage's reach, the USB packets and the readings' spread (the
+/// sim's measured need at 128- to 1024-frame periods and ±100 ppm, 2 ms
+/// under this at the most).
+pub const NEED_FIXED_MS: f64 = 13.0;
+
+/// The alignment a follower is expected to need before it is measured (ms;
+/// negative: none, by that much): its queue and a wakeup
+/// (`buffer_periods` + 1 periods of `period_ms`) and [`NEED_FIXED_MS`],
+/// less the least source the master holds ahead of its DAC
+/// (`master_lead_ms`, [`master_lead_ms`]). 2 to 15 ms above what the sim
+/// measures at 128- to 1024-frame periods.
+pub fn expected_need_ms(period_ms: f64, buffer_periods: u32, master_lead_ms: f64) -> f64 {
+    f64::from(buffer_periods + 1) * period_ms + NEED_FIXED_MS - master_lead_ms
+}
+
+/// A follower not placed yet: neither heard nor locked (its lateness can
+/// move without a step heard).
+pub fn unplaced(s: &FollowerSnapshot) -> bool {
+    !s.audible && s.state != FollowerState::Locked
+}
+
+/// The lateness a follower expected to need `expected_ms` of the alignment
+/// starts at (ms; `None`: none): what the alignment at its cap leaves of it
+/// and [`SHRINK_MARGIN_MS`], whole ms, within [`MAX_LAG_MS`].
+pub fn floor_lag_ms(expected_ms: f64) -> Option<f64> {
+    let cap = super::tee::MAX_ALIGN_MS;
+    let lag = ((expected_ms + SHRINK_MARGIN_MS).ceil() - cap).min(MAX_LAG_MS);
+    (lag > 0.0).then_some(lag)
+}
+
+/// The least source the master holds ahead of its DAC, ms, for a queue of
+/// `periods` periods of `quantum_ms`: one period fewer just before it
+/// wakes, less half a quantum for a late graph cycle.
+pub fn master_lead_ms(quantum_ms: f64, periods: u32) -> f64 {
+    (f64::from(periods) - 1.5).max(0.0) * quantum_ms
+}
+
 /// Paces [`next_alignment_ms`]: once a second (the slack's window), and
 /// not for 3 s after a change (the change reaches both DACs and the
-/// window refills).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// window refills). It also keeps what the followers need
+/// ([`Self::note_need`]) and, when that is less than the alignment, the
+/// shrink that waits for silence ([`Self::shrink`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AlignControl {
     /// The alignment applied, ms.
     pub ms: f64,
     next_s: f64,
     /// When it last changed.
     changed_s: f64,
+    /// What the followers need, ms (`NaN`: not known): the most the
+    /// alignment less their least worst slack
+    /// ([`FollowerSnapshot::slack_low_ms`]) has been since their paths last
+    /// changed ([`Self::forget_need`]): a high-water mark, kept through
+    /// pauses, xruns, speed and chain swaps (each restarts a follower's
+    /// worst slack, and the next window alone would undercut a stall seen
+    /// once before it).
+    pub need_ms: f64,
+    /// Seconds of play the need has been measured over (a shrink waits for
+    /// [`SHRINK_MEASURED_S`]), and the last measurement.
+    pub measured_s: f64,
+    last_need_s: f64,
+    /// The shrink sent, waiting for silence, ms.
+    pub pending: Option<f64>,
+}
+
+/// The play a need is measured over before a shrink goes to it, seconds.
+pub const SHRINK_MEASURED_S: f64 = 30.0;
+
+impl Default for AlignControl {
+    fn default() -> Self {
+        Self {
+            ms: 0.0,
+            next_s: 0.0,
+            changed_s: 0.0,
+            need_ms: f64::NAN,
+            measured_s: 0.0,
+            last_need_s: f64::NAN,
+            pending: None,
+        }
+    }
 }
 
 impl AlignControl {
     /// At `now_s` (any clock in seconds), with the followers' least slack:
     /// the new alignment, when it changes.
     pub fn tick(&mut self, now_s: f64, least_slack_ms: f64) -> Option<f64> {
-        if now_s < self.next_s {
+        // (Nothing measured yet: the first window's slack is looked at as
+        // soon as it is out.)
+        if now_s < self.next_s || !least_slack_ms.is_finite() {
             return None;
         }
         self.next_s = now_s + 1.0;
@@ -2501,7 +3979,102 @@ impl AlignControl {
         self.next_s = now_s + 3.0;
         self.changed_s = now_s;
         self.ms = want;
+        // (Applied at once, it drops a shrink waiting.)
+        self.pending = None;
         Some(want)
+    }
+
+    /// What the followers need now (ms, the most of them; `None`: not known
+    /// now, a follower is not measured, the master does not play): kept
+    /// once the last change has had time to reach their slack, and through
+    /// a pause, until a shrink lands or [`Self::forget_need`].
+    pub fn note_need(&mut self, now_s: f64, need_ms: Option<f64>) {
+        let measured = now_s >= self.changed_s + 3.0;
+        match need_ms.filter(|n| n.is_finite() && measured) {
+            Some(n) => {
+                self.need_ms = if self.need_ms.is_nan() {
+                    n
+                } else {
+                    self.need_ms.max(n)
+                };
+                // (Ticks a second apart; a gap is a pause, not play.)
+                if self.last_need_s.is_finite() {
+                    self.measured_s += (now_s - self.last_need_s).clamp(0.0, 2.0);
+                }
+                self.last_need_s = now_s;
+            }
+            None => self.last_need_s = f64::NAN,
+        }
+    }
+
+    /// While the need is not measured (a fresh pair, new paths): the
+    /// alignment the followers are expected to need (`expected_ms`,
+    /// [`expected_need_ms`]) plus [`SHRINK_MARGIN_MS`], when that is more
+    /// than it has, so a follower is placed with the source it needs and
+    /// never grows into it while heard. Only up: the shrink takes it down
+    /// to the measured need in silence.
+    pub fn floor(&mut self, now_s: f64, expected_ms: Option<f64>) -> Option<f64> {
+        if !self.need_ms.is_nan() {
+            return None;
+        }
+        let want = shrunk_alignment_ms(expected_ms?)?;
+        if want <= self.ms {
+            return None;
+        }
+        self.ms = want;
+        self.changed_s = now_s;
+        self.next_s = now_s + 3.0;
+        self.pending = None;
+        Some(want)
+    }
+
+    /// The followers' paths changed (one added or removed, a chain, a
+    /// period, the quantum): what they needed is not known any more.
+    pub fn forget_need(&mut self) {
+        self.need_ms = f64::NAN;
+        self.measured_s = 0.0;
+        self.last_need_s = f64::NAN;
+    }
+
+    /// The shrink to send when it changes (`Some((ms, quiet))`): to what the
+    /// followers need plus [`SHRINK_MARGIN_MS`], at the next silence
+    /// (`quiet`), when that is at least a millisecond under the alignment;
+    /// or the alignment itself, at once (not `quiet`), to drop a shrink
+    /// waiting that the need no longer allows. `allowed`: no follower plays
+    /// late (the alignment is at its cap then).
+    pub fn shrink(&mut self, now_s: f64, allowed: bool) -> Option<(f64, bool)> {
+        let target = shrunk_alignment_ms(self.need_ms).filter(|t| {
+            allowed
+                && self.measured_s >= SHRINK_MEASURED_S
+                && now_s >= self.changed_s + 3.0
+                && *t + 1.0 <= self.ms
+        });
+        match (target, self.pending) {
+            (Some(t), p) if p != Some(t) => {
+                self.pending = Some(t);
+                Some((t, true))
+            }
+            (None, Some(_)) => {
+                self.pending = None;
+                Some((self.ms, false))
+            }
+            _ => None,
+        }
+    }
+
+    /// The alignment the RT side applies is `applied_ms`: a shrink that
+    /// waited has landed (true). The followers re-measure from there.
+    pub fn landed(&mut self, now_s: f64, applied_ms: f64) -> bool {
+        if self.pending != Some(applied_ms) {
+            return false;
+        }
+        self.pending = None;
+        self.ms = applied_ms;
+        self.changed_s = now_s;
+        self.next_s = now_s + 3.0;
+        // (The need is the alignment less the slack: the step moves both,
+        // so the high-water mark holds.)
+        true
     }
 
     /// At its cap, and the last change has had time to reach the
@@ -2514,19 +4087,53 @@ impl AlignControl {
     pub fn reset(&mut self) {
         *self = Self::default();
     }
+
+    /// Start from the alignment the master had with its followers before
+    /// (a restart): applied at once, grown from there as usual.
+    pub fn start_at(&mut self, now_s: f64, ms: f64) -> Option<f64> {
+        if self.ms > 0.0 || !ms.is_finite() || ms <= 0.0 {
+            return None;
+        }
+        self.ms = ms.min(super::tee::MAX_ALIGN_MS);
+        self.changed_s = now_s;
+        self.next_s = now_s + 3.0;
+        Some(self.ms)
+    }
+
+    /// Why the alignment may still move at `now_s` with the followers'
+    /// least slack (`None`: it holds): it changed less than 3 s ago (the
+    /// followers re-acquire and the slack window refills), or a follower
+    /// is short of source and the next tick grows it.
+    pub fn settling(&self, now_s: f64, least_slack_ms: f64) -> Option<String> {
+        if self.ms > 0.0 && now_s < self.changed_s + 3.0 {
+            return Some(format!(
+                "the master's alignment changed {:.1} s ago",
+                (now_s - self.changed_s).max(0.0)
+            ));
+        }
+        next_alignment_ms(self.ms, least_slack_ms)
+            .map(|ms| format!("a follower is short of source: the alignment grows to {ms} ms"))
+    }
 }
 
-/// Paces [`next_lag_ms`] for one follower as [`AlignControl`] paces the
-/// alignment.
+/// Paces [`next_lag_ms`] and [`shrunk_lag_ms`] for one follower as
+/// [`AlignControl`] paces the alignment.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LagControl {
     next_s: f64,
 }
 
 impl LagControl {
-    /// At `now_s`, with the master's alignment at its cap: the follower's
-    /// new lateness (set on `c`), when it grows.
-    pub fn tick(&mut self, now_s: f64, s: &FollowerSnapshot, c: &FollowerControls) -> Option<f64> {
+    /// At `now_s`: the follower's new lateness (set on `c`), when it
+    /// changes. It grows only with the master's alignment at its cap
+    /// (`at_cap`), and steps back whenever the follower has the source to.
+    pub fn tick(
+        &mut self,
+        now_s: f64,
+        s: &FollowerSnapshot,
+        c: &FollowerControls,
+        at_cap: bool,
+    ) -> Option<f64> {
         if now_s < self.next_s {
             return None;
         }
@@ -2534,7 +4141,12 @@ impl LagControl {
         if !matches!(s.state, FollowerState::Acquiring | FollowerState::Locked) {
             return None;
         }
-        let lag = next_lag_ms(c.lag_ms(), s.slack_ms)?;
+        let grown = if at_cap {
+            next_lag_ms(c.lag_ms(), s.slack_ms)
+        } else {
+            None
+        };
+        let lag = grown.or_else(|| shrunk_lag_ms(c.lag_ms(), s.slack_ms))?;
         c.set_lag_ms(lag);
         self.next_s = now_s + 3.0;
         Some(lag)
@@ -2556,6 +4168,126 @@ pub fn lead_needed_ms(s: &FollowerSnapshot) -> Option<f64> {
     Some(ms.min(super::tee::MAX_LEAD_MS))
 }
 
+/// The config follower `device`'s chain is built from: `master` with the
+/// follower's own chain patch, without A/B.
+fn own_config(master: &EngineConfig, device: &str) -> EngineConfig {
+    match master.outputs.followers.iter().find(|f| f.device == device) {
+        Some(f) => crate::control::follower_chain::config(master, f),
+        None => {
+            let mut cfg = master.clone();
+            cfg.ab = None;
+            cfg.output_channels = None;
+            cfg
+        }
+    }
+}
+
+fn has_patch(master: &EngineConfig, device: &str) -> bool {
+    master
+        .outputs
+        .followers
+        .iter()
+        .any(|f| f.device == device && f.chain_patch.is_some())
+}
+
+/// The compensation the master needs for `followers` (state, chain
+/// latency in graph frames): how much longer the longest playing one's
+/// chain is than the master's (`master_chain_graph`), never below 0.
+/// `None` (hold what applies) while the master is not mapped or a follower
+/// is opening (it may play a longer chain in a moment); a lost or stopped
+/// one needs nothing, so with none playing the master settles to 0.
+pub fn comp_need_of(
+    followers: impl IntoIterator<Item = (FollowerState, f64)>,
+    master_chain_graph: f64,
+) -> Option<f64> {
+    if !master_chain_graph.is_finite() {
+        return None;
+    }
+    let mut need = 0.0f64;
+    for (state, chain) in followers {
+        match state {
+            FollowerState::Opening => return None,
+            FollowerState::Acquiring | FollowerState::Locked if chain.is_finite() => {
+                need = need.max(chain - master_chain_graph);
+            }
+            _ => {}
+        }
+    }
+    Some(need)
+}
+
+/// What followers in `snaps` need of the master's alignment `align_ms`
+/// (ms of source at the graph rate, as the alignment): the most of
+/// [`need_ms_of`] over those that play. `None` while one that plays has not
+/// measured it at 1× or faster, or one is opening.
+pub fn need_of(snaps: impl IntoIterator<Item = FollowerSnapshot>, align_ms: f64) -> Option<f64> {
+    let mut need: Option<f64> = None;
+    for s in snaps {
+        match s.state {
+            FollowerState::Opening => return None,
+            FollowerState::Acquiring | FollowerState::Locked => {
+                let n = need_ms_of(&s, align_ms)?;
+                need = Some(need.map_or(n, |m: f64| m.max(n)));
+            }
+            _ => {}
+        }
+    }
+    need
+}
+
+/// What one follower needs of the alignment `align_ms`, in the
+/// alignment's unit (ms of source at the graph rate): the alignment less
+/// its worst slack in source (its playback ms times the speed it was
+/// measured at). `None` before it is measured, or when it was measured
+/// slower than 1×: a playback queue holds fewer source frames then, so the
+/// need comes out short of what 1× needs (a shrink to it would starve on a
+/// resume at 1×). Faster speeds count (they need more).
+pub fn need_ms_of(s: &FollowerSnapshot, align_ms: f64) -> Option<f64> {
+    let v = s.slack_speed;
+    (s.slack_low_ms.is_finite() && v.is_finite() && v >= 1.0 - 1e-9)
+        .then_some(align_ms - s.slack_low_ms * v)
+}
+
+/// Paces the master's chain compensation ([`TeeHost::set_comp_frames`]):
+/// what the followers that play need (the longest chain's lead over the
+/// master's, graph frames) applies once it has held still for
+/// [`COMP_SETTLE_S`] (a chain edit swaps the devices a little apart).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CompControl {
+    /// The compensation applied, graph frames.
+    pub frames: usize,
+    want: usize,
+    since_s: f64,
+}
+
+impl CompControl {
+    /// At `now_s`, with `need` (graph frames, `None`: nothing known): the
+    /// new compensation when it changes, within `cap`.
+    pub fn tick(&mut self, now_s: f64, need: Option<f64>, cap: usize) -> Option<usize> {
+        let want = need.map_or(self.frames, |n| (n.max(0.0).ceil() as usize).min(cap));
+        if want != self.want {
+            self.want = want;
+            self.since_s = now_s;
+        }
+        if want == self.frames || now_s - self.since_s < COMP_SETTLE_S {
+            return None;
+        }
+        self.frames = want;
+        Some(want)
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Whether the compensation moves for `need` (as [`Self::tick`] would
+    /// take it, within `cap`).
+    pub fn settling(&self, need: Option<f64>, cap: usize) -> bool {
+        let want = need.map_or(self.frames, |n| (n.max(0.0).ceil() as usize).min(cap));
+        want != self.frames || self.want != self.frames
+    }
+}
+
 /// Every follower's thread, keyed by device (the control side; the tee's
 /// slots stay in [`TeeHost`]).
 pub struct FollowerHost {
@@ -2564,17 +4296,74 @@ pub struct FollowerHost {
     failed: BTreeMap<String, String>,
     build: ChainBuilder,
     desired_ratio: RatioFn,
-    quantum: QuantumFn,
+    /// What the loops learnt per master and follower pair
+    /// ([`super::clocks`]), and the master they play with now.
+    clocks: super::clocks::ClockStore,
+    master_device: String,
 }
 
 impl FollowerHost {
-    pub fn new(build: ChainBuilder, desired_ratio: RatioFn, quantum: QuantumFn) -> Self {
+    pub fn new(build: ChainBuilder, desired_ratio: RatioFn) -> Self {
         Self {
             by_device: BTreeMap::new(),
             failed: BTreeMap::new(),
             build,
             desired_ratio,
-            quantum,
+            clocks: super::clocks::ClockStore::in_memory(),
+            master_device: String::new(),
+        }
+    }
+
+    /// Keep the pairs' clocks in `store` (on disk).
+    pub fn with_clock_store(mut self, store: super::clocks::ClockStore) -> Self {
+        self.clocks = store;
+        self
+    }
+
+    /// What follower `device`'s loop knows of its pair now, into the store.
+    fn harvest(&mut self, device: &str) {
+        if let Some(h) = self.by_device.get(device) {
+            let mem = [h.controls.memory_at(0), h.controls.memory_at(1)];
+            self.clocks.note(&self.master_device, device, mem);
+        }
+    }
+
+    /// The master's alignment with its followers last time (ms), if known.
+    pub fn remembered_alignment(&self) -> Option<f64> {
+        self.clocks.alignment(&self.master_device)
+    }
+
+    /// The master's alignment now (ms), for the next start.
+    pub fn note_alignment(&mut self, ms: f64) {
+        let m = self.master_device.clone();
+        self.clocks.note_alignment(&m, ms);
+    }
+
+    /// The followers' loops into the store, written when it moved (at most
+    /// every [`super::clocks::SAVE_EVERY_S`]).
+    pub fn tick_clocks(&mut self) {
+        let devices: Vec<String> = self.by_device.keys().cloned().collect();
+        for d in &devices {
+            self.harvest(d);
+        }
+        self.clocks.save(false);
+    }
+
+    /// The master plays `master_device` now: each follower's loop starts
+    /// from what is known of its new pair (a clock ratio is a pair's).
+    fn set_master(&mut self, master_device: &str) {
+        if master_device == self.master_device {
+            return;
+        }
+        let devices: Vec<String> = self.by_device.keys().cloned().collect();
+        for d in &devices {
+            self.harvest(d);
+        }
+        self.clocks.save(true);
+        self.master_device = master_device.to_string();
+        for (d, h) in &self.by_device {
+            h.controls
+                .install_memory(self.clocks.get(&self.master_device, d));
         }
     }
 
@@ -2606,24 +4395,23 @@ impl FollowerHost {
         if self.by_device.len() >= MAX_FOLLOWERS {
             return Err(format!("at most {MAX_FOLLOWERS} followers"));
         }
+        self.set_master(master_device);
         tee.add_follower(device, master)?;
         let reader = tee
             .slots_mut()
             .get_mut(device)
             .and_then(|s| s.reader.take())
             .ok_or_else(|| format!("{device}: no tee ring"))?;
-        // A/B stays on the master.
-        let mut cfg = tee
-            .slots()
-            .get(device)
-            .map_or_else(|| master.clone(), |s| s.chain_config.clone());
-        cfg.ab = None;
-        let config = Arc::new(Mutex::new(cfg));
+        // Its own chain (chain A without a patch); A/B stays on the master.
+        let config = Arc::new(Mutex::new(own_config(master, device)));
         let opened = Arc::new(Mutex::new(None));
         let (swap_host, swaps) = chain_swaps();
         let status = Arc::new(FollowerStatus::default());
         let controls = Arc::new(FollowerControls::new(opts.trim_ms, opts.volume_db));
-        controls.set_volume_db(opts.volume_db);
+        controls.set_level(opts.volume_db, opts.follow_offset_db);
+        controls.set_compensate(true);
+        controls.install_memory(self.clocks.get(master_device, device));
+        controls.set_period_ms(opts.period_ms);
         let args = ThreadArgs {
             device: device.to_string(),
             reader,
@@ -2634,7 +4422,6 @@ impl FollowerHost {
             status: Arc::clone(&status),
             controls: Arc::clone(&controls),
             desired_ratio: Arc::clone(&self.desired_ratio),
-            quantum: Arc::clone(&self.quantum),
             opened: Arc::clone(&opened),
             swaps,
         };
@@ -2658,9 +4445,15 @@ impl FollowerHost {
                 swaps: swap_host,
                 thread: Some(thread),
                 lag: LagControl::default(),
+                patched: has_patch(master, device),
             },
         );
         Ok(())
+    }
+
+    /// The devices followers play, in order.
+    pub fn devices(&self) -> Vec<String> {
+        self.by_device.keys().cloned().collect()
     }
 
     /// A follower plays `device`.
@@ -2670,6 +4463,8 @@ impl FollowerHost {
 
     /// Stop and remove the follower on `device` (waits for its thread).
     pub fn remove(&mut self, tee: &mut TeeHost, device: &str) -> Result<(), String> {
+        self.harvest(device);
+        self.clocks.save(true);
         let Some(mut h) = self.by_device.remove(device) else {
             return Ok(());
         };
@@ -2690,6 +4485,7 @@ impl FollowerHost {
     /// controls of the others (a trim that moves a late follower earlier
     /// goes into its lateness, [`FollowerControls::retrim`]).
     pub fn sync(&mut self, tee: &mut TeeHost, master_device: &str, master: &EngineConfig) {
+        self.set_master(master_device);
         let want = &master.outputs.followers;
         let listed = |d: &str| want.iter().any(|f| f.device == d);
         let gone: Vec<String> = self
@@ -2710,13 +4506,19 @@ impl FollowerHost {
                 if c.trim_ms() != f.trim_ms {
                     c.retrim(f.trim_ms);
                 }
-                c.set_volume_db(f.volume_db);
+                c.set_level(f.volume_db, follow_offset_db(f, master));
                 c.set_enabled(f.enabled);
+                if c.set_period_ms(f.period_ms) {
+                    log::info!("follower {}: its period changed, it reopens", f.device);
+                    c.request_reopen();
+                }
                 continue;
             }
             let opts = FollowerOptions {
                 trim_ms: f.trim_ms,
                 volume_db: f.volume_db,
+                follow_offset_db: follow_offset_db(f, master),
+                period_ms: f.period_ms,
                 ..FollowerOptions::default()
             };
             match self.add(tee, &f.device, master_device, master, opts) {
@@ -2741,18 +4543,20 @@ impl FollowerHost {
     }
 
     /// The master's alignment is at its cap (`at_cap`): each follower that
-    /// still runs out of source plays later by what it lacks (owner
-    /// decision 3), paced as [`AlignControl`]: once a second, not for 3 s
-    /// after a change. It never shrinks while the follower runs.
+    /// still runs out of source plays later by what it lacks, paced as
+    /// [`AlignControl`]: once a second, not for 3 s
+    /// after a change. A follower that plays late and has more source than
+    /// it needs steps back, to aligned once nothing needs the delay.
     pub fn tick_lag(&mut self, now_s: f64, at_cap: bool) {
-        if !at_cap {
-            return;
-        }
         for (device, h) in &mut self.by_device {
-            if let Some(lag) = h.lag.tick(now_s, &h.status.snapshot(), &h.controls) {
-                log::info!(
+            let before = h.controls.lag_ms();
+            match h.lag.tick(now_s, &h.status.snapshot(), &h.controls, at_cap) {
+                Some(lag) if lag > before => log::info!(
                     "followers: {device} needs more than the master's alignment, plays {lag} ms late"
-                );
+                ),
+                Some(0.0) => log::info!("followers: {device} plays aligned again"),
+                Some(lag) => log::info!("followers: {device} needs less, plays {lag} ms late"),
+                None => {}
             }
         }
     }
@@ -2761,37 +4565,96 @@ impl FollowerHost {
         self.by_device.get(device).map(|h| &*h.controls)
     }
 
-    /// The master's config changed: every follower's slot follows (v1); its
-    /// chain is rebuilt from it at its next open (a live rebuild is not wired
-    /// yet).
+    /// The config follower `device`'s chain is built from now.
+    pub fn config_of(&self, device: &str) -> Option<EngineConfig> {
+        let h = self.by_device.get(device)?;
+        h.config.lock().ok().map(|c| c.clone())
+    }
+
+    /// Free what every follower's thread handed back from measurement
+    /// posts.
+    pub fn reclaim_measure(&self) {
+        for h in self.by_device.values() {
+            h.controls.measure_slot().reclaim();
+        }
+    }
+
+    /// The master's config changed: every follower's slot follows, with
+    /// its own chain patch; an open follower whose chain changed gets one
+    /// built for its device (swapped in on its thread), or reopens when its
+    /// own chain asks for another ratio.
     pub fn config_changed(&mut self, master: &EngineConfig) {
-        let mut cfg = master.clone();
-        cfg.ab = None;
         for (device, h) in &mut self.by_device {
+            let cfg = own_config(master, device);
             h.reap();
-            let changed = match h.config.lock() {
-                Ok(mut c) => {
-                    let changed = chain_inputs_differ(&c, &cfg);
-                    *c = cfg.clone();
-                    changed
-                }
-                Err(_) => false,
+            let old = match h.config.lock() {
+                Ok(mut c) => Some(std::mem::replace(&mut *c, cfg.clone())),
+                Err(_) => None,
             };
-            let opened = h.opened.lock().ok().and_then(|g| *g);
-            let Some((rate, ratio, format)) = opened.filter(|_| changed) else {
+            // Another output pair: its device opens again, at the channel
+            // count the pair needs.
+            let configured = master.outputs.followers.iter().any(|f| f.device == *device);
+            if configured
+                && old
+                    .as_ref()
+                    .is_some_and(|o| o.output_channels != cfg.output_channels)
+            {
+                log::info!("follower {device}: its output channels changed, it reopens");
+                h.patched = has_patch(master, device);
+                h.controls.request_reopen();
+                continue;
+            }
+            let Some(old) = old.filter(|c| chain_inputs_differ(c, &cfg)) else {
+                h.patched = has_patch(master, device);
                 continue;
             };
+            let opened = h.opened.lock().ok().and_then(|g| *g);
+            let patched = std::mem::replace(&mut h.patched, has_patch(master, device));
+            let Some((rate, ratio, format)) = opened else {
+                continue;
+            };
+            // A patch that sets (or set, until this edit) its own upsampler
+            // target: its device opens at its own ratio, when the ratio it
+            // asks for changes. (What it asks for and what its device gave
+            // may differ: the device stepped down, and keeps that.) Without
+            // a patch, a follower keeps the ratio it opened at.
+            if (patched || h.patched)
+                && (self.desired_ratio)(&old, rate) != (self.desired_ratio)(&cfg, rate)
+            {
+                // Its own upsampler target: a device open at another rate.
+                log::info!("follower {device}: its chain asks for another ratio, it reopens");
+                h.controls.request_reopen();
+                continue;
+            }
             // Built here, off its audio thread; it swaps in there. A
             // follower that reopens meanwhile builds from the slot anyway.
             match (self.build)(&cfg, rate, ratio, format) {
-                Ok(chain) => {
-                    if h.swaps.incoming.push(chain).is_err() {
-                        log::warn!(
-                            "follower {device}: chain queue full, the edit applies at its next open"
-                        );
-                    }
-                }
+                Ok(chain) => h.swaps.offer(chain),
                 Err(e) => log::warn!("follower {device}: chain not rebuilt: {e}"),
+            }
+        }
+    }
+
+    /// Rebuild any open follower whose opened rate's upsampler substitute
+    /// changed in the per-rate plan.
+    pub fn rebuild_for_rate_plan(
+        &mut self,
+        master: &EngineConfig,
+        old: &crate::api::RatePlan,
+        new: &crate::api::RatePlan,
+    ) {
+        for (device, h) in &mut self.by_device {
+            let cfg = own_config(master, device);
+            h.reap();
+            let Some((rate, ratio, format)) = h.opened.lock().ok().and_then(|g| *g) else {
+                continue;
+            };
+            if old.substitute(&cfg, rate) == new.substitute(&cfg, rate) {
+                continue;
+            }
+            match (self.build)(&cfg, rate, ratio, format) {
+                Ok(chain) => h.swaps.offer(chain),
+                Err(e) => log::warn!("follower {device}: chain not rebuilt for rate plan: {e}"),
             }
         }
     }
@@ -2820,6 +4683,111 @@ impl FollowerHost {
             .fold(0.0, f64::max)
     }
 
+    /// How much longer the longest playing follower's chain is than the
+    /// master's (`master_chain_graph`), graph frames: [`comp_need_of`].
+    pub fn comp_need(&self, master_chain_graph: f64) -> Option<f64> {
+        comp_need_of(
+            self.by_device.values().map(|h| {
+                let s = h.status.snapshot();
+                (s.state, s.chain_graph)
+            }),
+            master_chain_graph,
+        )
+    }
+
+    /// The first follower opening or locking (its device and state text),
+    /// whatever its `enabled`: its slack and chain still move the master's
+    /// alignment and compensation.
+    pub fn first_unsettled(&self) -> Option<(String, &'static str)> {
+        self.by_device
+            .iter()
+            .find_map(|(d, h)| match h.status.snapshot().state {
+                FollowerState::Opening => Some((d.clone(), "opening")),
+                FollowerState::Acquiring => Some((d.clone(), "locking")),
+                _ => None,
+            })
+    }
+
+    /// What the followers need of the master's alignment `align_ms` now
+    /// (ms, the most of them, [`need_of`]); `None` unless every follower
+    /// that plays has measured its worst slack, and none is opening.
+    pub fn alignment_need_ms(&self, align_ms: f64) -> Option<f64> {
+        need_of(
+            self.by_device.values().map(|h| h.status.snapshot()),
+            align_ms,
+        )
+    }
+
+    /// A follower plays later than aligned (its lateness, at the
+    /// alignment's cap).
+    pub fn any_late(&self) -> bool {
+        self.by_device.values().any(|h| h.controls.lag_ms() > 0.0)
+    }
+
+    /// What the enabled followers are expected to need of the alignment
+    /// (ms, the most of them, [`expected_need_ms`]; `None`: none), with the
+    /// master's queue `master_lead_ms` ahead: from the period its device
+    /// opened at, else the one it asks for at `graph_rate`.
+    pub fn expected_need_ms(
+        &self,
+        master: &EngineConfig,
+        graph_rate: u32,
+        master_lead_ms: f64,
+    ) -> Option<f64> {
+        self.by_device
+            .values()
+            .filter(|h| h.controls.enabled())
+            .filter_map(|h| self.expected_of(h, master, graph_rate, master_lead_ms))
+            .reduce(f64::max)
+    }
+
+    fn expected_of(
+        &self,
+        h: &FollowerHandle,
+        master: &EngineConfig,
+        graph_rate: u32,
+        master_lead_ms: f64,
+    ) -> Option<f64> {
+        let s = h.status.snapshot();
+        let ms = if s.period > 0 && s.device_rate > 0 {
+            f64::from(s.period) * 1e3 / f64::from(s.device_rate)
+        } else if graph_rate > 0 {
+            let ratio = (self.desired_ratio)(master, graph_rate);
+            let graph = period_graph_for(h.controls.period_ms(), graph_rate, ratio);
+            f64::from(graph) * 1e3 / f64::from(graph_rate)
+        } else {
+            return None;
+        };
+        let periods = FollowerOptions::default().buffer_periods;
+        Some(expected_need_ms(ms, periods, master_lead_ms))
+    }
+
+    /// Each enabled follower not placed yet (a new stream starts it
+    /// aligned: an open, a reopen, a rate change) and expected to need more
+    /// than the alignment's cap plays late by the rest from the start
+    /// ([`floor_lag_ms`]), so it is placed there, not grown into it while
+    /// heard. Only up, and not once heard (a step back in play stays).
+    pub fn floor_lag(&self, master: &EngineConfig, graph_rate: u32, master_lead_ms: f64) {
+        for (device, h) in &self.by_device {
+            let s = h.status.snapshot();
+            if !h.controls.enabled() || !unplaced(&s) {
+                continue;
+            }
+            let Some(lag) = self
+                .expected_of(h, master, graph_rate, master_lead_ms)
+                .and_then(floor_lag_ms)
+            else {
+                continue;
+            };
+            if lag > h.controls.lag_ms() {
+                h.controls.set_lag_ms(lag);
+                log::info!(
+                    "followers: {device} is expected to need more than the master's alignment, plays {lag} ms late"
+                );
+            }
+        }
+    }
+
     /// The least source slack over the followers that play (ms, `NaN`
     /// without one), for [`AlignControl::tick`].
     pub fn least_slack_ms(&self) -> f64 {
@@ -2835,6 +4803,11 @@ impl FollowerHost {
 
 impl Drop for FollowerHost {
     fn drop(&mut self) {
+        let devices: Vec<String> = self.by_device.keys().cloned().collect();
+        for d in &devices {
+            self.harvest(d);
+        }
+        self.clocks.save(true);
         for h in self.by_device.values_mut() {
             h.stop();
         }

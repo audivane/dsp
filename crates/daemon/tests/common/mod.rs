@@ -85,6 +85,8 @@ pub struct MockEngine {
     pub varispeed_holds: Mutex<Vec<audivane_dsp_daemon::api::VarispeedHold>>,
     /// Every live `set_varispeed(enabled, speed, ramp_ms)` call received.
     pub varispeed_calls: Mutex<Vec<(bool, f64, f64)>>,
+    /// The last per-rate plan given ([`Engine::set_rate_plan`]).
+    pub rate_plan: Mutex<audivane_dsp_daemon::api::RatePlan>,
 }
 
 impl MockEngine {
@@ -100,6 +102,7 @@ impl MockEngine {
             quantum: config.quantum,
             latency_ms: 7.5,
             filter_latency_ms: 0.0,
+            conv_latency_ms: 0.0,
             xruns: 0,
             dsp_load: 0.0,
             dsp_active: false,
@@ -151,6 +154,7 @@ impl MockEngine {
             varispeed: Mutex::new(Default::default()),
             varispeed_holds: Mutex::new(Vec::new()),
             varispeed_calls: Mutex::new(Vec::new()),
+            rate_plan: Mutex::new(Default::default()),
         })
     }
 
@@ -179,6 +183,9 @@ impl MockEngine {
 }
 
 impl Engine for MockEngine {
+    fn set_rate_plan(&self, plan: audivane_dsp_daemon::api::RatePlan) {
+        *self.rate_plan.lock().unwrap() = plan;
+    }
     fn set_varispeed_hold(&self, hold: audivane_dsp_daemon::api::VarispeedHold) -> u64 {
         use audivane_dsp_daemon::api::VarispeedHold;
         let mut holds = self.varispeed_holds.lock().unwrap();
@@ -249,7 +256,7 @@ impl Engine for MockEngine {
         self.ab_selects.fetch_add(1, Ordering::Relaxed);
         let status = AbStatus {
             enabled: true,
-            current: side,
+            current: Some(side),
             offset_db: -2.5,
             error: None,
             ..Default::default()
@@ -357,6 +364,7 @@ impl Harness {
             graph: false,
             mpris: false,
             mpris_interval: Duration::from_millis(100),
+            device_identity: false,
         };
         let daemon = Daemon::start(Arc::clone(&engine) as Arc<dyn Engine>, config, opts)
             .expect("start daemon");

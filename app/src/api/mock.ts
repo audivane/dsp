@@ -17,7 +17,7 @@ import { autoPreampDb, profileAutoPreampDb, profileChannelResponseDb } from "../
 import { bandRationalProblem, kaiserAttenuationDb, manualRationalProblem, minimumPhaseBlockReason, nyquistStopBlockReason, nyquistStopCutoff } from "../lib/upsamplerLimits";
 import { parseApo } from "../lib/apo";
 import { normalizeRatePolicy } from "../lib/rates";
-import { cpuRefusal } from "../lib/cpuBudget";
+import { cpuRefusal, rateAdmissions } from "../lib/cpuBudget";
 import { DEFAULT_CUSTOM_FIELDS, fromUpsamplerConfig, legacyToDesign, RECOMMENDED_PRESET, type LegacyUpsampler } from "../lib/upsamplerAdapter";
 import { presetCutoffFraction, presetEntry, presetRationalCost, presetRationalTaps, presetRatioNeed, presetTapsPerInput, rationalPipelines } from "../lib/filterPresets";
 import { ALLOWED_SOURCE_RATES } from "../lib/upsamplerLimits";
@@ -26,19 +26,27 @@ import { BUILTIN_TARGETS, DRAW_FREQS, OVERLAY_COLOURS, type OverlayData } from "
 import { bandCount, convList, deepEqual, emptyEq, eqIsActive, normalizeEq } from "../lib/chain";
 import { chainB as rawChainB, FLAT_PATCH, materializeB, patchError } from "../lib/abPatch";
 import { effectiveEndHz, normalizeTilt, tiltConfigError, tiltPairProblem, tiltProblem } from "../lib/tilt";
-import { limiterDelay, pitchActive as stagePitchActive, pitchCents } from "../lib/effects";
+import { crossfeedActive, defaultHarmonics, limiterDelay, pitchActive as stagePitchActive, pitchCents } from "../lib/effects";
 import { DaemonError, ErrorCode, type IrInfo, type Transport, type TransportHandlers } from "./transport";
 import { catalogueDesign } from "./mockCatalogue";
-import { checkDesign as mockCheckDesign, type MockCheckContext } from "./mockDesignCheck";
-import { sameDesign } from "../lib/filterDesign";
+import { MOCK_HARMONICS_PRESETS, MOCK_HARMONICS_SYSTEMS, mockHarmonicsReadout, mockHarmonicsSpectrum } from "./mockHarmonics";
+import { mockHarmonicsLive } from "./mockHarmonicsLive";
+import { mockConvResponse } from "./mockConvResponse";
+import { bandPassbandEnd, checkDesign as mockCheckDesign, designFallbacks as mockDesignFallbacks, type MockCheckContext } from "./mockDesignCheck";
+import { bandRate, sameDesign } from "../lib/filterDesign";
+import { applyPreset, PRESET_PARTS, presetCovers, presetMatches } from "../lib/presetParts";
 import type {
+  CalibrationStatus,
   TiltConfig,
+  RateAdmission,
+  HarmonicsSpectrumTrace,
   AbB,
   AbConfig,
   AbStatus,
   AbSide,
   Band,
   ChainConfig,
+  ConvolutionConfig,
   DaemonEvent,
   DcBlockConfig,
   DeviceCapabilities,
@@ -53,6 +61,7 @@ import type {
   PassthroughBreak,
   Preset,
   PresetInfo,
+  PresetPart,
   RateRatio,
   RateTarget,
   FilterDesign,
@@ -68,6 +77,7 @@ import type {
   SinkChoice,
   FollowerState,
   FollowerStatus,
+  PathLatency,
   OutputsStatus,
   Spectrum,
   Status,
@@ -161,13 +171,14 @@ function flatChain(): ChainConfig {
 }
 
 const DEVICES: DeviceInfo[] = [
-  { id: "hw:CARD=DAC,DEV=0", card: "DAC", name: "USB Audio DAC", hdmi: false, loopback: false, active: true },
-  { id: "hw:CARD=PCH,DEV=0", card: "PCH", name: "Built-in Audio", hdmi: false, loopback: false, active: false },
-  { id: "hw:CARD=HDMI,DEV=3", card: "HDMI", name: "HDMI 0 (monitor)", hdmi: true, loopback: false, active: false },
-  { id: "hw:CARD=Loopback,DEV=0", card: "Loopback", name: "Loopback", hdmi: false, loopback: true, active: false },
-  { id: "hw:CARD=SPK,DEV=0", card: "SPK", name: "USB speaker (48 kHz, 16-bit)", hdmi: false, loopback: false, active: false },
-  { id: "hw:CARD=USB,DEV=0", card: "USB", name: "Hi-res USB DAC", hdmi: false, loopback: false, active: false },
-  { id: "hw:CARD=USB48,DEV=0", card: "USB48", name: "USB DAC (48 kHz only)", hdmi: false, loopback: false, active: false },
+  { id: "hw:CARD=DAC,DEV=0", card: "DAC", name: "USB Audio DAC", hdmi: false, loopback: false, active: true, channels: [] },
+  { id: "hw:CARD=PCH,DEV=0", card: "PCH", name: "Built-in Audio", hdmi: false, loopback: false, active: false, channels: [] },
+  { id: "hw:CARD=HDMI,DEV=3", card: "HDMI", name: "HDMI 0 (monitor)", hdmi: true, loopback: false, active: false, channels: [] },
+  { id: "hw:CARD=Loopback,DEV=0", card: "Loopback", name: "Loopback", hdmi: false, loopback: true, active: false, channels: [] },
+  { id: "hw:CARD=SPK,DEV=0", card: "SPK", name: "USB speaker (48 kHz, 16-bit)", hdmi: false, loopback: false, active: false, channels: [] },
+  { id: "hw:CARD=USB,DEV=0", card: "USB", name: "Hi-res USB DAC", hdmi: false, loopback: false, active: false, channels: [] },
+  { id: "hw:CARD=USB48,DEV=0", card: "USB48", name: "USB DAC (48 kHz only)", hdmi: false, loopback: false, active: false, channels: [] },
+  { id: "hw:CARD=IFACE,DEV=0", card: "IFACE", name: "USB audio interface (8 out)", hdmi: false, loopback: false, active: false, channels: [8] },
 ];
 
 const RATES_44 = [44100, 88200, 176400, 352800, 705600];
@@ -196,16 +207,19 @@ export const MOCK_LIMITS: EngineLimits = {
  *   (×32 and ×64) in S32 (`?device=USB`).
  * - USB48: a USB DAC that plays 48 kHz only, S16/S24/S32 (24 significant
  *   bits), for the engine bypass resampler (`?device=USB48`).
+ * - IFACE: an audio interface that plays 8 channels only (no stereo mode),
+ *   44.1–192 kHz S32 (`?device=IFACE`): the output channel selector.
  */
 function capsFor(device: string): DeviceCapabilities | null {
   const card = DEVICES.find((d) => sameDevice(d, device))?.card ?? "";
   const row = (rate: number, formats: [SampleFormat, number | null][]) => ({ rate, formats: formats.map(([format, sbits]) => ({ format, sbits })) });
   const sorted = (rates: number[]) => [...rates].sort((a, b) => a - b);
+  const width = card === "IFACE" ? 8 : 2;
   const caps = (rows: ReturnType<typeof row>[]): DeviceCapabilities => ({
     device,
-    channels: 2,
-    channels_min: 2,
-    channels_max: 2,
+    channels: width,
+    channels_min: width,
+    channels_max: width,
     rates: rows,
     rate_min: rows[0]?.rate ?? 0,
     rate_max: rows[rows.length - 1]?.rate ?? 0,
@@ -228,6 +242,8 @@ function capsFor(device: string): DeviceCapabilities | null {
       return caps([row(48000, [["s16", 16]])]);
     case "USB48":
       return caps([row(48000, [["s16", 16], ["s24", 24], ["s32", 24]])]);
+    case "IFACE":
+      return caps([44100, 48000, 88200, 96000, 176400, 192000].map((r) => row(r, [["s32", 24]])));
     case "USB":
       return caps(
         sorted([...RATES_44, ...RATES_48, ...RATES_HIGH]).map((r) => row(r, [...(r <= 768000 ? ([["s16", 16], ["s24", 24]] as [SampleFormat, number][]) : []), ["s32", 32]])),
@@ -402,8 +418,8 @@ function normalizeChainFields(raw: Partial<ChainConfig>): ChainConfig {
   if (chain.dc_block !== undefined) chain.dc_block = normalizeDcBlock(chain.dc_block);
   // Serde field defaults: a patch like `{"crossfeed": {"enabled": true}}` on a
   // chain without the stage fills the rest in.
-  if (chain.crossfeed) chain.crossfeed = { enabled: true, mode: "bs2b_default", cutoff_hz: 700, feed_db: 4.5, level: "matched", ...(chain.crossfeed as Partial<NonNullable<ChainConfig["crossfeed"]>>) };
-  if (chain.harmonics) chain.harmonics = { enabled: true, character: "triode", h2_db: -40, h3_db: -58, h4_db: null, h5_db: null, dc_block: true, ...(chain.harmonics as Partial<NonNullable<ChainConfig["harmonics"]>>) };
+  if (chain.crossfeed) chain.crossfeed = { enabled: true, mode: "bs2b_default", cutoff_hz: 700, feed_db: 4.5, width: 1, width_shape: "flat", width_corner_hz: 700, ...(chain.crossfeed as Partial<NonNullable<ChainConfig["crossfeed"]>>) };
+  if (chain.harmonics) chain.harmonics = { ...defaultHarmonics(), ...(chain.harmonics as Partial<NonNullable<ChainConfig["harmonics"]>>) };
   // A removed `Option` field (`{"design": null}` in a merge patch) reads back as None.
   if (chain.upsampler) chain.upsampler = { ...chain.upsampler, preset: chain.upsampler.preset ?? null, design: chain.upsampler.design ?? null };
   if (chain.pitch) chain.pitch = { enabled: true, cents: 0, quality: "high", ...(chain.pitch as Partial<NonNullable<ChainConfig["pitch"]>>) };
@@ -470,7 +486,7 @@ function chainIsPassthrough(chain: ChainConfig): boolean {
   const dcBlockActive = chain.dc_block != null && (chain.dc_block.enabled ?? true);
   return (
     !dcBlockActive &&
-    !(chain.crossfeed?.enabled ?? false) &&
+    !crossfeedActive(chain.crossfeed) &&
     !eqActive &&
     !conv &&
     !pitchIsActive(chain.pitch) &&
@@ -497,7 +513,7 @@ function mockMeasurement(): OverlayData {
   });
   return {
     version: 1,
-    name: "Kali IN-5 (mock room)",
+    name: "Desk monitor (mock room)",
     kind: "measurement",
     source: "Simulated: this is the browser mock, not a real measurement.",
     points,
@@ -514,12 +530,23 @@ function newInstance(): string {
   return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
 }
 
+
+type MockPreset = Preset & { modified_unix: number };
+
+function presetKey(part: PresetPart | undefined, name: string): string {
+  return `${part ?? ""}/${name}`;
+}
+
 export class MockDaemon {
   config: EngineConfig;
-  presets = new Map<string, Preset & { modified_unix: number }>();
+  /** Keyed by `presetKey(part, name)`. */
+  presets = new Map<string, MockPreset>();
   /** When each stream started playing (a counter), for the arbiter's
    * first-started rule. Kept while it plays, across sink moves. */
   private startedAt = new Map<number, number>();
+  /** `harmonics_live`: frames counted, and the clock the mock's music follows. */
+  private liveSeq = 0;
+  private liveStart = Date.now();
   private startSeq = 0;
   private streamList: StreamInfo[] = [];
   nowPlaying: NowPlaying | null;
@@ -529,10 +556,14 @@ export class MockDaemon {
     sink_volume: "ignore", guard: "off", blocked: 0, last_blocked: null,
   };
   abSide: AbSide = "a";
+  /** The blind mask (`ab_blind`): status hides the side. */
+  abBlind = false;
   released = false;
   running: boolean;
   /** `Status.overload`: the fallback in effect after a simulated overload. */
   overload: OverloadReport | null = null;
+  /** Source rates where the request overloaded (the per-rate fallback's `cause: overload`). */
+  trippedRates: number[] = [];
   private overloadEpisodes = 0;
   /** `VolumeStatus.instance`: new on every (re)start. */
   instance = newInstance();
@@ -578,16 +609,10 @@ export class MockDaemon {
 
   /** Behave like an engine before fractional rates (0.9.4): no `rate_ratio`, integer targets only. */
   legacyRatio = false;
-  /** Behave like an engine before the crossfeed level policy: `level` is dropped (serde ignores it) and the stage is peak-safe. */
-  legacyCrossfeedLevel = false;
-
-  /** A crossfeed config as the engine keeps it: serde fills a missing `level` with `matched`; an older engine drops it. */
+  /** A crossfeed config as the engine keeps it: serde drops fields it does not know (an old client's `level`). */
   private crossfeedAsStored(xf: NonNullable<ChainConfig["crossfeed"]>): NonNullable<ChainConfig["crossfeed"]> {
-    if (this.legacyCrossfeedLevel) {
-      const { level: _level, ...rest } = xf;
-      return rest as NonNullable<ChainConfig["crossfeed"]>;
-    }
-    return { ...xf, level: xf.level ?? "matched" };
+    const { level: _level, ...rest } = xf as NonNullable<ChainConfig["crossfeed"]> & { level?: unknown };
+    return rest;
   }
 
   /** An engine error to report, pushed at once like the daemon's (`null` clears it). */
@@ -602,9 +627,8 @@ export class MockDaemon {
     this.emitStatus(true);
   }
 
-  constructor(opts: { running?: boolean; apps?: boolean; split?: boolean; overlays?: boolean | "none"; digitalVolume?: boolean; device?: string; engineVersion?: string; playRate?: number; legacyRatio?: boolean; legacyStreamVolume?: boolean; legacyCrossfeedLevel?: boolean; followers?: string[] } = {}) {
+  constructor(opts: { running?: boolean; apps?: boolean; split?: boolean; overlays?: boolean | "none"; digitalVolume?: boolean; device?: string; engineVersion?: string; playRate?: number; legacyRatio?: boolean; legacyStreamVolume?: boolean; followers?: string[] } = {}) {
     this.legacyRatio = opts.legacyRatio ?? false;
-    this.legacyCrossfeedLevel = opts.legacyCrossfeedLevel ?? false;
     this.legacyStreamVolume = opts.legacyStreamVolume ?? false;
     this.running = opts.running ?? true;
     this.engineVersion = opts.engineVersion ?? MOCK_APP_VERSION;
@@ -641,23 +665,31 @@ export class MockDaemon {
       varispeed: { enabled: false, speed: 1, ramp_ms: 200, keep_pitch: false },
       device_lost: "pause",
       outputs: { followers: [] },
+      channel_workers: true,
       active_preset: "HD650 AutoEQ",
+      active_part_presets: { eq: "HD650 AutoEQ" },
     };
     // Preloaded followers (`?followers=USB,SPK`): cards other than the main one.
     for (const card of opts.followers ?? []) {
       const d = DEVICES.find((x) => x.card === card || x.id === card);
       if (d && d.id !== this.config.device && !this.config.outputs.followers.some((f) => f.device === d.id) && this.config.outputs.followers.length < 3) {
-        this.config.outputs.followers.push({ device: d.id, enabled: true, trim_ms: 0, volume_db: 0 });
+        this.config.outputs.followers.push({ device: d.id, enabled: true, trim_ms: 0, volume_db: 0, follow_volume: false });
       }
     }
     // Already playing (and locked) when the preview opens.
     for (const f of this.config.outputs.followers) this.followerSince.set(f.device, Date.now() - 60_000);
     const now = Math.floor(Date.now() / 1000);
-    this.presets.set("HD650 AutoEQ", { version: 1, name: "HD650 AutoEQ", chain: clone(chain), modified_unix: now - 86400 * 3 });
+    this.presets.set(presetKey(undefined, "HD650 AutoEQ"), { version: 1, name: "HD650 AutoEQ", chain: clone(chain), modified_unix: now - 86400 * 3 });
     const room = baseChain();
     room.eq = eqProfile("Room + bass shelf", ROOM);
-    this.presets.set("Room + bass shelf", { version: 1, name: "Room + bass shelf", chain: room, modified_unix: now - 86400 * 12 });
-    this.presets.set("Flat", { version: 1, name: "Flat", chain: flatChain(), modified_unix: now - 86400 * 40 });
+    this.presets.set(presetKey(undefined, "Room + bass shelf"), { version: 1, name: "Room + bass shelf", chain: room, modified_unix: now - 86400 * 12 });
+    this.presets.set(presetKey(undefined, "Flat"), { version: 1, name: "Flat", chain: flatChain(), modified_unix: now - 86400 * 40 });
+    // Each page's own: two EQs to switch between, an upsampling setting.
+    this.presets.set(presetKey("eq", "HD650 AutoEQ"), { version: 1, name: "HD650 AutoEQ", part: "eq", chain: clone(chain), modified_unix: now - 86400 * 3 });
+    this.presets.set(presetKey("eq", "Room + bass shelf"), { version: 1, name: "Room + bass shelf", part: "eq", chain: clone(room), modified_unix: now - 86400 * 12 });
+    const desk = clone(chain);
+    desk.upsampler = { ...desk.upsampler, target: { ratio: 4 } } as typeof desk.upsampler;
+    this.presets.set(presetKey("upsampling", "Desk ×4"), { version: 1, name: "Desk ×4", part: "upsampling", chain: desk, modified_unix: now - 86400 * 5 });
     this.streams = [
       { node: 81, app_name: "Strawberry", binary: "strawberry", media_name: "Nils Frahm · Says", rate: opts.playRate ?? 44100, channels: 2, format: "S24LE", sink: "dsp", volume: 1, muted: false, volume_db: 0 },
       { node: 94, app_name: "Firefox", binary: "firefox", media_name: "YouTube", rate: 48000, channels: 2, format: "F32LE", sink: null, volume: 1, muted: false, volume_db: 0 },
@@ -1002,7 +1034,16 @@ export class MockDaemon {
     return rate;
   }
 
+  /** As the daemon: a chain fallback is per source rate; another rate ends it, and the rate left counts as overloaded. */
+  private perRateEnd() {
+    const o = this.overload;
+    if (!o || !o.source_rate || o.action.startsWith("varispeed") || this.graphRate() === o.source_rate) return;
+    if (!this.trippedRates.includes(o.source_rate)) this.trippedRates.push(o.source_rate);
+    this.overload = null;
+  }
+
   status(): Status {
+    this.perRateEnd();
     const st = this.currentStatus();
     if (!this.legacyRatio) return st;
     // A daemon that predates `rate_ratio`: none (and an integer `ratio`).
@@ -1022,6 +1063,8 @@ export class MockDaemon {
     let rate = this.graphRate();
     if (sink === "direct" && directRates.length && !directRates.includes(rate)) rate = this.sinkRate(rate, directRates, direct.native);
     const dspPath = this.config.dsp_enabled && this.overload?.action !== "bypass" && sink !== "direct";
+    const upsamplerRates = this.upsamplerRates();
+    const upsamplerFallbackNow = dspPath && this.feeding().length > 0 ? upsamplerRates.find((r) => r.source_rate === rate && r.fallback) : undefined;
     const caps = capsFor(this.config.device);
     const candidates = dspPath ? ratioCandidates(chain, rate, caps, this.config.formats) : this.bypassLadder(rate);
     const plan = caps ? planOpen(caps, rate, candidates, this.config.formats) : { ratio: candidates[0] ?? ONE, format: this.config.formats[0] ?? null };
@@ -1058,11 +1101,15 @@ export class MockDaemon {
     const limLat = dspPath && chain.limiter && chain.limiter.mode !== "off" ? limiterDelay(chain.limiter.lookahead_ms, outputRate).ms : 0;
     this.latency = (this.config.quantum / 48000) * 1000 * 2 + upLat + convLat + pitchLat + limLat;
     const loadBase = !dspPath ? 0.004 : 0.012 + convList(chain).filter((c) => c.enabled).length * 0.02 + (resampling ? (upTaps / 65536) * 0.03 * (Math.max(1, rateRatio.up / rateRatio.down) / 4) : 0);
-    const presetName = this.config.active_preset ?? null;
-    const preset = presetName ? this.presets.get(presetName) : undefined;
+    const partPresets = PRESET_PARTS.flatMap((part) => {
+      const state = this.presetState(part);
+      return state ? [{ part, ...state }] : [];
+    });
     return {
       version: this.engineVersion,
       state: !this.running ? "error" : this.released ? "idle" : feeding.length ? "playing" : "ready",
+      conv_warnings: [],
+      calibration: this.calibrationStatus(),
       device: this.config.device,
       error: this.engineError,
       format,
@@ -1073,6 +1120,7 @@ export class MockDaemon {
       quantum: this.config.quantum,
       latency_ms: Math.round(this.latency * 10) / 10,
       filter_latency_ms: Math.round((upLat + convLat + limLat) * 10) / 10,
+      conv_latency_ms: convLat,
       xruns: this.xruns,
       dsp_load: Math.round(loadBase * 1000) / 1000,
       dsp_enabled: this.config.dsp_enabled,
@@ -1084,7 +1132,8 @@ export class MockDaemon {
       },
       ab: this.config.ab ? this.abStatus() : null,
       volume: this.volumeStatus(),
-      preset: preset ? { name: preset.name, modified: !deepEqual(preset.chain, this.config.chain) } : null,
+      preset: this.presetState(undefined),
+      part_presets: partPresets,
       device_caps: this.released ? null : caps,
       effective_rates: this.released ? [] : [...new Set([...eff.allowed, ...directRates])].sort((a, b) => a - b),
       direct_rates: this.released ? [] : directRates,
@@ -1099,6 +1148,8 @@ export class MockDaemon {
       eq_tilt: this.tiltStatus(this.config.chain, rate),
       eq_tilt_b: this.config.ab ? this.tiltStatus(chainB(this.config.ab, this.config.chain), rate) : null,
       overload: this.overload ? clone(this.overload) : null,
+      upsampler_rates: upsamplerRates,
+      ...(upsamplerFallbackNow ? { upsampler_fallback_now: upsamplerFallbackNow } : {}),
       rt_load_max: 0,
       varispeed,
       limits: { ...MOCK_LIMITS },
@@ -1137,6 +1188,8 @@ export class MockDaemon {
         enabled: f.enabled,
         trim_ms: f.trim_ms,
         volume_db: f.volume_db,
+        follow_volume: f.follow_volume ?? false,
+        level_db: f.volume_db,
         state,
         offset_ms: state === "unaligned" || (state === "muted" && card === "SPK") ? 42 : 0,
         ppm: open ? Math.round(ppm * settle * 10) / 10 : 0,
@@ -1147,11 +1200,16 @@ export class MockDaemon {
         latency_ms: open ? Math.round(((period * 3) / rate) * 1000 * 10) / 10 : 0,
         device_rate: open ? rate : 0,
         period: open ? period : 0,
+        output_channels: f.output_channels,
+        device_channels: open ? Math.max(caps?.channels ?? 2, f.output_channels ? Math.max(...f.output_channels) + 1 : 0) : 0,
+        device_channels_max: open ? (caps?.channels_max ?? 2) : 0,
         error: state === "lost" ? "the device is not connected" : null,
+        own_chain: f.chain_patch ? Object.keys(f.chain_patch) : [],
+        latency: zeroLatency(open ? rate : 0),
       };
     });
     const alignment = followers.length === 0 ? 0 : followers.some((f) => f.offset_ms > 0) ? 60 : 6;
-    return { alignment_ms: alignment, followers };
+    return { alignment_ms: alignment, master: zeroLatency(followers.length ? masterRate : 0), followers, settling: null };
   }
 
   /** Like the daemon's `validate_outputs`. */
@@ -1251,6 +1309,7 @@ export class MockDaemon {
         : `The engine switched DSP off: the chain needed more CPU than real time allows (load ${pct}). Your settings are kept; make the chain lighter.`,
       episode: this.overloadEpisodes,
       applied: true,
+      source_rate: this.status().graph_rate,
     };
     this.emit({ event: "overload", data: clone(this.overload) as OverloadReport });
     this.emitStatus();
@@ -1271,6 +1330,7 @@ export class MockDaemon {
       message: `The engine turned A/B off and kept chain A: both sides together needed more CPU than real time allows (load ${Math.round(load * 100)}%). Your settings are kept; a new side B (a lighter filter, say) tries again.`,
       episode: this.overloadEpisodes,
       applied: true,
+      source_rate: this.status().graph_rate,
     };
     this.abSide = "a";
     this.emit({ event: "overload", data: clone(this.overload) as OverloadReport });
@@ -1353,7 +1413,8 @@ export class MockDaemon {
 
   /** The daemon's CPU admission of `next`, and the end of a fallback it replaces. */
   private admitCpu(next: EngineConfig) {
-    const refusal = cpuRefusal(this.config, next);
+    const st = this.status();
+    const refusal = cpuRefusal(this.config, next, st.state === "playing" ? st.graph_rate : null);
     if (refusal) throw new DaemonError(ErrorCode.INVALID_PARAMS, refusal);
     const o = this.overload;
     if (!o) return;
@@ -1364,7 +1425,10 @@ export class MockDaemon {
       return;
     }
     const ends = o.action === "bypass" ? JSON.stringify([next.dsp_enabled, next.chain, next.ab]) !== JSON.stringify([this.config.dsp_enabled, this.config.chain, this.config.ab]) : part(next) !== part(this.config);
-    if (ends) this.overload = null;
+    if (ends) {
+      this.overload = null;
+      this.trippedRates = [];
+    }
   }
 
   /**
@@ -1422,14 +1486,17 @@ export class MockDaemon {
   private abStatus(): AbStatus {
     const o = this.abOffset();
     const gain_a_db = Math.min(0, -o);
+    if (!this.config.ab) this.abBlind = false;
+    const blind = this.abBlind;
     return {
       enabled: true,
-      current: this.abSide,
+      current: blind ? null : this.abSide,
+      blind,
       offset_db: o,
       gain_a_db,
       gain_b_db: Math.min(0, gain_a_db + o),
       headroom_db: 0,
-      overs: { ...this.abOvers },
+      overs: blind ? { a: 0, b: 0 } : { ...this.abOvers },
       level: this.config.ab?.level ?? { mode: "analytic", weighting: "k" },
       measuring: this.abMeasure
         ? { seconds: this.abMeasure.seconds, offset_db: this.abMeasure.offset === null ? null : Math.round(this.abMeasure.offset * 1000) / 1000, stable: this.abMeasure.stable, max_seconds: this.abMeasure.max }
@@ -1520,33 +1587,52 @@ export class MockDaemon {
 
   private spectrum(): Spectrum {
     const rate = this.graphRate();
-    const fMin = 20;
+    const outputRate = this.status().output_rate || rate;
+    const fMin = 10;
     const bpo = 24;
-    const maxF = Math.min(20000, rate / 2);
-    const nBins = Math.max(1, Math.floor(bpo * Math.log2(maxF / fMin)) + 1);
-    const freqs: number[] = [];
-    const pre: number[] = [];
+    // Like the daemon: each tap up to its own Nyquist (less a little) or
+    // 100 kHz, no bin straddling the top.
+    const binCount = (r: number) => {
+      const top = Math.min(r / 2 - 100, 100000);
+      return Math.max(1, Math.floor(bpo * Math.log2(top / fMin) - 0.5) + 1);
+    };
     const t = this.phase;
-    for (let i = 0; i < nBins; i++) {
-      const f = fMin * Math.pow(2, i / bpo);
-      freqs.push(f);
+    const levelAt = (i: number, f: number) => {
       const oct = Math.log2(f / 55);
       const tilt = oct > 0 ? -3.0 * oct : -1.2 * Math.abs(oct);
+      // Steeper above 20 kHz: little real content up there.
+      const ultra = f > 20000 ? -30 * Math.log2(f / 20000) : 0;
       const motion =
         4.5 * Math.sin(t * 1.5 + i * 0.08) +
         3.0 * Math.cos(t * 2.4 - i * 0.13) +
         2.0 * Math.sin(t * 0.7 + Math.log2(f) * 2.0);
-      const db = Math.max(-88, Math.min(-3, -24 + tilt + motion));
-      pre.push(Math.round(db * 10) / 10);
-    }
+      return Math.max(-88, Math.min(-3, -24 + tilt + ultra + motion));
+    };
+    const tap = (n: number) => {
+      const freqs: number[] = [];
+      const db: number[] = [];
+      for (let i = 0; i < n; i++) {
+        const f = fMin * Math.pow(2, i / bpo);
+        freqs.push(f);
+        db.push(levelAt(i, f));
+      }
+      return { freqs, db };
+    };
+    const input = tap(binCount(rate));
+    const pre = input.db.map((v) => Math.round(v * 10) / 10);
+    // Past the source's Nyquist the output holds only the upsampler's stopband.
+    const output = tap(binCount(outputRate));
+    const outDb = output.db.map((v, i) => (output.freqs[i] < rate / 2 ? v : -88));
     const chain = this.chainOn();
     let post: number[];
     if (this.config.dsp_enabled && chain.eq) {
-      const l = profileChannelResponseDb(chain.eq, 0, rate, freqs);
-      const r = profileChannelResponseDb(chain.eq, 1, rate, freqs);
-      post = pre.map((v, i) => Math.round(Math.max(-90, Math.min(0, v + (l[i] + r[i]) * 0.5)) * 10) / 10);
+      // The EQ runs at the graph rate, below its Nyquist.
+      const inBand = output.freqs.filter((f) => f < rate / 2);
+      const l = profileChannelResponseDb(chain.eq, 0, rate, inBand);
+      const r = profileChannelResponseDb(chain.eq, 1, rate, inBand);
+      post = outDb.map((v, i) => Math.round(Math.max(-90, Math.min(0, v + (i < inBand.length ? (l[i] + r[i]) * 0.5 : 0))) * 10) / 10);
     } else {
-      post = [...pre];
+      post = outDb.map((v) => Math.round(v * 10) / 10);
     }
     return { f_min_hz: fMin, bins_per_octave: bpo, pre, post, rate };
   }
@@ -1591,21 +1677,25 @@ export class MockDaemon {
     const mixed = lu.phase === "intermediate" && lu.phase_mix > 0 && lu.phase_mix < 1;
     if (lu.auto_taps || lu.cutoff_mode === "band") {
       const atten = lu.auto_taps ? this.autoBudgetDb(lu) : lu.band.attenuation_db;
-      const delta = Math.max(0.005, lu.band.stopband_start - lu.band.passband_end);
+      const pass = bandPassbandEnd(lu.band, bandRate(sourceRate, ratio));
+      const delta = Math.max(0.005, lu.band.stopband_start - pass);
       const k = Math.ceil(((atten - 7.95) / (14.36 * delta)) * window);
       let taps = Math.min(4_194_304, 2 * k * scale + 1);
       if (mixed) taps = Math.round(taps * 1.45);
       const beta = atten > 50 ? 0.1102 * (atten - 8.7) : 0.5842 * Math.pow(atten - 21, 0.4) + 0.07886 * (atten - 21);
       const tw = Math.max(0.5, delta * edge);
-      const cutoff = (lu.band.passband_end + lu.band.stopband_start) / 2;
-      const band = { pass: lu.band.passband_end, stop: lu.band.passband_end + delta };
+      const cutoff = (pass + lu.band.stopband_start) / 2;
+      const band = { pass, stop: pass + delta };
       return { ratio, taps, phase: lu.phase, cutoff, atten, beta, tw, latency: latencyFor(taps, lu.phase), band };
     }
     const base = lu.taps_unit === "input" ? lu.taps * ratio.up : ratio.down > 1 ? lu.taps * ratio.down : lu.taps;
     const taps = mixed ? Math.round(base * 1.45) : base;
     const cutoff = lu.cutoff_mode === "nyquist_stop" ? nyquistStopCutoff(base, ratio.up, lu.kaiser_beta) : Math.max(0.5, Math.min(1, lu.cutoff));
     const tw = Math.max(0.5, Math.min(0.24 * edge, ((lu.kaiser_beta + 2) / (Math.PI * Math.max(256, base / window))) * sourceRate * ratio.up * 2.5));
-    return { ratio, taps, phase: lu.phase, cutoff, atten: kaiserAttenuationDb(lu.kaiser_beta), beta: lu.kaiser_beta, tw, latency: latencyFor(taps, lu.phase) };
+    // Stop at Nyquist reaches its full depth by the source Nyquist, as the
+    // engine's design does: drawn as a band ending there, centred on the cutoff.
+    const band = lu.cutoff_mode === "nyquist_stop" ? { pass: Math.max(0.5, 2 * cutoff - 1), stop: 1 } : undefined;
+    return { ratio, taps, phase: lu.phase, cutoff, atten: kaiserAttenuationDb(lu.kaiser_beta), beta: lu.kaiser_beta, tw, latency: latencyFor(taps, lu.phase), band };
   }
 
   /** Smooth analytic stand-in for the measured magnitude (dB) of a design. */
@@ -1834,8 +1924,23 @@ export class MockDaemon {
     if (!design) return {};
     const plan = mockCheckDesign(design, this.checkContext({ ...cfg, design, preset: null }, [rate])).plans[0]?.plan;
     if (!plan) return { design };
-    const kernel = design.kind === "windowed_sinc" || design.kind === "lanczos";
+    const kernel = design.kind === "windowed_sinc" || design.kind === "lanczos" || design.kind === "optimal";
     return { design, plan: { ...plan, grid_taps_exact: true, ...(kernel ? { bounded_peak_db: design.phase.type === "linear" ? 2.1 : 2.6 } : {}) } };
+  }
+
+  /**
+   * `status.upsampler_rates`: the CPU admission's rows, with Recommended at
+   * the rates chain A's custom design does not build at (`cause: design`).
+   */
+  private upsamplerRates(): RateAdmission[] {
+    const rows = rateAdmissions(this.config, this.trippedRates);
+    const u = this.config.chain.upsampler;
+    if (!u.design || u.preset || !this.config.dsp_enabled || u.target === "off") return rows;
+    const falls = mockDesignFallbacks(u.design, this.checkContext(u, this.config.rate.allowed_rates));
+    return rows.map((row) => {
+      const f = falls.find((x) => x.source_rate === row.source_rate);
+      return f ? { ...row, fallback: { action: "recommended" as const, cause: "design" as const, load: 0.05, reason: f.reason } } : row;
+    });
   }
 
   /** What `check_design` checks against: chain A's target and output, the given rates. */
@@ -1848,7 +1953,7 @@ export class MockDaemon {
       maxKernelTaps: MOCK_LIMITS.max_kernel_taps,
       autoDb: Math.min(6.02 * bits + 1.76 - (dithered ? 4.7712 : 0), dithered ? 141.47 : 146.24),
       pipelines: rationalPipelines(!!this.config.ab),
-      block: (rate) => Math.min(1024, Math.max(512, 2 ** Math.floor(Math.log2(Math.max(32, Math.floor((this.config.quantum * rate) / 48000)))))),
+      block: (rate) => Math.min(8192, Math.max(512, 2 ** Math.floor(Math.log2(Math.max(32, Math.floor((this.config.quantum * rate) / 48000)))))),
     };
   }
 
@@ -1857,13 +1962,47 @@ export class MockDaemon {
   }
 
   private listPresets(): PresetInfo[] {
-    return [...this.presets.values()]
-      .map((p) => ({ name: p.name, modified_unix: p.modified_unix, bands: bandsCountOfChain(p.chain), convolution: convList(p.chain).length }))
-      .sort((a, b) => a.name.localeCompare(b.name));
+    const order = (part: PresetPart | undefined) => (part ? PRESET_PARTS.indexOf(part) + 1 : 0);
+    return [...this.presets.values()].map((p) => this.info(p)).sort((a, b) => order(a.part) - order(b.part) || a.name.localeCompare(b.name));
   }
 
-  private info(p: Preset & { modified_unix: number }): PresetInfo {
-    return { name: p.name, modified_unix: p.modified_unix, bands: bandsCountOfChain(p.chain), convolution: convList(p.chain).length };
+  private info(p: MockPreset): PresetInfo {
+    const parts = presetCovers(p);
+    return {
+      name: p.name,
+      ...(p.part ? { part: p.part } : {}),
+      parts,
+      modified_unix: p.modified_unix,
+      bands: parts.includes("eq") ? bandsCountOfChain(p.chain) : 0,
+      convolution: parts.includes("convolution") ? convList(p.chain).length : 0,
+    };
+  }
+
+  private presetPart(part: unknown): PresetPart | undefined {
+    if (part === undefined || part === null) return undefined;
+    if (!PRESET_PARTS.includes(part as PresetPart)) this.bad(`unknown preset part ${JSON.stringify(part)}`);
+    return part as PresetPart;
+  }
+
+  private activeName(part: PresetPart | undefined): string | null {
+    return part ? (this.config.active_part_presets?.[part] ?? null) : this.config.active_preset;
+  }
+
+  private setActiveName(part: PresetPart | undefined, name: string | null) {
+    if (!part) {
+      this.config.active_preset = name;
+      return;
+    }
+    const map = { ...(this.config.active_part_presets ?? {}) };
+    if (name) map[part] = name;
+    else delete map[part];
+    this.config.active_part_presets = map;
+  }
+
+  private presetState(part: PresetPart | undefined): { name: string; modified: boolean } | null {
+    const name = this.activeName(part);
+    const preset = name ? this.presets.get(presetKey(part, name)) : undefined;
+    return preset ? { name: preset.name, modified: !presetMatches(preset, this.config.chain) } : null;
   }
 
   // ------------------------------------------------------------ calls
@@ -1913,6 +2052,21 @@ export class MockDaemon {
     return { node, volume_db, muted, max_db: cap, ...(limited ? { limited_by: limited } : {}) };
   }
 
+  private calibrationStatus(): CalibrationStatus | null {
+    const c = this.config.calibration;
+    if (!c) return null;
+    return {
+      label: c.label,
+      path: c.path,
+      design_rate_hz: c.design_rate_hz,
+      devices: [
+        ...(c.master ? [{ role: "master", device: this.config.device, entries: c.master.matrix?.length ?? 0, gain_db: c.master.gain_db, manifest_gain_db: c.master_manifest_gain_db ?? c.master.gain_db, trim_ms: 0, installed: true }] : []),
+        ...c.followers.map((f) => ({ role: "follower", device: f.device, entries: f.item.matrix?.length ?? 0, gain_db: f.item.gain_db, manifest_gain_db: f.manifest_gain_db ?? f.item.gain_db, trim_ms: f.trim_ms, installed: true })),
+      ],
+      warnings: [],
+    };
+  }
+
   private bad(msg: string): never {
     throw new DaemonError(ErrorCode.INVALID_PARAMS, msg);
   }
@@ -1944,20 +2098,39 @@ export class MockDaemon {
       }
     }
     const xf = chain.crossfeed;
-    if (xf && !this.legacyCrossfeedLevel && xf.level !== "matched" && xf.level !== "peak_safe") this.bad(`unknown variant \`${String(xf.level)}\`, expected \`matched\` or \`peak_safe\``);
     if (xf && xf.mode === "bs2b_custom") {
       if (!(xf.cutoff_hz >= 300 && xf.cutoff_hz <= 2000)) this.bad(`crossfeed cutoff_hz must be within 300..=2000 Hz (got ${xf.cutoff_hz})`);
       if (!(xf.feed_db >= 1 && xf.feed_db <= 15)) this.bad(`crossfeed feed_db must be within 1..=15 dB (got ${xf.feed_db})`);
     }
     const h = chain.harmonics;
-    if (h && h.character === "custom") {
-      for (const [k, v] of [["h2_db", h.h2_db], ["h3_db", h.h3_db], ["h4_db", h.h4_db], ["h5_db", h.h5_db]] as const) {
-        if (v === null || v === undefined) {
-          if (k === "h2_db" || k === "h3_db") this.bad(`harmonics ${k} is required`);
-          continue;
+    if (h) {
+      if (!Array.isArray(h.layers) || h.layers.length > 8) this.bad("harmonics layers must be a list of at most 8");
+      if (h.routing !== undefined && h.routing !== "parallel" && h.routing !== "series") this.bad(`harmonics routing must be "parallel" or "series" (got ${JSON.stringify(h.routing)})`);
+      h.layers.forEach((l, n) => {
+        if (l.kind === "chebyshev") {
+          if (!Array.isArray(l.levels_db) || l.levels_db.length !== 8) this.bad(`harmonics layers[${n}].levels_db must have 8 entries`);
+          l.levels_db.forEach((v, i) => {
+            if (v === null || v === undefined) return;
+            if (!(v >= -120 && v <= -20)) this.bad(`harmonics layers[${n}].levels_db[${i}] (H${i + 2}) must be within -120..=-20 dB (got ${v})`);
+          });
+          if (l.signs && (l.signs.length !== 8 || l.signs.some((x) => x !== "+" && x !== "-"))) this.bad("harmonics signs must be 8 of `+` or `-`");
+          if (!(l.drive_db >= -40 && l.drive_db <= 0)) this.bad(`harmonics layers[${n}].drive_db must be within -40..=0 dB (got ${l.drive_db})`);
+          if (!(l.amount >= 0 && l.amount <= 1)) this.bad(`harmonics layers[${n}].amount must be within 0..=1 (got ${l.amount})`);
+        } else if (l.kind === "flux") {
+          if (!(l.corner_hz >= 1 && l.corner_hz <= 5000)) this.bad(`harmonics layers[${n}].corner_hz must be within 1..=5000 Hz`);
+          if (!(l.max_boost_db >= 0 && l.max_boost_db <= 40)) this.bad(`harmonics layers[${n}].max_boost_db must be within 0..=40 dB`);
+          if (!(l.target_h3_db >= -120 && l.target_h3_db <= -12)) this.bad(`harmonics layers[${n}].target_h3_db must be within -120..=-12 dBc`);
+          if (!(l.calibration_hz >= 5 && l.calibration_hz <= 1000)) this.bad(`harmonics layers[${n}].calibration_hz must be within 5..=1000 Hz`);
+        } else if (l.kind === "hysteresis") {
+          if (!(l.saturation >= 0 && l.saturation <= 1)) this.bad(`harmonics layers[${n}].saturation must be within 0..=1`);
+          if (!(l.width >= 0 && l.width <= 1)) this.bad(`harmonics layers[${n}].width must be within 0..=1`);
+          if (!(l.amount >= 0 && l.amount <= 1)) this.bad(`harmonics layers[${n}].amount must be within 0..=1`);
+          if (!(l.target_h3_db >= -120 && l.target_h3_db <= -12)) this.bad(`harmonics layers[${n}].target_h3_db must be within -120..=-12 dBc`);
+          if (!(l.calibration_hz >= 20 && l.calibration_hz <= 5000)) this.bad(`harmonics layers[${n}].calibration_hz must be within 20..=5000 Hz`);
+        } else {
+          this.bad(`harmonics layers[${n}]: unknown kind`);
         }
-        if (!(v >= -120 && v <= -20)) this.bad(`harmonics ${k} must be within -120..=-20 dB (got ${v})`);
-      }
+      });
     }
     const pc = chain.pitch;
     if (pc) {
@@ -2060,6 +2233,7 @@ export class MockDaemon {
     const bandEdges = () => {
       const b = lu.band;
       if (!(b.passband_end >= 0.5 && b.passband_end <= 1)) this.bad(`${f}.band: passband end must be between 0.5 and 1 (got ${b.passband_end})`);
+      if (b.passband_end_hz != null && !(b.passband_end_hz > 0)) this.bad(`${f}.band: passband end in Hz must be above 0 (got ${b.passband_end_hz})`);
       if (!(b.stopband_start > b.passband_end && b.stopband_start <= 1.5)) this.bad(`${f}.band: stopband start must be above the passband end and at most 1.5 (got ${b.stopband_start})`);
     };
     if (lu.auto_taps) {
@@ -2229,7 +2403,63 @@ export class MockDaemon {
       case "set_convolution":
         return mutate(() => {
           const v = params as ChainConfig["convolution"];
-          cfg.chain.convolution = v === null ? [] : Array.isArray(v) ? clone(v) : [clone(v)];
+          const list = (v === null ? [] : Array.isArray(v) ? clone(v) : [clone(v)]).filter((c) => !c.calibration);
+          // As the daemon: the room calibration's item stays in place.
+          const kept = convList(cfg.chain).filter((c) => c.calibration);
+          cfg.chain.convolution = [...list, ...(cfg.calibration ? kept : [])];
+        });
+      case "bundle_load":
+        return mutate(() => {
+          const path = String((params as { path?: unknown } | null)?.path ?? "");
+          if (!path.endsWith(".json")) this.bad(`bundle_load: ${path}: not a bundle manifest`);
+          const item = {
+            name: "Room calibration: desk",
+            enabled: true,
+            ir_path: "",
+            gain_db: 0,
+            calibration: true,
+            matrix: [
+              { in: 0, out: 0, ir_path: IR_DIR + "mains_LL.wav", gain_db: 0 },
+              { in: 1, out: 1, ir_path: IR_DIR + "mains_RR.wav", gain_db: 0 },
+            ],
+          };
+          cfg.chain.convolution = [...convList(cfg.chain).filter((c) => !c.calibration), item];
+          cfg.calibration = { path, label: "desk", design_rate_hz: 48000, master: item, followers: [] };
+        });
+      case "bundle_unload":
+        return mutate(() => {
+          if (!cfg.calibration) this.bad("no room calibration is loaded");
+          cfg.chain.convolution = convList(cfg.chain).filter((c) => !c.calibration);
+          delete cfg.calibration;
+        });
+      case "bundle_gain":
+        mutate(() => {
+          const p = (params ?? {}) as { device?: string; gain_db?: number | null };
+          const c = cfg.calibration;
+          if (!c) this.conflict("no room calibration is loaded");
+          const g = p.gain_db ?? null;
+          if (g !== null && !(g >= -60 && g <= 24)) this.bad(`bundle_gain: gain_db must be between -60 and 24 dB (got ${g})`);
+          const main = !p.device || p.device === "master" || p.device === cfg.device;
+          const f = main ? null : c.followers.find((x) => x.device === p.device);
+          if (!main && !f) this.bad(`bundle_gain: ${p.device} is not a part of the loaded calibration`);
+          const item = main ? c.master : f!.item;
+          if (!item) this.bad("bundle_gain: the loaded calibration has no master part");
+          const base = (main ? c.master_manifest_gain_db : f!.manifest_gain_db) ?? item.gain_db;
+          item.gain_db = g ?? base;
+          const keep = item.gain_db !== base ? base : undefined;
+          if (main) {
+            if (keep === undefined) delete c.master_manifest_gain_db;
+            else c.master_manifest_gain_db = keep;
+            cfg.chain.convolution = convList(cfg.chain).map((x) => (x.calibration ? { ...x, gain_db: item.gain_db } : x));
+          } else if (keep === undefined) delete f!.manifest_gain_db;
+          else f!.manifest_gain_db = keep;
+        });
+        return this.calibrationStatus();
+      case "bundle_show":
+        return this.calibrationStatus();
+      case "set_convolution_safety":
+        return mutate(() => {
+          cfg.convolution_safety = clone(params as NonNullable<EngineConfig["convolution_safety"]>);
         });
       case "set_upsampler":
         return mutate(() => {
@@ -2277,6 +2507,35 @@ export class MockDaemon {
           this.validateChain(chain);
           cfg.chain = chain;
         });
+      case "harmonics_presets":
+        return clone(MOCK_HARMONICS_PRESETS);
+      case "harmonics_systems":
+        return clone(MOCK_HARMONICS_SYSTEMS);
+      case "harmonics_readout": {
+        const q = (params ?? {}) as { config?: NonNullable<ChainConfig["harmonics"]>; sweep?: boolean; sweep_freq_hz?: number; sweep_level_dbfs?: number };
+        if (q.config) this.validateChain({ ...cfg.chain, harmonics: q.config });
+        const h = q.config ?? cfg.chain.harmonics ?? { ...defaultHarmonics(), enabled: false };
+        const rate = this.status().output_rate || 96000;
+        return mockHarmonicsReadout(h, rate, !!q.sweep, q.sweep_freq_hz, q.sweep_level_dbfs);
+      }
+      case "harmonics_spectrum": {
+        const q = (params ?? {}) as { config?: NonNullable<ChainConfig["harmonics"]>; freq_hz: number; level_dbfs: number; traces?: HarmonicsSpectrumTrace[] };
+        if (q.config) this.validateChain({ ...cfg.chain, harmonics: q.config });
+        const h = q.config ?? cfg.chain.harmonics ?? { ...defaultHarmonics(), enabled: false };
+        const rate = this.status().output_rate || 96000;
+        const out = cfg.chain.output;
+        return mockHarmonicsSpectrum(h, rate, q.freq_hz, q.level_dbfs, q.traces ?? [], { bits: out.bits, dither: out.dither, headroom_db: out.headroom_db });
+      }
+      case "harmonics_live": {
+        const st = this.status();
+        const playing = st.state === "playing" && this.config.dsp_enabled;
+        this.liveSeq++;
+        // A blind test hides it (it would give the side away).
+        if (this.abBlind) return { ...mockHarmonicsLive(null, st.output_rate || 96000, false, 0, 0), state: "hidden" };
+        // The side playing.
+        const h = cfg.ab && this.abSide === "b" ? cfg.ab.chain_b?.harmonics : cfg.chain.harmonics;
+        return mockHarmonicsLive(h, st.output_rate || 96000, playing, Date.now() - this.liveStart, this.liveSeq);
+      }
       case "set_limiter":
         return mutate(() => {
           // Shared with chain B (normalizeB), like the upsampler and output.
@@ -2322,13 +2581,43 @@ export class MockDaemon {
         return mutate(() => {
           const device = String((params as { device?: unknown })?.device ?? "");
           if (device !== "" && !device.startsWith("hw:")) this.bad(`device must be an ALSA hw: device (got "${device}")`);
-          this.validateOutputs({ ...cfg, device: device || DEVICES[0].id });
-          cfg.device = device || DEVICES[0].id;
+          const pair = (params as { output_channels?: unknown })?.output_channels;
+          const next = device || DEVICES[0].id;
+          if (pair !== undefined) {
+            if (!Array.isArray(pair) || pair.length !== 2 || pair[0] === pair[1]) this.bad("output_channels: left and right need two different channels");
+            const max = capsFor(next)?.channels_max ?? 0;
+            const [l, r] = pair as [number, number];
+            if (max && Math.max(l, r) >= max) this.bad(`output_channels [${l}, ${r}]: device '${next}' has ${max} channels (0 to ${max - 1})`);
+          }
+          this.validateOutputs({ ...cfg, device: next });
+          if (pair !== undefined || next !== cfg.device) {
+            const p = pair as [number, number] | undefined;
+            if (!p || (p[0] === 0 && p[1] === 1)) delete cfg.output_channels;
+            else cfg.output_channels = p;
+          }
+          cfg.device = next;
+        });
+      case "assign_devices":
+        return mutate(() => {
+          const list = ((params ?? {}) as { assignments?: { output: string; device: string }[] }).assignments ?? [];
+          const next = structuredClone(cfg);
+          for (const a of list) {
+            if (!DEVICES.some((d) => d.id === a.device)) this.bad(`${a.device} is not a connected USB card`);
+            if (a.output === "master") next.device = a.device;
+            else {
+              const f = next.outputs?.followers.find((x) => x.device === a.output);
+              if (!f) this.bad(`${a.output} is not a follower`);
+              else f.device = a.device;
+            }
+          }
+          this.validateOutputs(next);
+          cfg.device = next.device;
+          if (next.outputs) cfg.outputs = next.outputs;
         });
       case "set_follower": {
-        const given = (params ?? {}) as { device?: unknown; remove?: unknown; enabled?: unknown; trim_ms?: unknown; volume_db?: unknown };
-        for (const k of ["remove", "enabled", "trim_ms", "volume_db"] as const) {
-          if (k in given && given[k] === null) this.bad(`invalid type: null, expected ${k === "remove" || k === "enabled" ? "a boolean" : "f64"}`);
+        const given = (params ?? {}) as { device?: unknown; remove?: unknown; enabled?: unknown; trim_ms?: unknown; volume_db?: unknown; follow_volume?: unknown; output_channels?: unknown; chain_patch?: unknown };
+        for (const k of ["remove", "enabled", "trim_ms", "volume_db", "follow_volume"] as const) {
+          if (k in given && given[k] === null) this.bad(`invalid type: null, expected ${k === "remove" || k === "enabled" || k === "follow_volume" ? "a boolean" : "f64"}`);
         }
         const device = String(given.device ?? "");
         const followers = clone(cfg.outputs.followers);
@@ -2337,11 +2626,24 @@ export class MockDaemon {
           if (at < 0) this.bad(`${device} is not a follower`);
           followers.splice(at, 1);
         } else {
-          const i = at >= 0 ? at : followers.push({ device, enabled: true, trim_ms: 0, volume_db: 0 }) - 1;
+          const i = at >= 0 ? at : followers.push({ device, enabled: true, trim_ms: 0, volume_db: 0, follow_volume: false }) - 1;
           const f = followers[i];
           if (typeof given.enabled === "boolean") f.enabled = given.enabled;
           if (typeof given.trim_ms === "number") f.trim_ms = given.trim_ms;
           if (typeof given.volume_db === "number") f.volume_db = given.volume_db;
+          if (Array.isArray(given.output_channels)) {
+            const [l, r] = given.output_channels as [number, number];
+            if (l === r) this.bad("output_channels: left and right need two different channels");
+            if (l === 0 && r === 1) delete f.output_channels;
+            else f.output_channels = [l, r];
+          }
+          if (typeof given.follow_volume === "boolean") f.follow_volume = given.follow_volume;
+          if ("chain_patch" in given) {
+            const p = given.chain_patch;
+            if (p === null || (typeof p === "object" && Object.keys(p as object).length === 0)) delete f.chain_patch;
+            else if (typeof p === "object" && !Array.isArray(p)) f.chain_patch = p as Record<string, unknown>;
+            else this.bad("outputs.followers[0].chain_patch must be a JSON object (a merge patch on chain A)");
+          }
         }
         this.validateOutputs({ ...cfg, outputs: { followers } });
         cfg.outputs = { followers };
@@ -2362,13 +2664,14 @@ export class MockDaemon {
             return;
           }
           this.abOvers = { a: 0, b: 0 };
+          this.abBlind = false;
           const { ab: next, notes: abNotes } = normalizeAbWithChainA(params, cfg.chain);
           this.validateChain(chainB(next, cfg.chain));
           this.admitCpu({ ...cfg, ab: next });
           notes.push(...abNotes);
           cfg.ab = next;
         });
-        return { ...(this.status().ab ?? { enabled: false, current: "a", offset_db: 0, error: null }), ...(notes.length ? { notes } : {}) };
+        return { ...(this.status().ab ?? { enabled: false, current: "a", blind: false, offset_db: 0, error: null }), ...(notes.length ? { notes } : {}) };
       }
       case "ab_measure": {
         if (!cfg.ab) throw new DaemonError(ErrorCode.INVALID_PARAMS, "A/B is not configured");
@@ -2385,11 +2688,19 @@ export class MockDaemon {
           this.abMeasureLock(m.offset, m.seconds);
           return this.status().ab;
         }
+        if (this.abBlind) throw new DaemonError(ErrorCode.BAD_STATE, "a blind test is running: the level is locked");
         const max = p.max_seconds === undefined ? 60 : Number(p.max_seconds);
         if (!Number.isFinite(max) || max < 10 || max > 300) throw new DaemonError(ErrorCode.INVALID_PARAMS, "ab_measure: max_seconds must be 10 to 300");
         this.abMeasureStart(max);
         this.emitStatus();
         return this.status().ab;
+      }
+      case "ab_blind": {
+        if (p.enabled && !cfg.ab) throw new DaemonError(ErrorCode.INVALID_PARAMS, "A/B is not configured");
+        if (p.enabled && this.abMeasure) this.abMeasureEnd(null);
+        this.abBlind = !!p.enabled && !!cfg.ab;
+        this.emitStatus();
+        return this.status().ab ?? { enabled: false, current: "a", blind: false, offset_db: 0, error: null };
       }
       case "ab_select": {
         if (!cfg.ab) throw new DaemonError(ErrorCode.INVALID_PARAMS, "A/B is not configured");
@@ -2487,47 +2798,70 @@ export class MockDaemon {
       case "list_presets":
         return this.listPresets();
       case "get_preset": {
-        const pr = this.presets.get(this.presetName(p.name));
+        const part = this.presetPart(p.part);
+        const pr = this.presets.get(presetKey(part, this.presetName(p.name)));
         if (!pr) this.bad(`no preset named "${String(p.name)}"`);
-        return { version: 1, name: pr.name, chain: clone(pr.chain) };
+        const { modified_unix: _, ...preset } = pr;
+        return clone(preset);
       }
       case "save_preset": {
+        const part = this.presetPart(p.part);
         const name = this.presetName(p.name);
-        if (this.presets.has(name) && !p.overwrite) this.conflict(`a preset named "${name}" already exists; pass overwrite to replace it`);
+        const key = presetKey(part, name);
+        if (this.presets.has(key) && !p.overwrite) this.conflict(`a preset named "${name}" already exists; pass overwrite to replace it`);
+        let parts: PresetPart[] | undefined;
+        if (!part && Array.isArray(p.parts)) {
+          parts = PRESET_PARTS.filter((x) => (p.parts as unknown[]).includes(x));
+          if (!parts.length) this.bad("a preset must hold at least one part");
+          if (parts.length === PRESET_PARTS.length) parts = undefined;
+        }
         // Chain A is stored as it is (the EQ keeps its own name), like the daemon.
-        const pr = { version: 1, name, chain: clone(cfg.chain), modified_unix: Math.floor(Date.now() / 1000) };
-        this.presets.set(name, pr);
-        cfg.active_preset = name;
+        const pr: MockPreset = { version: 1, name, ...(part ? { part } : {}), ...(parts ? { parts } : {}), chain: clone(cfg.chain), modified_unix: Math.floor(Date.now() / 1000) };
+        this.presets.set(key, pr);
+        this.setActiveName(part, name);
         this.emitPresets();
         this.emitConfig();
         return this.info(pr);
       }
       case "load_preset": {
-        const pr = this.presets.get(this.presetName(p.name));
+        const part = this.presetPart(p.part);
+        const pr = this.presets.get(presetKey(part, this.presetName(p.name)));
         if (!pr) this.bad(`no preset named "${String(p.name)}"`);
         return mutate(() => {
-          cfg.chain = clone(pr.chain);
-          cfg.active_preset = pr.name;
+          cfg.chain = applyPreset(cfg.chain, pr);
+          this.setActiveName(part, pr.name);
+          // A global preset replaces its parts: their pages' names go, like the daemon.
+          if (!part) for (const covered of presetCovers(pr)) this.setActiveName(covered, null);
+        });
+      }
+      case "blank_preset": {
+        const part = this.presetPart(p.part);
+        if (!part) this.bad("blank_preset needs a part");
+        return mutate(() => {
+          cfg.chain = applyPreset(cfg.chain, { version: 1, name: "", part, chain: defaultChain(emptyEq()) });
+          this.setActiveName(part, null);
         });
       }
       case "delete_preset": {
+        const part = this.presetPart(p.part);
         const name = this.presetName(p.name);
-        if (!this.presets.delete(name)) this.bad(`no preset named "${name}"`);
-        if (cfg.active_preset === name) cfg.active_preset = null;
+        if (!this.presets.delete(presetKey(part, name))) this.bad(`no preset named "${name}"`);
+        if (this.activeName(part) === name) this.setActiveName(part, null);
         this.emitPresets();
         this.emitConfig();
         return null;
       }
       case "rename_preset": {
+        const part = this.presetPart(p.part);
         const from = this.presetName(p.from);
         const to = this.presetName(p.to);
-        const pr = this.presets.get(from);
+        const pr = this.presets.get(presetKey(part, from));
         if (!pr) this.bad(`no preset named "${from}"`);
-        if (from !== to && this.presets.has(to)) this.conflict(`a preset named "${to}" already exists`);
-        this.presets.delete(from);
+        if (from !== to && this.presets.has(presetKey(part, to))) this.conflict(`a preset named "${to}" already exists`);
+        this.presets.delete(presetKey(part, from));
         const next = { ...pr, name: to, modified_unix: Math.floor(Date.now() / 1000) };
-        this.presets.set(to, next);
-        if (cfg.active_preset === from) cfg.active_preset = to;
+        this.presets.set(presetKey(part, to), next);
+        if (this.activeName(part) === from) this.setActiveName(part, to);
         this.emitPresets();
         this.emitConfig();
         return this.info(next);
@@ -2542,9 +2876,9 @@ export class MockDaemon {
         }
         if (parsed.profile.bands.length === 0) this.bad("cannot parse the EQ text: no filters found");
         if (!parsed.profile.name) parsed.profile.name = name;
-        // A flat preset: the default chain with only this EQ. Not loaded; an existing name is replaced.
-        const pr = { version: 1, name, chain: defaultChain(parsed.profile), modified_unix: Math.floor(Date.now() / 1000) };
-        this.presets.set(name, pr);
+        // An EQ preset: loading it touches nothing else. Not loaded; an existing name is replaced.
+        const pr: MockPreset = { version: 1, name, part: "eq", chain: defaultChain(parsed.profile), modified_unix: Math.floor(Date.now() / 1000) };
+        this.presets.set(presetKey("eq", name), pr);
         this.emitPresets();
         return this.info(pr);
       }
@@ -2562,10 +2896,28 @@ export class MockDaemon {
         const a = this.config.chain.upsampler;
         const target = req.target ?? a.target;
         if (target !== "off" && "ratio" in target && !(target.ratio >= 1 && target.ratio <= 64)) {
-          return { errors: [{ path: "target", message: `ratio must be between 1 and 64 (got ${target.ratio})` }], plans: [] };
+          return { errors: [{ path: "target", message: `ratio must be between 1 and 64 (got ${target.ratio})` }], plans: [], notes: [] };
         }
         const rates = req.source_rate !== undefined ? [req.source_rate] : this.config.rate.allowed_rates;
         return mockCheckDesign(req.design, this.checkContext({ ...a, target }, rates));
+      }
+      case "conv_response": {
+        const q = (params ?? {}) as { side?: "a" | "b"; device?: string };
+        const side = q.side ?? "a";
+        const device = q.device && q.device !== cfg.device ? q.device : null;
+        if (side === "b" && device) this.bad("A/B side B is the master's; a follower has no side B");
+        let conv = convList(cfg.chain);
+        if (side === "b") {
+          if (!cfg.ab) this.bad("A/B is not configured");
+          conv = convList(cfg.ab!.chain_b ?? cfg.chain);
+        } else if (device) {
+          const f = (cfg.outputs?.followers ?? []).find((x) => x.device === device);
+          if (!f) this.bad(`no follower "${device}"`);
+          const own = (f!.chain_patch as { convolution?: ConvolutionConfig[] } | undefined)?.convolution;
+          conv = own ?? conv.filter((c) => !c.calibration);
+        }
+        const channels = (path: string) => IR_FACTS[path.split("/").pop() ?? ""]?.channels ?? 2;
+        return mockConvResponse(conv, this.graphRate(), side, device, channels);
       }
       case "upsampler_response": {
         const req = (params ?? {}) as { config?: UpsamplerConfig | null; source_rate?: number | null; window?: ResponseWindowRequest | null };
@@ -2605,12 +2957,21 @@ export interface MockLatency {
   analysis?: number;
   /** When true, analysis calls reject with `ErrorCode.TIMEOUT`. */
   analysisTimeout?: boolean;
+  /** How long `set_upsampler` takes to design the filter (ms) before the
+   *  daemon applies it and answers, one build at a time (`?slow_build=<s>`). */
+  build?: number;
+  /** The client's timeout on `set_upsampler` (ms): a longer build rejects
+   *  with `ErrorCode.TIMEOUT` while the daemon goes on and applies it
+   *  (`?build_timeout=<s>`). */
+  buildTimeout?: number;
 }
 
 /** Transport backed by a MockDaemon (with a little latency, like a socket). */
 export class MockTransport implements Transport {
   readonly kind = "mock" as const;
-  private latency: { request: number; reply: number; event: number; analysis?: number; analysisTimeout?: boolean };
+  private latency: { request: number; reply: number; event: number; analysis?: number; analysisTimeout?: boolean; build?: number; buildTimeout?: number };
+  /** The build the mock daemon is busy with: the next one starts after it. */
+  private building: Promise<unknown> = Promise.resolve();
   private analysisSeq = 0;
   private cancelPendingAnalysis: (() => void) | null = null;
   constructor(
@@ -2621,10 +2982,39 @@ export class MockTransport implements Transport {
   }
 
   async call<T>(method: string, params?: unknown): Promise<T> {
+    if (method === "set_upsampler" && this.latency.build) return this.slowBuild<T>(params);
     await new Promise((r) => setTimeout(r, this.latency.request));
     const result = await this.daemon.handle(method, params === undefined ? undefined : clone(params));
     if (this.latency.reply > 0) await new Promise((r) => setTimeout(r, this.latency.reply));
     return result as T;
+  }
+
+  afterUpsamplerBuild(): Promise<EngineConfig> {
+    const read = this.building.then(() => clone(this.daemon.config));
+    const limit = this.latency.buildTimeout;
+    if (limit === undefined) return read;
+    return Promise.race([
+      read,
+      new Promise<EngineConfig>((_, reject) => setTimeout(() => reject(new DaemonError(ErrorCode.TIMEOUT, "The engine did not answer in time.")), limit)),
+    ]);
+  }
+
+  /** `set_upsampler` with [`MockLatency.build`]: designed, then applied, in turn. */
+  private slowBuild<T>(params: unknown): Promise<T> {
+    const build = this.latency.build ?? 0;
+    const run = this.building.then(async () => {
+      // Sent again unchanged (the app asking for the outcome): nothing to design.
+      const same = JSON.stringify(params) === JSON.stringify(this.daemon.config.chain.upsampler);
+      if (!same) await new Promise((r) => setTimeout(r, build));
+      return (await this.daemon.handle("set_upsampler", clone(params))) as T;
+    });
+    this.building = run.catch(() => undefined);
+    const limit = this.latency.buildTimeout;
+    if (limit === undefined) return run;
+    return Promise.race([
+      run,
+      new Promise<T>((_, reject) => setTimeout(() => reject(new DaemonError(ErrorCode.TIMEOUT, "The engine did not answer in time.")), limit)),
+    ]);
   }
 
   start(h: TransportHandlers): () => void {
@@ -2740,8 +3130,24 @@ export class MockTransport implements Transport {
     return MOCK_APP_VERSION;
   }
 
+  async appUpdatePending(): Promise<null> {
+    return null;
+  }
+
   async restartApp(): Promise<void> {
     if (typeof location !== "undefined") location.reload();
+  }
+
+  async appImageSetup(): Promise<null> {
+    return null;
+  }
+
+  async installAppImage(): Promise<void> {
+    throw new Error("Only the AppImage has a setup.");
+  }
+
+  async pickCalibrationBundle(): Promise<string | null> {
+    return "/home/me/room-correction/desk/bundle.json";
   }
 
   async pickImpulseResponse(): Promise<string | null> {
@@ -2908,3 +3314,18 @@ export class MockTransport implements Transport {
 }
 
 const MAIN_VIEW_KEY = "avdsp-mock-main-view";
+
+/** A path latency with nothing in it, at `rate`. */
+function zeroLatency(rate: number): PathLatency {
+  return {
+    rate_hz: rate,
+    chain_frames: 0,
+    chain_us: 0,
+    compensation_frames: 0,
+    compensation_us: 0,
+    alignment_frames: 0,
+    alignment_us: 0,
+    total_frames: 0,
+    total_us: 0,
+  };
+}

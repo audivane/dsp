@@ -252,6 +252,149 @@ fn bad_arguments_exit_with_code_2() {
     );
 }
 
+/// `process --config` checks a convolution item's shape as the daemon
+/// does: a matrix with an `ir_path` beside it, or an entry out of range,
+/// is refused with the same message.
+#[test]
+fn process_refuses_a_malformed_matrix_item() {
+    let dir = TempDir::new("matrix-shape");
+    run_ok(
+        &dir,
+        &[
+            "gen",
+            "white",
+            "--rate",
+            "44100",
+            "--seconds",
+            "0.02",
+            "--channels",
+            "2",
+            "in.wav",
+        ],
+    );
+    gen_white(&dir, "ir.wav", 16);
+    for (item, want) in [
+        (
+            r#"{"ir_path":"ir.wav","matrix":[{"in":0,"out":0,"ir_path":"ir.wav"}]}"#,
+            "convolution[0] has both ir_path and matrix",
+        ),
+        (
+            r#"{"matrix":[{"in":2,"out":0,"ir_path":"ir.wav"}]}"#,
+            "convolution[0].matrix[0]: in 2 / out 0 must be below 2",
+        ),
+        (
+            r#"{"matrix":[]}"#,
+            "convolution[0].matrix must have at least one entry",
+        ),
+    ] {
+        dir.write("chain.json", &format!(r#"{{"convolution":[{item}]}}"#));
+        let out = run(
+            &dir,
+            &[
+                "process",
+                "in.wav",
+                "out.wav",
+                "--config",
+                "chain.json",
+                "--format",
+                "f32",
+            ],
+        );
+        assert!(!out.status.success(), "{item} was accepted");
+        assert!(stderr(&out).contains(want), "{item}: {}", stderr(&out));
+    }
+}
+
+/// A chain from before the safety modes went: crossfeed `level` and the
+/// harmonics `series_makeup` routing.
+const LEGACY_CHAIN: &str = r#"{
+    "crossfeed": {"enabled": true, "mode": "bs2b_default", "level": "peak_safe"},
+    "harmonics": {"enabled": true, "routing": "series_makeup", "layers": [
+        {"kind": "chebyshev", "levels_db": [-30, -40, null, null, null, null, null, null],
+         "signs": ["+", "-", "+", "+", "+", "+", "+", "+"], "drive_db": 0, "amount": 1},
+        {"kind": "chebyshev", "levels_db": [-35, -45, null, null, null, null, null, null],
+         "signs": ["+", "-", "+", "+", "+", "+", "+", "+"], "drive_db": 0, "amount": 1}
+    ]}
+}"#;
+
+/// `process --config` reads a legacy chain itself (no daemon migration in
+/// between): `series_makeup` runs as `series`, the old `level` is ignored.
+#[test]
+fn process_reads_a_legacy_chain() {
+    let dir = TempDir::new("legacy-process");
+    run_ok(
+        &dir,
+        &[
+            "gen",
+            "white",
+            "--rate",
+            "48000",
+            "--seconds",
+            "0.05",
+            "--channels",
+            "2",
+            "in.wav",
+        ],
+    );
+    dir.write("chain.json", LEGACY_CHAIN);
+    run_ok(
+        &dir,
+        &[
+            "process",
+            "in.wav",
+            "out.wav",
+            "--config",
+            "chain.json",
+            "--format",
+            "f32",
+        ],
+    );
+    assert!(dir.path("out.wav").exists());
+}
+
+/// `ctl config set` parses the file before sending it: a legacy config goes
+/// out in the current form instead of being refused.
+#[test]
+fn config_set_sends_a_legacy_config_in_the_current_form() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    let dir = TempDir::new("legacy-config-set");
+    dir.write(
+        "config.json",
+        &format!(r#"{{"device": "hw:CARD=USB,DEV=0", "chain": {LEGACY_CHAIN}}}"#),
+    );
+    let socket = dir.path("ctl.sock");
+    let listener = UnixListener::bind(&socket).expect("bind the fake daemon");
+    let daemon = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let request: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let reply = serde_json::json!({"id": request["id"], "ok": null});
+        (&stream)
+            .write_all(format!("{reply}\n").as_bytes())
+            .unwrap();
+        request
+    });
+    let socket = socket.to_str().unwrap().to_owned();
+    let out = run_ok(
+        &dir,
+        &["ctl", "--socket", &socket, "config", "set", "config.json"],
+    );
+    assert!(
+        stdout(&out).contains("configuration applied"),
+        "{}",
+        stdout(&out)
+    );
+    let request = daemon.join().unwrap();
+    assert_eq!(request["method"], "set_config");
+    let chain = &request["params"]["chain"];
+    assert_eq!(chain["harmonics"]["routing"], "series", "{chain}");
+    assert!(chain["crossfeed"].get("level").is_none(), "{chain}");
+    assert_eq!(chain["crossfeed"]["mode"], "bs2b_default");
+}
+
 #[test]
 fn process_passthrough_is_bit_exact() {
     let dir = TempDir::new("passthrough");
@@ -294,6 +437,37 @@ fn process_passthrough_is_bit_exact() {
         data_chunk(&output),
         "24-bit passthrough must be byte-identical"
     );
+}
+
+/// The reported latency counts the upsampler's convolution block the live
+/// engine runs at the file's rate: 512 frames at 44.1 kHz with the default
+/// quantum, 1024 with quantum 2048, whatever `--block` the calls use.
+#[test]
+fn process_latency_follows_the_engine_block() {
+    let dir = TempDir::new("latency");
+    gen_white(&dir, "in.wav", 24);
+    let latency = |quantum: &str, block: &str| {
+        let output = run_ok(
+            &dir,
+            &[
+                "process",
+                "in.wav",
+                "out.wav",
+                "--upsample",
+                "2",
+                "--taps",
+                "4096",
+                "--quantum",
+                quantum,
+                "--block",
+                block,
+            ],
+        );
+        value(&stdout(&output), "latency")
+    };
+    let default = latency("1024", "1024");
+    assert_eq!(default, latency("1024", "100"));
+    assert_eq!(latency("2048", "1024") - default, 512.0 * 2.0);
 }
 
 #[test]

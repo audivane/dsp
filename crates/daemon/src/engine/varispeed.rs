@@ -15,13 +15,13 @@
 //! |---|---|---|
 //! | Install (enable, or a stage for a new rate) | restart at unity with zero history and a 5 ms source fade-in; the raw block fades out over 5 ms meanwhile (the stage's own delay keeps its output silent for ~6 ms, so the two barely overlap); the driver then ramps to the request | reset at the target, no fade (the next prime starts from there) |
 //! | Disable | the stage keeps playing until the driver has sized the next pull for a raw one (`VarispeedPort::raw_next`); then its output fades out over 5 ms, the stage retires, and the raw block fades in over 5 ms at the output, in the same period (the driver ends a stage call at the fade's end) | retire now |
-//! | DSP off (the processor defers the toggle) | the same fade-out, then the stage stays (stale) and the toggle applies; the raw block fades in | — |
-//! | Direct takeover, a rate it was not built for | untouched; the chains get the raw block | — |
-//! | Back to the DSP chain | restart at unity (no stale history plays), then the driver ramps to the request: after the DSP sink's own raw block, that block fades out while the stage fades in; otherwise under a source fade-in | — |
+//! | DSP off (the processor defers the toggle) | the same fade-out, then the stage stays (stale) and the toggle applies; the raw block fades in | - |
+//! | Direct takeover, a rate it was not built for | untouched; the chains get the raw block | - |
+//! | Back to the DSP chain | restart at unity (no stale history plays), then the driver ramps to the request: after the DSP sink's own raw block, that block fades out while the stage fades in; otherwise under a source fade-in | - |
 //! | Reopen or prime (`VarispeedPort::reset`), DSP reset | reset at the target (the driver's own fade covers it) | the same |
-//! | Underfeed | the source fades out over the last 5 ms before the gap (the slot holds 5 ms of source back, so the fade has frames even when the gap starts a call), and back in when frames arrive again | — |
+//! | Underfeed | the source fades out over the last 5 ms before the gap (the slot holds 5 ms of source back, so the fade has frames even when the gap starts a call), and back in when frames arrive again | - |
 //! | Keep pitch toggled (an install of the other kind) | the playing stage fades out over 5 ms (`StopKind::Switch`), then the new one starts at the driver's speed from silence with its source faded in: one gap, the new stage's delay (fade, prime, fade). Into the stretch it starts where varispeed's fade ended (the source that stage had taken but not played is carried over); toggled back before the fade starts, nothing changes | replace now |
-//! | Any stop of the stretch with a follower's alignment delay (which follows the stretch) | after its fade, silence for the delay's length before the stop applies, so the delay has played the fade out when its history restarts | — |
+//! | Any stop of the stretch with a follower's alignment delay (which follows the stretch) | after its fade, silence for the delay's length before the stop applies, so the delay has played the fade out when its history restarts | - |
 //!
 //! **Keep pitch** puts the key-locked stretch (`dsp_core::tempo`) in the slot
 //! instead of varispeed's resampler ([`Stage`]): the same pull contract,
@@ -1636,6 +1636,7 @@ impl VarispeedRt {
             step: st.step().bits(),
             limit: st.speed_limit(),
             slowest: self.slowest_speed(),
+            fastest: self.peak_until_settled(),
         })
     }
 

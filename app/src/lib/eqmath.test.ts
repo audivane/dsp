@@ -7,6 +7,7 @@ import {
   channelShapeDb,
   channelsMatch,
   design,
+  freeBandFreq,
   magDb,
   profileAutoPreampDb,
   profileChannelResponseDb,
@@ -145,5 +146,23 @@ describe("layered EQ response", () => {
     const rExp = responseDb([bR], 0.5, 48000, freqs);
     profileChannelResponseDb(migrated, 0, 48000, freqs).forEach((v, i) => expect(v).toBeCloseTo(lExp[i], 10));
     profileChannelResponseDb(migrated, 1, 48000, freqs).forEach((v, i) => expect(v).toBeCloseTo(rExp[i], 10));
+  });
+});
+
+describe("freeBandFreq", () => {
+  const at = (...fs: number[]): Band[] => fs.map((f) => ({ kind: "peaking", freq_hz: f, gain_db: 0, q: 1, enabled: true }));
+  it("starts at 1 kHz with no bands", () => {
+    expect(freeBandFreq([])).toBe(1000);
+  });
+  it("puts the next band in the widest gap, not on top of the last one", () => {
+    // 20 Hz to 1 kHz is the widest gap (5.6 octaves): its middle is 141 Hz.
+    expect(freeBandFreq(at(1000))).toBe(141);
+    const bands = at(1000);
+    for (let i = 0; i < 6; i++) bands.push(...at(freeBandFreq(bands)));
+    const fs = bands.map((b) => b.freq_hz);
+    expect(new Set(fs).size).toBe(fs.length);
+  });
+  it("fills an inner gap when it is the widest", () => {
+    expect(freeBandFreq(at(30, 50, 15000, 19000))).toBe(866);
   });
 });

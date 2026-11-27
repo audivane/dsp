@@ -1,4 +1,4 @@
-//! `avdsp render` — play a WAV file through the varispeed stage offline:
+//! `avdsp render`: play a WAV file through the varispeed stage offline:
 //! tempo and pitch change together by the speed, the rate stays the same.
 
 use crate::RenderArgs;

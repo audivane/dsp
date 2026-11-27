@@ -11,23 +11,28 @@
 use crate::api::{Engine, EngineError};
 use crate::control::ab_measure::{Measurement, Outcome};
 use crate::control::config::{self, ConfigStore};
+use crate::control::device_identity;
 use crate::control::graph::{Facts, GraphWatcher};
 use crate::control::mpris::MprisWatcher;
 use crate::control::passthrough::{self, SinkView, StreamView};
 use crate::control::persist::Persister;
 use crate::control::presets::{self, PresetError, PresetStore};
 use crate::control::volume_guard::{self, EPS_DB, LevelGuard, VolumeEventLog};
+use audivane_io_alsa::identity::{CardFacts, Roots};
 use audivane_io_pw::SinkVolumeRequest;
 use audivane_protocol::ipc::{
     AB_MEASURE_DEFAULT_SECONDS, AB_MEASURE_SECONDS, AbConfig, AbSide, AbStatus, BlockReason, Call,
-    DeviceInfo, EngineConfig, EngineState, FollowerConfig, GuardMode, LevelMatch, Meters,
-    NowPlaying, OutputsStatus, Passthrough, Preset, PresetInfo, PresetState, ResponseWindowRequest,
-    RoutingMode, RpcError, SinkChoice, SinkVolumePolicy, Spectrum, Status, StreamInfo, TiltStatus,
-    Topic, VarispeedConfig, VarispeedStatus, VolumeConfig, VolumeSource, VolumeStatus,
+    DeviceAssignment, DeviceInfo, EngineConfig, EngineState, FollowerConfig, GuardMode, LevelMatch,
+    Meters, NowPlaying, OutputsStatus, PartPresetState, Passthrough, Preset, PresetInfo,
+    PresetPart, PresetState, ResponseWindowRequest, RoutingMode, RpcError, SinkChoice,
+    SinkVolumePolicy, Spectrum, Status, StreamInfo, TiltStatus, Topic, UnresolvedDevice,
+    VarispeedConfig, VarispeedStatus, VolumeConfig, VolumeSource, VolumeStatus,
 };
-use audivane_protocol::{ChainConfig, RateRatio, TiltConfig, UpsamplerConfig, resolve_rate_ratio};
+use audivane_protocol::{
+    ChainConfig, HarmonicsConfig, RateRatio, TiltConfig, UpsamplerConfig, resolve_rate_ratio,
+};
 use serde_json::Value;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// Rate-specific bounds of an enabled tilt (cheap, no design). Recompute from
@@ -167,9 +172,10 @@ pub struct Service {
     store: Option<Arc<ConfigStore>>,
     /// Coalesced writer for `config.json` (None when there is no store).
     persister: Option<Arc<Persister>>,
-    /// Chain of the active preset, as last loaded/saved. `Status.preset.modified`
-    /// compares chain A with it, so `Status` never has to read the preset dir.
-    active_preset_chain: Mutex<Option<(String, ChainConfig)>>,
+    /// The active presets (global and per part), as last loaded/saved.
+    /// `Status.preset.modified` and `Status.part_presets` compare chain A
+    /// with them, so `Status` never has to read the preset dir.
+    preset_cache: Mutex<PresetCache>,
     graph: Option<Arc<GraphWatcher>>,
     mpris: Option<Arc<MprisWatcher>>,
     shutdown: Arc<ShutdownFlag>,
@@ -178,16 +184,23 @@ pub struct Service {
     /// Current A/B side, as last commanded. The engine snapshot is preferred
     /// when it reports one.
     ab_current: Mutex<AbSide>,
+    /// A blind test runs (`ab_blind`): status hides the side. Not persisted.
+    ab_blind: AtomicBool,
     /// Bumped on every config change (any client or file load); the event
     /// pump uses it to push `Event::Config`.
     config_gen: AtomicU64,
     /// Bumped whenever the preset directory changes through the daemon.
     presets_gen: AtomicU64,
+    /// Measurement playback (`measure_play`).
+    measurer: super::measure::Measurer,
     /// Recently measured upsampler responses, keyed by design and source rate.
     /// Reopening the view is instant; measuring a long kernel is expensive.
     /// Each entry keeps the measured impulse, so zoom windows are evaluated
     /// from it without measuring again.
     upsampler_cache: Mutex<Vec<UpsamplerCacheEntry>>,
+    /// Recent convolution response curves (`conv_response`), per loaded IRs
+    /// and rate.
+    conv_response_cache: super::conv_response::ResponseCache,
     /// Last analytic A/B offset computed from the config: chain A, chain B,
     /// rate and the result.
     ab_offset_cache: Mutex<Option<AbOffsetCacheEntry>>,
@@ -202,12 +215,30 @@ pub struct Service {
     overload: Mutex<super::overload::Supervisor>,
     /// Bumped on every fallback step, for `Event::Overload`.
     overload_gen: AtomicU64,
+    /// The per-rate upsampler plan the engine holds, what it was made from,
+    /// and its status rows ([`super::cpu_budget::plan_rates`]).
+    rate_plan: Mutex<RatePlanState>,
+    /// The source rate last seen playing on the DSP chain (0: none yet):
+    /// admission prices that landing while nothing plays.
+    last_source_rate: AtomicU32,
     /// The running measured level match (`ab_measure`), if any.
     ab_measure: Mutex<Option<MeasureRun>>,
     /// The last measurement epoch handed to the engine.
     ab_measure_epoch: AtomicU32,
     /// Why the last measurement ended without a lock ([`AbStatus::measure_error`]).
     ab_measure_error: Mutex<Option<String>>,
+    /// The cards as last looked at, and the outputs held closed then
+    /// ([`super::device_identity`]).
+    identity: Mutex<IdentityState>,
+}
+
+/// What [`Service::identity_tick`] saw last.
+#[derive(Default)]
+struct IdentityState {
+    roots: Roots,
+    /// The cards at the last look (`None`: look again).
+    cards: Option<Vec<CardFacts>>,
+    unresolved: Vec<UnresolvedDevice>,
 }
 
 /// A running `ab_measure`: the gating state and the pair it measures
@@ -288,7 +319,10 @@ type AbOffsetCacheEntry = (
 use audivane_dsp_core::ab_level::{AbGains, AbLevel};
 use audivane_dsp_core::resample::MeasuredUpsampler;
 
-type UpsamplerCacheEntry = ((UpsamplerConfig, u32), Arc<MeasuredUpsampler>);
+/// Keyed by design, source rate and the engine's largest input block there
+/// (the latency it reports counts that block).
+type UpsamplerCacheKey = (UpsamplerConfig, u32, usize);
+type UpsamplerCacheEntry = (UpsamplerCacheKey, Arc<MeasuredUpsampler>);
 
 /// How many measured responses to keep. Reopening a view usually replays one
 /// of a handful of source rates.
@@ -309,12 +343,18 @@ impl Service {
         let persister = store
             .as_ref()
             .map(|store| Persister::new(Arc::clone(store)));
-        let active_preset_chain = load_active_preset(store.as_ref(), &config);
+        let preset_cache = PresetCache::default().refreshed(store.as_ref(), &config);
         // The engine runs the startup config already: judged like an
         // accepted edit, so it can count as the last one that ran fine.
         let mut overload = super::overload::Supervisor::default();
         overload.seed(&config, engine.applied_generation());
-        Arc::new(Self {
+        let seed_upsampler = config.dsp_enabled
+            && !matches!(
+                config.chain.upsampler.target,
+                audivane_protocol::RateTarget::Off
+            );
+        let startup_cfg = seed_upsampler.then(|| config.clone());
+        let service = Arc::new(Self {
             engine,
             instance: new_instance_id(),
             levels: Mutex::new(LevelRevision {
@@ -326,26 +366,36 @@ impl Service {
             config: Mutex::new(config),
             store,
             persister,
-            active_preset_chain: Mutex::new(active_preset_chain),
+            preset_cache: Mutex::new(preset_cache),
             graph,
             mpris,
             shutdown,
             gate: Mutex::new(DispatchGate::default()),
             gate_cv: Condvar::new(),
             ab_current: Mutex::new(AbSide::A),
+            ab_blind: AtomicBool::new(false),
             config_gen: AtomicU64::new(0),
             presets_gen: AtomicU64::new(0),
+            measurer: super::measure::Measurer::default(),
             upsampler_cache: Mutex::new(Vec::new()),
+            conv_response_cache: Default::default(),
             ab_offset_cache: Mutex::new(None),
             tilt_design_cache: Mutex::new(Vec::new()),
             volume_log: Arc::new(VolumeEventLog::default()),
             sink_guard: Mutex::new(LevelGuard::default()),
             overload: Mutex::new(overload),
             overload_gen: AtomicU64::new(0),
+            rate_plan: Mutex::new(RatePlanState::default()),
+            last_source_rate: AtomicU32::new(0),
             ab_measure: Mutex::new(None),
             ab_measure_epoch: AtomicU32::new(0),
             ab_measure_error: Mutex::new(None),
-        })
+            identity: Mutex::new(IdentityState::default()),
+        });
+        if let Some(cfg) = startup_cfg {
+            service.sync_rate_plan(&cfg);
+        }
+        service
     }
 
     pub fn engine(&self) -> &Arc<dyn Engine> {
@@ -365,10 +415,7 @@ impl Service {
     }
 
     /// Look up a measured response and move it to the front (most recent).
-    fn cached_upsampler_response(
-        &self,
-        key: &(UpsamplerConfig, u32),
-    ) -> Option<Arc<MeasuredUpsampler>> {
+    fn cached_upsampler_response(&self, key: &UpsamplerCacheKey) -> Option<Arc<MeasuredUpsampler>> {
         let mut cache = self
             .upsampler_cache
             .lock()
@@ -380,11 +427,7 @@ impl Service {
         Some(measured)
     }
 
-    fn store_upsampler_response(
-        &self,
-        key: (UpsamplerConfig, u32),
-        measured: Arc<MeasuredUpsampler>,
-    ) {
+    fn store_upsampler_response(&self, key: UpsamplerCacheKey, measured: Arc<MeasuredUpsampler>) {
         let mut cache = self
             .upsampler_cache
             .lock()
@@ -502,7 +545,7 @@ impl Service {
                 // Normalized and validated in `apply_config`, after the live
                 // level has replaced the incoming one.
                 self.apply_config(cfg)?;
-                Ok(Value::Null)
+                self.conv_notes_reply()
             }
             Call::SetDcBlock(dc_block) => {
                 self.edit(|cfg| cfg.chain.dc_block = dc_block)?;
@@ -518,7 +561,11 @@ impl Service {
             }
             Call::SetConvolution(conv) => {
                 self.edit(|cfg| cfg.chain.convolution = conv)?;
-                Ok(Value::Null)
+                self.conv_notes_reply()
+            }
+            Call::SetConvolutionSafety(safety) => {
+                self.edit(|cfg| cfg.convolution_safety = safety)?;
+                self.conv_notes_reply()
             }
             Call::SetUpsampler(upsampler) => {
                 self.edit(|cfg| cfg.chain.upsampler = upsampler)?;
@@ -531,6 +578,105 @@ impl Service {
             Call::SetHarmonics(harmonics) => {
                 self.edit(|cfg| cfg.chain.harmonics = harmonics)?;
                 Ok(Value::Null)
+            }
+            Call::HarmonicsPresets => to_value(&audivane_protocol::harmonics_presets()),
+            Call::HarmonicsSystems => to_value(&audivane_protocol::harmonics_systems()),
+            // A blind test: nothing that could give the side away (the
+            // engine is not even asked, so its analysis stops).
+            Call::HarmonicsLive if self.ab_blind_active(&self.config()) => {
+                to_value(&crate::engine::harmonics_live::empty_frame(
+                    audivane_protocol::ipc::HarmonicsLiveState::Hidden,
+                    0,
+                    0,
+                ))
+            }
+            Call::HarmonicsLive => match self.engine.harmonics_live() {
+                Some(frame) => to_value(&frame),
+                None => Err(RpcError {
+                    code: RpcError::BAD_STATE,
+                    message: "the harmonics live view needs the audio engine".into(),
+                }),
+            },
+            Call::HarmonicsReadout {
+                config,
+                sweep,
+                sweep_freq_hz,
+                sweep_level_dbfs,
+            } => {
+                // Runs without the mutation lock: it only reads the config
+                // and simulates the stage's slow layers (milliseconds when
+                // cached; a few hundred milliseconds for a tape layer not
+                // seen yet, on up to four threads).
+                let config = match config {
+                    Some(c) => {
+                        config::validate_harmonics("config", &c).map_err(invalid_params)?;
+                        c
+                    }
+                    None => self.config().chain.harmonics.unwrap_or(HarmonicsConfig {
+                        enabled: false,
+                        layers: Vec::new(),
+                        ..Default::default()
+                    }),
+                };
+                let snap = self.engine.snapshot();
+                let rate = if snap.output_rate > 0 {
+                    f64::from(snap.output_rate)
+                } else {
+                    96_000.0
+                };
+                let readout = if sweep {
+                    audivane_dsp_core::harmonics::readout_sweeps(
+                        &config,
+                        rate,
+                        audivane_dsp_core::harmonics::ReadoutSweeps {
+                            level_sweep_hz: sweep_freq_hz,
+                            freq_sweep_dbfs: sweep_level_dbfs,
+                        },
+                    )
+                } else {
+                    audivane_dsp_core::harmonics::readout(&config, rate, false)
+                }
+                .map_err(|e| invalid_params(e.to_string()))?;
+                to_value(&readout)
+            }
+            Call::HarmonicsSpectrum {
+                config,
+                freq_hz,
+                level_dbfs,
+                traces,
+            } => {
+                // As the readout: without the mutation lock, read-only
+                // (milliseconds cached or without tape layers; up to a few
+                // tenths of a second for tape layers at 768 kHz).
+                let cfg = self.config();
+                let config = match config {
+                    Some(c) => {
+                        config::validate_harmonics("config", &c).map_err(invalid_params)?;
+                        c
+                    }
+                    None => cfg.chain.harmonics.clone().unwrap_or(HarmonicsConfig {
+                        enabled: false,
+                        layers: Vec::new(),
+                        ..Default::default()
+                    }),
+                };
+                let snap = self.engine.snapshot();
+                let rate = if snap.output_rate > 0 {
+                    f64::from(snap.output_rate)
+                } else {
+                    96_000.0
+                };
+                let output = &cfg.chain.output;
+                let word = audivane_protocol::ipc::HarmonicsSpectrumWord {
+                    bits: snap.dither_bits.unwrap_or(output.bits),
+                    dither: output.dither,
+                    headroom_db: output.headroom_db,
+                };
+                let spectrum = audivane_dsp_core::harmonics::spectrum(
+                    &config, rate, freq_hz, level_dbfs, &traces, word,
+                )
+                .map_err(|e| invalid_params(e.to_string()))?;
+                to_value(&spectrum)
             }
             Call::SetLimiter(limiter) => {
                 self.edit(|cfg| cfg.chain.limiter = limiter)?;
@@ -554,33 +700,46 @@ impl Service {
                 self.edit(|cfg| cfg.rate = rate)?;
                 Ok(Value::Null)
             }
-            Call::SetDevice { device } => {
+            Call::SetDevice {
+                device,
+                output_channels,
+            } => {
                 let device = if device.trim().is_empty() {
                     config::default_playback_device().unwrap_or(device)
                 } else {
                     device
                 };
-                self.edit(|cfg| cfg.device = device)?;
+                if let Some(pair) = output_channels {
+                    if let Some(e) = pair.error() {
+                        return Err(invalid_params(e));
+                    }
+                    // Known for the device that is open (or was probed).
+                    if let Some(caps) = self.engine.snapshot().device_caps
+                        && caps.device == device
+                        && let Some(e) = pair.fit_error(&device, caps.channels_max)
+                    {
+                        return Err(invalid_params(e));
+                    }
+                }
+                self.edit(|cfg| {
+                    // The pair belongs to the device: another device starts
+                    // from its first two channels unless one is given.
+                    if output_channels.is_some() || cfg.device != device {
+                        cfg.output_channels = output_channels;
+                    }
+                    cfg.device = device;
+                })?;
                 Ok(Value::Null)
             }
             Call::SetAb(ab) => {
                 let (status, notes) = self.set_ab(ab)?;
-                let mut value = to_value(&status)?;
-                if !notes.is_empty() {
-                    // Additive: clients that only want `AbStatus` ignore it.
-                    if let Some(object) = value.as_object_mut() {
-                        object.insert(
-                            "notes".into(),
-                            Value::Array(notes.into_iter().map(Value::String).collect()),
-                        );
-                    }
-                }
-                Ok(value)
+                with_notes(to_value(&status)?, notes)
             }
             Call::AbSelect { side, crossfade_ms } => {
                 let status = self.ab_select(side, crossfade_ms)?;
                 to_value(&status)
             }
+            Call::AbBlind { enabled } => to_value(&self.set_ab_blind(enabled)?),
             Call::AbMeasure {
                 max_seconds,
                 cancel,
@@ -615,22 +774,53 @@ impl Service {
                 enabled,
                 trim_ms,
                 volume_db,
-            } => self.set_follower(device, remove, enabled, trim_ms, volume_db),
+                output_channels,
+                follow_volume,
+                chain_patch,
+                period_ms,
+            } => self.set_follower(
+                device,
+                remove,
+                FollowerEdit {
+                    enabled,
+                    trim_ms,
+                    volume_db,
+                    output_channels,
+                    follow_volume,
+                    chain_patch,
+                    period_ms,
+                },
+            ),
             Call::ListStreams => to_value(&self.streams()),
             Call::ListPresets => to_value(&self.list_presets()?),
-            Call::GetPreset { name } => to_value(&self.get_preset(&name)?),
-            Call::SavePreset { name, overwrite } => to_value(&self.save_preset(&name, overwrite)?),
-            Call::LoadPreset { name } => {
-                self.load_preset(&name)?;
+            Call::GetPreset { name, part } => to_value(&self.get_preset(&name, part)?),
+            Call::SavePreset {
+                name,
+                overwrite,
+                part,
+                parts,
+            } => to_value(&self.save_preset(&name, overwrite, part, parts)?),
+            Call::LoadPreset { name, part } => {
+                self.load_preset(&name, part)?;
+                self.conv_notes_reply()
+            }
+            Call::BlankPreset { part } => {
+                self.blank_preset(part)?;
+                self.conv_notes_reply()
+            }
+            Call::DeletePreset { name, part } => {
+                self.delete_preset(&name, part)?;
                 Ok(Value::Null)
             }
-            Call::DeletePreset { name } => {
-                self.delete_preset(&name)?;
-                Ok(Value::Null)
+            Call::RenamePreset { from, to, part } => {
+                to_value(&self.rename_preset(&from, &to, part)?)
             }
-            Call::RenamePreset { from, to } => to_value(&self.rename_preset(&from, &to)?),
             Call::ImportApo { name, text } => to_value(&self.import_apo(&name, &text)?),
             Call::ListDevices => to_value(&self.devices()),
+            Call::AssignDevices { assignments } => {
+                self.assign_devices(assignments)?;
+                Ok(Value::Null)
+            }
             Call::Route { target, sink } => {
                 self.route(target, sink)?;
                 Ok(Value::Null)
@@ -648,6 +838,55 @@ impl Service {
             Call::SelfTest => {
                 let result = self.engine.selftest().map_err(engine_error)?;
                 to_value(&result)
+            }
+            Call::MeasurePlay(req) => {
+                let status = self
+                    .measurer
+                    .play(Arc::clone(&self.engine), self.config(), req)
+                    .map_err(engine_error)?;
+                to_value(&status)
+            }
+            Call::MeasureStop => to_value(&self.measurer.stop()),
+            Call::MeasureStatus => to_value(&self.measurer.status()),
+            Call::BundleLoad { path } => self.bundle_load(&path),
+            Call::BundleUnload => {
+                let notes = self.bundle_unload()?;
+                if notes.is_empty() {
+                    Ok(Value::Null)
+                } else {
+                    with_notes(Value::Object(serde_json::Map::new()), notes)
+                }
+            }
+            Call::BundleShow => to_value(&self.calibration_status(&self.config())),
+            Call::BundleAb { path } => {
+                let (status, notes) = self.bundle_ab(path.as_deref())?;
+                with_notes(to_value(&status)?, notes)
+            }
+            Call::BundleGain { device, gain_db } => self.bundle_gain(device.as_deref(), gain_db),
+            Call::ConvResponse { side, device } => {
+                // Without the mutation lock: it only reads the config, and
+                // the engine's IR cache holds the files at the graph rate.
+                let cfg = self.config();
+                let (chain, side, device) =
+                    super::conv_response::chain_for(&cfg, side, device.as_deref())
+                        .map_err(invalid_params)?;
+                let snap = self.engine.snapshot();
+                let rate = if snap.graph_rate > 0 {
+                    snap.graph_rate
+                } else {
+                    cfg.rate.default_rate.max(8_000)
+                };
+                let loaded = self
+                    .engine
+                    .load_conv(&chain.convolution, rate)
+                    .map_err(engine_error)?;
+                let computed = self
+                    .conv_response_cache
+                    .get(loaded, rate, crate::engine::DEFAULT_CHANNELS)
+                    .map_err(invalid_params)?;
+                to_value(&super::conv_response::reply(
+                    &chain, &computed, rate, side, device,
+                ))
             }
             Call::UpsamplerResponse {
                 config,
@@ -720,13 +959,21 @@ impl Service {
                     let nyquist_out = f64::from(source_rate) * f64::from(ratio.up) / 2.0;
                     validate_response_window(window, nyquist_out).map_err(invalid_params)?;
                 }
-                let key = (config.clone(), source_rate);
+                // The block the engine builds its chain with at this rate:
+                // the measured latency counts it, as the live one does.
+                let max_block = audivane_io_pw::scaled_quantum(active.quantum, source_rate)
+                    .clamp(512, 8192) as usize;
+                let key = (config.clone(), source_rate, max_block);
                 let measured = match self.cached_upsampler_response(&key) {
                     Some(measured) => measured,
                     None => {
                         let measured = Arc::new(
-                            audivane_dsp_core::resample::measure_upsampler(&config, source_rate)
-                                .map_err(invalid_params)?,
+                            audivane_dsp_core::resample::measure_upsampler_at(
+                                &config,
+                                source_rate,
+                                max_block,
+                            )
+                            .map_err(invalid_params)?,
                         );
                         self.store_upsampler_response(key, Arc::clone(&measured));
                         measured
@@ -734,13 +981,11 @@ impl Service {
                 };
                 let mut response = measured.with_window(window);
                 if let (Some(plan), Some(wire)) = (measured.plan(), response.plan.as_mut()) {
-                    let max_block = audivane_io_pw::scaled_quantum(active.quantum, source_rate)
-                        .clamp(512, 8192) as usize;
                     wire.cpu_load = plan
                         .callback
                         .seconds(super::cpu_budget::machine(), source_rate, max_block)
                         .ok()
-                        .map(|secs| 2.0 * secs)
+                        .map(|secs| super::cpu_budget::thread_load(secs, &active))
                         .filter(|l| l.is_finite());
                 }
                 response.device_landings = device_landings;
@@ -756,9 +1001,30 @@ impl Service {
                 target,
                 source_rate,
             } => {
-                // Cheap (no kernel designed): runs without the mutation lock.
+                // Runs without the mutation lock. The check itself designs
+                // no kernel; where the device lands each rate does (the
+                // driver's ladder keeps only the ratios the design builds
+                // at, an automatic length searched at each), so a design
+                // the check refuses is answered without it: its refusals
+                // do not depend on the landings.
                 let active = self.config();
                 let output = self.effective_output(&active);
+                let check = |landings: Option<&[(u32, RateRatio)]>| {
+                    config::check_design(
+                        &design,
+                        target,
+                        source_rate,
+                        &active,
+                        &output,
+                        super::cpu_budget::machine(),
+                        landings,
+                    )
+                };
+                let caps = self.engine.snapshot().device_caps;
+                let unplaced = check(None);
+                if !unplaced.errors.is_empty() || caps.is_none() {
+                    return to_value(&unplaced).map(Dispatch::Value);
+                }
                 // On a probed device, plan each rate where the engine would
                 // open it, not at the target's own ratio.
                 let up = UpsamplerConfig {
@@ -766,20 +1032,8 @@ impl Service {
                     preset: None,
                     design: Some(design.clone()),
                 };
-                let landings = crate::engine::preview_landings(
-                    &active,
-                    &up,
-                    self.engine.snapshot().device_caps.as_ref(),
-                );
-                to_value(&config::check_design(
-                    &design,
-                    target,
-                    source_rate,
-                    &active,
-                    &output,
-                    super::cpu_budget::machine(),
-                    landings.as_deref(),
-                ))
+                let landings = crate::engine::preview_landings(&active, &up, caps.as_ref());
+                to_value(&check(landings.as_deref()))
             }
             Call::Meters => to_value(&self.meters()),
             Call::ReleaseDevice => {
@@ -936,12 +1190,36 @@ impl Service {
         &self,
         device: String,
         remove: bool,
-        enabled: Option<bool>,
-        trim_ms: Option<f64>,
-        volume_db: Option<f64>,
+        edit: FollowerEdit,
     ) -> Result<Value, RpcError> {
+        let FollowerEdit {
+            enabled,
+            trim_ms,
+            volume_db,
+            output_channels,
+            follow_volume,
+            chain_patch,
+            period_ms,
+        } = edit;
+        if let Some(pair) = output_channels {
+            if let Some(e) = pair.error() {
+                return Err(invalid_params(e));
+            }
+            // Known once the follower has opened its device.
+            let max = self.engine.outputs().and_then(|o| {
+                o.followers
+                    .iter()
+                    .find(|f| f.device == device)
+                    .map(|f| f.device_channels_max)
+            });
+            if let Some(e) = max.and_then(|m| pair.fit_error(&device, m)) {
+                return Err(invalid_params(e));
+            }
+        }
         let _mutation = self.lock_mutation();
-        let mut outputs = self.config().outputs;
+        let current = self.config();
+        let master_db = self.master_level_db(&current);
+        let mut outputs = current.outputs;
         let at = outputs.followers.iter().position(|f| f.device == device);
         match (at, remove) {
             (None, true) => {
@@ -962,13 +1240,49 @@ impl Service {
                 if let Some(t) = trim_ms {
                     f.trim_ms = t;
                 }
+                // Following, its level is relative to the master's: set (or
+                // turned on) now, against the master's level now; turned
+                // off, it keeps the level it plays at.
+                let was = f.follow_volume;
+                let follow = follow_volume.unwrap_or(was);
+                if was && !follow && volume_db.is_none() {
+                    f.volume_db = crate::engine::follower::followed_level_db(f, master_db);
+                }
                 if let Some(v) = volume_db {
                     f.volume_db = v;
+                }
+                if let Some(p) = output_channels {
+                    f.output_channels = Some(p);
+                }
+                f.follow_volume = follow;
+                f.follow_ref_db = match (follow, was && volume_db.is_none()) {
+                    (false, _) => None,
+                    (true, true) => f.follow_ref_db,
+                    (true, false) => Some(master_db),
+                };
+                if chain_patch.is_some() {
+                    f.chain_patch = super::follower_chain::normalise(chain_patch);
+                }
+                // 0: the default period again.
+                if let Some(p) = period_ms {
+                    f.period_ms = (p != 0.0).then_some(p);
                 }
             }
         }
         let cfg = self.edit_locked(|cfg| cfg.outputs = outputs, None)?;
         to_value(&self.outputs_status(&cfg))
+    }
+
+    /// The master's level as its DAC plays it (the effective volume, after
+    /// the hardware's quantization: what a following follower tracks), or
+    /// its configured level before the engine reports one.
+    fn master_level_db(&self, cfg: &EngineConfig) -> f64 {
+        self.engine
+            .volume_state()
+            .0
+            .map(|v| v.volume_db)
+            .filter(|v| v.is_finite())
+            .unwrap_or_else(|| crate::engine::volume::target_db(&cfg.volume))
     }
 
     fn outputs_status(&self, cfg: &EngineConfig) -> OutputsStatus {
@@ -1004,6 +1318,16 @@ impl Service {
         cfg.volume.volume_db = current.volume.volume_db;
         cfg.volume.balance_db = current.volume.balance_db;
         cfg.volume.muted = current.volume.muted;
+        // The room calibration is the daemon's (`bundle_load`,
+        // `bundle_unload`): a whole config keeps it, its record following
+        // what the config does to the calibrated followers.
+        cfg.calibration = current.calibration.clone();
+        super::calibration::follow_edits(&mut cfg);
+        // So are the outputs' identities: a device the client kept keeps
+        // its identity, one it changed takes the new card's.
+        let cards = self.cards_if(device_identity::devices_changed(&current, &cfg));
+        device_identity::carry(&current, &mut cfg, &cards);
+        let identity = self.reconcile_edit(&current, &mut cfg, cards);
         // Only then normalize and validate: the ignored fields are not
         // checked, the ones that apply are. A side B the client sets must
         // apply to its chain A (normalizing would turn A/B off instead).
@@ -1018,33 +1342,18 @@ impl Service {
         self.adopt_sink_levels(&current, &mut cfg);
         // Chain B is normalized by the caller; keep this a hard invariant.
         config::normalize_config(&mut cfg);
-        self.engine_apply(&cfg)?;
-        let preloaded = match &cfg.active_preset {
-            Some(name) => {
-                let already_cached = self
-                    .active_preset_chain
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .as_ref()
-                    .is_some_and(|(cached, _)| cached == name);
-                if already_cached {
-                    None
-                } else {
-                    Some(load_active_preset(self.store.as_ref(), &cfg))
-                }
-            }
-            None => Some(None),
-        };
+        self.engine_apply_identified(&cfg, identity)?;
+        // Presets the new config names but the cache lacks are read now,
+        // outside the config lock.
+        let cache = self
+            .lock_presets()
+            .clone()
+            .refreshed(self.store.as_ref(), &cfg);
         {
             let mut guard = self.lock_config();
             *guard = cfg.clone();
             self.note_levels(&guard);
-            if let Some(entry) = preloaded {
-                *self
-                    .active_preset_chain
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = entry;
-            }
+            *self.lock_presets() = cache;
         }
         *self.ab_current.lock().unwrap_or_else(|e| e.into_inner()) = AbSide::A;
         self.apply_routing_locked(&cfg);
@@ -1066,7 +1375,7 @@ impl Service {
     fn edit_locked<F>(
         &self,
         edit: F,
-        preset_cache: Option<(String, ChainConfig)>,
+        preset_cache: Option<Preset>,
     ) -> Result<EngineConfig, RpcError>
     where
         F: FnOnce(&mut EngineConfig),
@@ -1074,6 +1383,14 @@ impl Service {
         let old = self.config();
         let mut next = old.clone();
         edit(&mut next);
+        super::calibration::follow_edits(&mut next);
+        let identity = if device_identity::outputs_changed(&old, &next) {
+            let cards = self.cards_if(true);
+            device_identity::fill(&old, &mut next, &cards);
+            self.reconcile_edit(&old, &mut next, cards)
+        } else {
+            None
+        };
         self.adopt_sink_levels(&old, &mut next);
         // Normalize before validating: chain B must follow A, never make a
         // chain A edit fail because chain B still has the old upsampler.
@@ -1087,16 +1404,13 @@ impl Service {
         }
         config::validate(&next).map_err(invalid_params)?;
         self.validate_live(&old, &next)?;
-        self.engine_apply(&next)?;
+        self.engine_apply_identified(&next, identity)?;
         {
             let mut guard = self.lock_config();
             *guard = next.clone();
             self.note_levels(&guard);
-            if let Some(entry) = preset_cache {
-                *self
-                    .active_preset_chain
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(entry);
+            if let Some(preset) = preset_cache {
+                self.lock_presets().set(preset.part, Some(preset));
             }
         }
         // A level-only edit (a slew step, the desktop's volume keys) leaves
@@ -1109,20 +1423,315 @@ impl Service {
         Ok(next)
     }
 
+    // ------------------------------------------------------------ device identity
+
+    /// Read the cards from somewhere else than `/proc/asound` and `/sys`
+    /// (tests).
+    pub fn set_identity_roots(&self, roots: Roots) {
+        let mut state = self.lock_identity();
+        state.roots = roots;
+        state.cards = None;
+    }
+
+    fn lock_identity(&self) -> MutexGuard<'_, IdentityState> {
+        self.identity.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn scan_cards(&self) -> Vec<CardFacts> {
+        let roots = self.lock_identity().roots.clone();
+        audivane_io_alsa::identity::scan_cards(&roots)
+    }
+
+    /// The cards now when `needed`, else none (nothing to look up).
+    fn cards_if(&self, needed: bool) -> Vec<CardFacts> {
+        if needed {
+            self.scan_cards()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// After an edit that changed the outputs' devices: find them among
+    /// the cards (renaming none normally, since each just took its card's
+    /// identity) and say what to pin. `None` when nothing was looked at.
+    fn reconcile_edit(
+        &self,
+        old: &EngineConfig,
+        next: &mut EngineConfig,
+        cards: Vec<CardFacts>,
+    ) -> Option<(device_identity::Outcome, Vec<CardFacts>)> {
+        if !device_identity::outputs_changed(old, next) {
+            return None;
+        }
+        let outcome = device_identity::reconcile(next, &cards);
+        for note in &outcome.notes {
+            log::info!("{note}");
+        }
+        Some((outcome, cards))
+    }
+
+    /// [`Self::engine_apply`], with the pins of a reconcile in place first
+    /// (the engine checks them when it opens a device); a failure leaves
+    /// the pins to the next look at the cards.
+    fn engine_apply_identified(
+        &self,
+        cfg: &EngineConfig,
+        identity: Option<(device_identity::Outcome, Vec<CardFacts>)>,
+    ) -> Result<(), RpcError> {
+        let Some((outcome, cards)) = identity else {
+            return self.engine_apply(cfg);
+        };
+        audivane_io_alsa::identity::set_pins(outcome.pins);
+        let applied = self.engine_apply(cfg);
+        let mut state = self.lock_identity();
+        if applied.is_ok() {
+            state.cards = Some(cards);
+            state.unresolved = outcome.unresolved;
+        } else {
+            state.cards = None;
+        }
+        applied
+    }
+
+    /// One look at the cards (the daemon's device thread, twice a second):
+    /// when they changed, find every output's device again and rename the
+    /// outputs to the cards that are theirs.
+    pub fn identity_tick(&self) {
+        let cards = self.scan_cards();
+        if self.lock_identity().cards.as_ref() == Some(&cards) {
+            return;
+        }
+        let _mutation = self.lock_mutation();
+        let current = self.config();
+        let mut next = current.clone();
+        let outcome = device_identity::reconcile(&mut next, &cards);
+        for note in &outcome.notes {
+            log::info!("{note}");
+        }
+        if next == current {
+            audivane_io_alsa::identity::set_pins(outcome.pins);
+            let mut state = self.lock_identity();
+            state.cards = Some(cards);
+            state.unresolved = outcome.unresolved;
+            return;
+        }
+        if let Err(e) = config::validate(&next) {
+            log::warn!("cannot follow the output devices to their cards: {e}");
+            audivane_io_alsa::identity::set_pins(outcome.pins);
+            let mut state = self.lock_identity();
+            state.cards = Some(cards);
+            state.unresolved = outcome.unresolved;
+            return;
+        }
+        if let Err(e) = self.engine_apply_identified(&next, Some((outcome, cards))) {
+            log::warn!(
+                "cannot follow the output devices to their cards: {}",
+                e.message
+            );
+            return;
+        }
+        {
+            let mut guard = self.lock_config();
+            *guard = next.clone();
+        }
+        self.note_config_change();
+        let _ = self.persist(&next);
+    }
+
+    /// Outputs held closed until the user says which card each is.
+    pub fn unresolved_devices(&self) -> Vec<UnresolvedDevice> {
+        self.lock_identity().unresolved.clone()
+    }
+
+    /// `assign_devices`: set every named output's device at once, each
+    /// taking the identity of the card it names now.
+    fn assign_devices(&self, assignments: Vec<DeviceAssignment>) -> Result<(), RpcError> {
+        let _mutation = self.lock_mutation();
+        let cards = self.scan_cards();
+        let current = self.config();
+        let mut next = current.clone();
+        let mut moved: Vec<(String, String)> = Vec::new();
+        for a in &assignments {
+            let device = a.device.trim().to_string();
+            let Some(identity) = device_identity::identity_of(&cards, &device) else {
+                return Err(invalid_params(format!(
+                    "{device} is not a connected USB card"
+                )));
+            };
+            if a.output == device_identity::MASTER {
+                next.device = device;
+                next.device_identity = Some(identity);
+            } else {
+                let at = current
+                    .outputs
+                    .followers
+                    .iter()
+                    .position(|f| f.device == a.output)
+                    .ok_or_else(|| invalid_params(format!("{} is not a follower", a.output)))?;
+                let f = &mut next.outputs.followers[at];
+                moved.push((a.output.clone(), device.clone()));
+                f.device = device;
+                f.identity = Some(identity);
+            }
+        }
+        // A calibration's parts stay with their followers.
+        if let Some(cal) = next.calibration.as_mut() {
+            for part in &mut cal.followers {
+                if let Some((_, new)) = moved.iter().find(|(old, _)| *old == part.device) {
+                    part.device = new.clone();
+                }
+            }
+        }
+        // The other outputs of those models are looked for again too.
+        self.edit_locked(|cfg| *cfg = next, None)?;
+        Ok(())
+    }
+
     /// The checks that need the running engine: the device's rates, and
     /// the CPU admission of a new upsampler ([`super::cpu_budget`]). Client
     /// changes only; the config the daemon starts with is never refused.
     fn validate_live(&self, old: &EngineConfig, next: &EngineConfig) -> Result<(), RpcError> {
-        let caps = self.engine.snapshot().device_caps;
+        // The probe as `next`'s output pair sees it.
+        let caps = self.caps_for(next);
         config::validate_against_device(next, caps.as_ref()).map_err(invalid_params)?;
         if let Some(rates) = self.engine.cpu_rates() {
-            super::cpu_budget::admit(rates, old, next, caps.as_ref()).map_err(invalid_params)?;
+            super::cpu_budget::admit(rates, old, next, caps.as_ref(), self.playing_rate())
+                .map_err(invalid_params)?;
+            // Each follower's own chain, on its own thread, at every rate.
+            for f in next
+                .outputs
+                .followers
+                .iter()
+                .filter(|f| f.chain_patch.is_some())
+            {
+                super::cpu_budget::admit_follower(rates, old, next, f).map_err(invalid_params)?;
+            }
         }
         Ok(())
     }
 
+    /// The device probe viewed for `cfg`'s output pair and formats.
+    fn caps_for(&self, cfg: &EngineConfig) -> Option<audivane_protocol::ipc::DeviceCapabilities> {
+        self.engine
+            .snapshot()
+            .device_caps
+            .map(|c| config::caps_view(cfg, &c))
+    }
+
     fn lock_overload(&self) -> MutexGuard<'_, super::overload::Supervisor> {
         self.overload.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lock_rate_plan(&self) -> MutexGuard<'_, RatePlanState> {
+        self.rate_plan.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The source rate admission prices a change at: the one playing on
+    /// the DSP chain, else the last one that played (`None`: the worst
+    /// case).
+    fn playing_rate(&self) -> Option<u32> {
+        let snap = self.engine.snapshot();
+        if snap.state == EngineState::Playing
+            && snap.active_sink != Some(SinkChoice::Direct)
+            && snap.graph_rate != 0
+        {
+            return Some(snap.graph_rate);
+        }
+        Some(self.last_source_rate.load(Ordering::Relaxed)).filter(|&r| r != 0)
+    }
+
+    /// Make the per-rate plan for the request `requested` and give it to
+    /// the engine when it changed (from the request, the device probe, the
+    /// last upsampler that ran or the rates that overloaded). Returns
+    /// whether it did. The engine builds with it from its next chain on.
+    fn sync_rate_plan(&self, requested: &EngineConfig) -> bool {
+        // Before the CPU is measured, the design's own fallbacks only, made
+        // again once it is (the key is kept only then).
+        let rates = self.engine.cpu_rates();
+        let caps = self.caps_for(requested);
+        let (last_good, tripped) = {
+            let sup = self.lock_overload();
+            (
+                sup.last_good_upsampler().cloned(),
+                sup.tripped_rates(requested).to_vec(),
+            )
+        };
+        let key = RatePlanKey::of(requested, caps.clone(), last_good.clone(), tripped.clone());
+        if rates.is_some() && self.lock_rate_plan().key.as_ref() == Some(&key) {
+            return false;
+        }
+        let (plan, rows) = super::cpu_budget::plan_rates(
+            rates,
+            requested,
+            caps.as_ref(),
+            last_good.as_ref(),
+            &tripped,
+        );
+        let mut st = self.lock_rate_plan();
+        let changed = st.plan != plan;
+        if changed {
+            self.engine.set_rate_plan(plan.clone());
+        }
+        let rows_changed = st.rows != rows;
+        if rows_changed {
+            for row in &rows {
+                if let Some(f) = &row.fallback {
+                    log::info!(
+                        "per-rate plan: {} falls back ({:?}, {:?}{}): the request takes {:.0}% of \
+                         a core there, the fallback {:.0}%",
+                        super::cpu_budget::khz(row.source_rate),
+                        f.action,
+                        f.cause,
+                        f.reason
+                            .as_ref()
+                            .map_or(String::new(), |r| format!(": {r}")),
+                        row.load * 100.0,
+                        f.load * 100.0
+                    );
+                }
+            }
+        }
+        *st = RatePlanState {
+            key: rates.is_some().then_some(key),
+            plan,
+            rows,
+        };
+        drop(st);
+        if rows_changed {
+            // Status carries the rows.
+            self.overload_gen.fetch_add(1, Ordering::Relaxed);
+        }
+        changed
+    }
+
+    /// The tick's part of the per-rate plan: made again when what it
+    /// depends on moved; when that changes the upsampler of the rate
+    /// playing, the request is applied again so the engine rebuilds it
+    /// (through the chain swap).
+    fn rate_plan_step(&self) {
+        let requested = self.config();
+        let before = self.lock_rate_plan().plan.clone();
+        if !self.sync_rate_plan(&requested) {
+            return;
+        }
+        let snap = self.engine.snapshot();
+        let effective = self.lock_overload().plan(&requested);
+        let after = self.lock_rate_plan().plan.clone();
+        let rate = snap.graph_rate;
+        if snap.state != EngineState::Idle
+            && before.substitute(&effective, rate) != after.substitute(&effective, rate)
+        {
+            log::info!(
+                "per-rate plan: the upsampler at {} changed; rebuilding the chain",
+                super::cpu_budget::khz(rate)
+            );
+            if let Err(e) = self.engine_apply(&requested) {
+                log::warn!(
+                    "per-rate plan: the engine refused the rebuild: {}",
+                    e.message
+                );
+            }
+        }
     }
 
     /// Apply the requested `cfg` to the engine, as the overload fallback
@@ -1144,7 +1753,14 @@ impl Service {
             }
         }
         let effective = self.lock_overload().plan(cfg);
-        self.engine.apply(&effective).map_err(engine_error)?;
+        let kept = self.lock_rate_plan().clone();
+        self.sync_rate_plan(cfg);
+        if let Err(e) = self.engine.apply(&effective) {
+            // The engine keeps the config it runs: and the plan made for it.
+            self.engine.set_rate_plan(kept.plan.clone());
+            *self.lock_rate_plan() = kept;
+            return Err(engine_error(e));
+        }
         let generation = self.engine.applied_generation();
         if self.lock_overload().commit_request(cfg, generation) {
             log::info!("overload fallback ended: the engine runs the requested setting again");
@@ -1181,6 +1797,7 @@ impl Service {
     pub fn overload_tick(&self) {
         let _mutation = self.lock_mutation();
         self.overload_step();
+        self.rate_plan_step();
         self.sync_varispeed_hold();
         self.ab_measure_step();
     }
@@ -1220,7 +1837,20 @@ impl Service {
             device,
             probes: snap.gaps.probes,
             varispeed: self.engine.varispeed_request(),
+            substituted: false,
+            source_rate: snap.graph_rate,
         };
+        let mut sample = sample;
+        let effective = self.lock_overload().plan(&requested);
+        sample.substituted = self
+            .lock_rate_plan()
+            .plan
+            .substitute(&effective, sample.source_rate)
+            .is_some();
+        if sample.running && sample.source_rate != 0 {
+            self.last_source_rate
+                .store(sample.source_rate, Ordering::Relaxed);
+        }
         let caps = snap.device_caps;
         let plays = |c: &EngineConfig| {
             super::overload::Landing::of(c, &crate::engine::predicted_landings(c, caps.as_ref()))
@@ -1243,14 +1873,31 @@ impl Service {
                     self.overload_gen.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
-                super::overload::Step::End => {
-                    // The fallback no longer plays on the device: the
-                    // request, if the engine takes it.
+                super::overload::Step::End | super::overload::Step::RateLeft { .. } => {
+                    // The fallback no longer plays on the device, or
+                    // playback left the rate it was made for: the request,
+                    // if the engine takes it (with the per-rate plan, which
+                    // now counts a rate left as over budget).
+                    let left = matches!(step, super::overload::Step::RateLeft { .. });
+                    if left {
+                        self.sync_rate_plan(&requested);
+                    }
                     match self.engine.apply(&requested) {
                         Ok(()) => {
                             let generation = self.engine.applied_generation();
                             self.lock_overload().end(&requested, generation);
-                            log::info!("overload fallback ended: it no longer plays on the device");
+                            if let super::overload::Step::RateLeft { from, to } = step {
+                                log::info!(
+                                    "overload fallback ended: playback moved from {} to {}, \
+                                     where the request runs",
+                                    super::cpu_budget::khz(from),
+                                    super::cpu_budget::khz(to)
+                                );
+                            } else {
+                                log::info!(
+                                    "overload fallback ended: it no longer plays on the device"
+                                );
+                            }
                             self.overload_gen.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(err) => {
@@ -1292,6 +1939,11 @@ impl Service {
                             let generation = self.engine.applied_generation();
                             let (log, _) = self.lock_overload().commit(t, &requested, generation);
                             log::warn!("{log}");
+                            if effective.ab.is_none() && self.lock_ab_measure().is_some() {
+                                self.ab_measure_end(Some(
+                                    "cancelled: A/B turned off by overload fallback".into(),
+                                ));
+                            }
                             self.overload_gen.fetch_add(1, Ordering::Relaxed);
                             return;
                         }
@@ -1376,26 +2028,66 @@ impl Service {
     }
 
     pub fn list_presets(&self) -> Result<Vec<PresetInfo>, RpcError> {
-        Ok(self.preset_store()?.list())
+        Ok(self.preset_store()?.list_all())
     }
 
     /// Preset list for events/snapshots; never fails (an unreadable directory
     /// is logged and reads as empty).
     pub fn presets_info(&self) -> Vec<PresetInfo> {
         self.preset_store()
-            .map(|store| store.list())
+            .map(|store| store.list_all())
             .unwrap_or_default()
     }
 
-    fn get_preset(&self, name: &str) -> Result<Preset, RpcError> {
-        self.preset_store()?.load(name).map_err(preset_error)
+    fn lock_presets(&self) -> MutexGuard<'_, PresetCache> {
+        self.preset_cache.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn save_preset(&self, name: &str, overwrite: bool) -> Result<PresetInfo, RpcError> {
+    fn get_preset(&self, name: &str, part: Option<PresetPart>) -> Result<Preset, RpcError> {
+        self.preset_store()?
+            .scoped(part)
+            .load(name)
+            .map_err(preset_error)
+    }
+
+    /// Point `scope`'s active name at `name` (and its cache at `preset`),
+    /// persisting the config when the name changed.
+    fn set_active_preset(
+        &self,
+        scope: Option<PresetPart>,
+        name: Option<String>,
+        preset: Option<Preset>,
+    ) -> Result<(), RpcError> {
+        let changed_cfg = {
+            let mut guard = self.lock_config();
+            self.lock_presets().set(scope, preset);
+            if active_name(&guard, scope) == name.as_ref() {
+                None
+            } else {
+                set_active_name(&mut guard, scope, name);
+                Some(guard.clone())
+            }
+        };
+        if let Some(cfg) = changed_cfg {
+            self.note_config_change();
+            self.persist(&cfg)?;
+        }
+        Ok(())
+    }
+
+    fn save_preset(
+        &self,
+        name: &str,
+        overwrite: bool,
+        part: Option<PresetPart>,
+        parts: Option<Vec<PresetPart>>,
+    ) -> Result<PresetInfo, RpcError> {
         let _mutation = self.lock_mutation();
-        let store = self.preset_store()?;
+        let store = self.preset_store()?.scoped(part);
         let name = presets::normalize_name(name).map_err(invalid_params)?;
-        let chain = self.config().chain;
+        let mut chain = self.config().chain;
+        // The room calibration belongs to the room: a preset never holds it.
+        chain.convolution.retain(|c| !c.calibration);
         let exists = store.load(&name).is_ok();
         if exists && !overwrite {
             return Err(RpcError {
@@ -1405,116 +2097,116 @@ impl Service {
                 ),
             });
         }
-        let preset = Preset::new(name.clone(), chain.clone());
-        presets::validate(&preset).map_err(invalid_params)?;
-        let info = store.save(&preset).map_err(preset_error)?;
-        let changed_cfg = {
-            let mut guard = self.lock_config();
-            *self
-                .active_preset_chain
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some((name.clone(), chain));
-            if guard.active_preset.as_deref() == Some(name.as_str()) {
-                None
-            } else {
-                guard.active_preset = Some(name);
-                Some(guard.clone())
+        let preset = match part {
+            Some(part) => Preset::for_part(name.clone(), part, chain),
+            None => {
+                let mut preset = Preset::new(name.clone(), chain);
+                // Every part ticked stores no list: the file is today's.
+                preset.parts =
+                    parts.filter(|parts| !PresetPart::ALL.iter().all(|part| parts.contains(part)));
+                preset
             }
         };
-        if let Some(cfg) = changed_cfg {
-            self.note_config_change();
-            self.persist(&cfg)?;
-        }
+        presets::validate(&preset).map_err(invalid_params)?;
+        let info = store.save(&preset).map_err(preset_error)?;
+        self.set_active_preset(part, Some(name), Some(preset))?;
         self.presets_gen.fetch_add(1, Ordering::Relaxed);
         Ok(info)
     }
 
-    fn load_preset(&self, name: &str) -> Result<(), RpcError> {
+    fn load_preset(&self, name: &str, part: Option<PresetPart>) -> Result<(), RpcError> {
         let _mutation = self.lock_mutation();
-        let store = self.preset_store()?;
+        let store = self.preset_store()?.scoped(part);
         let name = presets::normalize_name(name).map_err(invalid_params)?;
         let preset = store.load(&name).map_err(preset_error)?;
         presets::validate(&preset).map_err(invalid_params)?;
-        let chain = preset.chain.clone();
         let preset_name = preset.name.clone();
+        let source = preset.clone();
+        // A global preset replaces the parts it holds: their pages' presets
+        // are no longer what plays, so their names are cleared.
+        let replaced = if part.is_none() {
+            preset.covers()
+        } else {
+            Vec::new()
+        };
         self.edit_locked(
             |cfg| {
-                cfg.chain = chain;
-                cfg.active_preset = Some(preset_name);
+                cfg.chain = source.apply_to(&cfg.chain);
+                set_active_name(cfg, part, Some(preset_name));
+                for covered in &replaced {
+                    set_active_name(cfg, Some(*covered), None);
+                }
             },
-            Some((preset.name, preset.chain)),
+            Some(preset),
         )?;
+        let mut cache = self.lock_presets();
+        for covered in replaced {
+            cache.set(Some(covered), None);
+        }
         Ok(())
     }
 
-    fn delete_preset(&self, name: &str) -> Result<(), RpcError> {
+    /// [`Call::BlankPreset`]: `part` back to its defaults, unnamed.
+    fn blank_preset(&self, part: PresetPart) -> Result<(), RpcError> {
         let _mutation = self.lock_mutation();
-        let store = self.preset_store()?;
+        // A blank EQ is an empty one that is on (no EQ reads as switched off).
+        let chain = ChainConfig {
+            eq: Some(audivane_protocol::EqProfile::default()),
+            ..ChainConfig::default()
+        };
+        let blank = Preset::for_part(String::new(), part, chain);
+        self.edit_locked(
+            |cfg| {
+                cfg.chain = blank.apply_to(&cfg.chain);
+                set_active_name(cfg, Some(part), None);
+            },
+            None,
+        )?;
+        self.lock_presets().set(Some(part), None);
+        Ok(())
+    }
+
+    fn delete_preset(&self, name: &str, part: Option<PresetPart>) -> Result<(), RpcError> {
+        let _mutation = self.lock_mutation();
+        let store = self.preset_store()?.scoped(part);
         let name = presets::normalize_name(name).map_err(invalid_params)?;
-        let was_active = self.config().active_preset.as_deref() == Some(name.as_str());
+        let was_active = active_name(&self.config(), part) == Some(&name);
         store.delete(&name).map_err(preset_error)?;
         if was_active {
-            let changed_cfg = {
-                let mut guard = self.lock_config();
-                *self
-                    .active_preset_chain
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = None;
-                if guard.active_preset.is_none() {
-                    None
-                } else {
-                    guard.active_preset = None;
-                    Some(guard.clone())
-                }
-            };
-            if let Some(cfg) = changed_cfg {
-                self.note_config_change();
-                self.persist(&cfg)?;
-            }
+            self.set_active_preset(part, None, None)?;
         }
         self.presets_gen.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    fn rename_preset(&self, from: &str, to: &str) -> Result<PresetInfo, RpcError> {
+    fn rename_preset(
+        &self,
+        from: &str,
+        to: &str,
+        part: Option<PresetPart>,
+    ) -> Result<PresetInfo, RpcError> {
         let _mutation = self.lock_mutation();
-        let store = self.preset_store()?;
+        let store = self.preset_store()?.scoped(part);
         let from = presets::normalize_name(from).map_err(invalid_params)?;
         let to = presets::normalize_name(to).map_err(invalid_params)?;
-        let was_active = self.config().active_preset.as_deref() == Some(from.as_str());
+        let was_active = active_name(&self.config(), part) == Some(&from);
         let info = store.rename(&from, &to).map_err(preset_error)?;
         if was_active {
-            let changed_cfg = {
-                let mut guard = self.lock_config();
-                if let Some((name, _)) = self
-                    .active_preset_chain
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .as_mut()
-                {
-                    *name = info.name.clone();
-                }
-                if guard.active_preset.as_deref() == Some(info.name.as_str()) {
-                    None
-                } else {
-                    guard.active_preset = Some(info.name.clone());
-                    Some(guard.clone())
-                }
-            };
-            if let Some(cfg) = changed_cfg {
-                self.note_config_change();
-                self.persist(&cfg)?;
-            }
+            let cached = self.lock_presets().get(part).cloned().map(|mut preset| {
+                preset.name = info.name.clone();
+                preset
+            });
+            self.set_active_preset(part, Some(info.name.clone()), cached)?;
         }
         self.presets_gen.fetch_add(1, Ordering::Relaxed);
         Ok(info)
     }
 
-    /// Equalizer APO / AutoEQ text → preset with that EQ and flat defaults for
-    /// the rest of the chain. It does not load the preset.
+    /// Equalizer APO / AutoEQ text → an EQ preset (`presets/eq/`). It does
+    /// not load it and never touches the other parts of chain A.
     fn import_apo(&self, name: &str, text: &str) -> Result<PresetInfo, RpcError> {
         let _mutation = self.lock_mutation();
-        let store = self.preset_store()?;
+        let store = self.preset_store()?.scoped(Some(PresetPart::Eq));
         let name = presets::normalize_name(name).map_err(invalid_params)?;
         let parsed = audivane_dsp_core::eq_apo::parse(text)
             .map_err(|err| invalid_params(format!("cannot parse the EQ text: {err}")))?;
@@ -1529,16 +2221,13 @@ impl Service {
             eq: Some(profile),
             ..ChainConfig::default()
         };
-        let preset = Preset::new(name.clone(), chain.clone());
+        let preset = Preset::for_part(name.clone(), PresetPart::Eq, chain);
         presets::validate(&preset).map_err(invalid_params)?;
         let info = store.save(&preset).map_err(preset_error)?;
         {
             let guard = self.lock_config();
-            if guard.active_preset.as_deref() == Some(name.as_str()) {
-                *self
-                    .active_preset_chain
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some((name, chain));
+            if active_name(&guard, Some(PresetPart::Eq)) == Some(&name) {
+                self.lock_presets().set(Some(PresetPart::Eq), Some(preset));
             }
         }
         self.presets_gen.fetch_add(1, Ordering::Relaxed);
@@ -1552,6 +2241,7 @@ impl Service {
         let cfg = self.config();
         let mut devices = config::playback_devices();
         config::mark_active(&mut devices, &cfg.device);
+        device_identity::annotate(&mut devices, &self.scan_cards());
         devices
     }
 
@@ -1584,8 +2274,10 @@ impl Service {
             self.note_levels(&guard);
         }
         *self.ab_current.lock().unwrap_or_else(|e| e.into_inner()) = AbSide::A;
+        self.ab_blind.store(false, Ordering::Relaxed);
         self.note_config_change();
         self.persist(&next)?;
+        notes.extend(self.engine.conv_warnings().into_iter().map(|w| w.message));
         Ok((self.ab_status(), notes))
     }
 
@@ -1606,9 +2298,43 @@ impl Service {
             .engine
             .ab_select(side, crossfade_ms)
             .map_err(engine_error)?;
-        *self.ab_current.lock().unwrap_or_else(|e| e.into_inner()) = status.current;
+        if let Some(current) = status.current {
+            *self.ab_current.lock().unwrap_or_else(|e| e.into_inner()) = current;
+        }
         // The engine's gains once a pair runs, the config estimate before.
         Ok(self.ab_status())
+    }
+
+    /// `ab_blind`: set or clear the blind test mask ([`AbStatus::blind`]).
+    fn set_ab_blind(&self, enabled: bool) -> Result<AbStatus, RpcError> {
+        let _mutation = self.lock_mutation();
+        if enabled {
+            if self.lock_config().ab.is_none() {
+                return Err(RpcError {
+                    code: RpcError::INVALID_PARAMS,
+                    message: "A/B is not configured".into(),
+                });
+            }
+            // The level stays where it is for the whole run.
+            if self.lock_ab_measure().is_some() {
+                self.ab_measure_end(None);
+            }
+        }
+        self.ab_blind.store(enabled, Ordering::Relaxed);
+        // The live view keeps nothing across either edge: no frame, count
+        // or history from the blind run (it would tell the sides apart).
+        self.engine.harmonics_live_suspend();
+        Ok(self.ab_status())
+    }
+
+    /// Whether the blind mask is in force: set and A/B still configured.
+    /// A/B turning off by any route (a config load, `set_config`) ends it.
+    fn ab_blind_active(&self, cfg: &EngineConfig) -> bool {
+        if cfg.ab.is_none() {
+            self.ab_blind.store(false, Ordering::Relaxed);
+            return false;
+        }
+        self.ab_blind.load(Ordering::Relaxed)
     }
 
     fn lock_ab_measure(&self) -> MutexGuard<'_, Option<MeasureRun>> {
@@ -1669,6 +2395,12 @@ impl Service {
             };
             self.ab_measure_lock(offset_db, seconds)?;
             return Ok(self.ab_status());
+        }
+        if self.ab_blind_active(&cfg) {
+            return Err(RpcError {
+                code: RpcError::BAD_STATE,
+                message: "a blind test is running: the level is locked".into(),
+            });
         }
         let max_seconds = max_seconds.unwrap_or(AB_MEASURE_DEFAULT_SECONDS);
         if !max_seconds.is_finite() || !AB_MEASURE_SECONDS.contains(&max_seconds) {
@@ -1809,6 +2541,12 @@ impl Service {
             .as_ref()
             .map(|r| r.measurement.status());
         status.measure_error = self.lock_ab_measure_error().clone();
+        status.blind = self.ab_blind_active(cfg);
+        if status.blind {
+            // Overs differ between the sides, so they would give it away.
+            status.current = None;
+            status.overs = Default::default();
+        }
         status
     }
 
@@ -1822,12 +2560,21 @@ impl Service {
         let current = *self.ab_current.lock().unwrap_or_else(|e| e.into_inner());
         let snap = self.engine.snapshot();
         let Some(ab) = &cfg.ab else {
+            self.ab_blind_active(&cfg);
             return AbStatus {
                 enabled: false,
-                current,
+                current: Some(current),
                 ..Default::default()
             };
         };
+        if self.lock_overload().plan(&cfg).ab.is_none() {
+            let status = AbStatus {
+                enabled: false,
+                current: Some(current),
+                ..Default::default()
+            };
+            return self.decorate_ab(status, &cfg);
+        }
         if let Some(engine_ab) = snap.ab.filter(|s| s.enabled) {
             return self.decorate_ab(engine_ab, &cfg);
         }
@@ -1843,7 +2590,7 @@ impl Service {
         };
         let status = AbStatus {
             enabled: true,
-            current,
+            current: Some(current),
             offset_db: gains.offset_db,
             gain_a_db: gains.gain_a_db,
             gain_b_db: gains.gain_b_db,
@@ -1920,7 +2667,7 @@ impl Service {
     // ------------------------------------------------------------ status
 
     pub fn status(&self) -> Status {
-        let (cfg, preset, (applied, revision)) = {
+        let (cfg, (preset, part_presets), (applied, revision)) = {
             let guard = self.lock_config();
             let preset = self.preset_state(&guard);
             let levels = self.level_state_locked(&guard);
@@ -1998,18 +2745,25 @@ impl Service {
         let passthrough: Passthrough =
             passthrough::compute(&snap, &streams, sink_view.as_ref(), native_bits);
 
-        let ab = snap
-            .ab
-            .clone()
-            .map(|status| self.decorate_ab(status, &cfg))
-            .or_else(|| {
-                cfg.ab
-                    .as_ref()
-                    .map(|_| self.ab_status())
-                    .filter(|status| status.enabled)
-            });
+        let overload_ab_off = cfg.ab.is_some() && self.lock_overload().plan(&cfg).ab.is_none();
+        let ab = if overload_ab_off {
+            Some(self.ab_status())
+        } else {
+            snap.ab
+                .clone()
+                .map(|status| self.decorate_ab(status, &cfg))
+                .or_else(|| {
+                    cfg.ab
+                        .as_ref()
+                        .map(|_| self.ab_status())
+                        .filter(|status| status.enabled)
+                })
+        };
         let volume = Some(self.volume_status(&cfg, applied, revision));
 
+        // One lock: a second one in the literal below would deadlock (the
+        // first guard lives to the end of the statement).
+        let upsampler_rates = self.lock_rate_plan().rows.clone();
         Status {
             version: env!("CARGO_PKG_VERSION").to_string(),
             state: snap.state,
@@ -2025,6 +2779,7 @@ impl Service {
             quantum,
             latency_ms: snap.latency_ms,
             filter_latency_ms: snap.filter_latency_ms,
+            conv_latency_ms: snap.conv_latency_ms,
             xruns: snap.xruns,
             dsp_load: snap.dsp_load,
             dsp_enabled: cfg.dsp_enabled,
@@ -2037,6 +2792,7 @@ impl Service {
             passthrough,
             ab,
             preset,
+            part_presets,
             volume,
             device_caps: snap.device_caps.clone(),
             effective_rates: snap.effective_rates.clone(),
@@ -2082,6 +2838,17 @@ impl Service {
             },
             normal_output: facts.normal_output.clone(),
             overload: self.overload_report(),
+            upsampler_fallback_now: (snap.state == EngineState::Playing
+                && snap.active_sink != Some(SinkChoice::Direct)
+                && cfg.dsp_enabled)
+                .then(|| {
+                    upsampler_rates
+                        .iter()
+                        .find(|r| r.source_rate == snap.graph_rate && r.fallback.is_some())
+                        .cloned()
+                })
+                .flatten(),
+            upsampler_rates,
             rt_load_max: snap.rt_load_max,
             varispeed: Some(
                 snap.varispeed
@@ -2090,21 +2857,202 @@ impl Service {
             limits: Some(super::cpu_budget::engine_limits()),
             waiting_for_device: snap.waiting_for_device,
             outputs: self.outputs_status(&cfg),
+            conv_warnings: self.engine.conv_warnings(),
+            calibration: self.calibration_status(&cfg),
+            unresolved_devices: self.unresolved_devices(),
         }
     }
 
-    /// The active preset and whether chain A still matches it.
-    fn preset_state(&self, cfg: &EngineConfig) -> Option<PresetState> {
-        let name = cfg.active_preset.as_ref()?;
-        let cache = self
-            .active_preset_chain
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let (cached_name, chain) = cache.as_ref()?;
-        (cached_name == name).then(|| PresetState {
-            name: name.clone(),
-            modified: *chain != cfg.chain,
-        })
+    /// The loaded room calibration as it plays now.
+    fn calibration_status(
+        &self,
+        cfg: &EngineConfig,
+    ) -> Option<audivane_protocol::ipc::CalibrationStatus> {
+        cfg.calibration.as_ref()?;
+        let snap = self.engine.snapshot();
+        let playing = snap.state == EngineState::Playing;
+        super::calibration::status(
+            cfg,
+            if playing { snap.graph_rate } else { 0 },
+            if playing { snap.output_rate } else { 0 },
+            &self.outputs_status(cfg),
+        )
+    }
+
+    /// `bundle_load`: read and check the manifest, then install it as one
+    /// config edit (validated, CPU-admitted, applied, persisted); on any
+    /// error nothing changes. The reply is the calibration's status, the
+    /// load's own warnings added to `warnings`.
+    fn bundle_load(&self, path: &str) -> Result<Value, RpcError> {
+        let _mutation = self.lock_mutation();
+        let current = self.config();
+        let loaded = super::calibration::read(path, &current, crate::engine::DEFAULT_CHANNELS)
+            .map_err(|e| invalid_params(format!("bundle_load: {e}")))?;
+        let cal = loaded.calibration.clone();
+        let master_db = self.master_level_db(&current);
+        let cfg = self
+            .edit_locked(|cfg| super::calibration::install(cfg, cal, master_db), None)
+            .map_err(|e| RpcError {
+                code: e.code,
+                message: format!("bundle_load: nothing changed: {}", e.message),
+            })?;
+        log::info!(
+            "calibration: loaded {:?} from {}",
+            loaded.calibration.label,
+            loaded.calibration.path.display()
+        );
+        // The reply is the status, with what the load found (the manifest's
+        // notes, the convolution guards' warnings) after the rate warnings
+        // in `warnings`: `notes` is the manifest's own text.
+        let mut status = self.calibration_status(&cfg);
+        if let Some(s) = &mut status {
+            s.warnings.extend(loaded.notes);
+            s.warnings
+                .extend(self.engine.conv_warnings().into_iter().map(|w| w.message));
+        }
+        to_value(&status)
+    }
+
+    /// `bundle_unload`: remove exactly what the loaded calibration
+    /// installed; what is no longer valid to put back is skipped, in the
+    /// returned warnings. Without one, `BAD_STATE`.
+    fn bundle_unload(&self) -> Result<Vec<String>, RpcError> {
+        let _mutation = self.lock_mutation();
+        if self.config().calibration.is_none() {
+            return Err(RpcError {
+                code: RpcError::BAD_STATE,
+                message: "no room calibration is loaded".into(),
+            });
+        }
+        let mut warnings = Vec::new();
+        self.edit_locked(
+            |cfg| {
+                warnings = super::calibration::uninstall(cfg).unwrap_or_default();
+            },
+            None,
+        )?;
+        for w in &warnings {
+            log::warn!("calibration: {w}");
+        }
+        log::info!("calibration: unloaded");
+        Ok(warnings)
+    }
+
+    /// `bundle_gain`: one calibration part's level (its item's gain; `None`:
+    /// the manifest's), as one config edit: the boost cap and the rest of
+    /// the guards hold it, and on an error nothing changes. The reply is the
+    /// calibration's status, the guards' warnings in `notes`.
+    fn bundle_gain(&self, device: Option<&str>, gain_db: Option<f64>) -> Result<Value, RpcError> {
+        let _mutation = self.lock_mutation();
+        let mut current = self.config();
+        if current.calibration.is_none() {
+            return Err(RpcError {
+                code: RpcError::BAD_STATE,
+                message: "no room calibration is loaded".into(),
+            });
+        }
+        super::calibration::set_gain(&mut current, device, gain_db)
+            .map_err(|e| invalid_params(format!("bundle_gain: {e}")))?;
+        let cal = current.calibration.clone();
+        let cfg = self
+            .edit_locked(
+                |cfg| {
+                    cfg.calibration = cal;
+                    super::calibration::normalize(cfg);
+                },
+                None,
+            )
+            .map_err(|e| RpcError {
+                code: e.code,
+                message: format!("bundle_gain: nothing changed: {}", e.message),
+            })?;
+        let notes = self
+            .engine
+            .conv_warnings()
+            .into_iter()
+            .map(|w| w.message)
+            .collect();
+        with_notes(to_value(&self.calibration_status(&cfg))?, notes)
+    }
+
+    /// `bundle_ab`: A/B of calibrations on the master. Side B is chain A
+    /// with the bundle at `path` in place of the loaded calibration
+    /// (`None`: without one), the followers as they are (they keep the
+    /// loaded calibration on both sides).
+    fn bundle_ab(&self, path: Option<&str>) -> Result<(AbStatus, Vec<String>), RpcError> {
+        let loaded = match path {
+            Some(p) => Some(
+                super::calibration::read(p, &self.config(), crate::engine::DEFAULT_CHANNELS)
+                    .map_err(|e| invalid_params(format!("bundle_ab: {e}")))?,
+            ),
+            None => None,
+        };
+        let side = super::calibration::ab_side(loaded.as_ref());
+        let label = match &side.label {
+            Some(l) => format!("Calibration: {l}"),
+            None => "No calibration".to_string(),
+        };
+        let mut ab = AbConfig::new(audivane_protocol::ipc::AbB::Patch(Value::Object(
+            serde_json::Map::new(),
+        )));
+        ab.label = Some(label);
+        ab.calibration_b = Some(side);
+        let (status, mut notes) = self.set_ab(Some(ab))?;
+        if let Some(l) = &loaded {
+            notes.extend(l.notes.iter().cloned());
+            if !l.calibration.followers.is_empty() {
+                notes.push(
+                    "A/B switches the master only: the followers play the loaded calibration                      on both sides"
+                        .into(),
+                );
+            }
+        }
+        Ok((status, notes))
+    }
+
+    /// A mutation's reply: `null`, or `{"notes": [..]}` with the
+    /// convolution guards' warnings of the config it applied.
+    fn conv_notes_reply(&self) -> Result<Value, RpcError> {
+        let notes: Vec<Value> = self
+            .engine
+            .conv_warnings()
+            .into_iter()
+            .map(|w| Value::String(w.message))
+            .collect();
+        if notes.is_empty() {
+            return Ok(Value::Null);
+        }
+        let mut object = serde_json::Map::new();
+        object.insert("notes".into(), Value::Array(notes));
+        Ok(Value::Object(object))
+    }
+
+    /// The active presets (global, then each part's) and whether chain A
+    /// still matches them on the parts they hold.
+    fn preset_state(&self, cfg: &EngineConfig) -> (Option<PresetState>, Vec<PartPresetState>) {
+        let cache = self.lock_presets();
+        let global = cfg.active_preset.as_ref().and_then(|name| {
+            let preset = cache.get(None).filter(|preset| &preset.name == name)?;
+            Some(PresetState {
+                name: name.clone(),
+                modified: !preset.matches(&cfg.chain),
+            })
+        });
+        let parts = cfg
+            .active_part_presets
+            .iter()
+            .filter_map(|(part, name)| {
+                let preset = cache
+                    .get(Some(*part))
+                    .filter(|preset| &preset.name == name)?;
+                Some(PartPresetState {
+                    part: *part,
+                    name: name.clone(),
+                    modified: !preset.matches(&cfg.chain),
+                })
+            })
+            .collect();
+        (global, parts)
     }
 
     /// `applied`: the engine's volume, read together with `revision` (see
@@ -2458,6 +3406,31 @@ impl Service {
     }
 }
 
+/// `value` with `notes` added (additive: clients that only want the plain
+/// reply ignore it); unchanged without notes or when not an object.
+/// The fields a [`Call::SetFollower`] edit sets (`None`: kept).
+struct FollowerEdit {
+    enabled: Option<bool>,
+    trim_ms: Option<f64>,
+    volume_db: Option<f64>,
+    output_channels: Option<audivane_protocol::ipc::OutputChannels>,
+    follow_volume: Option<bool>,
+    chain_patch: Option<Value>,
+    period_ms: Option<f64>,
+}
+
+fn with_notes(mut value: Value, notes: Vec<String>) -> Result<Value, RpcError> {
+    if !notes.is_empty()
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert(
+            "notes".into(),
+            Value::Array(notes.into_iter().map(Value::String).collect()),
+        );
+    }
+    Ok(value)
+}
+
 /// True when `next` differs from `old` only in the volume level, balance or
 /// mute.
 fn level_only_change(old: &EngineConfig, next: &EngineConfig) -> bool {
@@ -2645,18 +3618,145 @@ fn preset_error(err: PresetError) -> RpcError {
     }
 }
 
-/// Load the chain of the preset named by `cfg.active_preset`, if any.
-fn load_active_preset(
-    store: Option<&Arc<ConfigStore>>,
-    cfg: &EngineConfig,
-) -> Option<(String, ChainConfig)> {
-    let name = cfg.active_preset.as_ref()?;
-    let store = store?;
-    match PresetStore::alongside(store).load(name) {
-        Ok(preset) => Some((preset.name, preset.chain)),
-        Err(err) => {
-            log::warn!("active preset {name:?}: {err}");
-            None
+/// The active presets' contents, keyed by scope (`None` = global).
+#[derive(Clone, Debug, Default)]
+struct PresetCache {
+    global: Option<Preset>,
+    parts: std::collections::BTreeMap<PresetPart, Preset>,
+}
+
+impl PresetCache {
+    fn get(&self, scope: Option<PresetPart>) -> Option<&Preset> {
+        match scope {
+            None => self.global.as_ref(),
+            Some(part) => self.parts.get(&part),
+        }
+    }
+
+    fn set(&mut self, scope: Option<PresetPart>, preset: Option<Preset>) {
+        match (scope, preset) {
+            (None, preset) => self.global = preset,
+            (Some(part), Some(preset)) => {
+                self.parts.insert(part, preset);
+            }
+            (Some(part), None) => {
+                self.parts.remove(&part);
+            }
+        }
+    }
+
+    /// This cache matched to the names `cfg` makes active: entries whose
+    /// name still matches are kept, the others read from disk (a missing or
+    /// unreadable one is logged and left out).
+    fn refreshed(self, store: Option<&Arc<ConfigStore>>, cfg: &EngineConfig) -> Self {
+        let root = store.map(|store| PresetStore::alongside(store));
+        let mut out = Self::default();
+        let scopes = std::iter::once(None).chain(PresetPart::ALL.into_iter().map(Some));
+        for scope in scopes {
+            let Some(name) = active_name(cfg, scope) else {
+                continue;
+            };
+            let kept = self
+                .get(scope)
+                .filter(|preset| &preset.name == name)
+                .cloned();
+            let preset = kept.or_else(|| {
+                let root = root.as_ref()?;
+                match root.scoped(scope).load(name) {
+                    Ok(preset) => Some(preset),
+                    Err(err) => {
+                        log::warn!("active preset {name:?}: {err}");
+                        None
+                    }
+                }
+            });
+            out.set(scope, preset);
+        }
+        out
+    }
+}
+
+/// The active preset name of `scope` (`None` = global) in `cfg`.
+fn active_name(cfg: &EngineConfig, scope: Option<PresetPart>) -> Option<&String> {
+    match scope {
+        None => cfg.active_preset.as_ref(),
+        Some(part) => cfg.active_part_presets.get(&part),
+    }
+}
+
+fn set_active_name(cfg: &mut EngineConfig, scope: Option<PresetPart>, name: Option<String>) {
+    match (scope, name) {
+        (None, name) => cfg.active_preset = name,
+        (Some(part), Some(name)) => {
+            cfg.active_part_presets.insert(part, name);
+        }
+        (Some(part), None) => {
+            cfg.active_part_presets.remove(&part);
+        }
+    }
+}
+
+/// [`Service::rate_plan`]: the plan the engine holds and its status rows.
+#[derive(Clone, Debug, Default)]
+struct RatePlanState {
+    key: Option<RatePlanKey>,
+    plan: crate::api::RatePlan,
+    rows: Vec<audivane_protocol::ipc::RateAdmission>,
+}
+
+/// What the per-rate plan is made from: the parts of the request it prices,
+/// the device probe, the last upsampler that ran and the rates that
+/// overloaded.
+#[derive(Clone, Debug, PartialEq)]
+struct RatePlanKey {
+    dsp_enabled: bool,
+    upsampler: UpsamplerConfig,
+    output: audivane_protocol::OutputConfig,
+    ab: Option<ChainConfig>,
+    /// Chain A's convolution and, with a filter matrix enabled (it runs on
+    /// the audio thread with the EQ before it,
+    /// [`super::cpu_budget::matrix_load`]), its EQ: both price into the
+    /// plan.
+    convolution: Vec<audivane_protocol::ConvolutionConfig>,
+    matrix_eq: Option<audivane_protocol::EqProfile>,
+    rate: audivane_protocol::ipc::RatePolicy,
+    quantum: u32,
+    device: String,
+    formats: Vec<audivane_protocol::SampleFormat>,
+    lanes: usize,
+    caps: Option<audivane_protocol::ipc::DeviceCapabilities>,
+    last_good: Option<UpsamplerConfig>,
+    tripped: Vec<u32>,
+}
+
+impl RatePlanKey {
+    fn of(
+        cfg: &EngineConfig,
+        caps: Option<audivane_protocol::ipc::DeviceCapabilities>,
+        last_good: Option<UpsamplerConfig>,
+        tripped: Vec<u32>,
+    ) -> Self {
+        Self {
+            dsp_enabled: cfg.dsp_enabled,
+            upsampler: cfg.chain.upsampler.clone(),
+            output: cfg.chain.output,
+            ab: cfg.ab.as_ref().map(|ab| ab.chain_b.clone()),
+            convolution: cfg.chain.convolution.clone(),
+            matrix_eq: cfg
+                .chain
+                .convolution
+                .iter()
+                .any(|c| c.enabled && c.matrix.is_some())
+                .then(|| cfg.chain.eq.clone())
+                .flatten(),
+            rate: cfg.rate.clone(),
+            quantum: cfg.quantum,
+            device: cfg.device.clone(),
+            formats: cfg.formats.clone(),
+            lanes: super::cpu_budget::lanes(cfg),
+            caps,
+            last_good,
+            tripped,
         }
     }
 }
@@ -2680,6 +3780,10 @@ mod tests {
         measure: Mutex<(u32, Vec<audivane_dsp_core::ab_measure::AbHop>)>,
         /// The graph rate `snapshot` reports instead of the config's.
         graph_rate: Mutex<Option<u32>>,
+        /// `harmonics_live_suspend` calls.
+        live_suspends: AtomicU64,
+        /// The probe `snapshot` reports.
+        caps: Mutex<Option<audivane_protocol::ipc::DeviceCapabilities>>,
     }
 
     impl MockEngine {
@@ -2693,6 +3797,9 @@ mod tests {
     }
 
     impl Engine for MockEngine {
+        fn harmonics_live_suspend(&self) {
+            self.live_suspends.fetch_add(1, Ordering::Relaxed);
+        }
         fn apply(&self, cfg: &EngineConfig) -> Result<(), EngineError> {
             *self.config.lock().unwrap() = cfg.clone();
             self.applies.fetch_add(1, Ordering::Relaxed);
@@ -2701,7 +3808,7 @@ mod tests {
         fn ab_select(&self, side: AbSide, _crossfade_ms: f64) -> Result<AbStatus, EngineError> {
             Ok(AbStatus {
                 enabled: true,
-                current: side,
+                current: Some(side),
                 offset_db: -3.0,
                 error: None,
                 ..Default::default()
@@ -2724,6 +3831,7 @@ mod tests {
                 quantum: cfg.quantum,
                 latency_ms: 0.0,
                 filter_latency_ms: 0.0,
+                conv_latency_ms: 0.0,
                 xruns: 0,
                 dsp_load: 0.0,
                 dsp_active: false,
@@ -2735,7 +3843,7 @@ mod tests {
                 frames_out: 0,
                 chain_generation: 0,
                 gaps: Default::default(),
-                device_caps: None,
+                device_caps: self.caps.lock().unwrap().clone(),
                 effective_rates: Vec::new(),
                 direct_rates: Vec::new(),
                 playable_rates: Vec::new(),
@@ -2824,6 +3932,8 @@ mod tests {
             applied: Mutex::new((None, 0)),
             measure: Mutex::new((0, Vec::new())),
             graph_rate: Mutex::new(None),
+            live_suspends: AtomicU64::new(0),
+            caps: Mutex::new(None),
         });
         let svc = Service::new(
             Arc::clone(&engine) as Arc<dyn Engine>,
@@ -2834,6 +3944,413 @@ mod tests {
             ShutdownFlag::new(),
         );
         (svc, engine)
+    }
+
+    /// `conv_response` measures at the engine's graph rate; side B needs A/B.
+    #[test]
+    fn conv_response_reads_the_graph_rate_and_checks_its_side() {
+        let (service, engine) = service();
+        *engine.graph_rate.lock().unwrap() = Some(96_000);
+        let r: audivane_protocol::ipc::ConvResponse =
+            serde_json::from_value(value(service.dispatch(Call::ConvResponse {
+                side: None,
+                device: None,
+            })))
+            .unwrap();
+        assert_eq!(r.rate_hz, 96_000);
+        assert_eq!(r.freqs_hz.len(), 241);
+        assert!(r.items.is_empty() && r.outputs.is_empty());
+        assert_eq!(r.combined_taps, 0);
+        let err = service
+            .dispatch(Call::ConvResponse {
+                side: Some(AbSide::B),
+                device: None,
+            })
+            .unwrap_err();
+        assert_eq!(err.code, RpcError::INVALID_PARAMS);
+    }
+
+    /// The per-rate plan is redone for chain A's convolution, and for its
+    /// EQ while a filter matrix runs (both cost the audio thread), not for
+    /// an EQ edit without one.
+    #[test]
+    fn the_rate_plan_key_follows_chain_a_matrix_and_its_eq() {
+        let key = |cfg: &EngineConfig| RatePlanKey::of(cfg, None, None, Vec::new());
+        let base = EngineConfig::default();
+        let mut eq_only = base.clone();
+        eq_only.chain.eq = Some(EqProfile {
+            preamp_db: -3.0,
+            ..Default::default()
+        });
+        assert_eq!(key(&base), key(&eq_only));
+        let mut matrix = base.clone();
+        matrix.chain.convolution = vec![audivane_protocol::ConvolutionConfig {
+            name: None,
+            enabled: true,
+            ir_path: Default::default(),
+            gain_db: 0.0,
+            matrix: Some(vec![audivane_protocol::MatrixEntry {
+                input: 1,
+                output: 0,
+                ir_path: "/irs/x.wav".into(),
+                channel: None,
+                gain_db: 0.0,
+            }]),
+            calibration: false,
+        }];
+        assert_ne!(key(&base), key(&matrix));
+        let mut matrix_eq = matrix.clone();
+        matrix_eq.chain.eq = eq_only.chain.eq.clone();
+        assert_ne!(key(&matrix), key(&matrix_eq));
+    }
+
+    /// Identical DACs: the outputs follow their USB ports when the names
+    /// swap, are held when both moved, and `assign_devices` settles it.
+    #[test]
+    fn outputs_follow_their_dacs_across_a_name_swap() {
+        use audivane_io_alsa::identity::testing::FakeTree;
+        let (service, engine) = service();
+        let t = FakeTree::new("service-swap");
+        let usb = "2522:0007";
+        t.usb(1, "USB", usb, "1.4.3", None);
+        t.usb(2, "USB_1", usb, "1.4.1.4", None);
+        service.set_identity_roots(t.roots.clone());
+        let mut cfg = service.config();
+        cfg.device = "hw:CARD=USB,DEV=0".into();
+        let mut sub = FollowerConfig::new("hw:CARD=USB_1,DEV=0");
+        sub.output_channels = Some(audivane_protocol::ipc::OutputChannels([2, 3]));
+        sub.follow_volume = true;
+        sub.trim_ms = 1.5;
+        cfg.outputs.followers = vec![sub];
+        // A client's identity is not taken: the card's is.
+        cfg.device_identity = Some(audivane_protocol::ipc::DeviceIdentity {
+            card: "X".into(),
+            usb_id: "0000:0000".into(),
+            serial: None,
+            port: None,
+        });
+        service.dispatch(Call::SetConfig(cfg)).unwrap();
+        let port = |chain: &str| Some(format!("pci-0000:00:14.0-usb-0:{chain}"));
+        let c = service.config();
+        assert_eq!(c.device_identity.as_ref().unwrap().port, port("1.4.3"));
+        assert_eq!(
+            c.outputs.followers[0].identity.as_ref().unwrap().port,
+            port("1.4.1.4")
+        );
+        service.identity_tick();
+        assert_eq!(service.config(), c, "nothing to follow");
+        // What a rename must keep of the follower (all but its device and
+        // identity).
+        let kept = |c: &EngineConfig| {
+            let f = &c.outputs.followers[0];
+            (
+                f.output_channels,
+                f.follow_volume,
+                f.follow_ref_db,
+                f.trim_ms,
+            )
+        };
+        let settings = kept(&c);
+        assert_eq!(
+            settings.0,
+            Some(audivane_protocol::ipc::OutputChannels([2, 3]))
+        );
+
+        // A reboot probes the sub's DAC first.
+        t.clear();
+        t.usb(1, "USB", usb, "1.4.1.4", None);
+        t.usb(2, "USB_1", usb, "1.4.3", None);
+        service.identity_tick();
+        let c = service.config();
+        assert_eq!(c.device, "hw:CARD=USB_1,DEV=0");
+        assert_eq!(c.outputs.followers[0].device, "hw:CARD=USB,DEV=0");
+        assert_eq!(engine.config.lock().unwrap().device, c.device, "applied");
+        assert_eq!(kept(&c), settings);
+        assert!(service.status().unresolved_devices.is_empty());
+        let present = |d: &str| audivane_io_alsa::device_present_gated_in(&t.roots, d);
+        assert!(present("hw:CARD=USB_1,DEV=0") && present("hw:CARD=USB,DEV=0"));
+
+        // Both moved: held, not guessed.
+        t.clear();
+        t.usb(1, "USB", usb, "2", None);
+        t.usb(2, "USB_1", usb, "3", None);
+        service.identity_tick();
+        let held = service.status().unresolved_devices;
+        assert_eq!(held.len(), 2);
+        assert_eq!(service.config(), c);
+        assert!(!present("hw:CARD=USB_1,DEV=0") && !present("hw:CARD=USB,DEV=0"));
+
+        // The user says which is which (a swap, at once).
+        let assign = |output: &str, device: &str| audivane_protocol::ipc::DeviceAssignment {
+            output: output.into(),
+            device: device.into(),
+        };
+        service
+            .dispatch(Call::AssignDevices {
+                assignments: vec![
+                    assign("master", "hw:CARD=USB,DEV=0"),
+                    assign("hw:CARD=USB,DEV=0", "hw:CARD=USB_1,DEV=0"),
+                ],
+            })
+            .unwrap();
+        let c = service.config();
+        assert_eq!(c.device, "hw:CARD=USB,DEV=0");
+        assert_eq!(c.device_identity.as_ref().unwrap().port, port("2"));
+        assert_eq!(c.outputs.followers[0].device, "hw:CARD=USB_1,DEV=0");
+        assert_eq!(
+            c.outputs.followers[0].identity.as_ref().unwrap().port,
+            port("3")
+        );
+        assert!(service.status().unresolved_devices.is_empty());
+        assert_eq!(kept(&c), settings);
+        assert!(present("hw:CARD=USB,DEV=0") && present("hw:CARD=USB_1,DEV=0"));
+        let err = service
+            .dispatch(Call::AssignDevices {
+                assignments: vec![assign("master", "hw:CARD=Nope,DEV=0")],
+            })
+            .unwrap_err();
+        assert!(
+            err.message.contains("not a connected USB card"),
+            "{}",
+            err.message
+        );
+        audivane_io_alsa::identity::set_pins([]);
+    }
+
+    /// With a quantized hardware mixer the master plays another level than
+    /// it asks for (−31 dB asked, −36 dB on the card): a follower's
+    /// reference, its untick and its edits go by the played level, the one
+    /// it tracks, so unticking keeps the level it plays at.
+    #[test]
+    fn follower_levels_go_by_the_masters_played_level() {
+        let (service, engine) = service();
+        let dev = "hw:CARD=USB,DEV=0";
+        let set = |follow_volume: Option<bool>, volume_db: Option<f64>| {
+            service
+                .dispatch(Call::SetFollower {
+                    device: dev.into(),
+                    remove: false,
+                    enabled: None,
+                    trim_ms: None,
+                    volume_db,
+                    follow_volume,
+                    output_channels: None,
+                    chain_patch: None,
+                    period_ms: None,
+                })
+                .unwrap();
+        };
+        let master = |asked: f64, played: f64| {
+            service
+                .dispatch(Call::SetVolume {
+                    volume_db: asked,
+                    balance_db: 0.0,
+                    muted: false,
+                })
+                .unwrap();
+            let status = VolumeStatus {
+                volume_db: played,
+                hardware: true,
+                ..VolumeStatus::from_config(&service.config().volume)
+            };
+            let mut a = engine.applied.lock().unwrap();
+            *a = (Some(status), a.1 + 1);
+        };
+        let fc = || service.config().outputs.followers[0].clone();
+        set(None, Some(-6.0));
+        master(-31.0, -36.0);
+        set(Some(true), None);
+        assert_eq!(fc().follow_ref_db, Some(-36.0), "the played level");
+        // The master 5 dB down as played (4 dB as asked): unticked, the
+        // follower keeps playing 5 dB below its −6 dB.
+        master(-35.0, -41.0);
+        set(Some(false), None);
+        assert_eq!((fc().volume_db, fc().follow_ref_db), (-11.0, None));
+        // An edit while following is the level it plays at then.
+        set(Some(true), None);
+        assert_eq!(fc().follow_ref_db, Some(-41.0));
+        master(-33.0, -36.0);
+        set(None, Some(-8.0));
+        assert_eq!((fc().volume_db, fc().follow_ref_db), (-8.0, Some(-36.0)));
+        let level = crate::engine::follower::followed_level_db(&fc(), -36.0);
+        assert_eq!(level, -8.0);
+    }
+
+    #[test]
+    fn output_channels_follow_the_device_and_are_checked() {
+        use audivane_protocol::ipc::{DeviceCapabilities, OutputChannels};
+        let (service, engine) = service();
+        let set = |device: &str, pair: Option<[u32; 2]>| {
+            service.dispatch(Call::SetDevice {
+                device: device.into(),
+                output_channels: pair.map(OutputChannels),
+            })
+        };
+        let wide = "hw:CARD=USB,DEV=0";
+        set(wide, Some([2, 3])).unwrap();
+        let cfg = service.config();
+        assert_eq!(
+            (cfg.device.as_str(), cfg.output_channels),
+            (wide, Some(OutputChannels([2, 3])))
+        );
+        assert_eq!(
+            engine.config.lock().unwrap().output_channels,
+            cfg.output_channels
+        );
+        // The same device without a pair keeps it; `[0, 1]` is no setting.
+        set(wide, None).unwrap();
+        assert_eq!(
+            service.config().output_channels,
+            Some(OutputChannels([2, 3]))
+        );
+        set(wide, Some([0, 1])).unwrap();
+        assert_eq!(service.config().output_channels, None);
+        set(wide, Some([7, 6])).unwrap();
+        // Another device starts from the first two.
+        set("hw:1,0", None).unwrap();
+        assert_eq!(service.config().output_channels, None);
+        // Not a pair: refused, nothing changes.
+        set(wide, Some([7, 6])).unwrap();
+        for bad in [[3, 3], [0, 64]] {
+            let e = set(wide, Some(bad)).unwrap_err();
+            assert!(e.message.contains("output_channels"), "{}", e.message);
+        }
+        assert_eq!(
+            service.config().output_channels,
+            Some(OutputChannels([7, 6]))
+        );
+        // Past the probed device's channels: refused at the edit.
+        *engine.caps.lock().unwrap() = Some(DeviceCapabilities {
+            device: wide.into(),
+            channels: 8,
+            channels_min: 8,
+            channels_max: 8,
+            ..Default::default()
+        });
+        let e = set(wide, Some([8, 9])).unwrap_err();
+        assert!(
+            e.message.contains("has 8 channels (0 to 7)"),
+            "{}",
+            e.message
+        );
+        set(wide, Some([4, 5])).unwrap();
+        // A whole config with a bad pair is refused too.
+        let mut cfg = service.config();
+        cfg.output_channels = Some(OutputChannels([1, 1]));
+        assert!(service.dispatch(Call::SetConfig(cfg)).is_err());
+        // A follower's pair: set, kept by other edits, reset by `[0, 1]`.
+        let follower = |pair: Option<[u32; 2]>, trim: Option<f64>| {
+            service.dispatch(Call::SetFollower {
+                device: "hw:CARD=USB_1,DEV=0".into(),
+                remove: false,
+                enabled: None,
+                trim_ms: trim,
+                volume_db: None,
+                output_channels: pair.map(OutputChannels),
+                follow_volume: None,
+                chain_patch: None,
+                period_ms: None,
+            })
+        };
+        follower(Some([2, 3]), None).unwrap();
+        follower(None, Some(1.0)).unwrap();
+        let f = service.config().outputs.followers[0].clone();
+        assert_eq!(
+            (f.output_channels, f.trim_ms),
+            (Some(OutputChannels([2, 3])), 1.0)
+        );
+        assert!(follower(Some([5, 5]), None).is_err());
+        follower(Some([0, 1]), None).unwrap();
+        assert_eq!(service.config().outputs.followers[0].output_channels, None);
+    }
+
+    #[test]
+    fn a_pair_edit_is_checked_against_its_own_channel_count() {
+        use audivane_protocol::SampleFormat;
+        use audivane_protocol::ipc::{
+            ChannelMode, DeviceCapabilities, FormatCapability, OutputChannels, RateCapability,
+        };
+        let (service, engine) = service();
+        let wide = "hw:CARD=USB,DEV=0";
+        let mut cfg = service.config();
+        cfg.device = wide.into();
+        cfg.output_channels = Some(OutputChannels([6, 7]));
+        cfg.chain.upsampler.target = audivane_protocol::RateTarget::Rate(96_000);
+        service.dispatch(Call::SetConfig(cfg.clone())).unwrap();
+        // Stereo plays 96 kHz; the 8-channel mode pair 7/8 needs, 48 kHz.
+        let row = |rate| RateCapability {
+            rate,
+            formats: vec![FormatCapability {
+                format: SampleFormat::S32,
+                sbits: Some(24),
+            }],
+        };
+        let probe = DeviceCapabilities {
+            device: wide.into(),
+            channels: 2,
+            channels_min: 2,
+            channels_max: 8,
+            formats: vec![SampleFormat::S32],
+            modes: vec![
+                ChannelMode {
+                    channels: 2,
+                    rates: vec![row(48_000), row(96_000)],
+                },
+                ChannelMode {
+                    channels: 8,
+                    rates: vec![row(48_000)],
+                },
+            ],
+            ..Default::default()
+        };
+        // The engine reports the probe as pair 7/8 sees it.
+        *engine.caps.lock().unwrap() = Some(config::caps_view(&cfg, &probe));
+        let set = |pair: [u32; 2]| {
+            service.dispatch(Call::SetDevice {
+                device: wide.into(),
+                output_channels: Some(OutputChannels(pair)),
+            })
+        };
+        // Back to 1/2 at 96 kHz: accepted.
+        set([0, 1]).unwrap();
+        assert_eq!(service.config().output_channels, None);
+        // 7/8 cannot play the explicit 96 kHz.
+        *engine.caps.lock().unwrap() = Some(config::caps_view(&service.config(), &probe));
+        let e = set([6, 7]).unwrap_err();
+        assert!(e.message.contains("96000"), "{}", e.message);
+    }
+
+    #[test]
+    fn set_follower_sets_its_period_and_refuses_one_out_of_range() {
+        let (service, _engine) = service();
+        let dev = "hw:CARD=USB,DEV=0";
+        let set = |period_ms| {
+            service.dispatch(Call::SetFollower {
+                device: dev.into(),
+                remove: false,
+                enabled: None,
+                trim_ms: None,
+                volume_db: None,
+                output_channels: None,
+                follow_volume: None,
+                chain_patch: None,
+                period_ms,
+            })
+        };
+        let period = || service.config().outputs.followers[0].period_ms;
+        set(None).unwrap();
+        assert_eq!(period(), None, "the default");
+        set(Some(10.0)).unwrap();
+        assert_eq!(period(), Some(10.0));
+        let e = set(Some(2.0)).unwrap_err();
+        assert!(
+            e.message
+                .contains("outputs.followers[0].period_ms must be between 5 and 50 ms"),
+            "{e:?}"
+        );
+        assert_eq!(period(), Some(10.0), "kept");
+        set(Some(0.0)).unwrap();
+        assert_eq!(period(), None, "0: the default again");
     }
 
     #[test]
@@ -2847,6 +4364,10 @@ mod tests {
                 enabled,
                 trim_ms,
                 volume_db,
+                output_channels: None,
+                follow_volume: None,
+                chain_patch: None,
+                period_ms: None,
             })
         };
         let outputs = |d: Result<Dispatch, RpcError>| match d.unwrap() {
@@ -2867,6 +4388,47 @@ mod tests {
         let o = outputs(set(dev, false, Some(false), None, Some(-6.0)));
         let f = &o.followers[0];
         assert_eq!((f.trim_ms, f.enabled, f.volume_db), (1.5, false, -6.0));
+        assert!(!f.follow_volume, "added by hand, it keeps its own level");
+        // Following: its level against the master's now, kept as it is.
+        let follow = |follow_volume: Option<bool>, volume_db: Option<f64>| {
+            outputs(service.dispatch(Call::SetFollower {
+                device: dev.into(),
+                remove: false,
+                enabled: None,
+                trim_ms: None,
+                volume_db,
+                follow_volume,
+                output_channels: None,
+                chain_patch: None,
+                period_ms: None,
+            }))
+        };
+        let master = |db: f64| {
+            service
+                .dispatch(Call::SetVolume {
+                    volume_db: db,
+                    balance_db: 0.0,
+                    muted: false,
+                })
+                .unwrap();
+        };
+        let fc = || service.config().outputs.followers[0].clone();
+        master(-20.0);
+        let o = follow(Some(true), None);
+        assert!(o.followers[0].follow_volume);
+        assert_eq!((fc().volume_db, fc().follow_ref_db), (-6.0, Some(-20.0)));
+        // A master change leaves the config alone (the engine moves it).
+        master(-26.0);
+        assert_eq!((fc().volume_db, fc().follow_ref_db), (-6.0, Some(-20.0)));
+        // Its level set while following: against the master's level now.
+        follow(None, Some(-3.0));
+        assert_eq!((fc().volume_db, fc().follow_ref_db), (-3.0, Some(-26.0)));
+        // Turned off: it keeps the level it plays at.
+        master(-30.0);
+        let o = follow(Some(false), None);
+        assert!(!o.followers[0].follow_volume);
+        assert_eq!((fc().volume_db, fc().follow_ref_db), (-7.0, None));
+        follow(None, Some(-6.0));
         // Refused, nothing changes.
         let e = set(dev, false, None, Some(60.0), None).unwrap_err();
         assert!(e.message.contains("trim_ms"), "{}", e.message);
@@ -2883,6 +4445,43 @@ mod tests {
             })
             .unwrap_err();
         assert!(e.message.contains("1.996"), "{}", e.message);
+        // Its own chain: kept as sent, cleared by `{}`; a patch that does
+        // not apply is refused naming its path.
+        let patch = |p: Value| {
+            service.dispatch(Call::SetFollower {
+                device: dev.into(),
+                remove: false,
+                enabled: None,
+                trim_ms: None,
+                volume_db: None,
+                output_channels: None,
+                follow_volume: None,
+                chain_patch: Some(p),
+                period_ms: None,
+            })
+        };
+        let limit = serde_json::json!({"limiter": {"mode": "limit"}});
+        outputs(patch(limit.clone()));
+        assert_eq!(
+            service.config().outputs.followers[0].chain_patch,
+            Some(limit)
+        );
+        let e = patch(serde_json::json!({"output": {"bits": "x"}})).unwrap_err();
+        assert!(
+            e.message
+                .starts_with("outputs.followers[0].chain_patch.output"),
+            "{}",
+            e.message
+        );
+        let e = patch(serde_json::json!({"limiter": {"lookahead_ms": 1000.0}})).unwrap_err();
+        assert!(
+            e.message.contains("outputs.followers[0].chain.limiter"),
+            "{}",
+            e.message
+        );
+        assert!(service.config().outputs.followers[0].chain_patch.is_some());
+        outputs(patch(serde_json::json!({})));
+        assert_eq!(service.config().outputs.followers[0].chain_patch, None);
         let o = outputs(set(dev, true, None, None, None));
         assert!(o.followers.is_empty());
         assert!(service.status().outputs.followers.is_empty());
@@ -3194,6 +4793,7 @@ mod tests {
         service
             .dispatch(Call::SetDevice {
                 device: "hw:1,0".into(),
+                output_channels: None,
             })
             .unwrap();
 
@@ -3302,6 +4902,36 @@ mod tests {
         assert_eq!(window.freqs_hz[0], 23_000.0);
         assert_eq!(*window.freqs_hz.last().unwrap(), 25_000.0);
         assert!(!response.crossings.is_empty());
+    }
+
+    /// The reported latency counts the block the engine builds its chain
+    /// with at the source rate, which follows the quantum: 512 frames at
+    /// 44.1 kHz by default, the 1024-frame cap at a 4096 quantum (2048 at
+    /// 44.1 kHz). Each block is its own cache entry.
+    #[test]
+    fn upsampler_response_latency_follows_the_engine_block() {
+        let (service, _) = service();
+        let cfg = audivane_dsp_core::resample::ManualConfig {
+            target: audivane_protocol::RateTarget::Ratio(2),
+            taps: 512,
+            ..Default::default()
+        }
+        .into_upsampler_config()
+        .unwrap();
+        let latency = || {
+            let v = value(service.dispatch(Call::UpsamplerResponse {
+                config: Some(cfg.clone()),
+                source_rate: Some(44_100),
+                window: None,
+            }));
+            v["latency_samples"].as_u64().unwrap()
+        };
+        service.edit(|c| c.quantum = 1024).unwrap();
+        let default = latency();
+        service.edit(|c| c.quantum = 4096).unwrap();
+        let large = latency();
+        assert_eq!(large - default, (1024 - 512) * 2);
+        assert_eq!(service.upsampler_cache.lock().unwrap().len(), 2);
     }
 
     fn value(d: Result<Dispatch, RpcError>) -> Value {
@@ -3451,11 +5081,185 @@ mod tests {
         assert_eq!(c.errors.len(), 1, "{:?}", c.errors);
         assert_eq!(c.errors[0].path, "design.length");
         assert!(
-            c.errors[0].message.starts_with("at 44100 Hz (160/147), "),
+            c.errors[0]
+                .message
+                .starts_with("6,554 taps per input sample is too heavy for a fractional ratio at 44.1k ×160/147. "),
             "{}",
             c.errors[0].message
         );
+        let advice = c.advice.as_ref().unwrap();
+        assert!(!advice.applied);
+        assert!(
+            advice.details[0].message.contains("kernel needs"),
+            "{advice:?}"
+        );
         assert!(c.plans.is_empty());
+
+        // A passband end in Hz that does not fit at a rate: a note there,
+        // the rate still planned; none where it fits.
+        let mut pinned = audivane_dsp_core::design::catalogue::recommended();
+        if let audivane_protocol::FilterDesign::Kernel(k) = &mut pinned
+            && let audivane_protocol::design::Shape::WindowedSinc {
+                cutoff: audivane_protocol::design::Cutoff::Band(b),
+                ..
+            } = &mut k.shape
+        {
+            b.passband_end_hz = Some(20_000.0);
+        }
+        let rec = audivane_protocol::StoredDesign::new(pinned);
+        let c = check(rec.clone(), Some(RateTarget::Ratio(2)), Some(32_000));
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        assert_eq!(c.plans.len(), 1);
+        assert_eq!(c.notes.len(), 1, "{:?}", c.notes);
+        assert_eq!(c.notes[0].source_rate, 32_000);
+        assert_eq!(c.notes[0].path, "design.cutoff.passband_end_hz");
+        let c = check(rec, Some(RateTarget::Ratio(2)), None);
+        assert!(c.notes.is_empty(), "{:?}", c.notes);
+    }
+
+    /// An equiripple design of 1,279 taps over 0.9..1.0.
+    fn equiripple_1279() -> audivane_protocol::design::FilterDesign {
+        use audivane_protocol::design::*;
+        let mut d = audivane_dsp_core::design::catalogue::recommended();
+        if let FilterDesign::Kernel(k) = &mut d {
+            k.shape = Shape::Optimal {
+                method: OptimalMethod::Equiripple,
+                length: Length::Fixed(1279),
+                passband_end: 0.9,
+                stopband_start: 1.0,
+            };
+            k.phase = Phase::Linear;
+            k.numerics.path = ArithmeticPath::Fir;
+        }
+        d
+    }
+
+    /// A design that builds at some of the rates it plays is applied: the
+    /// others play Recommended, said per rate in plain words, with fixes;
+    /// one that builds nowhere is refused in plain words.
+    #[test]
+    fn a_design_that_builds_at_some_rates_falls_back_at_the_others() {
+        use audivane_protocol::RateTarget;
+        use audivane_protocol::ipc::{DesignCheck, OverloadAction, RateFallbackCause};
+        let (service, engine) = service();
+        let check = |design, target| -> DesignCheck {
+            serde_json::from_value(value(service.dispatch(Call::CheckDesign {
+                design,
+                target,
+                source_rate: None,
+            })))
+            .unwrap()
+        };
+        let target = RateTarget::MaxRate(768_000);
+        let c = check(equiripple_1279().into(), Some(target));
+        assert!(c.errors.is_empty(), "{:?}", c.errors);
+        let advice = c.advice.clone().unwrap();
+        assert!(advice.applied);
+        eprintln!("{}", advice.message);
+        assert!(
+            advice.message.starts_with(
+                "1,279 taps is too long for an equiripple design at 176.4k ×4 and 192k ×4. "
+            ),
+            "{}",
+            advice.message
+        );
+        assert!(!advice.fixes.is_empty());
+        // The ladder skips the x16 rung the design does not build at
+        // (44.1k and 48k play it at x8); 176.4k and 192k build at no rung
+        // and play Recommended.
+        let falls: Vec<u32> = c.notes.iter().map(|n| n.source_rate).collect();
+        assert_eq!(falls, [176_400, 192_000], "{:?}", c.notes);
+        assert!(
+            c.notes
+                .iter()
+                .all(|n| n.plays.as_deref() == Some("recommended"))
+        );
+        assert!(
+            c.notes[0]
+                .message
+                .starts_with("too long for an equiripple design"),
+            "{:?}",
+            c.notes
+        );
+        let p44 = c.plans.iter().find(|p| p.source_rate == 44_100).unwrap();
+        assert_eq!(p44.ratio, RateRatio::integer(8));
+        // Every rate has a plan: the design's, or Recommended's.
+        assert_eq!(c.plans.len(), 6);
+        // A fix builds everywhere (the automatic length's searches are
+        // left to dsp-core's test: slow in a debug build).
+        for fix in advice
+            .fixes
+            .iter()
+            .filter(|f| !f.label.contains("automatic"))
+        {
+            let c = check(fix.design.clone(), Some(target));
+            assert!(
+                c.advice.is_none() && c.errors.is_empty(),
+                "{}: {c:?}",
+                fix.label
+            );
+        }
+
+        // Applied: the engine gets the design, and Recommended at the rates
+        // it does not build at.
+        let mut up = service.config().chain.upsampler;
+        up.target = target;
+        up.preset = None;
+        up.design = Some(equiripple_1279().into());
+        let r = service.dispatch(Call::SetUpsampler(up.clone()));
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(engine.config.lock().unwrap().chain.upsampler, up);
+        let status: audivane_protocol::ipc::Status =
+            serde_json::from_value(value(service.dispatch(Call::Status))).unwrap();
+        let rows = &status.upsampler_rates;
+        let f = rows
+            .iter()
+            .find(|r| r.source_rate == 176_400)
+            .and_then(|r| r.fallback.clone())
+            .expect("176.4k falls back");
+        assert_eq!(f.action, OverloadAction::Recommended);
+        assert_eq!(f.cause, RateFallbackCause::Design);
+        assert!(
+            f.reason
+                .unwrap()
+                .starts_with("too long for an equiripple design here")
+        );
+        let status_falls: Vec<u32> = rows
+            .iter()
+            .filter(|r| r.fallback.is_some())
+            .map(|r| r.source_rate)
+            .collect();
+        assert_eq!(status_falls, falls, "the check and the plan agree");
+        let plan = service.lock_rate_plan().plan.clone();
+        let cfg = service.config();
+        assert_eq!(
+            plan.substitute(&cfg, 176_400)
+                .and_then(|u| u.preset.clone())
+                .as_deref(),
+            Some("recommended")
+        );
+        assert_eq!(plan.substitute(&cfg, 44_100), None);
+
+        // Nowhere: refused, in plain words.
+        let mut nowhere = up.clone();
+        nowhere.target = RateTarget::Ratio(16);
+        let c = check(equiripple_1279().into(), Some(nowhere.target));
+        assert_eq!(c.errors.len(), 1, "{:?}", c.errors);
+        assert!(
+            c.errors[0]
+                .message
+                .starts_with("1,279 taps is too short at 44.1k ×16"),
+            "{:?}",
+            c.errors
+        );
+        assert!(!c.advice.unwrap().applied);
+        let r = service.dispatch(Call::SetUpsampler(nowhere));
+        assert!(r.is_err(), "{r:?}");
+        let text = format!("{r:?}");
+        assert!(
+            text.contains("chain.upsampler.design.length: 1,279 taps is too short"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -3587,7 +5391,7 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         };
         assert!(status.enabled);
-        assert_eq!(status.current, AbSide::A);
+        assert_eq!(status.current, Some(AbSide::A));
 
         let status = match service
             .dispatch(Call::AbSelect {
@@ -3599,11 +5403,81 @@ mod tests {
             Dispatch::Value(value) => serde_json::from_value::<AbStatus>(value).unwrap(),
             other => panic!("unexpected {other:?}"),
         };
-        assert_eq!(status.current, AbSide::B);
+        assert_eq!(status.current, Some(AbSide::B));
         // The fake engine runs no pair, so the reply carries the config's
         // gains: the manual -2 dB, B cut and A untouched.
         assert_eq!(status.offset_db, -2.0);
         assert_eq!((status.gain_a_db, status.gain_b_db), (0.0, -2.0));
+    }
+
+    /// `ab_blind` hides the side from every reply and from status, refuses
+    /// a level measurement, and ends on `{enabled: false}`, `set_ab` or A/B
+    /// off.
+    #[test]
+    fn ab_blind_masks_the_side() {
+        let (service, engine) = service();
+        let ab_value = |call| match service.dispatch(call).unwrap() {
+            Dispatch::Value(value) => serde_json::from_value::<AbStatus>(value).unwrap(),
+            other => panic!("unexpected {other:?}"),
+        };
+        let err = service
+            .dispatch(Call::AbBlind { enabled: true })
+            .unwrap_err();
+        assert_eq!(err.code, RpcError::INVALID_PARAMS, "no A/B yet");
+        let config = || {
+            Call::SetAb(Some(AbConfig {
+                level: LevelMatch::Manual { offset_db: -2.0 },
+                headroom: Default::default(),
+                ..AbConfig::chain(ChainConfig::neutral())
+            }))
+        };
+        ab_value(config());
+
+        let status = ab_value(Call::AbBlind { enabled: true });
+        assert!(status.blind);
+        assert_eq!(status.current, None);
+        // The live view forgets everything at the mask (and again at its
+        // end), so nothing from the run carries over.
+        assert_eq!(engine.live_suspends.load(Ordering::Relaxed), 1);
+        let status = ab_value(Call::AbSelect {
+            side: AbSide::B,
+            crossfade_ms: 10.0,
+        });
+        assert_eq!((status.blind, status.current), (true, None));
+        assert_eq!(status.offset_db, -2.0, "the level still shows");
+        let ab = service.status().ab.expect("A/B on");
+        assert_eq!((ab.blind, ab.current), (true, None));
+        let err = service
+            .dispatch(Call::AbMeasure {
+                max_seconds: None,
+                cancel: false,
+                accept: false,
+            })
+            .unwrap_err();
+        assert_eq!(err.code, RpcError::BAD_STATE);
+        assert!(err.message.contains("blind"));
+
+        // The harmonics live view hides too (it would give the side away).
+        match service.dispatch(Call::HarmonicsLive).unwrap() {
+            Dispatch::Value(v) => assert_eq!(v["state"], "hidden"),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let status = ab_value(Call::AbBlind { enabled: false });
+        assert_eq!((status.blind, status.current), (false, Some(AbSide::B)));
+        assert_eq!(engine.live_suspends.load(Ordering::Relaxed), 2);
+
+        // `set_ab` ends it.
+        ab_value(Call::AbBlind { enabled: true });
+        let status = ab_value(config());
+        assert_eq!((status.blind, status.current), (false, Some(AbSide::A)));
+
+        // A/B off ends it, and it does not come back with A/B.
+        ab_value(Call::AbBlind { enabled: true });
+        service.dispatch(Call::SetAb(None)).unwrap();
+        assert!(!service.ab_blind.load(Ordering::Relaxed));
+        let status = ab_value(config());
+        assert!(!status.blind);
     }
 
     /// Step 7: a patch may give B its own bits and dither (an output
@@ -3783,6 +5657,8 @@ mod tests {
             applied: Mutex::new((None, 0)),
             measure: Mutex::new((0, Vec::new())),
             graph_rate: Mutex::new(None),
+            live_suspends: AtomicU64::new(0),
+            caps: Mutex::new(None),
         });
         let mpris = MprisWatcher::stub();
         let service = Service::new(
@@ -3974,6 +5850,8 @@ mod tests {
             applied: Mutex::new((None, 0)),
             measure: Mutex::new((0, Vec::new())),
             graph_rate: Mutex::new(None),
+            live_suspends: AtomicU64::new(0),
+            caps: Mutex::new(None),
         });
         let service = Service::new(
             Arc::clone(&engine) as Arc<dyn Engine>,
@@ -3997,9 +5875,62 @@ mod tests {
         service
             .dispatch(Call::LoadPreset {
                 name: "Saved".into(),
+                part: None,
             })
             .unwrap();
         assert!(!service.status().preset.unwrap().modified);
+
+        service.flush_persist().unwrap();
+        service.stop_persist();
+        drop(service);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn import_apo_writes_an_eq_preset_with_the_file_preamp() {
+        let dir = std::env::temp_dir().join(format!(
+            "avdsp-svc-apo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(ConfigStore::new(dir.join("config.json")));
+        let config = EngineConfig {
+            device: "hw:0,0".into(),
+            ..EngineConfig::default()
+        };
+        let engine = Arc::new(MockEngine {
+            config: Mutex::new(config.clone()),
+            applies: AtomicU64::new(0),
+            refreshes: AtomicU64::new(0),
+            applied: Mutex::new((None, 0)),
+            measure: Mutex::new((0, Vec::new())),
+            graph_rate: Mutex::new(None),
+            live_suspends: AtomicU64::new(0),
+            caps: Mutex::new(None),
+        });
+        let service = Service::new(
+            Arc::clone(&engine) as Arc<dyn Engine>,
+            config,
+            Some(Arc::clone(&store)),
+            None,
+            None,
+            ShutdownFlag::new(),
+        );
+        service
+            .dispatch(Call::ImportApo {
+                name: "HP".into(),
+                text: "Preamp: -6 dB\nFilter 1: ON PK Fc 1000 Hz Gain 5 dB Q 1\n".into(),
+            })
+            .unwrap();
+        let root = PresetStore::alongside(&store);
+        assert!(root.load("HP").is_err(), "not a global preset");
+        let preset = root.scoped(Some(PresetPart::Eq)).load("HP").unwrap();
+        assert_eq!(preset.part, Some(PresetPart::Eq));
+        assert_eq!(preset.chain.eq.as_ref().unwrap().preamp_db, -6.0);
 
         service.flush_persist().unwrap();
         service.stop_persist();
@@ -4522,5 +6453,1039 @@ mod tests {
 
         let status = service.status();
         assert_eq!(status.volume, Some(reply));
+    }
+
+    /// An engine that validates as the real one does (the convolution
+    /// guards, the follower chains), at 48 kHz.
+    struct GuardMock {
+        inner: MockEngine,
+        cache: Mutex<crate::engine::ir::IrCache>,
+        warnings: Mutex<Vec<audivane_protocol::ipc::ConvWarning>>,
+    }
+    impl Engine for GuardMock {
+        fn apply(&self, cfg: &EngineConfig) -> Result<(), EngineError> {
+            let w = crate::engine::validate_engine_config(
+                cfg,
+                &mut self.cache.lock().unwrap(),
+                48_000,
+            )?;
+            *self.warnings.lock().unwrap() = w;
+            self.inner.apply(cfg)
+        }
+        fn conv_warnings(&self) -> Vec<audivane_protocol::ipc::ConvWarning> {
+            self.warnings.lock().unwrap().clone()
+        }
+        fn ab_select(&self, side: AbSide, crossfade_ms: f64) -> Result<AbStatus, EngineError> {
+            self.inner.ab_select(side, crossfade_ms)
+        }
+        fn snapshot(&self) -> EngineSnapshot {
+            self.inner.snapshot()
+        }
+        fn meters(&self) -> Meters {
+            self.inner.meters()
+        }
+        fn selftest(&self) -> Result<audivane_protocol::ipc::SelfTestResult, EngineError> {
+            self.inner.selftest()
+        }
+        fn release_device(&self) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn acquire_device(&self) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn shutdown(&self) {}
+    }
+
+    /// The convolution guards through the control plane: a boost over the
+    /// cap is refused by `set_convolution`, a preset load, `set_ab` (side
+    /// B) and `set_config`, each leaving the config as it was; a boost
+    /// under it applies, with its warnings in the reply's notes and in
+    /// status. The engine here validates as the real one does.
+    #[test]
+    fn convolution_over_the_cap_is_refused_on_every_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "avdsp-svc-convguard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ir = dir.join("ir.wav");
+        {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 48_000,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            let mut w = hound::WavWriter::create(&ir, spec).unwrap();
+            for i in 0..64 {
+                w.write_sample(if i == 0 { 1.0_f32 } else { 0.0 }).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let conv = |gain_db: f64| audivane_protocol::ConvolutionConfig {
+            name: None,
+            enabled: true,
+            ir_path: ir.clone(),
+            gain_db,
+            matrix: None,
+            calibration: false,
+        };
+        let store = Arc::new(ConfigStore::new(dir.join("config.json")));
+        let config = EngineConfig {
+            device: "hw:0,0".into(),
+            ..EngineConfig::default()
+        };
+        let loud = ChainConfig {
+            convolution: vec![conv(13.0)],
+            ..config.chain.clone()
+        };
+        let presets = PresetStore::alongside(&store);
+        presets.save(&Preset::new("Loud", loud.clone())).unwrap();
+        presets
+            .scoped(Some(PresetPart::Convolution))
+            .save(&Preset::for_part(
+                "Loud",
+                PresetPart::Convolution,
+                loud.clone(),
+            ))
+            .unwrap();
+        let engine = guard_mock(&config);
+        let service = Service::new(
+            Arc::clone(&engine) as Arc<dyn Engine>,
+            config,
+            Some(Arc::clone(&store)),
+            None,
+            None,
+            ShutdownFlag::new(),
+        );
+
+        // Under the cap: applied, its warnings (+6 dB down to DC) noted.
+        let reply = match service
+            .dispatch(Call::SetConvolution(vec![conv(6.0)]))
+            .unwrap()
+        {
+            Dispatch::Value(v) => v,
+            other => panic!("unexpected {other:?}"),
+        };
+        let notes = reply["notes"].as_array().expect("notes");
+        assert!(
+            notes[0]
+                .as_str()
+                .unwrap()
+                .starts_with("Below 20 Hz: +6.0 dB on L"),
+            "{reply}"
+        );
+        assert_eq!(service.status().conv_warnings.len(), 2);
+        let before = service.config();
+
+        let refused = |call: Call| {
+            let err = service.dispatch(call).unwrap_err();
+            assert_eq!(err.code, RpcError::INVALID_PARAMS);
+            assert!(err.message.contains("+12.0 dB cap"), "{}", err.message);
+            assert_eq!(service.config(), before);
+            err.message
+        };
+        refused(Call::SetConvolution(vec![conv(13.0)]));
+        refused(Call::LoadPreset {
+            name: "Loud".into(),
+            part: None,
+        });
+        refused(Call::LoadPreset {
+            name: "Loud".into(),
+            part: Some(PresetPart::Convolution),
+        });
+        let side_b = refused(Call::SetAb(Some(AbConfig::chain(loud.clone()))));
+        assert!(side_b.starts_with("A/B side B:"), "{side_b}");
+        refused(Call::SetConfig(EngineConfig {
+            chain: loud,
+            ..before.clone()
+        }));
+        assert_eq!(service.status().conv_warnings.len(), 2);
+
+        // A higher cap lets it through.
+        service
+            .dispatch(Call::SetConvolutionSafety(
+                audivane_protocol::ipc::ConvolutionSafety {
+                    max_boost_db: 14.0,
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        service
+            .dispatch(Call::SetConvolution(vec![conv(13.0)]))
+            .unwrap();
+        assert!(
+            service
+                .dispatch(Call::SetConvolutionSafety(
+                    audivane_protocol::ipc::ConvolutionSafety {
+                        max_boost_db: 12.0,
+                        ..Default::default()
+                    },
+                ))
+                .is_err()
+        );
+        assert_eq!(service.config().convolution_safety.max_boost_db, 14.0);
+
+        service.flush_persist().unwrap();
+        service.stop_persist();
+        drop(service);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn guard_mock(config: &EngineConfig) -> Arc<GuardMock> {
+        Arc::new(GuardMock {
+            inner: MockEngine {
+                config: Mutex::new(config.clone()),
+                applies: AtomicU64::new(0),
+                refreshes: AtomicU64::new(0),
+                applied: Mutex::new((None, 0)),
+                measure: Mutex::new((0, Vec::new())),
+                graph_rate: Mutex::new(None),
+                live_suspends: AtomicU64::new(0),
+                caps: Mutex::new(None),
+            },
+            cache: Mutex::new(crate::engine::ir::IrCache::new()),
+            warnings: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// A room-calibration bundle through the control plane, the engine
+    /// validating as the real one does: a load applies everything or
+    /// nothing (a bad IR or a boost over the cap on the follower leaves the
+    /// master untouched); unload puts back the chain items, the follower's
+    /// patch and trim; a preset load keeps the calibration's item (and a
+    /// saved preset never holds it); `bundle_ab` makes side B chain A with
+    /// another calibration, or none.
+    #[test]
+    fn a_calibration_bundle_loads_whole_unloads_exactly_and_survives_presets() {
+        use serde_json::json;
+        let dir = std::env::temp_dir().join(format!(
+            "avdsp-svc-bundle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = |name: &str, channels: u16, peak: f32| {
+            let spec = hound::WavSpec {
+                channels,
+                sample_rate: 48_000,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            let mut w = hound::WavWriter::create(dir.join(name), spec).unwrap();
+            for i in 0..64 {
+                for _ in 0..channels {
+                    w.write_sample(if i == 0 { peak } else { 0.0 }).unwrap();
+                }
+            }
+            w.finalize().unwrap();
+        };
+        wav("mine.wav", 1, 0.9);
+        wav("other.wav", 1, 0.8);
+        wav("ll.wav", 1, 1.0);
+        wav("rr.wav", 1, 1.0);
+        wav("sub.wav", 2, 0.5);
+        // +14 dB on the follower's one output: over the +12 dB cap.
+        wav("loud.wav", 2, 2.5);
+        const SUB: &str = "hw:CARD=USB_1,DEV=0";
+        let manifest = |name: &str, master_gain: f64, sub_ir: &str| {
+            let body = json!({
+                "bundle_version": 1, "label": name, "design_rate_hz": 48000,
+                "devices": [
+                    { "role": "master", "gain_db": master_gain,
+                      "matrix": [ { "in": 0, "out": 0, "ir": "ll.wav" },
+                                  { "in": 1, "out": 1, "ir": "rr.wav" } ] },
+                    { "role": "follower", "device": SUB, "trim_ms": 1.5,
+                      "matrix": [ { "in": 0, "out": 0, "ir": sub_ir, "channel": 0 },
+                                  { "in": 1, "out": 0, "ir": sub_ir, "channel": 1 } ] } ]
+            });
+            let p = dir.join(format!("{name}.json"));
+            std::fs::write(&p, body.to_string()).unwrap();
+            p.display().to_string()
+        };
+        let conv = |file: &str| audivane_protocol::ConvolutionConfig {
+            name: Some(file.into()),
+            enabled: true,
+            ir_path: dir.join(file),
+            gain_db: 0.0,
+            matrix: None,
+            calibration: false,
+        };
+        let store = Arc::new(ConfigStore::new(dir.join("config.json")));
+        let mut config = EngineConfig {
+            device: "hw:CARD=USB,DEV=0".into(),
+            ..EngineConfig::default()
+        };
+        config.chain.convolution = vec![conv("mine.wav")];
+        let mut sub = FollowerConfig::new(SUB);
+        sub.trim_ms = -2.0;
+        sub.chain_patch = Some(json!({"limiter": {"mode": "limit"}}));
+        config.outputs.followers.push(sub);
+        let presets = PresetStore::alongside(&store);
+        let other = ChainConfig {
+            convolution: vec![conv("other.wav")],
+            ..config.chain.clone()
+        };
+        presets
+            .scoped(Some(PresetPart::Convolution))
+            .save(&Preset::for_part("Other", PresetPart::Convolution, other))
+            .unwrap();
+        let engine = guard_mock(&config);
+        let service = Service::new(
+            Arc::clone(&engine) as Arc<dyn Engine>,
+            config,
+            Some(Arc::clone(&store)),
+            None,
+            None,
+            ShutdownFlag::new(),
+        );
+        let value = |c: Call| match service.dispatch(c).unwrap() {
+            Dispatch::Value(v) => v,
+            other => panic!("unexpected {other:?}"),
+        };
+        let before = service.config();
+
+        // Nothing changes on a bad follower part: its boost, or its file.
+        let loud = manifest("loud", 0.0, "loud.wav");
+        let err = service
+            .dispatch(Call::BundleLoad { path: loud })
+            .unwrap_err();
+        assert!(
+            err.message.contains("nothing changed")
+                && err.message.contains(&format!("follower {SUB}"))
+                && err.message.contains("+12.0 dB cap"),
+            "{}",
+            err.message
+        );
+        assert_eq!(service.config(), before);
+        let missing = manifest("missing", 0.0, "nope.wav");
+        let err = service
+            .dispatch(Call::BundleLoad { path: missing })
+            .unwrap_err();
+        assert!(
+            err.message.contains("devices[1].matrix[0].ir"),
+            "{}",
+            err.message
+        );
+        assert_eq!(service.config(), before);
+        assert!(service.dispatch(Call::BundleUnload).is_err(), "none loaded");
+
+        // A good one: the master's item after the user's, the follower's
+        // patch and trim; status shows it.
+        let desk = manifest("desk", -1.0, "sub.wav");
+        let reply = value(Call::BundleLoad { path: desk.clone() });
+        assert_eq!(reply["label"], "desk");
+        let cfg = service.config();
+        assert_eq!(cfg.chain.convolution.len(), 2);
+        assert_eq!(cfg.chain.convolution[0], before.chain.convolution[0]);
+        let item = cfg.chain.convolution[1].clone();
+        assert!(item.calibration && item.gain_db == -1.0);
+        let f = &cfg.outputs.followers[0];
+        assert_eq!(f.trim_ms, 1.5);
+        let patch = f.chain_patch.as_ref().unwrap();
+        assert_eq!(patch["limiter"], json!({"mode": "limit"}));
+        assert_eq!(
+            patch["convolution"][0]["matrix"].as_array().unwrap().len(),
+            2
+        );
+        let st = service.status().calibration.expect("status");
+        assert_eq!(st.devices.len(), 2);
+        assert!(st.devices.iter().all(|d| d.installed));
+        assert_eq!(value(Call::BundleShow)["devices"][1]["device"], SUB);
+
+        // Unload puts back exactly what was there, but the follower keeps
+        // following at its level (an unload never moves or unmutes it).
+        value(Call::BundleUnload);
+        let mut want = before.clone();
+        want.outputs.followers[0].follow_volume = true;
+        want.outputs.followers[0].follow_ref_db = Some(0.0);
+        assert_eq!(service.config(), want);
+        assert!(value(Call::BundleShow).is_null());
+
+        // Loaded again, a convolution preset replaces the user's item and
+        // keeps the calibration's; it is not "modified" for it.
+        value(Call::BundleLoad { path: desk.clone() });
+        value(Call::LoadPreset {
+            name: "Other".into(),
+            part: Some(PresetPart::Convolution),
+        });
+        let cfg = service.config();
+        assert_eq!(cfg.chain.convolution.len(), 2);
+        assert_eq!(cfg.chain.convolution[0].name.as_deref(), Some("other.wav"));
+        assert_eq!(cfg.chain.convolution[1], item);
+        let parts = service.status().part_presets;
+        assert!(parts.iter().all(|p| !p.modified), "{parts:?}");
+        // A convolution edit without it gets it back.
+        service
+            .dispatch(Call::SetConvolution(vec![conv("mine.wav")]))
+            .unwrap();
+        assert_eq!(service.config().chain.convolution[1], item);
+        // A saved preset holds the user's items only.
+        service
+            .dispatch(Call::SavePreset {
+                name: "Saved".into(),
+                overwrite: false,
+                part: Some(PresetPart::Convolution),
+                parts: None,
+            })
+            .unwrap();
+        let saved = presets
+            .scoped(Some(PresetPart::Convolution))
+            .load("Saved")
+            .unwrap();
+        assert_eq!(saved.chain.convolution, vec![conv("mine.wav")]);
+
+        // A/B of calibrations: B is chain A with the other one's master
+        // part; A keeps its own.
+        let quiet = manifest("quiet", -3.0, "sub.wav");
+        let reply = value(Call::BundleAb { path: Some(quiet) });
+        assert_eq!(reply["enabled"], true);
+        let notes = reply["notes"].as_array().unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.as_str().unwrap().contains("master only")),
+            "{notes:?}"
+        );
+        let cfg = service.config();
+        let ab = cfg.ab.as_ref().unwrap();
+        assert_eq!(ab.label.as_deref(), Some("Calibration: quiet"));
+        assert_eq!(ab.chain_b.convolution.len(), 2);
+        assert_eq!(ab.chain_b.convolution[0], cfg.chain.convolution[0]);
+        assert_eq!(ab.chain_b.convolution[1].gain_db, -3.0);
+        assert_eq!(cfg.chain.convolution[1], item);
+        // A later edit of A reaches B; B keeps its calibration.
+        service
+            .dispatch(Call::SetConvolution(vec![conv("other.wav")]))
+            .unwrap();
+        let cfg = service.config();
+        let b = &cfg.ab.as_ref().unwrap().chain_b;
+        assert_eq!(b.convolution[0].name.as_deref(), Some("other.wav"));
+        assert_eq!(b.convolution[1].gain_db, -3.0);
+        // Without a calibration on B.
+        value(Call::BundleAb { path: None });
+        let cfg = service.config();
+        let b = &cfg.ab.as_ref().unwrap().chain_b;
+        assert_eq!(b.convolution, vec![conv("other.wav")]);
+        // Any other side B keeps A's calibration.
+        service
+            .dispatch(Call::SetAb(Some(AbConfig::new(
+                audivane_protocol::ipc::AbB::Patch(json!({"convolution": []})),
+            ))))
+            .unwrap();
+        let cfg = service.config();
+        assert_eq!(cfg.ab.as_ref().unwrap().chain_b.convolution, vec![item]);
+
+        service.flush_persist().unwrap();
+        service.stop_persist();
+        drop(service);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A temporary folder with impulse-response WAVs (one channel each, a
+    /// first tap at `peak`) and a bundle manifest writer for the tests.
+    struct BundleDir(std::path::PathBuf);
+
+    impl BundleDir {
+        fn new(tag: &str) -> Self {
+            let d = std::env::temp_dir().join(format!(
+                "avdsp-svc-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos()
+            ));
+            std::fs::create_dir_all(&d).unwrap();
+            Self(d)
+        }
+        fn wav(&self, name: &str, peak: f32) -> std::path::PathBuf {
+            let p = self.0.join(name);
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 48_000,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            let mut w = hound::WavWriter::create(&p, spec).unwrap();
+            for i in 0..64 {
+                w.write_sample(if i == 0 { peak } else { 0.0 }).unwrap();
+            }
+            w.finalize().unwrap();
+            p
+        }
+        fn manifest(&self, name: &str, follower: Option<&str>) -> String {
+            let mut devices = vec![serde_json::json!(
+                { "role": "master", "matrix": [ { "in": 0, "out": 0, "ir": "ll.wav" } ] })];
+            if let Some(f) = follower {
+                devices.push(
+                    serde_json::json!({ "role": "follower", "device": f, "trim_ms": 1.5,
+                    "matrix": [ { "in": 0, "out": 0, "ir": "sub.wav" } ] }),
+                );
+            }
+            let body = serde_json::json!({ "bundle_version": 1, "label": name,
+                "design_rate_hz": 48000, "devices": devices });
+            let p = self.0.join(format!("{name}.json"));
+            std::fs::write(&p, body.to_string()).unwrap();
+            p.display().to_string()
+        }
+    }
+
+    impl Drop for BundleDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn bundle_service(config: EngineConfig, dir: &BundleDir) -> Arc<Service> {
+        let store = Arc::new(ConfigStore::new(dir.0.join("config.json")));
+        Service::new(
+            guard_mock(&config) as Arc<dyn Engine>,
+            config,
+            Some(store),
+            None,
+            None,
+            ShutdownFlag::new(),
+        )
+    }
+
+    /// `bundle_load`'s reply is a `CalibrationStatus`: the manifest's
+    /// `notes` text stays, the load's warnings come in `warnings`.
+    #[test]
+    fn the_load_reply_keeps_the_manifests_notes() {
+        let dir = BundleDir::new("bundle-notes");
+        dir.wav("ll.wav", 1.0);
+        let p = dir.0.join("noted.json");
+        std::fs::write(
+            &p,
+            serde_json::json!({ "bundle_version": 1, "label": "noted", "design_rate_hz": 48000,
+                "notes": "target and positions",
+                "devices": [ { "role": "master", "device": "hw:CARD=Other,DEV=0",
+                    "matrix": [ { "in": 0, "out": 0, "ir": "ll.wav" } ] } ] })
+            .to_string(),
+        )
+        .unwrap();
+        let config = EngineConfig {
+            device: "hw:CARD=USB,DEV=0".into(),
+            ..EngineConfig::default()
+        };
+        let service = bundle_service(config, &dir);
+        let reply = match service
+            .dispatch(Call::BundleLoad {
+                path: p.display().to_string(),
+            })
+            .unwrap()
+        {
+            Dispatch::Value(v) => v,
+            other => panic!("unexpected {other:?}"),
+        };
+        let st: audivane_protocol::ipc::CalibrationStatus = serde_json::from_value(reply).unwrap();
+        assert_eq!(st.notes.as_deref(), Some("target and positions"));
+        assert!(
+            st.warnings
+                .iter()
+                .any(|w| w.contains("hw:CARD=Other,DEV=0")),
+            "{:?}",
+            st.warnings
+        );
+        service.stop_persist();
+    }
+
+    /// The calibration is the daemon's across whole-config edits: a
+    /// `set_config` without it keeps it (and its record), so unload still
+    /// puts the follower's trim back.
+    #[test]
+    fn set_config_keeps_the_calibration() {
+        const SUB: &str = "hw:CARD=USB_1,DEV=0";
+        let dir = BundleDir::new("bundle-setcfg");
+        dir.wav("ll.wav", 1.0);
+        dir.wav("sub.wav", 0.5);
+        let mut config = EngineConfig {
+            device: "hw:CARD=USB,DEV=0".into(),
+            ..EngineConfig::default()
+        };
+        let mut f = FollowerConfig::new(SUB);
+        f.trim_ms = -2.0;
+        config.outputs.followers.push(f);
+        let service = bundle_service(config, &dir);
+        let before = service.config();
+        service
+            .dispatch(Call::BundleLoad {
+                path: dir.manifest("desk", Some(SUB)),
+            })
+            .unwrap();
+        let mut sent = service.config();
+        sent.calibration = None;
+        sent.chain.convolution.clear();
+        sent.quantum = 512;
+        service.dispatch(Call::SetConfig(sent)).unwrap();
+        let cfg = service.config();
+        assert!(cfg.calibration.is_some(), "kept");
+        assert!(
+            cfg.chain.convolution[0].calibration,
+            "its item back in place"
+        );
+        assert_eq!(cfg.outputs.followers[0].trim_ms, 1.5);
+        service.dispatch(Call::BundleUnload).unwrap();
+        let cfg = service.config();
+        assert_eq!(cfg.outputs.followers[0].trim_ms, -2.0);
+        let mut want = before.clone();
+        want.outputs.followers[0].follow_volume = true;
+        want.outputs.followers[0].follow_ref_db = Some(0.0);
+        assert_eq!(
+            EngineConfig {
+                quantum: before.quantum,
+                ..cfg
+            },
+            want
+        );
+        service.stop_persist();
+    }
+
+    /// `bundle_gain` sets one part's level: the master's reaches chain A's
+    /// item only, a follower's that follower's patch only; it is kept
+    /// through convolution edits, a preset load and `set_config`; the boost
+    /// cap refuses it (nothing changes); `null` goes back to the manifest's,
+    /// and a new load or an unload drops it.
+    #[test]
+    fn bundle_gain_sets_keeps_and_resets_each_part() {
+        const SUB: &str = "hw:CARD=USB_1,DEV=0";
+        const OTHER: &str = "hw:CARD=USB_2,DEV=0";
+        let dir = BundleDir::new("bundle-gain");
+        dir.wav("ll.wav", 1.0);
+        dir.wav("sub.wav", 0.5);
+        dir.wav("mine.wav", 1.0);
+        let mut config = EngineConfig {
+            device: "hw:CARD=USB,DEV=0".into(),
+            ..EngineConfig::default()
+        };
+        config.outputs.followers.push(FollowerConfig::new(OTHER));
+        let store = Arc::new(ConfigStore::new(dir.0.join("config.json")));
+        let presets = PresetStore::alongside(&store);
+        let mine = audivane_protocol::ConvolutionConfig {
+            name: Some("mine".into()),
+            enabled: true,
+            ir_path: dir.0.join("mine.wav"),
+            gain_db: 0.0,
+            matrix: None,
+            calibration: false,
+        };
+        let chain = ChainConfig {
+            convolution: vec![mine.clone()],
+            ..config.chain.clone()
+        };
+        presets
+            .scoped(Some(PresetPart::Convolution))
+            .save(&Preset::for_part("Mine", PresetPart::Convolution, chain))
+            .unwrap();
+        let service = Service::new(
+            guard_mock(&config) as Arc<dyn Engine>,
+            config,
+            Some(store),
+            None,
+            None,
+            ShutdownFlag::new(),
+        );
+        let value = |c: Call| match service.dispatch(c).unwrap() {
+            Dispatch::Value(v) => v,
+            other => panic!("unexpected {other:?}"),
+        };
+        let gain = |device: Option<&str>, gain_db: Option<f64>| Call::BundleGain {
+            device: device.map(Into::into),
+            gain_db,
+        };
+        let master_item = |c: &EngineConfig| {
+            c.chain
+                .convolution
+                .iter()
+                .find(|c| c.calibration)
+                .unwrap()
+                .gain_db
+        };
+        let patch_gain = |c: &EngineConfig, dev: &str| {
+            c.outputs
+                .followers
+                .iter()
+                .find(|f| f.device == dev)
+                .unwrap()
+                .chain_patch
+                .as_ref()
+                .and_then(|p| p.get("convolution"))
+                .map(|v| v[0]["gain_db"].as_f64().unwrap())
+        };
+        assert_eq!(
+            service.dispatch(gain(None, Some(-1.0))).unwrap_err().code,
+            RpcError::BAD_STATE,
+            "none loaded"
+        );
+        let desk = dir.manifest("desk", Some(SUB));
+        value(Call::BundleLoad { path: desk.clone() });
+
+        // The follower's part: its patch only, the master's item untouched.
+        let st = value(gain(Some(SUB), Some(3.0)));
+        assert_eq!(st["devices"][1]["gain_db"], 3.0);
+        assert_eq!(st["devices"][1]["manifest_gain_db"], 0.0);
+        let cfg = service.config();
+        assert_eq!(patch_gain(&cfg, SUB), Some(3.0));
+        assert_eq!(master_item(&cfg), 0.0);
+        assert_eq!(patch_gain(&cfg, OTHER), None, "another follower: none");
+        // The master's: chain A only.
+        value(gain(Some("master"), Some(-4.0)));
+        let cfg = service.config();
+        assert_eq!(master_item(&cfg), -4.0);
+        assert_eq!(patch_gain(&cfg, SUB), Some(3.0));
+        let st = service.status().calibration.unwrap();
+        assert_eq!(
+            (st.devices[0].gain_db, st.devices[0].manifest_gain_db),
+            (-4.0, 0.0)
+        );
+
+        // Out of range, an unknown part, and over the boost cap: refused,
+        // nothing changes.
+        let before = service.config();
+        assert!(service.dispatch(gain(None, Some(30.0))).is_err());
+        assert!(service.dispatch(gain(Some(OTHER), Some(1.0))).is_err());
+        let err = service.dispatch(gain(None, Some(20.0))).unwrap_err();
+        assert!(
+            err.message.contains("nothing changed") && err.message.contains("cap"),
+            "{}",
+            err.message
+        );
+        let err = service.dispatch(gain(Some(SUB), Some(24.0))).unwrap_err();
+        assert!(
+            err.message.contains(&format!("follower {SUB}")),
+            "{}",
+            err.message
+        );
+        assert_eq!(service.config(), before);
+
+        // Kept through a convolution edit, a preset load and set_config.
+        service
+            .dispatch(Call::SetConvolution(vec![mine.clone()]))
+            .unwrap();
+        value(Call::LoadPreset {
+            name: "Mine".into(),
+            part: Some(PresetPart::Convolution),
+        });
+        let mut sent = service.config();
+        sent.calibration = None;
+        sent.chain.convolution.retain(|c| !c.calibration);
+        sent.quantum = 512;
+        service.dispatch(Call::SetConfig(sent)).unwrap();
+        let cfg = service.config();
+        assert_eq!(master_item(&cfg), -4.0);
+        assert_eq!(patch_gain(&cfg, SUB), Some(3.0));
+
+        // Reset: back to the manifest's, the record cleared.
+        value(gain(Some(SUB), None));
+        let cfg = service.config();
+        assert_eq!(patch_gain(&cfg, SUB), Some(0.0));
+        let cal = cfg.calibration.as_ref().unwrap();
+        assert_eq!(cal.followers[0].manifest_gain_db, None);
+        assert_eq!(cal.master_manifest_gain_db, Some(0.0));
+
+        // A new load (the same bundle again) starts from the manifest.
+        value(Call::BundleLoad { path: desk });
+        let cfg = service.config();
+        assert_eq!(master_item(&cfg), 0.0);
+        assert_eq!(
+            cfg.calibration.as_ref().unwrap().master_manifest_gain_db,
+            None
+        );
+        // Unload removes it with the rest.
+        value(gain(None, Some(-2.0)));
+        service.dispatch(Call::BundleUnload).unwrap();
+        let cfg = service.config();
+        assert!(cfg.chain.convolution.iter().all(|c| !c.calibration));
+        assert!(service.dispatch(gain(None, Some(-2.0))).is_err());
+        service.stop_persist();
+    }
+
+    /// Unload works from the record as edits left it: a follower the
+    /// bundle added, removed and added again by hand, stays; a follower
+    /// whose IR from before the bundle is gone is put back without it (a
+    /// note says so), or with what the user set on it since.
+    #[test]
+    fn unload_follows_the_followers_edits() {
+        const SUB: &str = "hw:CARD=USB_1,DEV=0";
+        let dir = BundleDir::new("bundle-edits");
+        dir.wav("ll.wav", 1.0);
+        dir.wav("sub.wav", 0.5);
+        let own = dir.wav("own.wav", 0.5);
+        let config = EngineConfig {
+            device: "hw:CARD=USB,DEV=0".into(),
+            ..EngineConfig::default()
+        };
+        let service = bundle_service(config, &dir);
+        let follower = |patch: Option<Value>| Call::SetFollower {
+            device: SUB.into(),
+            remove: false,
+            enabled: None,
+            trim_ms: None,
+            volume_db: None,
+            output_channels: None,
+            follow_volume: None,
+            chain_patch: patch,
+            period_ms: None,
+        };
+        // Added by the bundle, removed and added again by hand.
+        service
+            .dispatch(Call::BundleLoad {
+                path: dir.manifest("desk", Some(SUB)),
+            })
+            .unwrap();
+        assert_eq!(service.config().outputs.followers.len(), 1);
+        service
+            .dispatch(Call::SetFollower {
+                device: SUB.into(),
+                remove: true,
+                enabled: None,
+                trim_ms: None,
+                volume_db: None,
+                output_channels: None,
+                follow_volume: None,
+                chain_patch: None,
+                period_ms: None,
+            })
+            .unwrap();
+        assert!(service.config().calibration.unwrap().followers.is_empty());
+        service.dispatch(follower(None)).unwrap();
+        service.dispatch(Call::BundleUnload).unwrap();
+        assert_eq!(
+            service.config().outputs.followers.len(),
+            1,
+            "the user's stays"
+        );
+
+        // Its own IR before the bundle goes missing: unload skips it.
+        let own_conv = serde_json::json!({"convolution": [{"ir_path": own}]});
+        service.dispatch(follower(Some(own_conv.clone()))).unwrap();
+        service
+            .dispatch(Call::BundleLoad {
+                path: dir.manifest("desk", Some(SUB)),
+            })
+            .unwrap();
+        std::fs::remove_file(&own).unwrap();
+        let reply = match service.dispatch(Call::BundleUnload).unwrap() {
+            Dispatch::Value(v) => v,
+            other => panic!("unexpected {other:?}"),
+        };
+        let note = reply["notes"][0].as_str().unwrap().to_string();
+        assert!(
+            note.contains("own.wav") && note.contains("not put back"),
+            "{note}"
+        );
+        assert_eq!(service.config().outputs.followers[0].chain_patch, None);
+
+        // What the user sets while calibrated is what unload puts back;
+        // the calibration's item keeps playing meanwhile.
+        dir.wav("own.wav", 0.5);
+        service.dispatch(follower(Some(own_conv))).unwrap();
+        service
+            .dispatch(Call::BundleLoad {
+                path: dir.manifest("desk", Some(SUB)),
+            })
+            .unwrap();
+        std::fs::remove_file(&own).unwrap();
+        service
+            .dispatch(follower(Some(serde_json::json!({"convolution": []}))))
+            .unwrap();
+        let patch = service.config().outputs.followers[0]
+            .chain_patch
+            .clone()
+            .unwrap();
+        assert_eq!(
+            patch["convolution"][0]["calibration"], true,
+            "still the bundle's"
+        );
+        assert!(matches!(
+            service.dispatch(Call::BundleUnload).unwrap(),
+            Dispatch::Value(Value::Null)
+        ));
+        assert_eq!(
+            service.config().outputs.followers[0].chain_patch,
+            Some(serde_json::json!({"convolution": []}))
+        );
+        service.stop_persist();
+    }
+
+    /// A master-only calibration never reaches another output: a follower
+    /// it does not name plays chain A without the calibration's item.
+    #[test]
+    fn a_master_calibration_stays_off_the_other_followers() {
+        let dir = BundleDir::new("bundle-masteronly");
+        dir.wav("ll.wav", 1.0);
+        let mine = dir.wav("mine.wav", 0.5);
+        let mut config = EngineConfig {
+            device: "hw:CARD=USB,DEV=0".into(),
+            ..EngineConfig::default()
+        };
+        config.chain.convolution = vec![audivane_protocol::ConvolutionConfig {
+            name: None,
+            enabled: true,
+            ir_path: mine,
+            gain_db: 0.0,
+            matrix: None,
+            calibration: false,
+        }];
+        config
+            .outputs
+            .followers
+            .push(FollowerConfig::new("hw:CARD=X,DEV=0"));
+        let service = bundle_service(config, &dir);
+        service
+            .dispatch(Call::BundleLoad {
+                path: dir.manifest("mains", None),
+            })
+            .unwrap();
+        let cfg = service.config();
+        assert_eq!(cfg.chain.convolution.len(), 2);
+        let f = &cfg.outputs.followers[0];
+        let own = super::super::follower_chain::config(&cfg, f);
+        assert_eq!(
+            own.chain.convolution,
+            vec![cfg.chain.convolution[0].clone()]
+        );
+        service.stop_persist();
+    }
+
+    #[test]
+    fn ab_overload_fallback_cancels_measurement_and_reports_disabled() {
+        struct OverloadMock {
+            inner: MockEngine,
+            rt_overloads: AtomicU64,
+            generation: AtomicU64,
+        }
+        impl Engine for OverloadMock {
+            fn apply(&self, cfg: &EngineConfig) -> Result<(), EngineError> {
+                self.generation.fetch_add(1, Ordering::Relaxed);
+                self.inner.apply(cfg)
+            }
+            fn applied_generation(&self) -> u64 {
+                self.generation.load(Ordering::Relaxed)
+            }
+            fn ab_select(&self, side: AbSide, crossfade_ms: f64) -> Result<AbStatus, EngineError> {
+                self.inner.ab_select(side, crossfade_ms)
+            }
+            fn snapshot(&self) -> EngineSnapshot {
+                let mut s = self.inner.snapshot();
+                s.state = EngineState::Playing;
+                s.chain_generation = self.generation.load(Ordering::Relaxed);
+                s.gaps.dsp_wanted = 1;
+                s.gaps.processed_periods = 100;
+                let ov = self.rt_overloads.load(Ordering::Relaxed);
+                s.gaps.rt_overloads = ov;
+                s.gaps.rt_signals = ov;
+                s.gaps.rt_overload_generation = s.chain_generation;
+                s
+            }
+            fn meters(&self) -> Meters {
+                self.inner.meters()
+            }
+            fn selftest(&self) -> Result<audivane_protocol::ipc::SelfTestResult, EngineError> {
+                self.inner.selftest()
+            }
+            fn release_device(&self) -> Result<(), EngineError> {
+                Ok(())
+            }
+            fn acquire_device(&self) -> Result<(), EngineError> {
+                Ok(())
+            }
+            fn shutdown(&self) {}
+            fn set_ab_measure(&self, epoch: u32) {
+                self.inner.set_ab_measure(epoch);
+            }
+            fn take_ab_hops(&self, out: &mut Vec<audivane_dsp_core::ab_measure::AbHop>) {
+                self.inner.take_ab_hops(out);
+            }
+        }
+
+        let engine = Arc::new(OverloadMock {
+            inner: MockEngine {
+                config: Mutex::new(EngineConfig {
+                    device: "hw:0,0".into(),
+                    ..EngineConfig::default()
+                }),
+                applies: AtomicU64::new(0),
+                refreshes: AtomicU64::new(0),
+                applied: Mutex::new((None, 0)),
+                measure: Mutex::new((0, Vec::new())),
+                graph_rate: Mutex::new(None),
+                live_suspends: AtomicU64::new(0),
+                caps: Mutex::new(None),
+            },
+            rt_overloads: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+        });
+        let service = Service::new(
+            Arc::clone(&engine) as Arc<dyn Engine>,
+            engine.inner.config.lock().unwrap().clone(),
+            None,
+            None,
+            None,
+            ShutdownFlag::new(),
+        );
+
+        service
+            .dispatch(Call::SetAb(Some(AbConfig::chain(ChainConfig::neutral()))))
+            .unwrap();
+        service
+            .dispatch(Call::AbMeasure {
+                max_seconds: Some(30.0),
+                cancel: false,
+                accept: false,
+            })
+            .unwrap();
+        assert!(service.ab_status().enabled);
+        assert!(service.ab_status().measuring.is_some());
+        assert_ne!(engine.inner.measure.lock().unwrap().0, 0);
+
+        // Settle, then trip an RT overload: the first fallback step turns A/B off.
+        for _ in 0..8 {
+            service.overload_tick();
+        }
+        engine.rt_overloads.store(1, Ordering::Relaxed);
+        for _ in 0..8 {
+            service.overload_tick();
+        }
+
+        assert!(
+            service.overload_report().is_some(),
+            "overload fallback should be active"
+        );
+        assert_eq!(
+            engine.inner.measure.lock().unwrap().0,
+            0,
+            "engine measurement epoch must be cleared"
+        );
+        let ab = service.ab_status();
+        assert!(
+            !ab.enabled,
+            "ab_status must report disabled during fallback"
+        );
+        assert!(ab.measuring.is_none(), "measurement must be cancelled");
+        assert!(
+            ab.measure_error
+                .as_deref()
+                .is_some_and(|e| e.contains("overload")),
+            "reason must stay visible: {:?}",
+            ab.measure_error
+        );
+        let status_ab = service
+            .status()
+            .ab
+            .expect("status.ab should stay present with reason");
+        assert!(
+            !status_ab.enabled,
+            "status.ab must report disabled during fallback"
+        );
+        assert_eq!(status_ab.measure_error, ab.measure_error);
     }
 }

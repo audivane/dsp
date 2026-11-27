@@ -172,6 +172,18 @@ impl StereoGainRamp {
         self.current
     }
 
+    /// Advance `frames` output frames with no audio to scale (a block
+    /// played as silence): the ramp ends exactly where [`Self::next_frame`]
+    /// `frames` times would leave it, so a mute set while the chain is
+    /// silent has finished (or gone as far) when sound comes back.
+    pub fn advance(&mut self, frames: usize) {
+        if frames == 0 || self.pos >= self.len {
+            return;
+        }
+        self.pos = (self.pos + frames - 1).min(self.len - 1);
+        self.next_frame();
+    }
+
     /// Scale `frames` samples per channel of a planar `f64` buffer in place.
     /// Zero-cost no-op when settled at unity.
     pub fn process_planar(&mut self, chans: &mut [Vec<f64>], frames: usize) {
@@ -437,6 +449,27 @@ impl MuteRamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advance_lands_where_frame_by_frame_does() {
+        for frames in [0, 1, 7, 100, 2_205, 10_000] {
+            let mut a = StereoGainRamp::unity(44_100);
+            let mut b = StereoGainRamp::unity(44_100);
+            a.set_targets([0.25, 0.0, 0.5], true);
+            b.set_targets([0.25, 0.0, 0.5], true);
+            // Part way in first, then the jump.
+            for _ in 0..13 {
+                a.next_frame();
+                b.next_frame();
+            }
+            a.advance(frames);
+            for _ in 0..frames {
+                b.next_frame();
+            }
+            assert_eq!(a.current(), b.current(), "{frames} frames");
+            assert_eq!(a.next_frame(), b.next_frame(), "{frames} frames, then one");
+        }
+    }
 
     #[test]
     fn balance_attenuates_correct_channel() {

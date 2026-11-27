@@ -1,6 +1,6 @@
 //! Deterministic test signals and small measurement helpers.
 
-/// xorshift64* — tiny, deterministic, good enough for test noise.
+/// xorshift64*: tiny, deterministic, good enough for test noise.
 pub struct Rng(u64);
 
 impl Rng {

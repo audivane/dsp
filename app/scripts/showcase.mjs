@@ -1,5 +1,5 @@
 // Cropped screenshots of the mock-transport app for the audivane.app website.
-// Usage: npm run build && npm run screenshots:showcase -- <outDir> [--skins light,midnight]
+// Usage: npm run build && npm run screenshots:showcase -- <outDir> [--skins light,graphite]
 //
 // Every shot runs the real UI against the in-memory mock daemon (no engine,
 // no audio): a split L/R EQ with no overlays, the live (simulated) spectrum,
@@ -17,7 +17,7 @@ const opt = (name, def) => {
   return i >= 0 ? args[i + 1] : def;
 };
 const outDir = resolve(args.find((a, i) => !a.startsWith("--") && !(i > 0 && args[i - 1].startsWith("--"))) ?? "test-results/showcase");
-const skins = opt("--skins", "light,midnight").split(",");
+const skins = opt("--skins", "light,graphite").split(",");
 const scale = Number(opt("--scale", "2"));
 mkdirSync(outDir, { recursive: true });
 

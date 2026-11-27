@@ -14,6 +14,9 @@ audivane-protocol.workspace = true
 rustfft.workspace = true
 realfft.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 cc = "1"
 

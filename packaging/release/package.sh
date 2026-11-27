@@ -65,7 +65,8 @@ vendor: Audivane
 homepage: https://audivane.app/dsp/
 license: AGPL-3.0-only
 description: |-
-  Bit-perfect system-wide equalizer, convolution and upsampling for PipeWire.
+  System-wide upsampling, harmonics, equalizer and convolution for PipeWire,
+  bit-perfect when processing is off.
   A background engine that owns the DAC and drives PipeWire from its clock,
   plus a desktop app to control it.
 mtime: "$mtime"

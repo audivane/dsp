@@ -32,8 +32,15 @@
 //! The saved config is never changed: [`Supervisor::plan`] and
 //! [`Supervisor::commit_request`] map what is requested to what runs, so a
 //! refused edit leaves the fallback as it was. It holds until the request
-//! changes what it replaced (the upsampler, the output, A/B) or the daemon
-//! restarts, which falls back the same way instead of crash-looping.
+//! changes what it replaced (the upsampler, the output, A/B), the daemon
+//! restarts (which falls back the same way instead of crash-looping), or,
+//! for the chain's steps, playback moves to another source rate
+//! ([`Step::RateLeft`]): the fallback is per rate. The request runs at the
+//! new rate, and the rate left counts as over budget for it
+//! ([`Supervisor::tripped_rates`]), so the per-rate plan
+//! ([`super::cpu_budget::plan_rates`]) builds a lighter upsampler there
+//! before it opens next time. That plan is the first line: this detector is
+//! the net for a wrong estimate.
 //!
 //! A config counts as running fine (the one step 1 returns to) after three calm
 //! seconds with no fallback, DSP on, its generation up and the device upsampled
@@ -121,6 +128,12 @@ pub struct Sample {
     pub probes: u64,
     /// Varispeed's request and whether its stage runs.
     pub varispeed: VarispeedRequest,
+    /// The per-rate plan ([`crate::api::RatePlan`]) builds another
+    /// upsampler than the request's at the rate playing: a calm is not the
+    /// request's own.
+    pub substituted: bool,
+    /// The source (graph) rate, Hz; 0 when unknown.
+    pub source_rate: u32,
 }
 
 impl Default for Sample {
@@ -144,6 +157,8 @@ impl Default for Sample {
             device: 0,
             probes: 0,
             varispeed: VarispeedRequest::default(),
+            substituted: false,
+            source_rate: 0,
         }
     }
 }
@@ -308,6 +323,8 @@ pub struct Transition {
     landing: Landing,
     trip: Trip,
     output_rate: u32,
+    /// The source rate it is for (0: unknown).
+    source_rate: u32,
 }
 
 impl Transition {
@@ -334,6 +351,11 @@ enum Cause {
 struct Trip {
     load: f64,
     cause: Cause,
+    /// The request's own upsampler ran when it tripped (not the per-rate
+    /// plan's): the fallback is per rate ([`Step::RateLeft`]). One made
+    /// while the plan's lighter design ran holds as before: the estimate
+    /// and its fallback both failed there.
+    per_rate: bool,
 }
 
 impl Trip {
@@ -389,6 +411,16 @@ pub enum Step {
     /// A new varispeed request ended the varispeed step in effect (nothing
     /// to apply but the hold, [`Supervisor::varispeed_hold`]).
     Ended,
+    /// Playback moved from the source rate the chain's fallback was made
+    /// for (`from`) to another (`to`): the fallback is per rate, so it ends
+    /// there. Handled as [`Self::End`] (apply the request, then
+    /// [`Supervisor::end`] or [`Supervisor::end_refused`]); `from` counts as
+    /// over budget for the request from now on
+    /// ([`Supervisor::tripped_rates`]).
+    RateLeft {
+        from: u32,
+        to: u32,
+    },
 }
 
 /// One try at running the step in effect, begun when the engine accepted
@@ -499,6 +531,9 @@ pub struct Supervisor {
     ending: Option<usize>,
     /// Refusals of the pending end in a row.
     end_refusals: u32,
+    /// The source rates where the request (its heavy part) overloaded and
+    /// a chain fallback ran: the per-rate plan treats them as over budget.
+    tripped: Option<(HeavyPart, Vec<u32>)>,
 }
 
 /// Whether going from the request `from` to `to` ends a fallback at
@@ -687,6 +722,21 @@ impl Supervisor {
         self.active.as_ref().map(|a| &a.report)
     }
 
+    /// The source rates where `requested` (its upsampler, output and A/B)
+    /// overloaded in this run and a fallback ran ([`Step::RateLeft`]): the
+    /// per-rate plan falls back there.
+    pub fn tripped_rates(&self, requested: &EngineConfig) -> &[u32] {
+        match &self.tripped {
+            Some((h, rates)) if *h == HeavyPart::of(requested) => rates,
+            _ => &[],
+        }
+    }
+
+    /// The last requested upsampler setting that ran without overload.
+    pub fn last_good_upsampler(&self) -> Option<&UpsamplerConfig> {
+        self.last_good.as_ref().map(|g| &g.upsampler)
+    }
+
     fn reset_window(&mut self, settle: usize) {
         self.window.clear();
         self.settle = settle;
@@ -742,8 +792,10 @@ impl Supervisor {
         if s.device != 0 && self.device != Some(s.device) {
             if self.device.is_some() {
                 // Another device behind the same name: a new attempt, and
-                // every step may play (or fail) there anew.
+                // every step may play (or fail) there anew, and every rate
+                // is priced anew.
                 self.failed.clear();
+                self.tripped = None;
                 self.ending = None;
                 let probes = before(|p| p.probes);
                 if let Some(a) = &mut self.active {
@@ -829,8 +881,12 @@ impl Supervisor {
         self.next_step(
             current.as_ref(),
             false,
-            Trip { load, cause },
-            s.output_rate,
+            Trip {
+                load,
+                cause,
+                per_rate: !s.substituted,
+            },
+            (s.output_rate, s.source_rate),
             requested,
             plays,
         )
@@ -853,6 +909,37 @@ impl Supervisor {
             }
             *wait = 0;
             return Some(Step::End);
+        }
+        // Per rate: a chain fallback made at one source rate ends once
+        // playback runs at another (the request is judged there afresh, and
+        // the per-rate plan keeps the old rate on a fallback).
+        if let Some(a) = &self.active
+            && !a.level.is_varispeed()
+            && a.trip.per_rate
+            && a.report.source_rate != 0
+            && s.running
+            && !s.switching
+            && !s.error
+            && s.source_rate != 0
+            && s.source_rate != a.report.source_rate
+        {
+            let (from, to) = (a.report.source_rate, s.source_rate);
+            let heavy = HeavyPart::of(requested);
+            match &mut self.tripped {
+                Some((h, rates)) if *h == heavy => {
+                    if !rates.contains(&from) {
+                        rates.push(from);
+                    }
+                }
+                _ => self.tripped = Some((heavy, vec![from])),
+            }
+            log::info!(
+                "overload fallback made at {from} Hz: playback moved to {to} Hz, running the \
+                 requested setting there ({from} Hz falls back from now on)"
+            );
+            self.ending = Some(0);
+            self.end_refusals = 0;
+            return Some(Step::RateLeft { from, to });
         }
         let a = self.active.as_mut()?;
         a.attempt.age += 1;
@@ -936,7 +1023,7 @@ impl Supervisor {
         let Some(a) = &self.active else {
             return Step::Nothing;
         };
-        let (trip, rate) = (a.trip, a.report.output_rate);
+        let (trip, rate, source_rate) = (a.trip, a.report.output_rate, a.report.source_rate);
         self.reset_window(SETTLE);
         let next = self
             .choose(Some(&from), true, requested, plays)
@@ -948,6 +1035,7 @@ impl Supervisor {
                 landing,
                 trip,
                 output_rate: rate,
+                source_rate,
             });
         }
         log::warn!(
@@ -963,6 +1051,7 @@ impl Supervisor {
     /// fallback, DSP on, upsampling, and the device at an upsampled rate.
     fn upsampler_runs(&self, s: &Sample, requested: &EngineConfig) -> bool {
         self.active.is_none()
+            && !s.substituted
             && self.applied.as_ref() == Some(&run_key(requested))
             && requested.dsp_enabled
             && requested.chain.upsampler.target != RateTarget::Off
@@ -985,7 +1074,7 @@ impl Supervisor {
             Some(&t.level),
             true,
             t.trip,
-            t.output_rate,
+            (t.output_rate, t.source_rate),
             requested,
             plays,
         )
@@ -996,7 +1085,7 @@ impl Supervisor {
         from: Option<&Level>,
         from_failed: bool,
         trip: Trip,
-        output_rate: u32,
+        (output_rate, source_rate): (u32, u32),
         requested: &EngineConfig,
         plays: &dyn Fn(&EngineConfig) -> Landing,
     ) -> Step {
@@ -1007,6 +1096,7 @@ impl Supervisor {
                 landing,
                 trip,
                 output_rate,
+                source_rate,
             });
         }
         if self.exhausted_logged {
@@ -1099,6 +1189,7 @@ impl Supervisor {
             landing,
             trip,
             output_rate,
+            source_rate,
         } = t;
         let why = trip.predicate();
         let upsampling = requested.chain.upsampler.target != RateTarget::Off;
@@ -1228,6 +1319,7 @@ impl Supervisor {
             message,
             episode: self.episodes,
             applied: false,
+            source_rate,
         };
         let running = level.apply(requested);
         self.applied = Some(run_key(&running));
@@ -1263,6 +1355,7 @@ fn action_name(action: OverloadAction) -> &'static str {
         OverloadAction::LightUpsampler => "lightest upsampler",
         OverloadAction::Bypass => "bypass",
         OverloadAction::None => "none",
+        OverloadAction::Recommended => "Recommended",
     }
 }
 
@@ -1382,6 +1475,7 @@ mod tests {
                 s: Sample {
                     output_rate: 768_000,
                     ratio: RateRatio::integer(16),
+                    source_rate: 48_000,
                     ..Sample::default()
                 },
                 generation: 0,
@@ -1491,7 +1585,7 @@ mod tests {
                         self.exhausted += 1;
                         return;
                     }
-                    Step::End => {
+                    Step::End | Step::RateLeft { .. } => {
                         self.generation += 1;
                         self.running = Some(cfg.clone());
                         if !self.lag {
@@ -1566,6 +1660,12 @@ mod tests {
             }
         }
 
+        /// The device moves to `ratio` on the same 48 kHz graph rate.
+        fn set_ratio(&mut self, ratio: RateRatio) {
+            self.s.ratio = ratio;
+            self.s.output_rate = ratio.output_rate(48_000).unwrap_or(48_000);
+        }
+
         fn actions(&self) -> Vec<OverloadAction> {
             self.reports.iter().map(|r| r.action).collect()
         }
@@ -1591,6 +1691,80 @@ mod tests {
             requests: rig.s.varispeed.requests + 1,
             hold_ack: rig.s.varispeed.hold_ack,
         };
+    }
+
+    #[test]
+    fn a_chain_fallback_is_per_source_rate() {
+        // The request overloads at 192 kHz (x4 to 768 kHz): the reactive
+        // fallback runs there, and holds while 192 kHz plays.
+        let cfg = heavy();
+        let mut rig = Rig::new(&cfg);
+        rig.set_ratio(RateRatio::integer(4));
+        rig.s.output_rate = 768_000;
+        rig.s.source_rate = 192_000;
+        rig.feed(&cfg, FIRST, 1.4, 0, everything_plays);
+        assert_eq!(rig.actions(), vec![OverloadAction::UpsamplerOff]);
+        assert_eq!(rig.reports[0].source_rate, 192_000);
+        // The step lands at x1 on the same graph rate: it holds.
+        rig.set_ratio(RateRatio::ONE);
+        rig.s.output_rate = 192_000;
+        rig.feed(&cfg, 3 * NEXT, 0.3, 0, everything_plays);
+        assert_eq!(rig.actions().len(), 1);
+        assert_eq!(rig.ended, 0);
+        assert!(rig.sup.report().is_some());
+        assert!(rig.sup.tripped_rates(&cfg).is_empty());
+        // A 48 kHz track: the fallback ends and the request runs there; 192
+        // kHz now counts as over budget for it.
+        rig.s.switching = true;
+        rig.wait(&cfg, 2, everything_plays);
+        rig.s.switching = false;
+        rig.set_ratio(RateRatio::integer(16));
+        rig.s.output_rate = 768_000;
+        rig.s.source_rate = 48_000;
+        rig.feed(&cfg, 1, 0.3, 0, everything_plays);
+        assert_eq!(rig.ended, 1);
+        assert_eq!(*rig.runs(), cfg);
+        assert!(rig.sup.report().is_none());
+        assert_eq!(rig.sup.tripped_rates(&cfg), &[192_000]);
+        // Calm at 48 kHz: it runs fine, and stays.
+        rig.feed(&cfg, 2 * NEXT, 0.3, 0, everything_plays);
+        assert_eq!(rig.actions().len(), 1);
+        assert_eq!(rig.sup.last_good_upsampler(), Some(&cfg.chain.upsampler));
+        // Another request starts afresh.
+        assert!(rig.sup.tripped_rates(&light()).is_empty());
+    }
+
+    #[test]
+    fn a_fallback_made_under_the_per_rate_plan_holds_across_rates() {
+        // The plan's lighter design ran at 192 kHz and overloaded anyway:
+        // its fallback holds when the rate moves (no cycling between the
+        // request and the fallback).
+        let cfg = heavy();
+        let mut rig = Rig::new(&cfg);
+        rig.s.source_rate = 192_000;
+        rig.s.substituted = true;
+        rig.feed(&cfg, FIRST, 1.4, 0, everything_plays);
+        assert_eq!(rig.actions(), vec![OverloadAction::UpsamplerOff]);
+        rig.s.substituted = false;
+        rig.s.source_rate = 48_000;
+        rig.feed(&cfg, 2 * NEXT, 0.3, 0, everything_plays);
+        assert_eq!(rig.ended, 0);
+        assert!(rig.sup.report().is_some());
+        assert!(rig.sup.tripped_rates(&cfg).is_empty());
+    }
+
+    #[test]
+    fn a_calm_under_the_per_rate_plan_is_not_the_request_s() {
+        // The per-rate plan builds a lighter upsampler at the rate playing:
+        // its calm says nothing of the request.
+        let cfg = heavy();
+        let mut rig = Rig::new(&cfg);
+        rig.s.substituted = true;
+        rig.feed(&cfg, 2 * GOOD_AFTER, 0.3, 0, everything_plays);
+        assert_eq!(rig.sup.last_good_upsampler(), None);
+        rig.s.substituted = false;
+        rig.feed(&cfg, GOOD_AFTER + 1, 0.3, 0, everything_plays);
+        assert_eq!(rig.sup.last_good_upsampler(), Some(&cfg.chain.upsampler));
     }
 
     #[test]
@@ -1790,7 +1964,7 @@ mod tests {
         assert_eq!(rig.runs().chain.upsampler.target, RateTarget::Off);
         assert!(rig.runs().dsp_enabled);
         // The next sample sees the step's chain running: applied.
-        rig.s.ratio = RateRatio::ONE;
+        rig.set_ratio(RateRatio::ONE);
         rig.feed(&cfg, 1, 0.9, 0, everything_plays);
         assert_eq!(rig.confirmed, 1);
         assert!(rig.sup.report().unwrap().applied);
@@ -1822,7 +1996,7 @@ mod tests {
     fn a_b_off_is_the_first_step_and_the_later_ones_keep_it_off() {
         let cfg = with_heavy_b(&light());
         let mut rig = Rig::new(&cfg);
-        rig.s.ratio = RateRatio::integer(4);
+        rig.set_ratio(RateRatio::integer(4));
         rig.feed(&cfg, SETTLE / 2 + LOADED_SAMPLES, 1.4, 0, everything_plays);
         assert_eq!(rig.actions(), [OverloadAction::AbOff]);
         let report = &rig.reports[0];
@@ -1879,13 +2053,13 @@ mod tests {
     fn falls_back_to_the_last_setting_that_ran() {
         let good = light();
         let mut rig = Rig::new(&good);
-        rig.s.ratio = RateRatio::integer(4);
+        rig.set_ratio(RateRatio::integer(4));
         rig.feed(&good, SETTLE / 2 + GOOD_AFTER, 0.3, 0, everything_plays);
         assert!(rig.reports.is_empty());
         let bad = heavy();
         rig.edit(&bad).unwrap();
         assert_eq!(rig.runs(), &bad);
-        rig.s.ratio = RateRatio::integer(16);
+        rig.set_ratio(RateRatio::integer(16));
         rig.feed(&bad, SETTLE / 2 + LOADED_SAMPLES, 1.5, 0, everything_plays);
         assert_eq!(rig.actions(), [OverloadAction::Reverted]);
         assert_eq!(rig.runs().chain.upsampler, good.chain.upsampler);
@@ -1909,7 +2083,7 @@ mod tests {
         let mut off = heavy();
         off.dsp_enabled = false;
         let mut rig = Rig::new(&off);
-        rig.s.ratio = RateRatio::ONE;
+        rig.set_ratio(RateRatio::ONE);
         rig.feed(&off, SETTLE / 2 + 2 * GOOD_AFTER, 0.1, 0, everything_plays);
         // At x1 (the device could not land the ratio): nothing either.
         let cfg = heavy();
@@ -1919,7 +2093,7 @@ mod tests {
         let mut heavier = heavy();
         heavier.chain.upsampler = manual_up(RateTarget::Ratio(16), 2 << 20);
         rig.edit(&heavier).unwrap();
-        rig.s.ratio = RateRatio::integer(16);
+        rig.set_ratio(RateRatio::integer(16));
         rig.feed(
             &heavier,
             SETTLE / 2 + LOADED_SAMPLES,
@@ -1934,7 +2108,7 @@ mod tests {
     fn calm_before_the_chain_runs_is_not_counted() {
         let good = light();
         let mut rig = Rig::new(&good);
-        rig.s.ratio = RateRatio::integer(4);
+        rig.set_ratio(RateRatio::integer(4));
         rig.feed(&good, SETTLE / 2 + GOOD_AFTER, 0.3, 0, everything_plays);
         // A heavy edit whose chain has not been swapped in yet: calm
         // samples there are the old chain's.
@@ -2234,7 +2408,7 @@ mod tests {
         rig.s.device = 1;
         rig.feed(cfg, SETTLE / 2 + LOADED_SAMPLES, 1.4, 0, only_48k);
         assert_eq!(rig.actions(), [OverloadAction::UpsamplerOff]);
-        rig.s.ratio = RateRatio::ONE;
+        rig.set_ratio(RateRatio::ONE);
         rig.s.output_rate = 48_000;
         rig.feed(cfg, 5, 0.3, 0, only_48k);
         assert_eq!(rig.confirmed, 1);
@@ -2258,7 +2432,7 @@ mod tests {
             rig.runs().chain.upsampler,
             cheapest_upsampler(&cfg.chain.upsampler)
         );
-        rig.s.ratio = RateRatio::integer(16);
+        rig.set_ratio(RateRatio::integer(16));
         rig.s.output_rate = 768_000;
         rig.feed(&cfg, 1, 0.3, 0, only_high_rates);
         assert_eq!(rig.confirmed, 2);
@@ -2304,7 +2478,7 @@ mod tests {
         let mut rig = Rig::new(&cfg);
         rig.s.device = 1;
         rig.feed(&cfg, SETTLE / 2 + LOADED_SAMPLES, 1.4, 0, everything_plays);
-        rig.s.ratio = RateRatio::ONE;
+        rig.set_ratio(RateRatio::ONE);
         rig.feed(&cfg, 5, 0.3, 0, everything_plays);
         assert_eq!(rig.confirmed, 1);
         // Unplugged (nothing probed) and in error: not the step's failure.
@@ -2327,7 +2501,7 @@ mod tests {
         let mut rig = Rig::new(&cfg);
         rig.s.device = 1;
         rig.feed(&cfg, SETTLE / 2 + LOADED_SAMPLES, 1.4, 0, everything_plays);
-        rig.s.ratio = RateRatio::ONE;
+        rig.set_ratio(RateRatio::ONE);
         rig.feed(&cfg, 5, 0.3, 0, everything_plays);
         let mut other = cfg.clone();
         other.device = "hw:CARD=USB,DEV=0".into();
@@ -2383,30 +2557,30 @@ mod tests {
             (false, OverloadAction::UpsamplerOff),
         ] {
             let mut rig = Rig::started(&good, seeded);
-            rig.s.ratio = RateRatio::integer(4);
+            rig.set_ratio(RateRatio::integer(4));
             rig.feed(&good, SETTLE / 2 + GOOD_AFTER, 0.3, 0, everything_plays);
             rig.edit(&bad).unwrap();
-            rig.s.ratio = RateRatio::integer(16);
+            rig.set_ratio(RateRatio::integer(16));
             rig.feed(&bad, SETTLE / 2 + LOADED_SAMPLES, 1.5, 0, everything_plays);
             assert_eq!(rig.actions(), [first], "seeded: {seeded}");
         }
         let mut rig = Rig::started(&good, true);
         assert_eq!(rig.runs().chain.upsampler, good.chain.upsampler);
         // Seeded, but the device ran it at x1: certifies nothing.
-        rig.s.ratio = RateRatio::ONE;
+        rig.set_ratio(RateRatio::ONE);
         rig.feed(&good, SETTLE / 2 + 2 * GOOD_AFTER, 0.3, 0, everything_plays);
         rig.edit(&bad).unwrap();
-        rig.s.ratio = RateRatio::integer(16);
+        rig.set_ratio(RateRatio::integer(16));
         rig.feed(&bad, SETTLE / 2 + LOADED_SAMPLES, 1.5, 0, everything_plays);
         assert_eq!(rig.actions(), [OverloadAction::UpsamplerOff]);
         // Seeded with DSP off: nothing either.
         let mut off = good.clone();
         off.dsp_enabled = false;
         let mut rig = Rig::started(&off, true);
-        rig.s.ratio = RateRatio::integer(4);
+        rig.set_ratio(RateRatio::integer(4));
         rig.feed(&off, SETTLE / 2 + 2 * GOOD_AFTER, 0.3, 0, everything_plays);
         rig.edit(&bad).unwrap();
-        rig.s.ratio = RateRatio::integer(16);
+        rig.set_ratio(RateRatio::integer(16));
         rig.feed(&bad, SETTLE / 2 + LOADED_SAMPLES, 1.5, 0, everything_plays);
         assert_eq!(rig.actions(), [OverloadAction::UpsamplerOff]);
     }
@@ -2440,7 +2614,7 @@ mod tests {
         // the new one's.
         for (new_chain, reports) in [(false, 0), (true, 1)] {
             let mut rig = Rig::new(&good);
-            rig.s.ratio = RateRatio::integer(4);
+            rig.set_ratio(RateRatio::integer(4));
             rig.feed(&good, SETTLE / 2 + GOOD_AFTER, 0.3, 0, everything_plays);
             let old = rig.s.chain_generation;
             rig.lag = true;
@@ -2453,7 +2627,7 @@ mod tests {
             // now): judged after the settle.
             rig.lag = false;
             rig.s.chain_generation = rig.generation;
-            rig.s.ratio = RateRatio::integer(16);
+            rig.set_ratio(RateRatio::integer(16));
             rig.feed(&bad, SETTLE / 2 + 2, 0.5, 0, everything_plays);
             assert_eq!(rig.reports.len(), reports, "new chain: {new_chain}");
             if new_chain {
@@ -2482,7 +2656,7 @@ mod tests {
         assert!(msg.contains("moved off real-time priority"), "{msg}");
         assert!(!msg.contains("load"), "{msg}");
         // The step after it, when that one still overloads in load: says so.
-        rig.s.ratio = RateRatio::ONE;
+        rig.set_ratio(RateRatio::ONE);
         rig.feed(&cfg, 1 + SETTLE + LOADED_SAMPLES, 1.3, 0, everything_plays);
         let msg = &rig.reports[1].message;
         assert!(
@@ -2505,10 +2679,10 @@ mod tests {
         let (good, bad) = (light(), heavy());
         let mut rig = Rig::new(&good);
         rig.s.device = 1;
-        rig.s.ratio = RateRatio::integer(4);
+        rig.set_ratio(RateRatio::integer(4));
         rig.feed(&good, SETTLE / 2 + GOOD_AFTER, 0.3, 0, everything_plays);
         rig.edit(&bad).unwrap();
-        rig.s.ratio = RateRatio::integer(16);
+        rig.set_ratio(RateRatio::integer(16));
         // Back to the calm setting, still overloaded: upsampler off.
         rig.feed(&bad, SETTLE / 2 + LOADED_SAMPLES, 1.5, 0, everything_plays);
         rig.feed(&bad, 1 + SETTLE + LOADED_SAMPLES, 1.5, 0, everything_plays);

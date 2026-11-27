@@ -2,8 +2,9 @@
 
 How much the desktop app costs while it sits in the tray with its window
 closed, measured to decide whether a tray-only process without a webview is
-worth building. Numbers from a release build (`--features custom-protocol`) on
-a headless Xvfb display, with webkit2gtk 4.1 and GTK 3.24.
+worth building. Numbers come from a release build
+(`--features custom-protocol`) on a headless Xvfb display, with webkit2gtk 4.1
+and GTK 3.24.
 
 ## How it was measured
 
@@ -90,15 +91,15 @@ would add to that the pieces the app already has and that do not need WebKit:
 the daemon client and its `status`/`streams`/`config`/`presets` subscription,
 `ui_settings`, `volume_step` (guarded volume writes), the tray-host watch, the
 single-instance name and the GlobalShortcuts portal. Those are one socket, one
-D-Bus connection each and a few threads: keep the estimate at **10–15 MB RSS,
-~0.05 % CPU**, i.e. a tenth of what the tray costs now.
+D-Bus connection each and a few threads: estimate **10–15 MB RSS, ~0.05 %
+CPU**, about a tenth of the tray's current cost.
 
 The catch is that the popup and the OSD are webviews, and the tray menu, the
 wheel and the volume keys are what make the tray useful. A tray-only process
-therefore cannot be the app with its GUI code removed: it is a second binary
-that answers the tray, the keys and the daemon, and starts the UI process (and
-so the popup/OSD webviews) only when it needs one. The existing window
-lifecycle already fits that (windows made on demand and destroyed after 30 s,
+cannot be the app with its GUI code removed: it is a second binary that
+answers the tray, the keys and the daemon, and starts the UI process (and so
+the popup and OSD webviews) only when it needs one. The window lifecycle
+already fits that (windows made on demand and destroyed after 30 s,
 `create: false`, the page rebuilt from the daemon's config), so the split is
 feasible, but it is a process split, not a flag.
 
@@ -125,8 +126,8 @@ feasible, but it is a process split, not a flag.
 The tray costs 164 MB RSS / 115 MB PSS and ~0.03 % CPU; almost all of the
 memory is WebKit staying initialised in the UI process (85 MB PSS) plus the
 shared `WebKitNetworkProcess` (29 MB PSS). A tray-only process with ksni and
-the app's existing D-Bus and socket pieces would cost ~10–15 MB — saving
-~150 MB (90 % of the idle footprint) — and is worth building if sitting in the
+the app's existing D-Bus and socket pieces would cost ~10–15 MB, saving
+~150 MB (90 % of the idle footprint), and is worth building if sitting in the
 tray at login all day is the resting state. Because the popup and OSD are
 webviews, it requires a separate tray shell binary that starts the UI process
 on demand rather than a build flag. If the tray is only used briefly while

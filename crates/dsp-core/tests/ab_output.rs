@@ -177,31 +177,31 @@ fn same_output_settings_are_bit_identical_to_one_quantizer() {
             output(16, DitherKind::Shaped),
             LimiterMode::Limit,
             &[1024][..],
-            0x5ef7_8a96_1ddd_2986,
+            0x6232_d6d3_003e_44df,
         ),
         (
             output(24, DitherKind::Tpdf),
             LimiterMode::Off,
             &[1024],
-            0x908a_c038_cf86_e649,
+            0xb0da_3963_d72e_70b4,
         ),
         (
             output(16, DitherKind::Resonant5),
             LimiterMode::AutoHeadroom,
             &[1024],
-            0x27d3_f08a_51ed_c84f,
+            0xcebe_32d7_8ac8_c19e,
         ),
         (
             output(20, DitherKind::None),
             LimiterMode::Off,
             &[1024],
-            0x1960_bc09_c792_4df0,
+            0xcfac_f144_ece9_cb87,
         ),
         (
             output(16, DitherKind::Shaped),
             LimiterMode::Off,
             odd,
-            0xd99c_be9c_55a9_535f,
+            0x4e94_4611_c5ed_13e0,
         ),
     ] {
         let mut ab = pair(out, out, limiter);

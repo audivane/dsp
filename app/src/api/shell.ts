@@ -73,6 +73,9 @@ export type ShellEvent =
   /** The main window is closing to the tray: hand over its place now
    *  (`mainCloseReady`); the page is destroyed right after. */
   | { kind: "main-closing" }
+  /** The app was upgraded: it relaunches once the user leaves the window
+   *  ("ready"), or it could not relaunch ("failed"). */
+  | { kind: "update-pending"; state: "ready" | "failed" }
   | { kind: "osd"; payload: OsdPayload };
 
 export interface ShellTransport {

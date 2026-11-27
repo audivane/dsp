@@ -23,12 +23,22 @@ struct Counting;
 thread_local! {
     static ARMED: Cell<bool> = const { Cell::new(false) };
     static COUNT: Cell<usize> = const { Cell::new(0) };
+    /// A channel worker's thread (counted in [`WORKER_COUNT`]).
+    static WORKER: Cell<bool> = const { Cell::new(false) };
 }
+
+/// Heap operations on channel worker threads since their start.
+static WORKER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn note() {
     let _ = ARMED.try_with(|armed| {
         if armed.get() {
             COUNT.with(|c| c.set(c.get() + 1));
+        }
+    });
+    let _ = WORKER.try_with(|worker| {
+        if worker.get() {
+            WORKER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     });
 }
@@ -111,6 +121,8 @@ fn make_eq_chain(preamp_db: f64, ratio: u32, taps: usize, conv: bool) -> ActiveC
                     enabled: true,
                     ir_path: "unused".into(),
                     gain_db: 0.0,
+                    matrix: None,
+                    calibration: false,
                 }]
             } else {
                 Vec::new()
@@ -132,7 +144,16 @@ fn make_eq_chain(preamp_db: f64, ratio: u32, taps: usize, conv: bool) -> ActiveC
         channels: 2,
         max_block: 1024,
         irs: if conv {
-            Some(vec![vec![1.0; 2048]])
+            // A compact IR (a short decay, as a calibration's): an EQ
+            // edit's fade bound lets it take the playing chain over.
+            Some(
+                vec![
+                    (0..2048)
+                        .map(|i| 0.1 * 0.9f64.powi(i))
+                        .collect::<Vec<f64>>(),
+                ]
+                .into(),
+            )
         } else {
             None
         },
@@ -344,6 +365,138 @@ fn rt_warmup_and_latency_mismatch_swaps_never_allocate_or_deallocate() {
         proc.reset_dsp_state();
     });
     assert!(recycle_rx.pop().is_ok());
+
+    // An EQ edit before the convolution: the incoming chain takes the
+    // playing one over in place (moves) and fades the edit in before the
+    // convolution.
+    swap_tx
+        .push(PendingSwap {
+            chain: make_eq_chain(-5.0, 4, 8192, true),
+            crossfade: true,
+            generation: 3,
+            swap_seq: 3,
+        })
+        .unwrap();
+    let more: Vec<_> = (0..40).map(|_| gen_block()).collect();
+    let mut first = 0;
+    assert_no_alloc("an upstream edit taken over in place", || {
+        for inp in &more {
+            proc.poll_updates(SinkChoice::Dsp, 48_000, RateRatio::integer(4), true);
+            if first == 0 {
+                first = proc.active_generation();
+            }
+            proc.process_block(
+                SinkChoice::Dsp,
+                inp,
+                inp,
+                &mut out,
+                2,
+                RateRatio::integer(4),
+                48_000,
+                0,
+            );
+        }
+    });
+    assert_eq!(first, 3, "taken over at the first poll");
+    assert_eq!(proc.active_generation(), 3);
+    assert!(recycle_rx.pop().is_ok());
+}
+
+/// The warm-up and fade swaps above with chains on channel workers: the
+/// audio thread and the worker allocate nothing.
+#[test]
+fn rt_swaps_of_chains_on_channel_workers_never_allocate() {
+    use audivane_dsp_core::workers::LanePool;
+    use std::sync::atomic::Ordering;
+    let pool = LanePool::spawn(1, |_| WORKER.with(|w| w.set(true))).unwrap();
+    assert!(pool.wait_started(std::time::Duration::from_secs(10)));
+    let on_workers = |mut chain: ActiveChain| {
+        let ActiveChain::Single(c) = &mut chain else {
+            unreachable!()
+        };
+        assert!(c.attach_workers(&pool));
+        chain
+    };
+    let (_cmd_tx, cmd_rx) = rtrb::RingBuffer::new(16);
+    let (mut swap_tx, swap_rx) = rtrb::RingBuffer::new(16);
+    let (recycle_tx, mut recycle_rx) = rtrb::RingBuffer::new(8);
+    let mut proc = DaemonProcessor::new(
+        on_workers(make_eq_chain(0.0, 4, 8192, false)),
+        true,
+        2,
+        512,
+        16,
+        48_000,
+        Arc::new(AtomicU8::new(0)),
+        MeterBank::new(2),
+        cmd_rx,
+        swap_rx,
+        recycle_tx,
+    );
+    swap_tx
+        .push(PendingSwap {
+            chain: on_workers(make_eq_chain(-3.0, 4, 8192, false)),
+            crossfade: true,
+            generation: 1,
+            swap_seq: 1,
+        })
+        .unwrap();
+    let inp: Vec<f32> = (0..512 * 2)
+        .map(|i| ((i / 2) as f64 * 0.05).sin() as f32 * 0.4)
+        .collect();
+    let mut out = vec![0_i32; 512 * 4 * 2];
+    let worker_before = WORKER_COUNT.load(Ordering::SeqCst);
+    let mut run = |proc: &mut DaemonProcessor, blocks: usize| {
+        for _ in 0..blocks {
+            proc.poll_updates(SinkChoice::Dsp, 48_000, RateRatio::integer(4), true);
+            proc.process_block(
+                SinkChoice::Dsp,
+                &inp,
+                &inp,
+                &mut out,
+                2,
+                RateRatio::integer(4),
+                48_000,
+                0,
+            );
+        }
+    };
+    assert_no_alloc("swap between chains on workers", || run(&mut proc, 35));
+    assert!(recycle_rx.pop().is_ok());
+    swap_tx
+        .push(PendingSwap {
+            chain: on_workers(make_eq_chain(-6.0, 4, 8192, true)),
+            crossfade: true,
+            generation: 2,
+            swap_seq: 2,
+        })
+        .unwrap();
+    assert_no_alloc("mismatched-latency swap on workers + reset", || {
+        run(&mut proc, 40);
+        proc.reset_dsp_state();
+        run(&mut proc, 5);
+    });
+    assert!(recycle_rx.pop().is_ok());
+    // An EQ edit before the convolution (in the lanes): taken over in place,
+    // the fade before the convolution in each lane.
+    swap_tx
+        .push(PendingSwap {
+            chain: on_workers(make_eq_chain(-5.0, 4, 8192, true)),
+            crossfade: true,
+            generation: 3,
+            swap_seq: 3,
+        })
+        .unwrap();
+    assert_no_alloc("an upstream edit taken over on workers", || {
+        run(&mut proc, 10)
+    });
+    assert_eq!(proc.active_generation(), 3);
+    assert!(recycle_rx.pop().is_ok());
+    assert_eq!(
+        WORKER_COUNT.load(Ordering::SeqCst) - worker_before,
+        0,
+        "heap operations on the channel worker"
+    );
 }
 
 #[test]
@@ -1701,4 +1854,195 @@ fn rt_keep_pitch_switches_and_stretched_tee_never_allocate() {
         (3, 3),
         "every stage retired to its queue"
     );
+}
+
+/// Measurement playback on the RT threads: the master takes the job, arms,
+/// mutes the source, plays the file after its chain (`bypass`) or at its
+/// input (`active`, with the keepalive again after the chain), and a
+/// follower plays its part at its stage input (and around its chain for
+/// `bypass`); both record their DAC readings; a stop fades out and the
+/// mute lifts, and the job goes back. None of it allocates.
+#[test]
+fn rt_measurement_playback_never_allocates() {
+    use audivane_dsp_daemon::engine::follower::{
+        FollowerControls, FollowerParams, FollowerPcm, FollowerRt, FollowerStatus, PcmFault,
+        prime_device, step_device,
+    };
+    use audivane_dsp_daemon::engine::measure::{MeasureDevice, MeasureJob, MeasureSlot};
+    use audivane_dsp_daemon::engine::tee::TeeHost;
+    use audivane_protocol::ipc::{EngineConfig, MeasureChain};
+    use std::sync::atomic::Ordering;
+
+    struct Fake {
+        written: u64,
+        played: f64,
+        period: usize,
+        buffer: usize,
+        t_ns: i64,
+    }
+    impl FollowerPcm for Fake {
+        fn status(&mut self) -> Result<(i64, i64), PcmFault> {
+            Ok((self.written as i64 - self.played as i64, self.t_ns))
+        }
+        fn avail(&mut self) -> Result<usize, PcmFault> {
+            let queued = (self.written as i64 - self.played as i64).max(0) as usize;
+            Ok(self.buffer.saturating_sub(queued))
+        }
+        fn write(&mut self, samples: &[i32]) -> Result<usize, PcmFault> {
+            let n = (samples.len() / 2).min(self.avail()?);
+            self.written += n as u64;
+            Ok(n)
+        }
+        fn start(&mut self) -> Result<(), PcmFault> {
+            Ok(())
+        }
+        fn wait(&mut self, _timeout_ms: u32) -> Result<bool, PcmFault> {
+            self.played += self.period as f64;
+            self.t_ns += (self.period as f64 / 48_000.0 * 1e9) as i64;
+            Ok(true)
+        }
+        fn needs_restart(&self) -> bool {
+            false
+        }
+    }
+
+    let (_cmd_tx, cmd_rx) = rtrb::RingBuffer::new(16);
+    let (_swap_tx, swap_rx) = rtrb::RingBuffer::new(8);
+    let (recycle_tx, _recycle_rx) = rtrb::RingBuffer::new(8);
+    let (mut host, tee_rt) = TeeHost::pair(2);
+    let slot = Arc::new(MeasureSlot::default());
+    let mut proc = DaemonProcessor::new(
+        make_eq_chain(-1.0, 1, 16, false),
+        true,
+        2,
+        8192,
+        16,
+        48_000,
+        Arc::new(AtomicU8::new(0)),
+        MeterBank::new(2),
+        cmd_rx,
+        swap_rx,
+        recycle_tx,
+    )
+    .with_tee(tee_rt)
+    .with_measure(Arc::clone(&slot), 2);
+    host.add_follower("hw:CARD=A,DEV=0", &EngineConfig::default())
+        .unwrap();
+    let reader = host
+        .slots_mut()
+        .get_mut("hw:CARD=A,DEV=0")
+        .unwrap()
+        .reader
+        .take()
+        .unwrap();
+    let status = Arc::new(FollowerStatus::default());
+    let controls = Arc::new(FollowerControls::new(0.0, -3.0));
+    let p = FollowerParams {
+        graph_rate: 48_000,
+        channels: 2,
+        device_rate: 48_000,
+        period: 512,
+        buffer: 1536,
+        ratio: RateRatio::ONE,
+    };
+    let mut rt = FollowerRt::new(
+        p,
+        reader,
+        host.shared().clone(),
+        make_eq_chain(-1.0, 1, 16, false),
+        Arc::clone(&status),
+        Arc::clone(&controls),
+    )
+    .unwrap();
+    let mut pcm = Fake {
+        written: 0,
+        played: 0.0,
+        period: 512,
+        buffer: 1536,
+        t_ns: 1_000_000_000,
+    };
+    let input: Vec<f32> = (0..2 * 1024)
+        .map(|i| (0.3 * (i as f64 * 0.01).sin()) as f32)
+        .collect();
+    let mut out = vec![0_i32; 2 * 1024];
+    let mut pos = 0u64;
+    let mut master_block = |proc: &mut DaemonProcessor, t_ns: i64| {
+        proc.poll_updates(SinkChoice::Dsp, 48_000, RateRatio::ONE, true);
+        proc.dac_read(1024, t_ns as u64);
+        proc.process_block(
+            SinkChoice::Dsp,
+            &input,
+            &input,
+            &mut out,
+            2,
+            RateRatio::ONE,
+            48_000,
+            pos,
+        );
+        pos += 1024;
+    };
+    for _ in 0..4 {
+        master_block(&mut proc, pcm.t_ns);
+    }
+    prime_device(&mut pcm, &mut rt).unwrap();
+    let job = |chain| {
+        Arc::new(MeasureJob::new(
+            chain,
+            true,
+            1e-5,
+            4_800,
+            48_000,
+            vec![
+                MeasureDevice::new(None, 48_000, 48_000, vec![(1, vec![0.25; 9_600])], 4_800)
+                    .with_readings(4096),
+                MeasureDevice::new(
+                    Some("hw:CARD=A,DEV=0".into()),
+                    48_000,
+                    48_000,
+                    vec![(0, vec![0.25; 9_600])],
+                    4_800,
+                )
+                .with_readings(4096),
+            ],
+        ))
+    };
+    let jobs = [job(MeasureChain::Bypass), job(MeasureChain::Active)];
+    for (n, j) in jobs.iter().enumerate() {
+        // The control side's posts (they box the job) stay outside.
+        controls.measure_slot().post(Some((Arc::clone(j), 1)));
+        slot.post(Some((Arc::clone(j), 0)));
+        assert_no_alloc("a measurement", || {
+            for i in 0..120u64 {
+                if i % 2 == 0 {
+                    master_block(&mut proc, pcm.t_ns);
+                }
+                if n == 1 && i == 40 {
+                    j.cancel.store(true, Ordering::Release);
+                }
+                if i == 90 {
+                    // Every device drained by now.
+                    assert!(j.devices.iter().all(|d| d.done.load(Ordering::Acquire)));
+                    j.release.store(true, Ordering::Release);
+                }
+                assert!(step_device(&mut pcm, &mut rt, &controls).is_none());
+            }
+        });
+        slot.post(None);
+        controls.measure_slot().post(None);
+        assert_no_alloc("taking a measurement back", || {
+            for _ in 0..4u64 {
+                master_block(&mut proc, pcm.t_ns);
+                assert!(step_device(&mut pcm, &mut rt, &controls).is_none());
+            }
+        });
+        slot.reclaim();
+        controls.measure_slot().reclaim();
+        assert!(j.s0().is_some(), "armed");
+        // The master's DAC readings were taken (into the buffer built on
+        // the control side).
+        assert!(!j.devices[0].readings.snapshot().is_empty());
+        assert!(j.devices[0].done.load(Ordering::Acquire));
+        assert!(j.released.load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(j), 1, "the threads let go of the job");
+    }
 }

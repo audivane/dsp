@@ -123,6 +123,11 @@ pub struct DeviceModel {
     pub timestamp_jitter_s: f64,
     /// When the device starts playing its frame 0, seconds.
     pub start_s: f64,
+    /// Wakeups on the device's own period, not on the bus's packets (a
+    /// timer-driven reader): the pointer grid's phase against them then
+    /// sweeps with the device's clock against the bus's (a reading bias of
+    /// up to a grid step that moves slowly).
+    pub free_wake: bool,
 }
 
 impl DeviceModel {
@@ -146,6 +151,7 @@ impl DeviceModel {
             latency_s: (30e-6, 150e-6),
             timestamp_jitter_s: 5e-6,
             start_s: 0.0,
+            free_wake: false,
         }
     }
 
@@ -220,7 +226,7 @@ impl DeviceModel {
     /// The wakeup after the device has played `n` frames.
     pub fn wake_after(&self, n: f64, rng: &mut Rng) -> f64 {
         let mut t = self.time_of(n);
-        if self.packet_s > 0.0 {
+        if self.packet_s > 0.0 && !self.free_wake {
             let b = self.boundary_before(t);
             if b < t {
                 t = b + self.bus_packet();

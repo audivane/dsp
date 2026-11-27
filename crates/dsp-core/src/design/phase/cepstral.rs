@@ -27,8 +27,8 @@
 //! Precision: the minimum phase is a Hilbert transform of `log|H|`, so it
 //! depends on bins far down the stopband (200 to 280 dB below the peak for
 //! these windows), and the taps react to the last bits of the prototype.
-//! So step 2's magnitudes come from a double-double FFT (`ddfft`) — the
-//! logarithm makes the rest well conditioned, so steps 3 to 5 run in f64 —
+//! So step 2's magnitudes come from a double-double FFT (`ddfft`): the
+//! logarithm makes the rest well conditioned, so steps 3 to 5 run in f64,
 //! and the prototypes are defined to the last bit where their design says
 //! so: the Chebyshev and Kaiser designs (`crate::design::paths::exact`:
 //! an f64 sinc with a fixed operation order, the window in x87 extended

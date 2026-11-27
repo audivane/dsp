@@ -58,7 +58,7 @@ audivane_note_upgrade() {
     echo "==> Audivane DSP updated. No running engine was restarted; start it with"
     echo "    systemctl --user daemon-reload && systemctl --user enable --now audivane-dsp"
   fi
-  echo "    If the app is open, click Restart in its update banner (or reopen it)."
+  echo "    A running app restarts itself into the new version (if it cannot, it says so)."
 }
 
 audivane_postinst() {

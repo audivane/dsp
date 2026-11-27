@@ -31,6 +31,9 @@ pub struct DaemonOptions {
     /// Start the MPRIS watcher.
     pub mpris: bool,
     pub mpris_interval: Duration,
+    /// Watch the sound cards so each output follows its USB device
+    /// ([`crate::control::device_identity`]).
+    pub device_identity: bool,
 }
 
 impl DaemonOptions {
@@ -41,6 +44,7 @@ impl DaemonOptions {
             graph: true,
             mpris: true,
             mpris_interval: DEFAULT_INTERVAL,
+            device_identity: true,
         }
     }
 
@@ -63,6 +67,7 @@ pub struct Daemon {
     volume_thread: Mutex<Option<JoinHandle<()>>>,
     overload_thread: Mutex<Option<JoinHandle<()>>>,
     device_thread: Mutex<Option<JoinHandle<()>>>,
+    identity_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Daemon {
@@ -136,6 +141,12 @@ impl Daemon {
             None
         };
 
+        let identity_thread = if opts.device_identity {
+            spawn_identity_thread(Arc::clone(&service), Arc::clone(&volume_stop))
+        } else {
+            None
+        };
+
         let server = IpcServer::serve(Arc::clone(&service), opts.socket)?;
         log::info!(
             "listening on {} (device {})",
@@ -155,6 +166,7 @@ impl Daemon {
             volume_thread: Mutex::new(volume_thread),
             overload_thread: Mutex::new(overload_thread),
             device_thread: Mutex::new(device_thread),
+            identity_thread: Mutex::new(identity_thread),
         })
     }
 
@@ -207,6 +219,9 @@ impl Daemon {
             let _ = thread.join();
         }
         if let Some(thread) = self.device_thread.lock().ok().and_then(|mut t| t.take()) {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.identity_thread.lock().ok().and_then(|mut t| t.take()) {
             let _ = thread.join();
         }
         // Every exit path (IPC `shutdown`, SIGTERM/SIGINT, main returning)
@@ -274,12 +289,36 @@ fn spawn_overload_thread(service: Arc<Service>, stop: Arc<AtomicBool>) -> Option
             while !stop.load(Ordering::Acquire) {
                 std::thread::sleep(crate::control::overload::TICK);
                 service.overload_tick();
+                crate::engine::workers::tick();
             }
         });
     match spawned {
         Ok(handle) => Some(handle),
         Err(err) => {
             log::warn!("DSP overload fallback disabled: {err}");
+            None
+        }
+    }
+}
+
+/// How often the identity watch looks at the sound cards.
+const IDENTITY_TICK: Duration = Duration::from_millis(500);
+
+/// Follows each output to its USB device as cards come and go
+/// ([`Service::identity_tick`]) until `stop`.
+fn spawn_identity_thread(service: Arc<Service>, stop: Arc<AtomicBool>) -> Option<JoinHandle<()>> {
+    let spawned = std::thread::Builder::new()
+        .name("avdsp-identity".into())
+        .spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                service.identity_tick();
+                std::thread::sleep(IDENTITY_TICK);
+            }
+        });
+    match spawned {
+        Ok(handle) => Some(handle),
+        Err(err) => {
+            log::warn!("device identity watch disabled: {err}");
             None
         }
     }

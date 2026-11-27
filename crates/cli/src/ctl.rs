@@ -1,4 +1,4 @@
-//! `avdsp ctl` — talk to the running daemon over its Unix socket.
+//! `avdsp ctl`: talk to the running daemon over its Unix socket.
 //!
 //! One subcommand per IPC call. Output is human-readable by default and raw
 //! JSON with `--json`. A daemon error reply exits 1 with the daemon's message;
@@ -8,14 +8,17 @@ use anyhow::{Context, Result};
 use audivane_dsp_core::design::budget::MAX_KERNEL_TAPS;
 use audivane_protocol::ipc::{
     AbB, AbConfig, AbSide, Call, EngineConfig, FollowerState, FollowerStatus, LevelMatch,
-    LevelWeighting, OutputsStatus, RouteTarget, RoutingMode, SinkChoice, Status, Topic,
-    VarispeedConfig, VarispeedOverloadHold, VarispeedStatus,
+    LevelWeighting, OutputChannels, OutputsStatus, PresetPart, RouteTarget, RoutingMode,
+    SinkChoice, Status, Topic, VarispeedConfig, VarispeedOverloadHold, VarispeedStatus,
 };
 use audivane_protocol::{
-    Band, ChainConfig, ChannelEq, ConvolutionConfig, CrossfeedConfig, CrossfeedLevel,
+    Band, ChainConfig, ChannelEq, ChebyshevLayer, ConvolutionConfig, CrossfeedConfig,
     CrossfeedMode, CutoffMode, DcBlockConfig, EqProfile, FilterPhase, FilterPreset, FilterType,
-    HarmonicsCharacter, HarmonicsConfig, PitchConfig, PitchQuality, RateTarget, SampleFormat,
-    TapsUnit, TiltConfig, TiltPivot, UpsamplerConfig, WindowKind,
+    FluxLayer, HARMONICS_DEFAULT_SIGNS, HARMONICS_ORDERS, HarmonicSign, HarmonicsBias,
+    HarmonicsConfig, HarmonicsLayer, HarmonicsRouting, HarmonicsSag, HarmonicsTilt,
+    HysteresisBassEq, HysteresisLayer, PitchConfig, PitchQuality, RateTarget, SampleFormat,
+    StereoWidthShape, TILT_SLOPES, TapsUnit, TiltConfig, TiltPivot, TiltShelf, UpsamplerConfig,
+    WindowKind,
 };
 use clap::{Args, Subcommand, ValueEnum};
 use serde_json::Value;
@@ -144,13 +147,34 @@ pub enum CtlCommand {
         #[command(subcommand)]
         command: StreamCommand,
     },
-    /// Presets stored by the daemon (chain A's signal path).
+    /// Presets stored by the daemon: global ones (parts of chain A's
+    /// signal path) or, with --part, one page's own.
     Preset {
+        /// A page's presets: eq, convolution, stereo, harmonics, upsampling
+        /// or output (DC block, pitch, limiter and output together; default:
+        /// the global ones).
+        #[arg(long, global = true, value_parser = parse_preset_part)]
+        part: Option<PresetPart>,
         #[command(subcommand)]
         command: PresetCommand,
     },
     /// List ALSA playback devices (from /proc/asound; nothing is opened).
-    Devices,
+    Devices {
+        #[command(subcommand)]
+        command: Option<DevicesCommand>,
+    },
+    /// Show or set the output device, and the device channels the left and
+    /// right play on (for a device with more than two).
+    Device {
+        /// ALSA device, e.g. hw:CARD=USB,DEV=0 (left out: show the current
+        /// one).
+        device: Option<String>,
+        /// The device channels (from 0) the left and right play on, e.g.
+        /// `2,3`; `0,1` is the default (the first two). The other channels
+        /// play silence.
+        #[arg(long, value_name = "L,R", value_parser = parse_output_channels)]
+        output_channels: Option<OutputChannels>,
+    },
     /// Move a stream (by node id or app) to one of our sinks.
     Route(RouteArgs),
     /// Choose system-wide routing or per-app rules.
@@ -162,6 +186,18 @@ pub enum CtlCommand {
     NowPlaying,
     /// Run the bit-exactness self-test through the Direct path.
     Selftest,
+    /// Measurement playback: a WAV file straight to chosen output channels,
+    /// other streams muted, the DACs kept awake.
+    Measure {
+        #[command(subcommand)]
+        command: MeasureCommand,
+    },
+    /// Room calibration: a bundle of per-device filter matrices, gains and
+    /// trims, loaded as one edit.
+    Bundle {
+        #[command(subcommand)]
+        command: BundleCommand,
+    },
     /// Give the DAC back to the session (engine idles).
     Release,
     /// Take the DAC again.
@@ -292,6 +328,8 @@ pub enum CrossfeedCommand {
     JanMeier,
     /// Linkwitz-style crossfeed (mono-flat, 0.3 ms interaural delay, -6.0 dB).
     Linkwitz,
+    /// No crossfeed: the stage runs for its stereo width alone.
+    None,
     /// Custom BS2B parameters.
     Custom {
         /// Low-pass cutoff frequency in Hz (300..=2000).
@@ -301,59 +339,223 @@ pub enum CrossfeedCommand {
         #[arg(long)]
         feed_db: f64,
     },
-    /// Level policy: `matched` keeps the loudness the same with crossfeed on
-    /// and off (rare worst-case peaks clip at the output unless the limiter
-    /// is on or the digital volume leaves room; hardware volume does not),
-    /// `peak-safe` can never go over but is quieter. Presets keep it.
-    Level {
-        #[arg(value_enum)]
-        level: CrossfeedLevelArg,
+    /// Stereo width: the side (L - R) gain, 0..=2 (0 mono, 1 unchanged,
+    /// 1.25 and 1.5 one and two steps wider). The centre is untouched, so
+    /// wider is also louder. Presets keep it.
+    Width {
+        /// Side gain (0..=2).
+        width: f64,
+        /// `flat` (every frequency) or `above-bass` (side gain 1 in the
+        /// bass, the width above the corner).
+        #[arg(long, value_enum)]
+        shape: Option<WidthShapeArg>,
+        /// Corner of the `above-bass` shape in Hz (200..=2000).
+        #[arg(long)]
+        corner_hz: Option<f64>,
     },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum CrossfeedLevelArg {
-    Matched,
-    PeakSafe,
+pub enum WidthShapeArg {
+    Flat,
+    AboveBass,
 }
 
-impl From<CrossfeedLevelArg> for CrossfeedLevel {
-    fn from(arg: CrossfeedLevelArg) -> Self {
+impl From<WidthShapeArg> for StereoWidthShape {
+    fn from(arg: WidthShapeArg) -> Self {
         match arg {
-            CrossfeedLevelArg::Matched => Self::Matched,
-            CrossfeedLevelArg::PeakSafe => Self::PeakSafe,
+            WidthShapeArg::Flat => Self::Flat,
+            WidthShapeArg::AboveBass => Self::AboveBass,
         }
     }
 }
 
 #[derive(Subcommand, Debug)]
 pub enum HarmonicsCommand {
-    /// Print the current harmonics setting.
+    /// Print the current layers and the stage's readouts.
     Show,
     /// Turn harmonics off.
     Off,
-    /// Warm triode character (dominant 2nd harmonic, subtle 3rd/4th).
-    Triode,
-    /// Pentode character (dominant 3rd harmonic, subtle 2nd/5th).
-    Pentode,
-    /// Custom harmonic levels relative to fundamental at 0 dBFS.
+    /// List the built-in layer presets.
+    Presets,
+    /// One layer from a preset (see `presets`).
+    Preset {
+        /// Preset id.
+        id: String,
+        #[command(flatten)]
+        layer: HarmonicsLayerArgs,
+    },
+    /// List the built-in system presets (whole stages standing for a
+    /// typical piece of gear).
+    Systems,
+    /// Replace the whole stage with a system preset (see `systems`): its
+    /// layers, each from a layer preset, and its routing.
+    System {
+        /// System id.
+        id: String,
+    },
+    /// The `triode` preset (dominant 2nd harmonic, subtle 3rd/4th).
+    Triode {
+        #[command(flatten)]
+        layer: HarmonicsLayerArgs,
+    },
+    /// The `pentode` preset (dominant 3rd harmonic, subtle 2nd/5th).
+    Pentode {
+        #[command(flatten)]
+        layer: HarmonicsLayerArgs,
+    },
+    /// A Chebyshev layer with your own levels, relative to the fundamental
+    /// for a 0 dBFS sine at drive 0 dB (orders left out are off).
     Custom {
         /// 2nd harmonic level in dB (-120..=-20).
         #[arg(long, allow_hyphen_values = true)]
-        h2_db: f64,
+        h2_db: Option<f64>,
         /// 3rd harmonic level in dB (-120..=-20).
         #[arg(long, allow_hyphen_values = true)]
-        h3_db: f64,
-        /// Optional 4th harmonic level in dB (-120..=-20).
+        h3_db: Option<f64>,
+        /// 4th harmonic level in dB (-120..=-20).
         #[arg(long, allow_hyphen_values = true)]
         h4_db: Option<f64>,
-        /// Optional 5th harmonic level in dB (-120..=-20).
+        /// 5th harmonic level in dB (-120..=-20).
         #[arg(long, allow_hyphen_values = true)]
         h5_db: Option<f64>,
-        /// Disable the post-shaper DC-blocking high-pass filter.
+        /// 6th harmonic level in dB (-120..=-20).
+        #[arg(long, allow_hyphen_values = true)]
+        h6_db: Option<f64>,
+        /// 7th harmonic level in dB (-120..=-20).
+        #[arg(long, allow_hyphen_values = true)]
+        h7_db: Option<f64>,
+        /// 8th harmonic level in dB (-120..=-20).
+        #[arg(long, allow_hyphen_values = true)]
+        h8_db: Option<f64>,
+        /// 9th harmonic level in dB (-120..=-20).
+        #[arg(long, allow_hyphen_values = true)]
+        h9_db: Option<f64>,
+        /// Sign of each order's term from H2 up, one `+` or `-` each (e.g.
+        /// `+-+-`); orders left out keep the default (H3 `-`, others `+`).
+        #[arg(long, allow_hyphen_values = true, value_parser = parse_harmonic_signs)]
+        signs: Option<[HarmonicSign; HARMONICS_ORDERS]>,
+        /// Flip every even order's sign.
         #[arg(long)]
-        no_dc_block: bool,
+        invert_even: bool,
+        #[command(flatten)]
+        layer: HarmonicsLayerArgs,
     },
+    /// A flux (transformer or tape core saturation) layer.
+    Flux {
+        /// Low-shelf corner in Hz (1..=5000): the boost starts below it.
+        #[arg(long)]
+        corner_hz: f64,
+        /// Low-frequency boost in dB (0..=40).
+        #[arg(long)]
+        boost_db: f64,
+        /// H3 in dBc for a 0 dBFS sine at `--at-hz` (-120..=-12).
+        #[arg(long, allow_hyphen_values = true)]
+        h3_db: f64,
+        /// Calibration frequency in Hz (5..=1000).
+        #[arg(long)]
+        at_hz: f64,
+        /// Add the layer to the current ones instead of replacing them.
+        #[arg(long)]
+        add: bool,
+    },
+    /// A tape magnetic hysteresis (Jiles-Atherton) layer.
+    Hysteresis {
+        /// Saturation character (0..=1): lower emphasizes Rayleigh pinning,
+        /// higher pushes deeper into the soft Langevin knee near full scale.
+        #[arg(long, default_value_t = 0.5)]
+        saturation: f64,
+        /// Hysteresis loop width (0..=1): 0 is anhysteretic, 1 is a wide loop.
+        #[arg(long, default_value_t = 0.35)]
+        width: f64,
+        /// Distortion wet amount (0..=1).
+        #[arg(long, default_value_t = 1.0)]
+        amount: f64,
+        /// H3 in dBc for a 0 dBFS sine at `--at-hz` (at amount 1, -120..=-12).
+        #[arg(long, allow_hyphen_values = true)]
+        h3_db: f64,
+        /// Calibration frequency in Hz (20..=5000).
+        #[arg(long, default_value_t = 1_000.0)]
+        at_hz: f64,
+        /// Record/playback bass EQ pair, `HZ:DB` (corner 20..=500 Hz, boost
+        /// into the core 0..=12 dB, 12 dB/oct; exact inverse after it): the
+        /// distortion rises toward the bass, the music stays flat.
+        #[arg(long, value_parser = parse_bass_eq)]
+        bass_eq: Option<TiltShelf>,
+        /// DC offset of the core's field (-1..=1, in units of its
+        /// saturation knee): adds H2 and the other even orders.
+        #[arg(long, allow_hyphen_values = true)]
+        asymmetry: Option<f64>,
+        /// Add the layer to the current ones instead of replacing them.
+        #[arg(long)]
+        add: bool,
+    },
+    /// Remove layer N (as numbered by `show`, from 1).
+    Remove { index: usize },
+    /// Move layer N to position TO (as numbered by `show`, from 1); the
+    /// order matters in series.
+    Move { index: usize, to: usize },
+    /// How the layers combine: `parallel` (summed; the default) or `series`
+    /// (one after the other in list order, each feeding the next at the
+    /// level it puts out, as a preamp into a tape machine).
+    Routing {
+        #[arg(value_enum)]
+        mode: HarmonicsRoutingArg,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum HarmonicsRoutingArg {
+    Parallel,
+    Series,
+}
+
+impl From<HarmonicsRoutingArg> for HarmonicsRouting {
+    fn from(a: HarmonicsRoutingArg) -> Self {
+        match a {
+            HarmonicsRoutingArg::Parallel => Self::Parallel,
+            HarmonicsRoutingArg::Series => Self::Series,
+        }
+    }
+}
+
+/// Options shared by the Chebyshev layer commands.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct HarmonicsLayerArgs {
+    /// Drive in dB (-40..=0): where a 0 dBFS sine sits on the curve.
+    #[arg(long, allow_hyphen_values = true)]
+    drive_db: Option<f64>,
+    /// Amount of the layer's harmonics (0..=1).
+    #[arg(long)]
+    amount: Option<f64>,
+    /// Harmonics rising toward the bass, `HZ:DB[:SLOPE]` (corner 20..=2000
+    /// Hz, -24..=24 dB, slope 6, 12, 18 or 24 dB/oct, default 12; odd
+    /// orders unless --tilt-even). Replaces a preset's.
+    #[arg(long, allow_hyphen_values = true, value_parser = parse_tilt_shelf)]
+    tilt_low: Option<TiltShelf>,
+    /// Harmonics rising toward the treble, `HZ:DB[:SLOPE]` (corner
+    /// 200..=20000 Hz, -24..=24 dB, slope 6, 12, 18 or 24 dB/oct, default
+    /// 6; every order). Replaces a preset's.
+    #[arg(long, allow_hyphen_values = true, value_parser = parse_tilt_shelf)]
+    tilt_high: Option<TiltShelf>,
+    /// The low tilt applies to even orders too.
+    #[arg(long)]
+    tilt_even: bool,
+    /// Supply sag, `DB[:ATTACK_MS:RELEASE_MS]`: loud passages lower the
+    /// drive by up to DB (0..=6; 0 = off; default times 20:200 ms).
+    #[arg(long, value_parser = parse_sag)]
+    sag: Option<HarmonicsSag>,
+    /// Bias shift, `DEPTH[:ATTACK_MS:RELEASE_MS]`: sustained loud passages
+    /// move the operating point to DEPTH (-0.25..=0.25 of full scale; 0 =
+    /// off; default times 300:2000 ms). Not with a tilt on the same layer.
+    #[arg(long, allow_hyphen_values = true, value_parser = parse_bias)]
+    bias: Option<HarmonicsBias>,
+    /// Add the layer to the current ones instead of replacing them.
+    #[arg(long)]
+    add: bool,
+    /// Disable the DC-blocking high-pass filter on the even orders.
+    #[arg(long)]
+    no_dc_block: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -497,6 +699,19 @@ pub enum EqCommand {
         #[arg(long)]
         high: bool,
     },
+    /// Set the bass and treble knobs: a low shelf at 140 Hz and a high
+    /// shelf at 4.9 kHz on every channel, ±6 dB each (0 removes it).
+    Tone {
+        /// Bass in dB (below about 150 Hz).
+        #[arg(long, allow_hyphen_values = true)]
+        bass: Option<f64>,
+        /// Treble in dB (above about 5 kHz).
+        #[arg(long, allow_hyphen_values = true)]
+        treble: Option<f64>,
+        /// Set both knobs to 0 dB.
+        #[arg(long, conflicts_with_all = ["bass", "treble"])]
+        off: bool,
+    },
     /// Print the current parametric EQ of chain A.
     Show,
 }
@@ -504,8 +719,11 @@ pub enum EqCommand {
 #[derive(Subcommand, Debug)]
 pub enum ConvCommand {
     /// Replace the convolution chain with one or more WAV impulse responses (or --off).
+    /// `IN:OUT[:CH]=PATH` gives a filter-matrix entry (from input channel IN
+    /// to output OUT; channel CH of the WAV, else a mono file); a run of
+    /// entries is one matrix item, e.g. `0:0=sub_L.wav 1:0=sub_R.wav`.
     Set {
-        #[arg(value_name = "IR.wav")]
+        #[arg(value_name = "IR.wav | IN:OUT[:CH]=IR.wav")]
         files: Vec<PathBuf>,
         /// Remove convolution instead.
         #[arg(long)]
@@ -517,10 +735,11 @@ pub enum ConvCommand {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Append a WAV impulse response to the convolution chain.
+    /// Append a WAV impulse response to the convolution chain, or a filter
+    /// matrix given as `IN:OUT[:CH]=PATH` entries.
     Add {
-        #[arg(value_name = "IR.wav")]
-        file: PathBuf,
+        #[arg(value_name = "IR.wav | IN:OUT[:CH]=IR.wav", required = true)]
+        files: Vec<PathBuf>,
         /// Extra gain for the IR, in dB.
         #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
         gain_db: f64,
@@ -537,10 +756,37 @@ pub enum ConvCommand {
     Enable { target: String },
     /// Disable an impulse response by index (0-based), name, or path.
     Disable { target: String },
-    /// List configured impulse responses.
+    /// List configured impulse responses, and the guards' warnings.
     List,
     /// Remove all impulse responses from the convolution chain.
     Clear,
+    /// Show the frequency response of the convolution: each enabled item
+    /// and the combined result per output, at the graph rate.
+    Response {
+        /// A follower's own chain (default: the master).
+        #[arg(long)]
+        device: Option<String>,
+        /// The A/B side (default: a).
+        #[arg(long, value_enum)]
+        side: Option<ConvSideArg>,
+    },
+    /// Show or set the convolution guards: the boost cap (a chain whose
+    /// convolution boosts more on any output is refused) and the subsonic
+    /// limit (a warning for gain below it).
+    Safety {
+        /// The most the convolution may boost on any output, dB (0..=24).
+        #[arg(long)]
+        max_boost_db: Option<f64>,
+        /// Warn about gain below this frequency, Hz (5..=60).
+        #[arg(long)]
+        subsonic_hz: Option<f64>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ConvSideArg {
+    A,
+    B,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -628,12 +874,67 @@ pub struct FollowerSetArgs {
     /// Its delay behind the main output, ms (-50..=50).
     #[arg(long, value_name = "MS", allow_hyphen_values = true)]
     pub trim_ms: Option<f64>,
-    /// Its digital volume, dB (-120..=0).
+    /// Its own digital volume, dB (-120..=0); following the main volume,
+    /// the level it plays at now.
     #[arg(long, value_name = "DB", allow_hyphen_values = true)]
     pub volume_db: Option<f64>,
+    /// Follow the main volume (on): its changes, balance and mute move this
+    /// device too, keeping its level to the main one; off (the default for
+    /// a device added by hand), its volume is its own.
+    #[arg(long, value_enum)]
+    pub follow_volume: Option<OnOff>,
     /// Heard (on) or muted in sync (off).
     #[arg(long, value_enum)]
     pub enabled: Option<OnOff>,
+    /// The device channels (from 0) its left and right play on, e.g. `2,3`
+    /// (`0,1`: the first two).
+    #[arg(long, value_name = "L,R", value_parser = parse_output_channels)]
+    pub output_channels: Option<OutputChannels>,
+    /// Its own chain: a JSON merge patch over chain A (inline JSON, or a
+    /// file holding it), e.g. '{"convolution":[{"ir_path":"/abs/sub.wav"}]}'.
+    /// It follows chain A outside what it names; `{}` clears it.
+    #[arg(long, value_name = "JSON|FILE", conflicts_with = "no_chain_patch")]
+    pub chain_patch: Option<String>,
+    /// Play chain A again (clear its own chain).
+    #[arg(long)]
+    pub no_chain_patch: bool,
+    /// Its device period, ms (5..=50, as the nearest power of two of
+    /// frames; 0: the default, about 5 ms). Shorter needs less of the main
+    /// output's alignment. It reopens the device.
+    #[arg(long, value_name = "MS")]
+    pub period_ms: Option<f64>,
+}
+
+/// An `--output-channels` value: `L,R`, two device channels from 0.
+fn parse_output_channels(arg: &str) -> Result<OutputChannels, String> {
+    let (l, r) = arg
+        .split_once(',')
+        .ok_or_else(|| format!("{arg:?}: give two channels as L,R (e.g. 2,3)"))?;
+    let channel = |s: &str| {
+        s.trim()
+            .parse::<u32>()
+            .map_err(|_| format!("{s:?} is not a channel number (from 0)"))
+    };
+    let pair = OutputChannels([channel(l)?, channel(r)?]);
+    match pair.error() {
+        Some(e) => Err(e),
+        None => Ok(pair),
+    }
+}
+
+/// A `--chain-patch` value: inline JSON, else a file holding it.
+fn chain_patch_arg(arg: &str) -> CtlResult<serde_json::Value> {
+    let text = if arg.trim_start().starts_with('{') {
+        arg.to_string()
+    } else {
+        std::fs::read_to_string(arg).with_context(|| format!("reading the chain patch {arg}"))?
+    };
+    let v: serde_json::Value =
+        serde_json::from_str(&text).context("the chain patch is not valid JSON")?;
+    if !v.is_object() {
+        bail!("the chain patch must be a JSON object (a merge patch on chain A)");
+    }
+    Ok(v)
 }
 
 #[derive(Args, Debug)]
@@ -745,10 +1046,13 @@ pub struct UpsampleSetArgs {
     /// Disable automatic taps and return to manual or band mode.
     #[arg(long)]
     pub manual_taps: bool,
-    /// Band design: end of the passband, fraction of the source Nyquist
-    /// (implies --cutoff-mode band).
-    #[arg(long)]
-    pub passband_end: Option<f64>,
+    /// Band design: end of the passband, a fraction of the source Nyquist
+    /// (`0.908`) or a frequency in Hz that stays put at every source rate
+    /// (`20k`, `20kHz`, `20000Hz`; a plain number above 1.5 is Hz too). A
+    /// frequency that does not fit the band at a rate falls back to the
+    /// band's fraction there (implies --cutoff-mode band).
+    #[arg(long, value_parser = parse_passband_end)]
+    pub passband_end: Option<PassbandEnd>,
     /// Band design: start of the stopband, fraction of the source Nyquist
     /// (implies --cutoff-mode band).
     #[arg(long)]
@@ -867,6 +1171,12 @@ pub enum AbCommand {
         #[arg(long, conflicts_with_all = ["accept", "cancel"])]
         wait: bool,
     },
+    /// Hide the playing side for a blind test (status reads `hidden`).
+    /// The app runs blind tests; this sets only the mask.
+    Blind {
+        #[arg(value_enum)]
+        state: OnOff,
+    },
     /// Turn A/B off (chain A stays active).
     Off,
 }
@@ -880,19 +1190,27 @@ pub enum PresetCommand {
         #[arg(value_name = "NAME")]
         name: String,
     },
-    /// Save chain A as a preset and make it active.
+    /// Save chain A (or, with --part, that part of it) as a preset and make
+    /// it active.
     Save {
         #[arg(value_name = "NAME")]
         name: String,
         /// Replace an existing preset of the same name.
         #[arg(long)]
         overwrite: bool,
+        /// A global preset holding only these parts (comma-separated;
+        /// default: every part).
+        #[arg(long, value_delimiter = ',', value_parser = parse_preset_part, conflicts_with = "part")]
+        parts: Option<Vec<PresetPart>>,
     },
-    /// Apply a preset to chain A and make it active.
+    /// Apply a preset's parts to chain A (the others stay) and make it active.
     Load {
         #[arg(value_name = "NAME")]
         name: String,
     },
+    /// Reset that part (needs --part) to its defaults, with no preset
+    /// active: `save NAME` then saves it as a new one.
+    Blank,
     /// Delete a preset.
     Delete {
         #[arg(value_name = "NAME")]
@@ -905,7 +1223,7 @@ pub enum PresetCommand {
         #[arg(value_name = "TO")]
         to: String,
     },
-    /// Import an Equalizer APO / AutoEQ file as a preset (not loaded).
+    /// Import an Equalizer APO / AutoEQ file as an EQ preset (not loaded).
     Import {
         #[arg(value_name = "FILE")]
         file: PathBuf,
@@ -1105,6 +1423,181 @@ impl RouteArgs {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum MeasureCommand {
+    /// Play FILE and wait until it has left the DACs; prints where and when
+    /// it played (`--json`: the final `measure_status`). Exit code 1 when it
+    /// ended early.
+    Play(MeasurePlayArgs),
+    /// Stop the running measurement (the file fades out, the mute lifts).
+    Stop,
+    /// The running (or last) measurement.
+    Status,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BundleCommand {
+    /// Load the bundle manifest FILE (replacing the loaded one): checked
+    /// whole, applied as one edit; on any error nothing changes.
+    Load { file: String },
+    /// Remove the loaded calibration (the followers' trims and patches put
+    /// back).
+    Unload,
+    /// The loaded calibration.
+    Show,
+    /// A/B of calibrations on the master: side B is chain A with FILE's
+    /// calibration in place of the loaded one (`--none`: without one).
+    Ab {
+        #[arg(required_unless_present = "none", conflicts_with = "none")]
+        file: Option<String>,
+        #[arg(long)]
+        none: bool,
+    },
+    /// Set one calibration part's level (its gain, dB; `--reset`: the
+    /// manifest's). `--device` names a follower part; left out, the master's.
+    Gain {
+        #[arg(long)]
+        device: Option<String>,
+        #[arg(
+            required_unless_present = "reset",
+            conflicts_with = "reset",
+            allow_negative_numbers = true
+        )]
+        db: Option<f64>,
+        #[arg(long)]
+        reset: bool,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct MeasurePlayArgs {
+    /// A WAV file on the daemon's machine: mono (played on every route) or
+    /// one channel per route, in order.
+    pub file: String,
+    /// `DEVICE:CHANNEL` (repeatable): `master` or the main device's name,
+    /// or a follower's device; channels from 0.
+    #[arg(long = "route", value_name = "DEV:CH", required = true)]
+    pub routes: Vec<String>,
+    /// Play at the chain's input, through every stage (default: after the
+    /// chain, its stages skipped).
+    #[arg(long)]
+    pub active: bool,
+    /// Keepalive noise under the file, dBFS RMS (default -100).
+    #[arg(
+        long,
+        value_name = "DB",
+        allow_negative_numbers = true,
+        conflicts_with = "no_keepalive"
+    )]
+    pub keepalive_db: Option<f64>,
+    /// No keepalive noise.
+    #[arg(long)]
+    pub no_keepalive: bool,
+    /// The keepalive alone before the file, ms (default 2000).
+    #[arg(long, value_name = "MS")]
+    pub lead_in_ms: Option<f64>,
+    /// Let other streams play (on the channels the file does not use).
+    #[arg(long)]
+    pub no_mute: bool,
+}
+
+/// `DEV:CH`: the channel after the last colon (device names hold colons).
+fn parse_measure_route(s: &str) -> Result<audivane_protocol::ipc::MeasureRoute, String> {
+    let (dev, ch) = s
+        .rsplit_once(':')
+        .ok_or_else(|| format!("--route {s}: expected DEVICE:CHANNEL"))?;
+    let channel = ch
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| format!("--route {s}: {ch:?} is not a channel number"))?;
+    if dev.trim().is_empty() {
+        return Err(format!("--route {s}: no device"));
+    }
+    Ok(audivane_protocol::ipc::MeasureRoute {
+        device: dev.trim().to_string(),
+        channel,
+    })
+}
+
+fn print_measure_status(s: &audivane_protocol::ipc::MeasureStatus) {
+    use audivane_protocol::ipc::MeasureChain;
+    let chain = match s.chain {
+        Some(MeasureChain::Active) => "active",
+        Some(MeasureChain::Bypass) => "bypass",
+        None => "-",
+    };
+    println!(
+        "measure #{}: {:?}{}",
+        s.run,
+        s.state,
+        s.error
+            .as_ref()
+            .map(|e| format!(": {e}"))
+            .unwrap_or_default()
+    );
+    if s.run == 0 {
+        return;
+    }
+    println!(
+        "  file {} ({} frames, {:.2} s at {} Hz), {chain}, graph {} Hz, played {:.2} s",
+        s.file.as_deref().unwrap_or("-"),
+        s.file_frames,
+        s.duration_s,
+        s.file_rate_hz,
+        s.graph_rate_hz,
+        s.progress_s
+    );
+    if let Some(f) = s.source_frame {
+        println!(
+            "  starts at source frame {f}, after a {:.0} ms lead-in",
+            s.lead_in_ms
+        );
+    }
+    for d in &s.devices {
+        let chans: Vec<String> = d.channels.iter().map(u32::to_string).collect();
+        println!(
+            "  {} ({}) ch {}: {} Hz (injected at {} Hz{}), latency {:.1} frames = {:.1} us (chain {:.1} + queue {:.1}), start frame {}, start time {}",
+            d.device,
+            d.role,
+            chans.join(","),
+            d.rate_hz,
+            d.injection_rate_hz,
+            if d.resampled { ", resampled" } else { "" },
+            d.latency_frames,
+            d.latency_us,
+            d.chain_latency_frames,
+            d.queue_frames,
+            d.start_frame.map_or("-".into(), |v| v.to_string()),
+            d.start_time_ns.map_or("-".into(), |v| format!("{v} ns")),
+        );
+        if d.clamped_samples > 0 || d.drained {
+            println!(
+                "    {}{}",
+                if d.drained { "drained" } else { "not drained" },
+                if d.clamped_samples > 0 {
+                    format!(", {} samples clamped at -1 dBFS", d.clamped_samples)
+                } else {
+                    String::new()
+                }
+            );
+        }
+        if let Some(c) = &d.continuity {
+            println!(
+                "    continuity: {} readings, largest residual {:.1} frames = {:.0} us, largest step {:.1} frames = {:.0} us at {:.3} s",
+                c.readings,
+                c.max_residual_frames,
+                c.max_residual_us,
+                c.jump_frames,
+                c.jump_us,
+                c.jump_at_s
+            );
+        }
+    }
+    for n in &s.notes {
+        println!("  note: {n}");
+    }
+}
+
+#[derive(Subcommand, Debug)]
 pub enum ModeCommand {
     /// Make Audivane DSP the default sink.
     System,
@@ -1134,6 +1627,18 @@ pub enum WatchTopic {
     Presets,
     Spectrum,
     Devices,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DevicesCommand {
+    /// Say which card each output is, when identical DACs moved USB ports
+    /// (`status` lists the outputs held): OUTPUT DEVICE pairs, OUTPUT being
+    /// `master` or a follower's device as configured, e.g.
+    /// `assign master hw:CARD=USB,DEV=0 hw:CARD=USB,DEV=0 hw:CARD=USB_1,DEV=0`.
+    Assign {
+        #[arg(value_name = "OUTPUT DEVICE", num_args = 2.., required = true)]
+        pairs: Vec<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -1493,60 +1998,232 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
                 println!("configuration applied");
             }
         },
-        CtlCommand::Harmonics { command } => match command {
-            HarmonicsCommand::Show => {
-                let current: EngineConfig = serde_json::from_value(client.call(Call::GetConfig)?)?;
-                if json {
-                    print_json(&serde_json::to_value(&current.chain.harmonics)?)?;
-                } else {
+        CtlCommand::Harmonics { command } => {
+            match command {
+                HarmonicsCommand::Show => {
+                    let harmonics = current_harmonics(client)?;
+                    if json {
+                        print_json(&serde_json::to_value(&harmonics)?)?;
+                    } else {
+                        print_harmonics(harmonics.as_ref());
+                        if let Some(h) = harmonics.as_ref().filter(|h| h.enabled) {
+                            for (i, l) in h.layers.iter().enumerate() {
+                                println!("  {}. {}", i + 1, describe_layer(l));
+                            }
+                            // An older daemon has no readouts: skip them.
+                            if let Ok(v) = client.call(Call::HarmonicsReadout {
+                                config: None,
+                                sweep: false,
+                                sweep_freq_hz: None,
+                                sweep_level_dbfs: None,
+                            }) && let Ok(r) = serde_json::from_value(v)
+                            {
+                                print_harmonics_readout(&r);
+                                if h.layers.iter().any(|l| {
+                                    l.enabled()
+                                        && matches!(l, HarmonicsLayer::Chebyshev(c) if c.is_dynamic())
+                                }) {
+                                    println!(
+                                        "  (curves at rest: sag and bias move them on loud passages)"
+                                    );
+                                }
+                            }
+                            let output_rate = client
+                                .call(Call::Status)
+                                .ok()
+                                .and_then(|v| serde_json::from_value::<Status>(v).ok())
+                                .map(|s| s.output_rate);
+                            if let Some(note) = output_rate.and_then(|r| harmonics_alias_note(h, r))
+                            {
+                                println!("{note}");
+                            }
+                        }
+                    }
+                }
+                HarmonicsCommand::Off => {
+                    client.call(Call::SetHarmonics(None))?;
+                    println!("harmonics off");
+                }
+                HarmonicsCommand::Presets => {
+                    let presets = audivane_protocol::harmonics_presets();
+                    if json {
+                        print_json(&serde_json::to_value(presets)?)?;
+                    } else {
+                        for p in presets {
+                            println!(
+                                "{:<22} {} [{}]: {}",
+                                p.id,
+                                p.name,
+                                p.origin,
+                                summarize_layer(&p.layer)
+                            );
+                        }
+                    }
+                }
+                HarmonicsCommand::Systems => {
+                    let systems = audivane_protocol::harmonics_systems();
+                    if json {
+                        print_json(&serde_json::to_value(systems)?)?;
+                    } else {
+                        for s in systems {
+                            let layers: Vec<&str> =
+                                s.layers.iter().filter_map(|l| l.preset()).collect();
+                            let routing = match s.routing {
+                                HarmonicsRouting::Parallel => "",
+                                HarmonicsRouting::Series => ", in series",
+                            };
+                            println!(
+                                "{:<22} {} [{}{routing}]\n{:<22} {}\n{:<22} {}",
+                                s.id,
+                                s.name,
+                                layers.join(" → "),
+                                "",
+                                s.gear,
+                                "",
+                                s.sound
+                            );
+                        }
+                    }
+                }
+                HarmonicsCommand::System { id } => {
+                    let Some(system) = audivane_protocol::harmonics_system(&id) else {
+                        let ids: Vec<&str> = audivane_protocol::harmonics_systems()
+                            .iter()
+                            .map(|s| s.id.as_str())
+                            .collect();
+                        bail!(
+                            "unknown harmonics system {id:?} (one of: {})",
+                            ids.join(", ")
+                        );
+                    };
+                    let cfg = system.to_config();
+                    client.call(Call::SetHarmonics(Some(cfg.clone())))?;
                     println!(
-                        "harmonics: {}",
-                        summarize_harmonics(current.chain.harmonics.as_ref())
+                        "harmonics set to {}: {}",
+                        system.name,
+                        summarize_harmonics(Some(&cfg))
                     );
                 }
-            }
-            HarmonicsCommand::Off => {
-                client.call(Call::SetHarmonics(None))?;
-                println!("harmonics off");
-            }
-            HarmonicsCommand::Triode => {
-                let cfg = HarmonicsConfig {
-                    enabled: true,
-                    character: HarmonicsCharacter::Triode,
-                    ..Default::default()
-                };
-                client.call(Call::SetHarmonics(Some(cfg.clone())))?;
-                println!("harmonics set: {}", summarize_harmonics(Some(&cfg)));
-            }
-            HarmonicsCommand::Pentode => {
-                let cfg = HarmonicsConfig {
-                    enabled: true,
-                    character: HarmonicsCharacter::Pentode,
-                    ..Default::default()
-                };
-                client.call(Call::SetHarmonics(Some(cfg.clone())))?;
-                println!("harmonics set: {}", summarize_harmonics(Some(&cfg)));
-            }
-            HarmonicsCommand::Custom {
-                h2_db,
-                h3_db,
-                h4_db,
-                h5_db,
-                no_dc_block,
-            } => {
-                let cfg = HarmonicsConfig {
-                    enabled: true,
-                    character: HarmonicsCharacter::Custom,
+                HarmonicsCommand::Preset { id, layer } => set_harmonics_preset(client, &id, layer)?,
+                HarmonicsCommand::Triode { layer } => {
+                    set_harmonics_preset(client, "triode", layer)?
+                }
+                HarmonicsCommand::Pentode { layer } => {
+                    set_harmonics_preset(client, "pentode", layer)?
+                }
+                HarmonicsCommand::Custom {
                     h2_db,
                     h3_db,
                     h4_db,
                     h5_db,
-                    dc_block: !no_dc_block,
-                };
-                client.call(Call::SetHarmonics(Some(cfg.clone())))?;
-                println!("harmonics set: {}", summarize_harmonics(Some(&cfg)));
+                    h6_db,
+                    h7_db,
+                    h8_db,
+                    h9_db,
+                    signs,
+                    invert_even,
+                    layer,
+                } => {
+                    let l = ChebyshevLayer {
+                        enabled: true,
+                        preset: None,
+                        levels_db: [h2_db, h3_db, h4_db, h5_db, h6_db, h7_db, h8_db, h9_db],
+                        signs: signs.unwrap_or(HARMONICS_DEFAULT_SIGNS),
+                        invert_even,
+                        drive_db: layer.drive_db.unwrap_or(0.0),
+                        amount: layer.amount.unwrap_or(1.0),
+                        tilt: layer.tilt(None).map(Box::new),
+                        sag: layer.sag,
+                        bias: layer.bias,
+                    };
+                    set_harmonics_layer(
+                        client,
+                        HarmonicsLayer::Chebyshev(l),
+                        layer.add,
+                        layer.no_dc_block,
+                    )?;
+                }
+                HarmonicsCommand::Flux {
+                    corner_hz,
+                    boost_db,
+                    h3_db,
+                    at_hz,
+                    add,
+                } => {
+                    let l = FluxLayer {
+                        enabled: true,
+                        preset: None,
+                        corner_hz,
+                        max_boost_db: boost_db,
+                        target_h3_db: h3_db,
+                        calibration_hz: at_hz,
+                    };
+                    set_harmonics_layer(client, HarmonicsLayer::Flux(l), add, false)?;
+                }
+                HarmonicsCommand::Hysteresis {
+                    saturation,
+                    width,
+                    amount,
+                    h3_db,
+                    at_hz,
+                    bass_eq,
+                    asymmetry,
+                    add,
+                } => {
+                    let l = HysteresisLayer {
+                        enabled: true,
+                        preset: None,
+                        saturation,
+                        width,
+                        amount,
+                        target_h3_db: h3_db,
+                        calibration_hz: at_hz,
+                        bass_eq: bass_eq.map(|s| HysteresisBassEq {
+                            enabled: true,
+                            hz: s.hz,
+                            db: s.db,
+                        }),
+                        asymmetry,
+                    };
+                    set_harmonics_layer(client, HarmonicsLayer::Hysteresis(l), add, false)?;
+                }
+                HarmonicsCommand::Remove { index } => {
+                    let Some(mut cfg) = current_harmonics(client)? else {
+                        bail!("harmonics are off");
+                    };
+                    if index == 0 || index > cfg.layers.len() {
+                        bail!("no layer {index} (the stage has {})", cfg.layers.len());
+                    }
+                    cfg.layers.remove(index - 1);
+                    client.call(Call::SetHarmonics(Some(cfg.clone())))?;
+                    println!("harmonics set: {}", summarize_harmonics(Some(&cfg)));
+                }
+                HarmonicsCommand::Move { index, to } => {
+                    let Some(mut cfg) = current_harmonics(client)? else {
+                        bail!("harmonics are off");
+                    };
+                    let n = cfg.layers.len();
+                    if index == 0 || index > n || to == 0 || to > n {
+                        bail!(
+                            "no layer {} (the stage has {n})",
+                            if index == 0 || index > n { index } else { to }
+                        );
+                    }
+                    let layer = cfg.layers.remove(index - 1);
+                    cfg.layers.insert(to - 1, layer);
+                    client.call(Call::SetHarmonics(Some(cfg.clone())))?;
+                    println!("harmonics set: {}", summarize_harmonics(Some(&cfg)));
+                }
+                HarmonicsCommand::Routing { mode } => {
+                    let Some(mut cfg) = current_harmonics(client)? else {
+                        bail!("harmonics are off");
+                    };
+                    cfg.routing = mode.into();
+                    client.call(Call::SetHarmonics(Some(cfg.clone())))?;
+                    println!("harmonics set: {}", summarize_harmonics(Some(&cfg)));
+                }
             }
-        },
+        }
         CtlCommand::DcBlock { state, cutoff } => {
             let current: EngineConfig = serde_json::from_value(client.call(Call::GetConfig)?)?;
             match (state, cutoff) {
@@ -1595,31 +2272,49 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
                 client.call(Call::SetCrossfeed(None))?;
                 println!("crossfeed off");
             }
-            CrossfeedCommand::Level { level } => {
+            CrossfeedCommand::Width {
+                width,
+                shape,
+                corner_hz,
+            } => {
                 let current: EngineConfig = serde_json::from_value(client.call(Call::GetConfig)?)?;
-                let Some(mut cfg) = current.chain.crossfeed.filter(|c| c.enabled) else {
-                    bail!("crossfeed is off; pick a preset first");
-                };
-                cfg.level = level.into();
+                // With the stage off, width alone (no crossfeed).
+                let mut cfg =
+                    current
+                        .chain
+                        .crossfeed
+                        .filter(|c| c.enabled)
+                        .unwrap_or(CrossfeedConfig {
+                            mode: CrossfeedMode::None,
+                            ..CrossfeedConfig::default()
+                        });
+                cfg.width = width;
+                if let Some(shape) = shape {
+                    cfg.width_shape = shape.into();
+                }
+                if let Some(hz) = corner_hz {
+                    cfg.width_corner_hz = hz;
+                }
                 client.call(Call::SetCrossfeed(Some(cfg.clone())))?;
                 let rate = XfRate::query(client, current.rate.default_rate);
                 println!("crossfeed set: {}", summarize_crossfeed(Some(&cfg), rate));
             }
             preset => {
-                // Presets keep the level policy already chosen.
+                // Presets keep the width already chosen.
                 let current: EngineConfig = serde_json::from_value(client.call(Call::GetConfig)?)?;
-                let level = current.chain.crossfeed.map(|c| c.level).unwrap_or_default();
+                let kept = current.chain.crossfeed.unwrap_or_default();
                 let (mode, cutoff_hz, feed_db) = match preset {
                     CrossfeedCommand::Default => (CrossfeedMode::Bs2bDefault, None, None),
                     CrossfeedCommand::ChuMoy => (CrossfeedMode::Bs2bChuMoy, None, None),
                     CrossfeedCommand::JanMeier => (CrossfeedMode::Bs2bJanMeier, None, None),
                     CrossfeedCommand::Linkwitz => (CrossfeedMode::Linkwitz, None, None),
+                    CrossfeedCommand::None => (CrossfeedMode::None, None, None),
                     CrossfeedCommand::Custom { cutoff_hz, feed_db } => {
                         (CrossfeedMode::Bs2bCustom, Some(cutoff_hz), Some(feed_db))
                     }
                     CrossfeedCommand::Show
                     | CrossfeedCommand::Off
-                    | CrossfeedCommand::Level { .. } => unreachable!(),
+                    | CrossfeedCommand::Width { .. } => unreachable!(),
                 };
                 let defaults = CrossfeedConfig::default();
                 let cfg = CrossfeedConfig {
@@ -1627,7 +2322,9 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
                     mode,
                     cutoff_hz: cutoff_hz.unwrap_or(defaults.cutoff_hz),
                     feed_db: feed_db.unwrap_or(defaults.feed_db),
-                    level,
+                    width: kept.width,
+                    width_shape: kept.width_shape,
+                    width_corner_hz: kept.width_corner_hz,
                 };
                 client.call(Call::SetCrossfeed(Some(cfg.clone())))?;
                 let rate = XfRate::query(client, current.rate.default_rate);
@@ -2116,6 +2813,23 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
                     }
                 }
             }
+            EqCommand::Tone { bass, treble, off } => {
+                let current: EngineConfig = serde_json::from_value(client.call(Call::GetConfig)?)?;
+                let mut profile = current.chain.eq.unwrap_or_default();
+                let mut tone = profile.tone.unwrap_or_default();
+                if off {
+                    tone = Default::default();
+                }
+                if let Some(db) = bass {
+                    tone.bass_db = db;
+                }
+                if let Some(db) = treble {
+                    tone.treble_db = db;
+                }
+                profile.tone = tone.is_active().then_some(tone);
+                client.call(Call::SetEq(Some(profile)))?;
+                println!("EQ tone: {}", format_tone(&tone));
+            }
             EqCommand::Show => {
                 let current: EngineConfig = serde_json::from_value(client.call(Call::GetConfig)?)?;
                 if json {
@@ -2142,82 +2856,78 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
                     if files.is_empty() {
                         bail!("give at least one impulse response WAV or --off");
                     }
-                    if files.len() > 1 && name.is_some() {
+                    let convs = crate::conv_args::conv_items(&files, gain_db, name.as_deref())?;
+                    if convs.len() > 1 && name.is_some() {
                         bail!(
-                            "--name can only be used with a single file; use `conv add` for named entries"
+                            "--name can only be used with a single item; use `conv add` for named entries"
                         );
                     }
-                    for f in &files {
-                        if !f.is_file() {
-                            bail!("{} does not exist", f.display());
-                        }
-                    }
-                    let convs: Vec<ConvolutionConfig> = files
-                        .iter()
-                        .map(|f| ConvolutionConfig {
-                            name: name.clone(),
-                            enabled: true,
-                            ir_path: f.clone(),
-                            gain_db,
-                        })
-                        .collect();
-                    client.call(Call::SetConvolution(convs))?;
-                    if files.len() == 1 {
-                        println!("convolution set from {}", files[0].display());
+                    let n = convs.len();
+                    let what = crate::conv_args::conv_files(&convs[0]);
+                    let matrix = convs[0].matrix.is_some();
+                    let reply = client.call(Call::SetConvolution(convs))?;
+                    if n == 1 && matrix {
+                        println!("convolution set to a filter matrix: {what}");
+                    } else if n == 1 {
+                        println!("convolution set from {what}");
                     } else {
-                        println!("convolution set ({} IRs)", files.len());
+                        println!("convolution set ({n} IRs)");
                     }
+                    print_notes(&reply);
                 }
             }
             ConvCommand::Add {
-                file,
+                files,
                 gain_db,
                 name,
                 disabled,
             } => {
-                if !file.is_file() {
-                    bail!("{} does not exist", file.display());
+                let mut items = crate::conv_args::conv_items(&files, gain_db, name.as_deref())?;
+                if items.len() != 1 {
+                    bail!("give one IR, or the entries of one filter matrix");
                 }
+                let mut item = items.remove(0);
+                item.enabled = !disabled;
+                let what = crate::conv_args::conv_files(&item);
                 let mut current: EngineConfig =
                     serde_json::from_value(client.call(Call::GetConfig)?)?;
-                current.chain.convolution.push(ConvolutionConfig {
-                    name,
-                    enabled: !disabled,
-                    ir_path: file.clone(),
-                    gain_db,
-                });
+                current.chain.convolution.push(item);
                 let idx = current.chain.convolution.len() - 1;
-                client.call(Call::SetConvolution(current.chain.convolution))?;
-                println!("added convolution IR [{idx}] {}", file.display());
+                let reply = client.call(Call::SetConvolution(current.chain.convolution))?;
+                println!("added convolution IR [{idx}] {what}");
+                print_notes(&reply);
             }
             ConvCommand::Remove { target } => {
                 let mut current: EngineConfig =
                     serde_json::from_value(client.call(Call::GetConfig)?)?;
                 let idx = find_conv_index(&current.chain.convolution, &target)?;
                 let removed = current.chain.convolution.remove(idx);
-                client.call(Call::SetConvolution(current.chain.convolution))?;
+                let reply = client.call(Call::SetConvolution(current.chain.convolution))?;
                 println!(
                     "removed convolution IR [{idx}] {}",
-                    removed.ir_path.display()
+                    crate::conv_args::conv_files(&removed)
                 );
+                print_notes(&reply);
             }
             ConvCommand::Enable { target } => {
                 let mut current: EngineConfig =
                     serde_json::from_value(client.call(Call::GetConfig)?)?;
                 let idx = find_conv_index(&current.chain.convolution, &target)?;
                 current.chain.convolution[idx].enabled = true;
-                let path = current.chain.convolution[idx].ir_path.clone();
-                client.call(Call::SetConvolution(current.chain.convolution))?;
-                println!("enabled convolution IR [{idx}] {}", path.display());
+                let what = crate::conv_args::conv_files(&current.chain.convolution[idx]);
+                let reply = client.call(Call::SetConvolution(current.chain.convolution))?;
+                println!("enabled convolution IR [{idx}] {what}");
+                print_notes(&reply);
             }
             ConvCommand::Disable { target } => {
                 let mut current: EngineConfig =
                     serde_json::from_value(client.call(Call::GetConfig)?)?;
                 let idx = find_conv_index(&current.chain.convolution, &target)?;
                 current.chain.convolution[idx].enabled = false;
-                let path = current.chain.convolution[idx].ir_path.clone();
-                client.call(Call::SetConvolution(current.chain.convolution))?;
-                println!("disabled convolution IR [{idx}] {}", path.display());
+                let what = crate::conv_args::conv_files(&current.chain.convolution[idx]);
+                let reply = client.call(Call::SetConvolution(current.chain.convolution))?;
+                println!("disabled convolution IR [{idx}] {what}");
+                print_notes(&reply);
             }
             ConvCommand::List => {
                 let current: EngineConfig = serde_json::from_value(client.call(Call::GetConfig)?)?;
@@ -2225,6 +2935,51 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
                     print_json(&serde_json::to_value(&current.chain.convolution)?)?;
                 } else {
                     print_conv_list(&current.chain.convolution);
+                    print_conv_guards(client, &current)?;
+                }
+            }
+            ConvCommand::Safety {
+                max_boost_db,
+                subsonic_hz,
+            } => {
+                let mut current: EngineConfig =
+                    serde_json::from_value(client.call(Call::GetConfig)?)?;
+                if max_boost_db.is_none() && subsonic_hz.is_none() {
+                    if json {
+                        print_json(&serde_json::to_value(current.convolution_safety)?)?;
+                    } else {
+                        print_conv_guards(client, &current)?;
+                    }
+                } else {
+                    let safety = &mut current.convolution_safety;
+                    if let Some(v) = max_boost_db {
+                        safety.max_boost_db = v;
+                    }
+                    if let Some(v) = subsonic_hz {
+                        safety.subsonic_hz = v;
+                    }
+                    let safety = *safety;
+                    let reply = client.call(Call::SetConvolutionSafety(safety))?;
+                    println!(
+                        "convolution guards: boost cap {:+.1} dB, subsonic limit {} Hz",
+                        safety.max_boost_db, safety.subsonic_hz
+                    );
+                    print_notes(&reply);
+                }
+            }
+            ConvCommand::Response { device, side } => {
+                let value = client.call(Call::ConvResponse {
+                    side: side.map(|s| match s {
+                        ConvSideArg::A => AbSide::A,
+                        ConvSideArg::B => AbSide::B,
+                    }),
+                    device: device.clone(),
+                })?;
+                let response: audivane_protocol::ipc::ConvResponse = serde_json::from_value(value)?;
+                if json {
+                    println!("{}", serde_json::to_string(&response)?);
+                } else {
+                    print_conv_response(&response);
                 }
             }
             ConvCommand::Clear => {
@@ -2339,8 +3094,7 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
                                 if k.numerics.path
                                     == audivane_protocol::design::ArithmeticPath::Standard =>
                             {
-                                audivane_dsp_core::design::paths::standard::legacy_config(k, 44_100)
-                                    .ok()
+                                editable_config(k)
                             }
                             _ => None,
                         })
@@ -2391,8 +3145,13 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
                                  --cutoff-mode band"
                             );
                         }
-                        if let Some(v) = set.passband_end {
-                            m.band.passband_end = v;
+                        match set.passband_end {
+                            Some(PassbandEnd::Fraction(v)) => {
+                                m.band.passband_end = v;
+                                m.band.passband_end_hz = None;
+                            }
+                            Some(PassbandEnd::Hz(hz)) => m.band.passband_end_hz = Some(hz),
+                            None => {}
                         }
                         if let Some(v) = set.stopband_start {
                             m.band.stopband_start = v;
@@ -2553,17 +3312,28 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
             }
         }
         CtlCommand::Follower(args) => {
-            let call = |device: String, remove: bool, set: FollowerSetArgs| Call::SetFollower {
-                device,
-                remove,
-                enabled: set.enabled.map(|e| e == OnOff::On),
-                trim_ms: set.trim_ms,
-                volume_db: set.volume_db,
+            let call = |device: String, remove: bool, set: FollowerSetArgs| -> CtlResult<Call> {
+                let chain_patch = match (&set.chain_patch, set.no_chain_patch) {
+                    (Some(p), _) => Some(chain_patch_arg(p)?),
+                    (None, true) => Some(serde_json::json!({})),
+                    (None, false) => None,
+                };
+                Ok(Call::SetFollower {
+                    device,
+                    remove,
+                    enabled: set.enabled.map(|e| e == OnOff::On),
+                    trim_ms: set.trim_ms,
+                    volume_db: set.volume_db,
+                    output_channels: set.output_channels,
+                    follow_volume: set.follow_volume.map(|e| e == OnOff::On),
+                    chain_patch,
+                    period_ms: set.period_ms,
+                })
             };
             let call = match (args.command, args.device) {
-                (Some(FollowerCommand::Add { device, set }), _) => call(device, false, set),
+                (Some(FollowerCommand::Add { device, set }), _) => call(device, false, set)?,
                 (Some(FollowerCommand::Remove { device }), _) => {
-                    call(device, true, FollowerSetArgs::default())
+                    call(device, true, FollowerSetArgs::default())?
                 }
                 (None, Some(device)) => {
                     // Editing never adds: a typo must not open another DAC.
@@ -2571,15 +3341,27 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
                     if !st.outputs.followers.iter().any(|f| f.device == device) {
                         bail!("{device} is not a follower (add it with `follower add {device}`)");
                     }
-                    call(device, false, args.set)
+                    call(device, false, args.set)?
                 }
                 (None, None) => bail!("give a follower's DEVICE, or `add` / `remove`"),
+            };
+            let (device, removed) = match &call {
+                Call::SetFollower { device, remove, .. } => (device.clone(), *remove),
+                _ => (String::new(), true),
             };
             let outputs: OutputsStatus = serde_json::from_value(client.call(call)?)?;
             if json {
                 print_json(&serde_json::to_value(&outputs)?)?;
             } else {
                 print_outputs(&outputs);
+                if !removed {
+                    // Its own chain's convolution warnings (clip risk,
+                    // subsonic energy), as `conv` prints chain A's.
+                    let st: Status = serde_json::from_value(client.call(Call::Status)?)?;
+                    for m in follower_warnings(&st.conv_warnings, &device) {
+                        println!("warning: {m}");
+                    }
+                }
             }
         }
         CtlCommand::Dsp { state } => {
@@ -2714,6 +3496,9 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
                     println!("{}", describe_measure(&status));
                 }
             }
+            AbCommand::Blind { state } => print_ab(client.call(Call::AbBlind {
+                enabled: state == OnOff::On,
+            })?)?,
             AbCommand::Off => {
                 let value = client.call(Call::SetAb(None))?;
                 let status: audivane_protocol::ipc::AbStatus = serde_json::from_value(value)?;
@@ -2789,28 +3574,7 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
         CtlCommand::Volume(args) => {
             if args.edits_settings() {
                 let mut cfg: EngineConfig = serde_json::from_value(client.call(Call::GetConfig)?)?;
-                let v = &mut cfg.volume;
-                if let Some(mode) = args.mode {
-                    v.mode = mode;
-                }
-                if let Some(OptDb(db)) = args.hardware_db {
-                    v.hardware_db = db;
-                }
-                if let Some(OptDb(db)) = args.ceiling {
-                    v.max_volume_db = db;
-                }
-                if let Some(policy) = args.sink_volume {
-                    v.sink_volume = policy;
-                }
-                if let Some(mode) = args.guard {
-                    v.guard.mode = mode;
-                }
-                if let Some(rise) = args.rise {
-                    v.guard.max_rise_db_per_s = rise;
-                }
-                if let Some(OptDb(db)) = args.stream_max {
-                    v.guard.stream_max_db = db;
-                }
+                apply_volume_settings(&mut cfg.volume, &args);
                 client.call(Call::SetConfig(cfg))?;
             }
             if !args.edits_level() {
@@ -2879,28 +3643,45 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
                 println!("{}", stream_volume_line(&volume, args.db));
             }
         }
-        CtlCommand::Preset { command } => match command {
+        CtlCommand::Preset { part, command } => match command {
             PresetCommand::List => {
                 let value = client.call(Call::ListPresets)?;
+                let presets: Vec<audivane_protocol::ipc::PresetInfo> =
+                    serde_json::from_value(value)?;
+                let presets: Vec<_> = presets.into_iter().filter(|p| p.part == part).collect();
                 if json {
-                    print_json(&value)?;
+                    print_json(&serde_json::to_value(&presets)?)?;
                 } else {
-                    let presets: Vec<audivane_protocol::ipc::PresetInfo> =
-                        serde_json::from_value(value)?;
-                    let active: Option<String> = serde_json::from_value::<
-                        audivane_protocol::ipc::Status,
-                    >(client.call(Call::Status)?)
-                    .ok()
-                    .and_then(|status| status.preset.map(|preset| preset.name));
+                    let status = serde_json::from_value::<audivane_protocol::ipc::Status>(
+                        client.call(Call::Status)?,
+                    )
+                    .ok();
+                    let active: Option<String> = status.and_then(|status| match part {
+                        None => status.preset.map(|preset| preset.name),
+                        Some(part) => status
+                            .part_presets
+                            .into_iter()
+                            .find(|state| state.part == part)
+                            .map(|state| state.name),
+                    });
                     print_presets(&presets, active.as_deref())?;
                 }
             }
             PresetCommand::Show { name } => {
-                let value = client.call(Call::GetPreset { name })?;
+                let value = client.call(Call::GetPreset { name, part })?;
                 print_json(&value)?;
             }
-            PresetCommand::Save { name, overwrite } => {
-                let value = client.call(Call::SavePreset { name, overwrite })?;
+            PresetCommand::Save {
+                name,
+                overwrite,
+                parts,
+            } => {
+                let value = client.call(Call::SavePreset {
+                    name,
+                    overwrite,
+                    part,
+                    parts,
+                })?;
                 let info: audivane_protocol::ipc::PresetInfo = serde_json::from_value(value)?;
                 if json {
                     println!("{}", serde_json::to_string(&info)?);
@@ -2909,17 +3690,33 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
                 }
             }
             PresetCommand::Load { name } => {
-                client.call(Call::LoadPreset { name: name.clone() })?;
+                client.call(Call::LoadPreset {
+                    name: name.clone(),
+                    part,
+                })?;
                 println!("loaded preset {name:?}");
             }
+            PresetCommand::Blank => {
+                let Some(part) = part else {
+                    bail!(
+                        "preset blank needs --part (eq, convolution, stereo, harmonics, upsampling or output)"
+                    );
+                };
+                client.call(Call::BlankPreset { part })?;
+                println!("{} reset to defaults, no preset active", part.name());
+            }
             PresetCommand::Delete { name } => {
-                client.call(Call::DeletePreset { name: name.clone() })?;
+                client.call(Call::DeletePreset {
+                    name: name.clone(),
+                    part,
+                })?;
                 println!("deleted preset {name:?}");
             }
             PresetCommand::Rename { from, to } => {
                 let value = client.call(Call::RenamePreset {
                     from: from.clone(),
                     to: to.clone(),
+                    part,
                 })?;
                 let info: audivane_protocol::ipc::PresetInfo = serde_json::from_value(value)?;
                 if json {
@@ -2960,7 +3757,55 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
                 }
             }
         },
-        CtlCommand::Devices => {
+        CtlCommand::Devices {
+            command: Some(DevicesCommand::Assign { pairs }),
+        } => {
+            if pairs.len() % 2 != 0 {
+                return Err(anyhow::anyhow!("assign takes OUTPUT DEVICE pairs").into());
+            }
+            let assignments = pairs
+                .chunks(2)
+                .map(|p| audivane_protocol::ipc::DeviceAssignment {
+                    output: p[0].clone(),
+                    device: p[1].clone(),
+                })
+                .collect();
+            client.call(Call::AssignDevices { assignments })?;
+            if !json {
+                println!("outputs assigned");
+            }
+        }
+        CtlCommand::Device {
+            device,
+            output_channels,
+        } => {
+            if device.is_some() || output_channels.is_some() {
+                let device = match device {
+                    Some(d) => d,
+                    None => {
+                        let c: EngineConfig =
+                            serde_json::from_value(client.call(Call::GetConfig)?)?;
+                        c.device
+                    }
+                };
+                client.call(Call::SetDevice {
+                    device,
+                    output_channels,
+                })?;
+            }
+            let config: EngineConfig = serde_json::from_value(client.call(Call::GetConfig)?)?;
+            let st: Status = serde_json::from_value(client.call(Call::Status)?)?;
+            if json {
+                print_json(&serde_json::json!({
+                    "device": config.device,
+                    "output_channels": config.output_channels.unwrap_or(OutputChannels::DEFAULT),
+                    "device_caps": st.device_caps,
+                }))?;
+            } else {
+                println!("{}", device_line(&config, st.device_caps.as_ref()));
+            }
+        }
+        CtlCommand::Devices { command: None } => {
             let value = client.call(Call::ListDevices)?;
             if json {
                 print_json(&value)?;
@@ -3092,6 +3937,179 @@ fn dispatch(client: &mut Client, command: CtlCommand, json: bool) -> CtlResult<i
                 }
             }
         },
+        CtlCommand::Measure { command } => {
+            use audivane_protocol::ipc::{
+                MeasureChain, MeasurePlayRequest, MeasureState, MeasureStatus,
+            };
+            let status = match command {
+                MeasureCommand::Stop => {
+                    serde_json::from_value::<MeasureStatus>(client.call(Call::MeasureStop)?)?
+                }
+                MeasureCommand::Status => {
+                    serde_json::from_value::<MeasureStatus>(client.call(Call::MeasureStatus)?)?
+                }
+                MeasureCommand::Play(a) => {
+                    let routes = a
+                        .routes
+                        .iter()
+                        .map(|r| parse_measure_route(r))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| CtlError::Other(anyhow::anyhow!(e)))?;
+                    let file = std::fs::canonicalize(&a.file)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or(a.file.clone());
+                    let req = MeasurePlayRequest {
+                        file,
+                        routes,
+                        chain: if a.active {
+                            MeasureChain::Active
+                        } else {
+                            MeasureChain::Bypass
+                        },
+                        mute_others: !a.no_mute,
+                        keepalive_db: if a.no_keepalive {
+                            None
+                        } else {
+                            Some(a.keepalive_db.unwrap_or(-100.0))
+                        },
+                        lead_in_ms: a.lead_in_ms.unwrap_or(2000.0),
+                    };
+                    let started: MeasureStatus =
+                        serde_json::from_value(client.call(Call::MeasurePlay(req))?)?;
+                    let mut last = started.state;
+                    if !json {
+                        eprintln!("measure #{}: {:?}", started.run, last);
+                    }
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        let s: MeasureStatus =
+                            serde_json::from_value(client.call(Call::MeasureStatus)?)?;
+                        if s.run != started.run {
+                            break s;
+                        }
+                        if s.state != last && !json {
+                            eprintln!("measure #{}: {:?}", s.run, s.state);
+                        }
+                        last = s.state;
+                        if !matches!(
+                            s.state,
+                            MeasureState::Preparing
+                                | MeasureState::LeadIn
+                                | MeasureState::Playing
+                                | MeasureState::Tail
+                        ) {
+                            break s;
+                        }
+                    }
+                }
+            };
+            if json {
+                println!("{}", serde_json::to_string(&status)?);
+            } else {
+                print_measure_status(&status);
+            }
+            if matches!(status.state, MeasureState::Error | MeasureState::Stopped) {
+                return Ok(1);
+            }
+        }
+        CtlCommand::Bundle { command } => {
+            use audivane_protocol::ipc::CalibrationStatus;
+            let abs = |f: &str| {
+                std::fs::canonicalize(f)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| f.to_string())
+            };
+            let value = match command {
+                BundleCommand::Load { file } => {
+                    client.call(Call::BundleLoad { path: abs(&file) })?
+                }
+                BundleCommand::Unload => {
+                    let v = client.call(Call::BundleUnload)?;
+                    if json {
+                        println!("{}", serde_json::to_string(&v)?);
+                    } else {
+                        for n in v
+                            .get("notes")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                        {
+                            eprintln!("note: {n}");
+                        }
+                        println!("room calibration removed");
+                    }
+                    return Ok(0);
+                }
+                BundleCommand::Show => client.call(Call::BundleShow)?,
+                BundleCommand::Ab { file, none } => client.call(Call::BundleAb {
+                    path: if none { None } else { file.as_deref().map(abs) },
+                })?,
+                BundleCommand::Gain { device, db, reset } => client.call(Call::BundleGain {
+                    device,
+                    gain_db: if reset { None } else { db },
+                })?,
+            };
+            if json {
+                println!("{}", serde_json::to_string(&value)?);
+                return Ok(0);
+            }
+            if let Some(notes) = value.get("notes").and_then(Value::as_array) {
+                for n in notes.iter().filter_map(Value::as_str) {
+                    eprintln!("note: {n}");
+                }
+            }
+            if value.get("current").is_some() {
+                // `bundle ab`: the A/B status.
+                let st: audivane_protocol::ipc::AbStatus = serde_json::from_value(value)?;
+                println!(
+                    "A/B on: B is chain A with the other calibration (offset {:+.2} dB); \
+                     `ab select b` switches",
+                    st.offset_db
+                );
+                return Ok(0);
+            }
+            match serde_json::from_value::<Option<CalibrationStatus>>(value)? {
+                None => println!("no room calibration loaded"),
+                Some(c) => {
+                    println!(
+                        "{} ({}, designed at {} Hz)",
+                        c.label, c.path, c.design_rate_hz
+                    );
+                    if let Some(n) = &c.notes {
+                        println!("  notes: {n}");
+                    }
+                    for d in &c.devices {
+                        println!(
+                            "  {:<8} {}: {} filter{}, {:+.1} dB{}{}{}",
+                            d.role,
+                            d.device,
+                            d.entries,
+                            if d.entries == 1 { "" } else { "s" },
+                            d.gain_db,
+                            if d.gain_db == d.manifest_gain_db {
+                                String::new()
+                            } else {
+                                format!(" (bundle {:+.1} dB)", d.manifest_gain_db)
+                            },
+                            if d.role == "follower" {
+                                format!(", trim {:+.3} ms", d.trim_ms)
+                            } else {
+                                String::new()
+                            },
+                            if d.installed {
+                                ""
+                            } else {
+                                " (not installed: removed since)"
+                            }
+                        );
+                    }
+                    for w in &c.warnings {
+                        println!("  warning: {w}");
+                    }
+                }
+            }
+        }
         CtlCommand::Selftest => {
             let value = client.call(Call::SelfTest)?;
             let result: audivane_protocol::ipc::SelfTestResult = serde_json::from_value(value)?;
@@ -3283,6 +4301,30 @@ fn print_design_check(check: &audivane_protocol::ipc::DesignCheck) {
     for e in &check.errors {
         println!("refused {}: {}", e.path, e.message);
     }
+    if let Some(a) = &check.advice
+        && a.applied
+    {
+        println!("applied where it builds: {}", a.message);
+    }
+    for n in &check.notes {
+        match &n.plays {
+            Some(plays) => println!(
+                "{} Hz plays {}: {}",
+                n.source_rate,
+                plays_name(plays),
+                n.message
+            ),
+            None => println!("{} Hz: {}", n.source_rate, n.message),
+        }
+    }
+    if let Some(a) = &check.advice {
+        for f in &a.fixes {
+            println!("fix: {}", f.label);
+        }
+        for d in &a.details {
+            println!("detail {} Hz ({}): {}", d.source_rate, d.ratio, d.message);
+        }
+    }
     for p in &check.plans {
         let plan = &p.plan;
         let taps = if plan.grid_taps == 0 {
@@ -3305,6 +4347,9 @@ fn print_design_check(check: &audivane_protocol::ipc::DesignCheck) {
             plan.workspace_bytes as f64 / 1e6,
             plan.resident_bytes as f64 / 1e6,
         );
+    }
+    for n in &check.notes {
+        println!("note {}: {}", n.path, n.message);
     }
     if check.errors.is_empty() && check.plans.is_empty() {
         println!("ok (the target does not upsample at the checked rates)");
@@ -3530,7 +4575,9 @@ fn format_volume(v: &audivane_protocol::ipc::VolumeStatus) -> String {
     if let Some(hw) = v.hardware_db
         && !v.hardware
     {
-        extra.push(format!("hardware fixed at {hw:.1} dB"));
+        // A fixed level (`hardware_db`), or where an earlier mode left the
+        // card (`software` without one): the status does not say which.
+        extra.push(format!("hardware at {hw:.1} dB"));
     }
     if v.hardware && v.software_db != 0.0 {
         extra.push(format!(
@@ -3592,10 +4639,44 @@ fn print_outputs(o: &OutputsStatus) {
         println!("followers:  none");
         return;
     }
-    println!("alignment:  {:.0} ms on the main output", o.alignment_ms);
+    println!("alignment:  {}", format_alignment(o));
+    if o.master.rate_hz > 0 {
+        println!("main:       {}", format_path_latency(&o.master));
+    }
     for f in &o.followers {
         println!("follower:   {}", format_follower(f));
+        if f.latency.rate_hz > 0 {
+            println!("            {}", format_path_latency(&f.latency));
+        }
     }
+}
+
+fn format_alignment(o: &OutputsStatus) -> String {
+    let mut s = format!("{:.0} ms on the main output", o.alignment_ms);
+    match (o.alignment_need_ms, o.alignment_shrink_ms) {
+        (Some(need), Some(to)) => {
+            s += &format!(
+                " (the followers need {need:.1} ms: down to {to:.0} ms at the next silence)"
+            )
+        }
+        (Some(need), None) => s += &format!(" (the followers need {need:.1} ms)"),
+        (None, Some(to)) => s += &format!(" (down to {to:.0} ms at the next silence)"),
+        (None, None) => {}
+    }
+    s
+}
+
+fn format_path_latency(l: &audivane_protocol::ipc::PathLatency) -> String {
+    format!(
+        "latency {:.0} frames ({:.0} µs) = chain {:.0} + compensation {:.0} + alignment {:.0} \
+         frames at {} Hz",
+        l.total_frames,
+        l.total_us,
+        l.chain_frames,
+        l.compensation_frames,
+        l.alignment_frames,
+        l.rate_hz
+    )
 }
 
 fn format_follower(f: &FollowerStatus) -> String {
@@ -3618,12 +4699,41 @@ fn format_follower(f: &FollowerStatus) -> String {
     if !f.enabled {
         s += ", disabled";
     }
-    s += &format!(", trim {:+.2} ms, volume {:.1} dB", f.trim_ms, f.volume_db);
+    if !f.own_chain.is_empty() {
+        s += &format!(", own chain: {} differs", f.own_chain.join(", "));
+    }
+    let level = f.level_db.unwrap_or(f.volume_db);
+    s += &format!(
+        ", trim {:+.2} ms, volume {level:.1} dB{}",
+        f.trim_ms,
+        if f.follow_volume {
+            ", follows the main volume"
+        } else {
+            ""
+        }
+    );
+    if f.output_channels.is_some() || f.device_channels > 2 {
+        let pair = f.output_channels.unwrap_or(OutputChannels::DEFAULT);
+        s += &format!(", left/right on {pair}");
+        if f.device_channels > 0 {
+            s += &format!(" of {}", f.device_channels);
+        }
+    }
     if f.device_rate > 0 {
         s += &format!(
-            ", {:+.2} ppm, error {:.2} frames, {} Hz × {}, latency {:.1} ms, skips {}, xruns {}",
-            f.ppm, f.phase_error_frames, f.device_rate, f.period, f.latency_ms, f.skips, f.xruns
+            ", {:+.2} ppm, error {:.2} frames, {} Hz × {} ({:.1} ms), latency {:.1} ms, skips {}, xruns {}",
+            f.ppm,
+            f.phase_error_frames,
+            f.device_rate,
+            f.period,
+            f64::from(f.period) * 1e3 / f64::from(f.device_rate),
+            f.latency_ms,
+            f.skips,
+            f.xruns
         );
+    }
+    if let Some(n) = f.need_ms {
+        s += &format!(", needs {n:.1} ms of alignment");
     }
     if let Some(e) = &f.error {
         s += &format!(", error: {e}");
@@ -3738,6 +4848,22 @@ fn print_status(
     println!("audivane-dsp {}", status.version);
     println!("state:      {}", status_state(status));
     println!("device:     {}", status.device);
+    if !status.unresolved_devices.is_empty() {
+        println!(
+            "held:       identical DACs changed USB ports; which is which? \
+             (`devices assign OUTPUT DEVICE ...`)"
+        );
+        for u in &status.unresolved_devices {
+            println!(
+                "            {} was on {}; now one of {}",
+                u.output,
+                u.identity
+                    .port_chain()
+                    .map_or_else(|| u.identity.to_string(), |c| format!("USB port {c}")),
+                u.candidates.join(", ")
+            );
+        }
+    }
     println!(
         "format:     {}",
         status
@@ -3806,8 +4932,13 @@ fn print_status(
     if let Some(bits) = status.dither_bits {
         println!("dither:     {bits} bits");
     }
+    let conv = if status.conv_latency_ms > 0.0 {
+        format!(" (convolution {:.1} ms)", status.conv_latency_ms)
+    } else {
+        String::new()
+    };
     println!(
-        "buffers:    quantum {} frames, latency {:.1} ms",
+        "buffers:    quantum {} frames, latency {:.1} ms{conv}",
         status.quantum, status.latency_ms
     );
     let peak = if status.rt_load_max > 0.0 {
@@ -3839,6 +4970,17 @@ fn print_status(
     }
     if let Some(overload) = &status.overload {
         println!("overload:   {}", overload.message);
+    }
+    if let Some(now) = &status.upsampler_fallback_now
+        && let Some(text) = rate_fallback_text(now)
+    {
+        println!(
+            "upsampler:  plays {text} at {} instead of the requested filter",
+            khz(now.source_rate)
+        );
+    }
+    if let Some(line) = per_rate_line(&status.upsampler_rates) {
+        println!("per rate:   {line}");
     }
     match status.active_sink {
         Some(sink) => println!("sink:       {} (active)", sink_name(sink)),
@@ -3926,8 +5068,20 @@ fn preset_line(preset: &audivane_protocol::ipc::PresetInfo) -> String {
     )
 }
 
+fn parse_preset_part(text: &str) -> Result<PresetPart, String> {
+    PresetPart::from_name(text).ok_or_else(|| {
+        let names: Vec<&str> = PresetPart::ALL.iter().map(|part| part.name()).collect();
+        format!("unknown part `{text}` (one of {})", names.join(", "))
+    })
+}
+
 fn preset_summary(preset: &audivane_protocol::ipc::PresetInfo) -> String {
     let mut parts = Vec::new();
+    // A global preset holding some parts only names them.
+    if preset.part.is_none() && preset.parts.len() < PresetPart::ALL.len() {
+        let names: Vec<&str> = preset.parts.iter().map(|part| part.name()).collect();
+        parts.push(names.join("+"));
+    }
     if preset.bands > 0 {
         parts.push(format!(
             "{} band{}",
@@ -3978,15 +5132,20 @@ fn print_devices(devices: &[audivane_protocol::ipc::DeviceInfo]) -> CtlResult<()
         return Ok(());
     }
     println!(
-        "{:<28} {:<10} {:<28} {:<9} ACTIVE",
-        "DEVICE", "CARD", "NAME", "KIND"
+        "{:<28} {:<10} {:<28} {:<9} {:<9} ACTIVE",
+        "DEVICE", "CARD", "NAME", "KIND", "CHANNELS"
     );
     for device in devices {
+        let name = match &device.suffix {
+            Some(suffix) => format!("{} ({suffix})", device.name),
+            None => device.name.clone(),
+        };
+        let channels: Vec<String> = device.channels.iter().map(u32::to_string).collect();
         println!(
-            "{:<28} {:<10} {:<28} {:<9} {}",
+            "{:<28} {:<10} {:<28} {:<9} {:<9} {}",
             device.id,
             truncate(&device.card, 10),
-            truncate(&device.name, 28),
+            truncate(&name, 28),
             if device.hdmi {
                 "hdmi"
             } else if device.loopback {
@@ -3994,10 +5153,34 @@ fn print_devices(devices: &[audivane_protocol::ipc::DeviceInfo]) -> CtlResult<()
             } else {
                 "analog"
             },
+            if channels.is_empty() {
+                "-".to_string()
+            } else {
+                channels.join(",")
+            },
             if device.active { "yes" } else { "" }
         );
     }
     Ok(())
+}
+
+/// `device hw:CARD=USB,DEV=0, opens at 8 channels (takes 8), left/right on 2/3`.
+fn device_line(
+    config: &EngineConfig,
+    caps: Option<&audivane_protocol::ipc::DeviceCapabilities>,
+) -> String {
+    let pair = config.output_channels.unwrap_or(OutputChannels::DEFAULT);
+    let mut s = format!("device {}", config.device);
+    if let Some(c) = caps.filter(|c| c.device == config.device) {
+        let takes = if c.channels_min == c.channels_max {
+            c.channels_min.to_string()
+        } else {
+            format!("{}-{}", c.channels_min, c.channels_max)
+        };
+        s += &format!(", opens at {} channels (takes {takes})", c.channels);
+    }
+    s += &format!(", left/right on {pair}");
+    s
 }
 
 fn config_line(config: &audivane_protocol::ipc::EngineConfig) -> String {
@@ -4053,6 +5236,225 @@ fn band_count(count: usize) -> String {
     format!("{count} band{}", if count == 1 { "" } else { "s" })
 }
 
+fn current_harmonics(client: &mut Client) -> CtlResult<Option<HarmonicsConfig>> {
+    let cfg: EngineConfig = serde_json::from_value(client.call(Call::GetConfig)?)?;
+    Ok(cfg.chain.harmonics)
+}
+
+/// Set one layer: replacing the stage's layers, or added to them.
+fn set_harmonics_layer(
+    client: &mut Client,
+    layer: HarmonicsLayer,
+    add: bool,
+    no_dc_block: bool,
+) -> CtlResult<()> {
+    let mut cfg = match current_harmonics(client)? {
+        Some(h) if add => HarmonicsConfig { enabled: true, ..h },
+        _ => HarmonicsConfig {
+            system: None,
+            enabled: true,
+            layers: Vec::new(),
+            dc_block: true,
+            routing: Default::default(),
+        },
+    };
+    cfg.layers.push(layer);
+    if no_dc_block {
+        cfg.dc_block = false;
+    }
+    client.call(Call::SetHarmonics(Some(cfg.clone())))?;
+    println!("harmonics set: {}", summarize_harmonics(Some(&cfg)));
+    Ok(())
+}
+
+fn set_harmonics_preset(client: &mut Client, id: &str, args: HarmonicsLayerArgs) -> CtlResult<()> {
+    let Some(preset) = audivane_protocol::harmonics_preset(id) else {
+        let ids: Vec<&str> = audivane_protocol::harmonics_presets()
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect();
+        bail!(
+            "unknown harmonics preset {id:?} (one of: {})",
+            ids.join(", ")
+        );
+    };
+    let mut layer = preset.to_layer();
+    let tilting = args.tilt_low.is_some() || args.tilt_high.is_some() || args.tilt_even;
+    let dynamic = args.sag.is_some() || args.bias.is_some();
+    match &mut layer {
+        HarmonicsLayer::Chebyshev(l) => {
+            l.drive_db = args.drive_db.unwrap_or(l.drive_db);
+            l.tilt = args.tilt(l.tilt.take().map(|t| *t)).map(Box::new);
+            l.sag = args.sag.or(l.sag);
+            l.bias = args.bias.or(l.bias);
+        }
+        _ if args.drive_db.is_some() || tilting || dynamic => {
+            bail!("--drive-db, --tilt-*, --sag and --bias apply to Chebyshev layers only");
+        }
+        _ => {}
+    }
+    if let Some(amount) = args.amount {
+        match layer.amount_mut() {
+            Some(a) => *a = amount,
+            None => bail!("--amount applies to Chebyshev and hysteresis layers only"),
+        }
+    }
+    set_harmonics_layer(client, layer, args.add, args.no_dc_block)
+}
+
+impl HarmonicsLayerArgs {
+    /// `base` (a preset's tilt) with the `--tilt-*` options applied.
+    fn tilt(&self, base: Option<HarmonicsTilt>) -> Option<HarmonicsTilt> {
+        if self.tilt_low.is_none() && self.tilt_high.is_none() && !self.tilt_even {
+            return base;
+        }
+        let mut t = base.unwrap_or_default();
+        if let Some(s) = self.tilt_low {
+            t.low = s;
+        }
+        if let Some(s) = self.tilt_high {
+            t.high = s;
+        }
+        t.low_even |= self.tilt_even;
+        Some(t)
+    }
+}
+
+/// `V` or `V:ATTACK_MS:RELEASE_MS` (times from `default`).
+fn parse_envelope(text: &str, default: (f64, f64)) -> Result<(f64, f64, f64), String> {
+    let num = |v: &str| {
+        v.trim()
+            .parse::<f64>()
+            .map_err(|_| format!("not a number: {v:?}"))
+    };
+    let parts: Vec<&str> = text.split(':').collect();
+    match parts[..] {
+        [v] => Ok((num(v)?, default.0, default.1)),
+        [v, a, r] => Ok((num(v)?, num(a)?, num(r)?)),
+        _ => Err(format!(
+            "expected VALUE or VALUE:ATTACK_MS:RELEASE_MS, got {text:?}"
+        )),
+    }
+}
+
+/// `--sag DB[:ATTACK_MS:RELEASE_MS]`, e.g. `2` or `2:10:300`.
+fn parse_sag(text: &str) -> Result<HarmonicsSag, String> {
+    let d = HarmonicsSag::default();
+    let (depth_db, attack_ms, release_ms) = parse_envelope(text, (d.attack_ms, d.release_ms))?;
+    let sag = HarmonicsSag {
+        depth_db,
+        attack_ms,
+        release_ms,
+    };
+    sag.validate()?;
+    Ok(sag)
+}
+
+/// `--bias DEPTH[:ATTACK_MS:RELEASE_MS]`, e.g. `0.1` or `-0.1:300:2000`.
+fn parse_bias(text: &str) -> Result<HarmonicsBias, String> {
+    let d = HarmonicsBias::default();
+    let (depth, attack_ms, release_ms) = parse_envelope(text, (d.attack_ms, d.release_ms))?;
+    let bias = HarmonicsBias {
+        depth,
+        attack_ms,
+        release_ms,
+    };
+    bias.validate()?;
+    Ok(bias)
+}
+
+/// `HZ:DB[:SLOPE]`, e.g. `60:12` or `60:12:24` (slope in dB/oct).
+/// `--bass-eq HZ:DB`: a tilt shelf without a slope (the pair is fixed at
+/// 12 dB/oct).
+fn parse_bass_eq(text: &str) -> Result<TiltShelf, String> {
+    let shelf = parse_tilt_shelf(text)?;
+    if shelf.slope.is_some() {
+        return Err(format!(
+            "expected HZ:DB (the bass EQ is 12 dB/oct), got {text:?}"
+        ));
+    }
+    Ok(shelf)
+}
+
+fn parse_tilt_shelf(text: &str) -> Result<TiltShelf, String> {
+    let num = |v: &str| {
+        v.trim()
+            .parse::<f64>()
+            .map_err(|_| format!("not a number: {v:?}"))
+    };
+    let parts: Vec<&str> = text.split(':').collect();
+    let (hz, db, slope) = match parts[..] {
+        [hz, db] => (hz, db, None),
+        [hz, db, slope] => (hz, db, Some(slope)),
+        _ => {
+            return Err(format!(
+                "expected HZ:DB or HZ:DB:SLOPE (e.g. 60:12 or 60:12:24), got {text:?}"
+            ));
+        }
+    };
+    let slope = match slope {
+        None => None,
+        Some(v) => {
+            let v = v.trim();
+            match v.parse::<u8>() {
+                Ok(s) if TILT_SLOPES.contains(&s) => Some(s),
+                _ => return Err(format!("slope must be 6, 12, 18 or 24 dB/oct, got {v:?}")),
+            }
+        }
+    };
+    Ok(TiltShelf {
+        hz: num(hz)?,
+        db: num(db)?,
+        slope,
+    })
+}
+
+/// `, 24 dB/oct` for a shelf whose slope is set.
+fn slope_text(s: &TiltShelf) -> String {
+    s.slope.map(|v| format!(", {v} dB/oct")).unwrap_or_default()
+}
+
+/// A tilt in words: "tilt low +12 dB below 60 Hz (odd), high +6 dB above
+/// 6000 Hz, 1 order overridden".
+fn summarize_tilt(t: &HarmonicsTilt) -> Option<String> {
+    if t.is_flat() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if t.low.db != 0.0 {
+        let which = if t.low_even {
+            "all orders"
+        } else {
+            "odd orders"
+        };
+        parts.push(format!(
+            "low {:+.1} dB below {} Hz ({which}{})",
+            t.low.db,
+            t.low.hz,
+            slope_text(&t.low)
+        ));
+    }
+    if t.high.db != 0.0 {
+        let slope = t
+            .high
+            .slope
+            .map(|v| format!(" ({v} dB/oct)"))
+            .unwrap_or_default();
+        parts.push(format!(
+            "high {:+.1} dB above {} Hz{slope}",
+            t.high.db, t.high.hz
+        ));
+    }
+    let n = t.orders.iter().filter(|o| o.is_some()).count();
+    if n > 0 {
+        parts.push(format!(
+            "{n} order{} overridden",
+            if n == 1 { "" } else { "s" }
+        ));
+    }
+    Some(format!("tilt {}", parts.join(", ")))
+}
+
 fn summarize_harmonics(h: Option<&HarmonicsConfig>) -> String {
     let Some(h) = h else {
         return "off".to_string();
@@ -4060,38 +5462,235 @@ fn summarize_harmonics(h: Option<&HarmonicsConfig>) -> String {
     if !h.enabled {
         return "off".to_string();
     }
-    let (h2, h3, h4, h5) = h.effective_levels_db();
-    let label = match h.character {
-        HarmonicsCharacter::Triode => "triode",
-        HarmonicsCharacter::Pentode => "pentode",
-        HarmonicsCharacter::Custom => "custom",
-    };
-    let mut extras = Vec::new();
-    if let Some(v) = h4 {
-        extras.push(format!("H4 {v:.1}"));
+    let mut parts: Vec<String> = h.layers.iter().map(describe_layer).collect();
+    if parts.is_empty() {
+        parts.push("no layers".to_string());
     }
-    if let Some(v) = h5 {
-        extras.push(format!("H5 {v:.1}"));
+    match h.routing {
+        HarmonicsRouting::Series => parts.push("in series".to_string()),
+        HarmonicsRouting::Parallel => {}
     }
     if !h.dc_block {
-        extras.push("no dc-block".to_string());
+        parts.push("no dc-block".to_string());
     }
-    // The level change hardly depends on the rate (only via the DC blocker).
+    // The level change hardly depends on the rate (DC blocker, flux filters).
     if let Ok(stage) = audivane_dsp_core::harmonics::Harmonics::try_new(h, 192_000.0, 1) {
-        extras.push(format!(
-            "level {:+.2} dB at 0 dBFS, {:+.2} dB small-signal",
-            stage.peak_trim_db(),
+        parts.push(format!(
+            "peak {:+.2} dB, {:+.2} dB small-signal",
+            stage.peak_gain_db(),
             stage.small_signal_gain_db()
         ));
     }
-    if extras.is_empty() {
-        format!("{label} (H2 {h2:.1} dB, H3 {h3:.1} dB)")
-    } else {
-        format!(
-            "{label} (H2 {h2:.1} dB, H3 {h3:.1} dB, {})",
-            extras.join(", ")
-        )
+    parts.join("; ")
+}
+
+/// A layer's name (its preset, marked when modified) and parameters.
+fn describe_layer(l: &HarmonicsLayer) -> String {
+    let name = match l.preset() {
+        Some(id) if l.is_modified() == Some(true) => format!("{id} (modified)"),
+        Some(id) => id.to_string(),
+        None => match l {
+            HarmonicsLayer::Chebyshev(_) => "custom".to_string(),
+            HarmonicsLayer::Flux(_) => "flux".to_string(),
+            HarmonicsLayer::Hysteresis(_) => "hysteresis".to_string(),
+        },
+    };
+    let off = if l.enabled() { "" } else { ", off" };
+    format!("{name} ({}{off})", summarize_layer(l))
+}
+
+/// One layer's parameters.
+fn summarize_layer(l: &HarmonicsLayer) -> String {
+    match l {
+        HarmonicsLayer::Chebyshev(c) => {
+            let mut parts: Vec<String> = c
+                .levels_db
+                .iter()
+                .enumerate()
+                .filter_map(|(i, level)| level.map(|v| format!("H{} {v:.1} dB", i + 2)))
+                .collect();
+            if parts.is_empty() {
+                parts.push("no orders".to_string());
+            }
+            if c.signs != HARMONICS_DEFAULT_SIGNS {
+                parts.push(format!(
+                    "signs {} (H2..H9)",
+                    format_harmonic_signs(&c.signs)
+                ));
+            }
+            if c.invert_even {
+                parts.push("even orders inverted".to_string());
+            }
+            if c.drive_db != 0.0 {
+                parts.push(format!("drive {:.1} dB", c.drive_db));
+            }
+            if c.amount != 1.0 {
+                parts.push(format!("amount {:.2}", c.amount));
+            }
+            if let Some(t) = c.tilt.as_deref().and_then(summarize_tilt) {
+                parts.push(t);
+            }
+            if let Some(sag) = c.sag.filter(HarmonicsSag::is_on) {
+                parts.push(format!(
+                    "sag {:.1} dB ({}/{} ms)",
+                    sag.depth_db, sag.attack_ms, sag.release_ms
+                ));
+            }
+            if let Some(bias) = c.bias.filter(HarmonicsBias::is_on) {
+                parts.push(format!(
+                    "bias {:+.3} ({}/{} ms)",
+                    bias.depth, bias.attack_ms, bias.release_ms
+                ));
+            }
+            parts.join(", ")
+        }
+        HarmonicsLayer::Flux(f) => format!(
+            "flux, corner {} Hz, boost {} dB, H3 {:.1} dBc at {} Hz",
+            f.corner_hz, f.max_boost_db, f.target_h3_db, f.calibration_hz
+        ),
+        HarmonicsLayer::Hysteresis(h) => {
+            let mut s = format!(
+                "hysteresis, sat {:.2}, width {:.2}, H3 {:.1} dBc at {} Hz",
+                h.saturation, h.width, h.target_h3_db, h.calibration_hz
+            );
+            if h.amount != 1.0 {
+                s.push_str(&format!(", amount {:.2}", h.amount));
+            }
+            if let Some(eq) = h.active_bass_eq() {
+                s.push_str(&format!(", bass EQ +{} dB below {} Hz", eq.db, eq.hz));
+            }
+            if h.asymmetry() != 0.0 {
+                s.push_str(&format!(", asymmetry {:+.2}", h.asymmetry()));
+            }
+            s
+        }
     }
+}
+
+fn print_harmonics(h: Option<&HarmonicsConfig>) {
+    let Some(h) = h.filter(|h| h.enabled) else {
+        println!("harmonics: off");
+        return;
+    };
+    let n = h.layers.len();
+    let mut line = format!("harmonics: on, {n} layer{}", if n == 1 { "" } else { "s" });
+    match h.routing {
+        HarmonicsRouting::Series => line.push_str(", in series"),
+        HarmonicsRouting::Parallel => {}
+    }
+    if !h.dc_block {
+        line.push_str(", no dc-block");
+    }
+    if let Ok(stage) = audivane_dsp_core::harmonics::Harmonics::try_new(h, 192_000.0, 1) {
+        line.push_str(&format!(
+            ", peak {:+.2} dB, {:+.2} dB small-signal",
+            stage.peak_gain_db(),
+            stage.small_signal_gain_db()
+        ));
+    }
+    println!("{line}");
+}
+
+fn print_harmonics_readout(r: &audivane_protocol::ipc::HarmonicsReadout) {
+    println!(
+        "readouts at {} Hz: level change on music {:+.2} dB",
+        r.rate_hz, r.level_change_db
+    );
+    println!(
+        "  peak gain {:+.2} dB (worst case at full scale; the limiter and the output headroom handle what goes over)",
+        r.peak_gain_db
+    );
+    for b in &r.bias_limited {
+        println!(
+            "  layer {}: bias limited to {:+.3} of {:+.3} (the curve's high orders would raise the peak more than 1 dB)",
+            b.layer + 1,
+            b.reach,
+            b.depth
+        );
+    }
+    for p in &r.points {
+        println!(
+            "  {:>4} dBFS {:>5} Hz: THD {} ({:.1} dB), GedLee Gm {:.4}",
+            p.input_dbfs,
+            p.freq_hz,
+            fmt_percent(100.0 * 10f64.powf(p.thd_db / 20.0)),
+            p.thd_db,
+            p.gedlee_gm
+        );
+    }
+}
+
+fn fmt_percent(p: f64) -> String {
+    if p >= 1.0 {
+        format!("{p:.2} %")
+    } else if p >= 0.01 {
+        format!("{p:.3} %")
+    } else {
+        format!("{p:.1e} %")
+    }
+}
+
+/// Warning line when the stage's measured aliasing at the DAC rate
+/// `output_rate` (0 = unknown: no line) is above the threshold
+/// ([`audivane_dsp_core::harmonics::aliasing`]), with the clean rate of
+/// each tape layer below it. The stage applies it anyway.
+fn harmonics_alias_note(h: &HarmonicsConfig, output_rate: u32) -> Option<String> {
+    if output_rate == 0 {
+        return None;
+    }
+    let rate = f64::from(output_rate);
+    let a = audivane_dsp_core::harmonics::aliasing(h, rate).ok()?;
+    if !a.warn {
+        return None;
+    }
+    let mut lines = vec![format!(
+        "warning: a 0 dBFS {:.1} kHz tone folds back {:.1} dBc of aliasing into the audio band at \
+         {output_rate} Hz output (loudest {:.1} dBc at {:.0} Hz); upsample further to lower it",
+        a.tone_hz / 1e3,
+        a.level_db,
+        a.worst_db,
+        a.worst_hz
+    )];
+    for (i, clean) in audivane_dsp_core::harmonics::below_clean_rate(h, rate) {
+        let kind = match &h.layers[i] {
+            HarmonicsLayer::Hysteresis(_) => "tape hysteresis",
+            _ => "it",
+        };
+        lines.push(format!(
+            "warning: layer {} ({kind}) aliases strongly below {} Hz output",
+            i + 1,
+            clean.round()
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
+fn format_harmonic_signs(signs: &[HarmonicSign]) -> String {
+    signs
+        .iter()
+        .map(|s| match s {
+            HarmonicSign::Positive => '+',
+            HarmonicSign::Negative => '-',
+        })
+        .collect()
+}
+
+/// `--signs`: one `+` or `-` per order from H2; the rest keep the default.
+fn parse_harmonic_signs(text: &str) -> Result<[HarmonicSign; HARMONICS_ORDERS], String> {
+    let mut signs = HARMONICS_DEFAULT_SIGNS;
+    if text.is_empty() || text.chars().count() > HARMONICS_ORDERS {
+        return Err(format!(
+            "expected 1 to {HARMONICS_ORDERS} signs (`+` or `-`, from H2 up), got {text:?}"
+        ));
+    }
+    for (slot, c) in signs.iter_mut().zip(text.chars()) {
+        *slot = match c {
+            '+' => HarmonicSign::Positive,
+            '-' => HarmonicSign::Negative,
+            other => return Err(format!("sign must be `+` or `-`, got {other:?}")),
+        };
+    }
+    Ok(signs)
 }
 
 fn summarize_dc_block(dc: Option<&DcBlockConfig>) -> String {
@@ -4142,18 +5741,47 @@ fn summarize_crossfeed(cf: Option<&CrossfeedConfig>, rate: XfRate) -> String {
     }
     let (fc, feed) = cf.effective_params();
     // The stage's own level, so the user sees where it went (it varies a
-    // little with the rate).
-    let policy = match cf.level {
-        CrossfeedLevel::Matched => "matched",
-        CrossfeedLevel::PeakSafe => "peak-safe",
-    };
+    // little with the rate), and its worst case, which the limiter or the
+    // output headroom has to cover.
     let (hz, assumed) = match rate {
         XfRate::Active(r) => (r, String::new()),
         XfRate::Assumed(r) => (r, format!(", assuming {r} Hz")),
     };
     let level = audivane_dsp_core::crossfeed::Crossfeed::try_new(cf, f64::from(hz), 2)
-        .map(|stage| format!(", level {:+.2} dB {policy}{assumed}", stage.level_db()))
+        .map(|stage| {
+            format!(
+                ", level {:+.2} dB, peak {:+.2} dB{assumed}",
+                stage.level_db(),
+                stage.peak_gain_db()
+            )
+        })
         .unwrap_or_default();
+    let width = if cf.width_active() {
+        let side = if cf.width > 0.0 {
+            format!("side {:+.1} dB", 20.0 * cf.width.log10())
+        } else {
+            "mono".to_string()
+        };
+        let shape = match cf.width_shape {
+            StereoWidthShape::Flat => String::new(),
+            StereoWidthShape::AboveBass => format!(" above {:.0} Hz", cf.width_corner_hz),
+        };
+        format!("width {:.2}: {side}{shape}", cf.width)
+    } else {
+        String::new()
+    };
+    let level = if width.is_empty() {
+        level
+    } else {
+        format!(", {width}{level}")
+    };
+    if cf.mode == CrossfeedMode::None {
+        return if cf.width_active() {
+            format!("no crossfeed ({}", &level[2..]) + ")"
+        } else {
+            "off (no crossfeed, width 1)".to_string()
+        };
+    }
     match cf.mode {
         CrossfeedMode::Bs2bDefault => format!("bs2b default ({fc:.0} Hz, {feed:.1} dB{level})"),
         CrossfeedMode::Bs2bChuMoy => format!("bs2b Chu Moy ({fc:.0} Hz, {feed:.1} dB{level})"),
@@ -4162,6 +5790,18 @@ fn summarize_crossfeed(cf: Option<&CrossfeedConfig>, rate: XfRate) -> String {
         }
         CrossfeedMode::Bs2bCustom => format!("bs2b custom ({fc:.0} Hz, {feed:.1} dB{level})"),
         CrossfeedMode::Linkwitz => format!("linkwitz ({fc:.1} Hz, {feed:.1} dB{level})"),
+        CrossfeedMode::None => unreachable!("handled above"),
+    }
+}
+
+/// A section's bands for the status line: "22 bands" when all are on,
+/// "0 of 22 bands on" when some are switched off.
+fn bands_on(bands: &[Band]) -> String {
+    let on = bands.iter().filter(|b| b.enabled).count();
+    if on == bands.len() {
+        band_count(bands.len())
+    } else {
+        format!("{on} of {}", band_count(bands.len())) + " on"
     }
 }
 
@@ -4176,20 +5816,20 @@ fn summarize_eq(eq: Option<&EqProfile>) -> String {
     };
     let mut parts = Vec::new();
     if eq.linked_enabled {
-        parts.push(format!("L+R: {}", band_count(eq.bands.len())));
+        parts.push(format!("L+R: {}", bands_on(&eq.bands)));
     } else {
         parts.push("L+R: off".to_string());
     }
     if let Some(left) = &eq.left {
         if left.enabled {
-            parts.push(format!("L: {}", band_count(left.bands.len())));
+            parts.push(format!("L: {}", bands_on(&left.bands)));
         } else {
             parts.push("L: off".to_string());
         }
     }
     if let Some(right) = &eq.right {
         if right.enabled {
-            parts.push(format!("R: {}", band_count(right.bands.len())));
+            parts.push(format!("R: {}", bands_on(&right.bands)));
         } else {
             parts.push("R: off".to_string());
         }
@@ -4276,13 +5916,7 @@ fn summarize_conv(convs: &[ConvolutionConfig]) -> String {
     let names: Vec<String> = convs
         .iter()
         .map(|c| {
-            let label = c.name.as_deref().map(str::to_string).unwrap_or_else(|| {
-                c.ir_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("?")
-                    .to_string()
-            });
+            let label = crate::conv_args::conv_label(c);
             if c.enabled {
                 label
             } else {
@@ -4304,6 +5938,13 @@ fn print_band_list(bands: &[audivane_protocol::Band]) {
             b.q
         );
     }
+}
+
+fn format_tone(tone: &audivane_protocol::ToneConfig) -> String {
+    format!(
+        "bass {:+.1} dB, treble {:+.1} dB",
+        tone.bass_db, tone.treble_db
+    )
 }
 
 fn print_eq(eq: Option<&EqProfile>) {
@@ -4357,9 +5998,54 @@ fn print_eq(eq: Option<&EqProfile>) {
     if let Some(tilt) = &eq.tilt {
         println!("  tilt: {}", format_tilt(tilt));
     }
+    if let Some(tone) = eq.tone.as_ref().filter(|t| t.is_active()) {
+        println!("  tone: {}", format_tone(tone));
+    }
     if let Some(high) = &eq.tilt_high {
         println!("  treble tilt: {}", format_tilt(high));
     }
+}
+
+/// The `notes` of a mutation's reply, one per line.
+fn print_notes(reply: &Value) {
+    for note in reply
+        .get("notes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        println!("  note: {note}");
+    }
+}
+
+/// The convolution warnings of follower `device`'s own chain.
+fn follower_warnings(
+    warnings: &[audivane_protocol::ipc::ConvWarning],
+    device: &str,
+) -> Vec<String> {
+    warnings
+        .iter()
+        .filter(|w| w.device.as_deref() == Some(device))
+        .map(|w| w.message.clone())
+        .collect()
+}
+
+/// The convolution guards' settings and the warnings status reports.
+fn print_conv_guards(client: &mut Client, cfg: &EngineConfig) -> CtlResult<()> {
+    let safety = cfg.convolution_safety;
+    println!(
+        "guards: boost cap {:+.1} dB, subsonic limit {} Hz",
+        safety.max_boost_db, safety.subsonic_hz
+    );
+    let status: Status = serde_json::from_value(client.call(Call::Status)?)?;
+    if status.conv_warnings.is_empty() {
+        println!("warnings: none");
+    }
+    for w in &status.conv_warnings {
+        println!("warning: {}", w.message);
+    }
+    Ok(())
 }
 
 fn print_conv_list(convs: &[ConvolutionConfig]) {
@@ -4369,9 +6055,10 @@ fn print_conv_list(convs: &[ConvolutionConfig]) {
     }
     for (i, c) in convs.iter().enumerate() {
         let state = if c.enabled { "on " } else { "off" };
+        let files = crate::conv_args::conv_files(c);
         let label = match &c.name {
-            Some(n) => format!("{n} ({})", c.ir_path.display()),
-            None => c.ir_path.display().to_string(),
+            Some(n) => format!("{n} ({files})"),
+            None => files,
         };
         println!("[{i}] {state}  {label}  gain {:+.2} dB", c.gain_db);
     }
@@ -4511,10 +6198,101 @@ fn sink_name(sink: SinkChoice) -> &'static str {
     }
 }
 
-fn side_name(side: AbSide) -> &'static str {
+/// The side playing; `hidden` while a blind test runs.
+/// The frequencies `conv response` prints, Hz.
+const CONV_RESPONSE_AT: [f64; 7] = [20.0, 50.0, 100.0, 500.0, 1_000.0, 5_000.0, 15_000.0];
+
+fn conv_curve_name(c: &audivane_protocol::ipc::ConvResponseCurve) -> String {
+    let ch = |n: u32| match n {
+        0 => "L".to_string(),
+        1 => "R".to_string(),
+        n => format!("ch{n}"),
+    };
+    match (c.input, c.output) {
+        (Some(i), Some(o)) if i == o => ch(o),
+        (Some(i), Some(o)) => format!("{}→{}", ch(i), ch(o)),
+        (None, Some(o)) => ch(o),
+        _ => "all".into(),
+    }
+}
+
+fn print_conv_curve(name: &str, freqs: &[f32], c: &audivane_protocol::ipc::ConvResponseCurve) {
+    let at = |f: f64| {
+        freqs
+            .iter()
+            .enumerate()
+            .min_by(|a, b| {
+                (f64::from(*a.1) - f)
+                    .abs()
+                    .total_cmp(&(f64::from(*b.1) - f).abs())
+            })
+            .map(|(i, _)| i)
+    };
+    let mut cells = Vec::new();
+    for f in CONV_RESPONSE_AT {
+        if let Some(i) = at(f).filter(|&i| (f64::from(freqs[i]) / f).log2().abs() < 0.1) {
+            cells.push(format!("{:+.1}", c.mag_db[i]));
+        } else {
+            cells.push("-".into());
+        }
+    }
+    let (lo, hi) = c
+        .mag_db
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &m| {
+            (lo.min(m), hi.max(m))
+        });
+    println!(
+        "  {name:<28} {}   range {lo:+.1}..{hi:+.1} dB",
+        cells
+            .iter()
+            .map(|c| format!("{c:>6}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+}
+
+fn print_conv_response(r: &audivane_protocol::ipc::ConvResponse) {
+    let who = r.device.as_deref().unwrap_or("master");
+    let side = match r.side {
+        AbSide::A => "",
+        AbSide::B => ", A/B side B",
+    };
+    println!(
+        "convolution response ({who}{side}) at {} Hz: combined {} taps",
+        r.rate_hz, r.combined_taps
+    );
+    if r.items.is_empty() {
+        println!("  no enabled filters");
+        return;
+    }
+    let head: Vec<String> = CONV_RESPONSE_AT
+        .iter()
+        .map(|&f| {
+            if f >= 1000.0 {
+                format!("{:>5}k", f / 1000.0)
+            } else {
+                format!("{f:>6}")
+            }
+        })
+        .collect();
+    println!("  {:<28} {} (dB)", "Hz", head.join(" "));
+    for item in &r.items {
+        for c in &item.curves {
+            let name = format!("[{}] {} {}", item.index, item.label, conv_curve_name(c));
+            print_conv_curve(&name, &r.freqs_hz, c);
+        }
+    }
+    for c in &r.outputs {
+        print_conv_curve(&format!("combined {}", conv_curve_name(c)), &r.freqs_hz, c);
+    }
+}
+
+fn side_name(side: Option<AbSide>) -> &'static str {
     match side {
-        AbSide::A => "A",
-        AbSide::B => "B",
+        Some(AbSide::A) => "A",
+        Some(AbSide::B) => "B",
+        None => "hidden",
     }
 }
 
@@ -4685,18 +6463,19 @@ fn stage_patch(a: &ChainConfig, stage: AbStage) -> std::result::Result<(Value, S
             }
         }
         AbStage::Eq => {
-            // Bands and preamp off; the tilt (its own stage) stays.
+            // Bands, tone knobs and preamp off; the tilt (its own stage) stays.
             let active = a.eq.as_ref().is_some_and(|eq| {
                 eq.preamp_db != 0.0
                     || (eq.linked_enabled && eq.bands.iter().any(|b| b.enabled))
                     || eq.left.as_ref().is_some_and(ChannelEq::is_active)
                     || eq.right.as_ref().is_some_and(ChannelEq::is_active)
+                    || eq.tone.is_some_and(|t| t.is_active())
             });
             if !active {
                 return Err("EQ is off in chain A; nothing to compare".into());
             }
             Ok((
-                json!({"eq": {"preamp_db": 0.0, "bands": [], "left": null, "right": null}}),
+                json!({"eq": {"preamp_db": 0.0, "bands": [], "left": null, "right": null, "tone": null}}),
                 "EQ off".into(),
             ))
         }
@@ -4811,7 +6590,7 @@ fn describe_upsampler(up: &UpsamplerConfig) -> String {
     };
     if let audivane_protocol::FilterDesign::Kernel(k) = &stored.design
         && k.numerics.path == audivane_protocol::design::ArithmeticPath::Standard
-        && let Ok(m) = audivane_dsp_core::design::paths::standard::legacy_config(k, 44_100)
+        && let Some(m) = editable_config(k)
     {
         let phase = match m.phase {
             FilterPhase::Intermediate => format!("intermediate phase (mix {})", m.phase_mix),
@@ -4837,7 +6616,8 @@ fn describe_upsampler(up: &UpsamplerConfig) -> String {
             };
             return format!(
                 "{target} (automatic taps: {budget}, passband to {}, stopband from {}, {phase}{extras})",
-                m.band.passband_end, m.band.stopband_start
+                passband_text(&m.band),
+                m.band.stopband_start
             );
         }
         return match m.cutoff_mode {
@@ -4851,7 +6631,9 @@ fn describe_upsampler(up: &UpsamplerConfig) -> String {
             ),
             CutoffMode::Band => format!(
                 "{target} (band: passband to {}, stopband from {}, {} dB, {phase}{extras})",
-                m.band.passband_end, m.band.stopband_start, m.band.attenuation_db
+                passband_text(&m.band),
+                m.band.stopband_start,
+                m.band.attenuation_db
             ),
         };
     }
@@ -4860,6 +6642,64 @@ fn describe_upsampler(up: &UpsamplerConfig) -> String {
         None => String::new(),
     };
     format!("{target} (custom {}{based})", stored.design.kind_name())
+}
+
+/// A band's passband end as `upsample` prints it: the fraction, or the
+/// frequency and the fraction it falls back to.
+fn passband_text(band: &audivane_protocol::BandSpec) -> String {
+    match band.passband_end_hz {
+        Some(hz) => format!("{hz} Hz ({} where it does not fit)", band.passband_end),
+        None => band.passband_end.to_string(),
+    }
+}
+
+/// The Custom builder's fields of a `standard` design for editing: the
+/// stepped values at 44.1 kHz, the band as the design holds it (a passband
+/// end in Hz kept, not converted).
+fn editable_config(
+    k: &audivane_protocol::design::KernelDesign,
+) -> Option<audivane_dsp_core::design::paths::standard::ManualConfig> {
+    let mut m = audivane_dsp_core::design::paths::standard::legacy_config(k, 44_100).ok()?;
+    if let Some(b) =
+        audivane_dsp_core::design::band_of(&audivane_protocol::FilterDesign::Kernel(k.clone()))
+    {
+        m.band = *b;
+    }
+    Some(m)
+}
+
+/// A `--passband-end` value: a fraction of the Nyquist or a frequency.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PassbandEnd {
+    Fraction(f64),
+    Hz(f64),
+}
+
+/// `0.908` is a fraction; `20k`, `20kHz`, `20000Hz` and a plain number
+/// above 1.5 (the largest band edge) are frequencies.
+fn parse_passband_end(s: &str) -> Result<PassbandEnd, String> {
+    let t = s.trim().to_ascii_lowercase();
+    let (num, scale, unit) = if let Some(n) = t.strip_suffix("khz") {
+        (n, 1000.0, true)
+    } else if let Some(n) = t.strip_suffix('k') {
+        (n, 1000.0, true)
+    } else if let Some(n) = t.strip_suffix("hz") {
+        (n, 1.0, true)
+    } else {
+        (t.as_str(), 1.0, false)
+    };
+    let v: f64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("{s:?} is not a fraction (0.908) or a frequency (20k)"))?;
+    if !v.is_finite() || v <= 0.0 {
+        return Err(format!("{s:?} must be above 0"));
+    }
+    Ok(if unit || v > 1.5 {
+        PassbandEnd::Hz(v * scale)
+    } else {
+        PassbandEnd::Fraction(v)
+    })
 }
 
 fn passthrough_reasons(passthrough: &audivane_protocol::ipc::Passthrough) -> String {
@@ -4970,10 +6810,227 @@ fn passthrough_caveat(caveat: &audivane_protocol::ipc::PassthroughCaveat) -> Str
     }
 }
 
+/// The source rates that fall back ([`Status::upsampler_rates`]), one
+/// line: `192 kHz light filter (estimate 171%)`; `None` when the request
+/// runs at every rate.
+fn per_rate_line(rows: &[audivane_protocol::ipc::RateAdmission]) -> Option<String> {
+    let parts: Vec<String> = rows
+        .iter()
+        .filter_map(|r| Some(format!("{} {}", khz(r.source_rate), rate_fallback_text(r)?)))
+        .collect();
+    (!parts.is_empty()).then(|| format!("falls back at {}", parts.join(", ")))
+}
+
+/// What a source rate plays instead and why (`Recommended (too short here
+/// (needs about 1,600 taps))`, `light filter (estimate 171%)`); `None`
+/// when it plays the request.
+fn rate_fallback_text(r: &audivane_protocol::ipc::RateAdmission) -> Option<String> {
+    use audivane_protocol::ipc::{OverloadAction, RateFallbackCause};
+    let f = r.fallback.as_ref()?;
+    let what = match f.action {
+        OverloadAction::Reverted => "last setting that ran",
+        OverloadAction::Recommended => "Recommended",
+        _ => "light filter",
+    };
+    let why = match f.cause {
+        RateFallbackCause::Estimate => format!("estimate {:.0}%", r.load * 100.0),
+        RateFallbackCause::Overload => "overloaded".into(),
+        RateFallbackCause::Design => f
+            .reason
+            .clone()
+            .unwrap_or_else(|| "the design does not build here".into()),
+    };
+    Some(format!("{what} ({why})"))
+}
+
+/// A design name as `design check` prints it.
+fn plays_name(plays: &str) -> &str {
+    match plays {
+        "recommended" => "Recommended",
+        "recommended_light" => "a lighter Recommended",
+        _ => plays,
+    }
+}
+
+fn apply_volume_settings(v: &mut audivane_protocol::ipc::VolumeConfig, args: &VolumeArgs) {
+    let prev_mode = v.mode;
+    if let Some(mode) = args.mode {
+        v.mode = mode;
+    }
+    if let Some(OptDb(db)) = args.hardware_db {
+        v.hardware_db = db;
+    } else if args.mode == Some(audivane_protocol::ipc::VolumeMode::Software)
+        && prev_mode != audivane_protocol::ipc::VolumeMode::Software
+        && v.hardware_db.is_none()
+    {
+        // Default the DAC mixer to 0 dB on switching to software so an earlier
+        // hardware-driven attenuation isn't doubled; the engine stages the raise.
+        v.hardware_db = Some(0.0);
+    }
+    if let Some(OptDb(db)) = args.ceiling {
+        v.max_volume_db = db;
+    }
+    if let Some(policy) = args.sink_volume {
+        v.sink_volume = policy;
+    }
+    if let Some(mode) = args.guard {
+        v.guard.mode = mode;
+    }
+    if let Some(rise) = args.rise {
+        v.guard.max_rise_db_per_s = rise;
+    }
+    if let Some(OptDb(db)) = args.stream_max {
+        v.guard.stream_max_db = db;
+    }
+}
+
+fn khz(rate: u32) -> String {
+    let k = f64::from(rate) / 1000.0;
+    if (k - k.round()).abs() < 1e-9 {
+        format!("{k:.0} kHz")
+    } else {
+        format!("{} kHz", format!("{k:.3}").trim_end_matches('0'))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use audivane_protocol::ipc::{Passthrough, PassthroughBreak, PassthroughCaveat};
+
+    #[test]
+    fn a_follower_reply_prints_its_own_conv_warnings_only() {
+        use audivane_protocol::ipc::{ConvWarning, ConvWarningKind};
+        let w = |device: Option<&str>, m: &str| ConvWarning {
+            side: AbSide::A,
+            device: device.map(str::to_string),
+            output: 0,
+            kind: ConvWarningKind::ClipRisk,
+            gain_db: 6.0,
+            freq_hz: None,
+            limit_hz: None,
+            headroom_db: Some(0.0),
+            message: m.into(),
+        };
+        let all = [
+            w(None, "chain A"),
+            w(
+                Some("hw:CARD=USB,DEV=0"),
+                "follower hw:CARD=USB,DEV=0: clips",
+            ),
+            w(Some("hw:CARD=B,DEV=0"), "other"),
+        ];
+        assert_eq!(
+            follower_warnings(&all, "hw:CARD=USB,DEV=0"),
+            vec!["follower hw:CARD=USB,DEV=0: clips".to_string()]
+        );
+    }
+
+    #[test]
+    fn measure_play_parses_routes_with_colons_in_the_device() {
+        use clap::Parser;
+        let r = parse_measure_route("hw:CARD=USB,DEV=0:1").unwrap();
+        assert_eq!((r.device.as_str(), r.channel), ("hw:CARD=USB,DEV=0", 1));
+        assert_eq!(parse_measure_route("master:0").unwrap().device, "master");
+        assert!(parse_measure_route("master").is_err());
+        assert!(parse_measure_route(":1").is_err());
+        assert!(parse_measure_route("master:x").is_err());
+        let argv = [
+            "avdsp",
+            "measure",
+            "play",
+            "a.wav",
+            "--route",
+            "master:0",
+            "--route",
+            "hw:CARD=USB_1,DEV=0:0",
+            "--active",
+            "--keepalive-db",
+            "-110",
+        ];
+        match TestCli::try_parse_from(argv).unwrap().command {
+            CtlCommand::Measure {
+                command: MeasureCommand::Play(a),
+            } => {
+                assert_eq!(a.routes.len(), 2);
+                assert!(a.active);
+                assert_eq!(a.keepalive_db, Some(-110.0));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            TestCli::try_parse_from(["avdsp", "measure", "play", "a.wav"]).is_err(),
+            "a route is required"
+        );
+    }
+
+    #[test]
+    fn passband_end_takes_a_fraction_or_hz() {
+        use super::{PassbandEnd, parse_passband_end};
+        assert_eq!(
+            parse_passband_end("0.908"),
+            Ok(PassbandEnd::Fraction(0.908))
+        );
+        assert_eq!(parse_passband_end("1"), Ok(PassbandEnd::Fraction(1.0)));
+        assert_eq!(parse_passband_end("20k"), Ok(PassbandEnd::Hz(20_000.0)));
+        assert_eq!(parse_passband_end("20 kHz"), Ok(PassbandEnd::Hz(20_000.0)));
+        assert_eq!(parse_passband_end("21500Hz"), Ok(PassbandEnd::Hz(21_500.0)));
+        assert_eq!(parse_passband_end("20000"), Ok(PassbandEnd::Hz(20_000.0)));
+        assert!(parse_passband_end("0").is_err());
+        assert!(parse_passband_end("fast").is_err());
+    }
+
+    /// `software` without a fixed level reports where an earlier mode left
+    /// the card; the line must not call that a fixed level.
+    #[test]
+    fn a_digital_volume_names_the_hardware_level_without_calling_it_fixed() {
+        use audivane_protocol::ipc::{VolumeConfig, VolumeMode, VolumeStatus};
+        let v = VolumeStatus {
+            hardware: false,
+            hardware_db: Some(-20.0),
+            ..VolumeStatus::from_config(&VolumeConfig {
+                mode: VolumeMode::Software,
+                volume_db: -30.0,
+                ..VolumeConfig::default()
+            })
+        };
+        let line = format_volume(&v);
+        assert!(line.contains("hardware at -20.0 dB"), "{line}");
+        assert!(!line.contains("fixed"), "{line}");
+    }
+
+    #[test]
+    fn switching_to_software_defaults_hardware_db_to_zero_unless_cleared() {
+        use audivane_protocol::ipc::{VolumeConfig, VolumeMode};
+        use clap::Parser;
+        let parse =
+            |args: &[&str]| match TestCli::try_parse_from(["avdsp", "volume"].iter().chain(args))
+                .unwrap()
+                .command
+            {
+                CtlCommand::Volume(a) => a,
+                other => panic!("unexpected {other:?}"),
+            };
+
+        let mut v = VolumeConfig::default(); // Auto, hardware_db: None
+        apply_volume_settings(&mut v, &parse(&["--mode", "software"]));
+        assert_eq!(v.mode, VolumeMode::Software);
+        assert_eq!(v.hardware_db, Some(0.0));
+
+        // Explicit --hardware-db none keeps it None even on the mode switch.
+        let mut v = VolumeConfig::default();
+        apply_volume_settings(
+            &mut v,
+            &parse(&["--mode", "software", "--hardware-db", "none"]),
+        );
+        assert_eq!(v.mode, VolumeMode::Software);
+        assert_eq!(v.hardware_db, None);
+
+        // Already in software with None: unrelated setting edits keep None.
+        apply_volume_settings(&mut v, &parse(&["--ceiling", "-6"]));
+        assert_eq!(v.hardware_db, None);
+    }
 
     #[derive(clap::Parser, Debug)]
     struct TestCli {
@@ -5289,38 +7346,341 @@ mod tests {
     }
 
     #[test]
-    fn crossfeed_summary_uses_the_active_rate_or_names_the_assumed_one() {
-        let cf = CrossfeedConfig {
-            level: CrossfeedLevel::PeakSafe,
-            ..Default::default()
+    fn harmonic_signs_parse_from_h2_up() {
+        use HarmonicSign::{Negative as N, Positive as P};
+        assert_eq!(parse_harmonic_signs("+-").unwrap(), HARMONICS_DEFAULT_SIGNS);
+        assert_eq!(
+            parse_harmonic_signs("-+--").unwrap(),
+            [N, P, N, N, P, P, P, P]
+        );
+        assert_eq!(parse_harmonic_signs("--------").unwrap(), [N; 8]);
+        assert!(parse_harmonic_signs("").is_err());
+        assert!(parse_harmonic_signs("+++++++++").is_err());
+        assert!(parse_harmonic_signs("+x").is_err());
+        assert_eq!(format_harmonic_signs(&[N, P, N]), "-+-");
+    }
+
+    #[test]
+    fn harmonics_custom_takes_high_orders_and_signs() {
+        use clap::Parser;
+        let argv = [
+            "avdsp",
+            "harmonics",
+            "custom",
+            "--h2-db",
+            "-40",
+            "--h3-db",
+            "-50",
+            "--h9-db",
+            "-90",
+            "--signs",
+            "-+",
+            "--drive-db",
+            "-6",
+            "--tilt-low",
+            "60:12",
+            "--tilt-high",
+            "6000:-3:18",
+            "--add",
+        ];
+        match TestCli::try_parse_from(argv).unwrap().command {
+            CtlCommand::Harmonics {
+                command:
+                    HarmonicsCommand::Custom {
+                        h9_db,
+                        h6_db,
+                        signs,
+                        layer,
+                        ..
+                    },
+            } => {
+                assert_eq!(h9_db, Some(-90.0));
+                assert_eq!(h6_db, None);
+                let signs = signs.unwrap();
+                assert_eq!(signs[0], HarmonicSign::Negative);
+                assert_eq!(signs[1], HarmonicSign::Positive);
+                assert_eq!(signs[2..], HARMONICS_DEFAULT_SIGNS[2..]);
+                assert_eq!(layer.drive_db, Some(-6.0));
+                assert!(layer.add);
+                let t = layer.tilt(None).unwrap();
+                assert_eq!((t.low.hz, t.low.db), (60.0, 12.0));
+                assert_eq!((t.high.hz, t.high.db), (6000.0, -3.0));
+                assert_eq!((t.low.slope, t.high.slope), (None, Some(18)));
+                assert!(!t.low_even);
+                let text = summarize_tilt(&t).unwrap();
+                assert!(text.contains("low +12.0 dB below 60 Hz (odd orders)"));
+                assert!(text.contains("high -3.0 dB above 6000 Hz (18 dB/oct)"));
+                assert!(parse_tilt_shelf("60:12:24").unwrap().slope == Some(24));
+                assert!(parse_tilt_shelf("60:12:20").is_err());
+                assert!(parse_tilt_shelf("60:12:24:1").is_err());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let argv = [
+            "avdsp",
+            "harmonics",
+            "flux",
+            "--corner-hz",
+            "100",
+            "--boost-db",
+            "12",
+            "--h3-db",
+            "-24",
+            "--at-hz",
+            "20",
+        ];
+        assert!(matches!(
+            TestCli::try_parse_from(argv).unwrap().command,
+            CtlCommand::Harmonics {
+                command: HarmonicsCommand::Flux { h3_db, add: false, .. }
+            } if h3_db == -24.0
+        ));
+        let argv = [
+            "avdsp",
+            "harmonics",
+            "hysteresis",
+            "--saturation",
+            "0.4",
+            "--width",
+            "0.35",
+            "--amount",
+            "0.8",
+            "--h3-db",
+            "-28",
+            "--at-hz",
+            "1000",
+            "--bass-eq",
+            "100:3.5",
+            "--asymmetry",
+            "-0.1",
+            "--add",
+        ];
+        assert!(matches!(
+            TestCli::try_parse_from(argv).unwrap().command,
+            CtlCommand::Harmonics {
+                command: HarmonicsCommand::Hysteresis {
+                    saturation,
+                    width,
+                    amount,
+                    h3_db,
+                    at_hz,
+                    bass_eq: Some(TiltShelf { hz, db, slope: None }),
+                    asymmetry: Some(asymmetry),
+                    add: true,
+                }
+            } if saturation == 0.4 && width == 0.35 && amount == 0.8 && h3_db == -28.0 && at_hz == 1000.0
+                && hz == 100.0 && db == 3.5 && asymmetry == -0.1
+        ));
+    }
+
+    #[test]
+    fn harmonics_routing_and_move_parse_and_series_is_summarized() {
+        use clap::Parser;
+        let parse = |argv: &[&str]| TestCli::try_parse_from(argv).unwrap().command;
+        match parse(&["avdsp", "harmonics", "routing", "series"]) {
+            CtlCommand::Harmonics {
+                command: HarmonicsCommand::Routing { mode },
+            } => assert_eq!(HarmonicsRouting::from(mode), HarmonicsRouting::Series),
+            other => panic!("{other:?}"),
+        }
+        match parse(&["avdsp", "harmonics", "move", "3", "1"]) {
+            CtlCommand::Harmonics {
+                command: HarmonicsCommand::Move { index, to },
+            } => assert_eq!((index, to), (3, 1)),
+            other => panic!("{other:?}"),
+        }
+        match parse(&["avdsp", "harmonics", "system", "set_amp"]) {
+            CtlCommand::Harmonics {
+                command: HarmonicsCommand::System { id },
+            } => {
+                let cfg = audivane_protocol::harmonics_system(&id)
+                    .unwrap()
+                    .to_config();
+                let text = summarize_harmonics(Some(&cfg));
+                assert!(text.contains("se_triode_low_mu (modified)"), "{text}");
+                assert!(text.contains("in series"), "{text}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut cfg = HarmonicsConfig::from_preset("triode").unwrap();
+        cfg.layers
+            .push(HarmonicsConfig::from_preset("tape_studio").unwrap().layers[0].clone());
+        assert!(!summarize_harmonics(Some(&cfg)).contains("in series"));
+        cfg.routing = HarmonicsRouting::Series;
+        let text = summarize_harmonics(Some(&cfg));
+        assert!(text.contains("; in series; peak "), "{text}");
+    }
+
+    #[test]
+    fn harmonics_summary_names_layers_and_lists_every_order() {
+        let triode = summarize_harmonics(Some(&HarmonicsConfig::from_preset("triode").unwrap()));
+        assert!(
+            triode.starts_with("triode (H2 -40.0 dB, H3 -58.0 dB, H4 -72.0 dB); peak "),
+            "{triode}"
+        );
+        let mut custom = HarmonicsConfig::from_preset("triode").unwrap();
+        let HarmonicsLayer::Chebyshev(l) = &mut custom.layers[0] else {
+            unreachable!()
         };
+        l.levels_db[7] = Some(-80.0);
+        let text = summarize_harmonics(Some(&custom));
+        assert!(text.starts_with("triode (modified) ("), "{text}");
+        assert!(text.contains("H4 -72.0 dB, H9 -80.0 dB)"), "{text}");
+        assert!(!text.contains("signs"), "{text}");
+        let HarmonicsLayer::Chebyshev(l) = &mut custom.layers[0] else {
+            unreachable!()
+        };
+        l.signs[7] = HarmonicSign::Negative;
+        l.preset = None;
+        let text = summarize_harmonics(Some(&custom));
+        assert!(text.starts_with("custom ("), "{text}");
+        assert!(text.contains("signs +-+++++- (H2..H9)"), "{text}");
+        custom
+            .layers
+            .push(HarmonicsConfig::from_preset("tape").unwrap().layers[0].clone());
+        let text = summarize_harmonics(Some(&custom));
+        assert!(
+            text.contains(
+                "; tape (flux, corner 400 Hz, boost 6 dB, H3 -30.0 dBc at 1000 Hz); peak"
+            ),
+            "{text}"
+        );
+        let hyst = summarize_harmonics(Some(&HarmonicsConfig::from_preset("tape_studio").unwrap()));
+        assert!(hyst.starts_with("tape_studio (hysteresis, sat "), "{hyst}");
+    }
+
+    #[test]
+    fn sag_and_bias_options_parse_with_default_times() {
+        assert_eq!(
+            parse_sag("2").unwrap(),
+            HarmonicsSag {
+                depth_db: 2.0,
+                ..HarmonicsSag::default()
+            }
+        );
+        assert_eq!(
+            parse_bias("-0.1:300:1500").unwrap(),
+            HarmonicsBias {
+                depth: -0.1,
+                attack_ms: 300.0,
+                release_ms: 1500.0
+            }
+        );
+        assert!(parse_sag("7").unwrap_err().contains("sag.depth_db"));
+        assert!(parse_bias("0.1:300").is_err());
+        assert!(
+            parse_bias("0.1:0:100")
+                .unwrap_err()
+                .contains("bias.attack_ms")
+        );
+        let mut cheb = HarmonicsConfig::from_preset("pentode").unwrap();
+        if let HarmonicsLayer::Chebyshev(c) = &mut cheb.layers[0] {
+            c.sag = Some(parse_sag("1.5").unwrap());
+        }
+        let text = summarize_harmonics(Some(&cheb));
+        assert!(text.contains("sag 1.5 dB (20/200 ms)"), "{text}");
+    }
+
+    #[test]
+    fn harmonics_alias_note_says_the_measured_level() {
+        let mut h = HarmonicsConfig::from_preset("triode").unwrap();
+        assert_eq!(harmonics_alias_note(&h, 192_000), None);
+        assert_eq!(harmonics_alias_note(&h, 0), None);
+        // The preset alone stays under the threshold at 96 kHz; a hot H5
+        // (100 kHz, folding to 4 kHz) warns.
+        let mut hot = h.clone();
+        let HarmonicsLayer::Chebyshev(l) = &mut hot.layers[0] else {
+            unreachable!()
+        };
+        l.levels_db[3] = Some(-40.0);
+        let note = harmonics_alias_note(&hot, 96_000).unwrap();
+        assert!(
+            note.starts_with("warning: a 0 dBFS 20.0 kHz tone folds back"),
+            "{note}"
+        );
+        assert!(note.contains("at 96000 Hz output"), "{note}");
+        // H9 at -50 dB folds back at 192 kHz; at -90 dB it is measured
+        // below the threshold (-60 dBc): no warning.
+        let HarmonicsLayer::Chebyshev(l) = &mut h.layers[0] else {
+            unreachable!()
+        };
+        l.levels_db[7] = Some(-50.0);
+        let note = harmonics_alias_note(&h, 192_000).unwrap();
+        assert!(note.contains("-50.0 dBc"), "{note}");
+        let HarmonicsLayer::Chebyshev(l) = &mut h.layers[0] else {
+            unreachable!()
+        };
+        l.levels_db[7] = Some(-90.0);
+        assert_eq!(harmonics_alias_note(&h, 192_000), None);
+
+        let hyst = HarmonicsConfig::from_preset("tape_studio").unwrap();
+        assert_eq!(harmonics_alias_note(&hyst, 0), None);
+        let note = harmonics_alias_note(&hyst, 44_100).unwrap();
+        assert!(note.contains("layer 1 (tape hysteresis) aliases"), "{note}");
+        let note = harmonics_alias_note(&hyst, 96_000).unwrap();
+        assert!(note.contains("below 176400 Hz"), "{note}");
+    }
+
+    #[test]
+    fn crossfeed_summary_uses_the_active_rate_or_names_the_assumed_one() {
+        let cf = CrossfeedConfig::default();
         let at = |r: f64| {
-            audivane_dsp_core::crossfeed::Crossfeed::try_new(&cf, r, 2)
-                .unwrap()
-                .level_db()
+            let st = audivane_dsp_core::crossfeed::Crossfeed::try_new(&cf, r, 2).unwrap();
+            (st.level_db(), st.peak_gain_db())
         };
         assert_eq!(XfRate::new(Some(96_000), 48_000), XfRate::Active(96_000));
         assert_eq!(XfRate::new(Some(0), 48_000), XfRate::Assumed(48_000));
         assert_eq!(XfRate::new(None, 44_100), XfRate::Assumed(44_100));
         let active = summarize_crossfeed(Some(&cf), XfRate::Active(96_000));
+        let (level, peak) = at(96_000.0);
         assert!(
-            active.contains(&format!("level {:+.2} dB peak-safe)", at(96_000.0))),
+            active.contains(&format!("level {level:+.2} dB, peak {peak:+.2} dB)")),
             "{active}"
         );
         assert!(!active.contains("assuming"));
         let assumed = summarize_crossfeed(Some(&cf), XfRate::Assumed(44_100));
+        let (level, peak) = at(44_100.0);
         assert!(
             assumed.contains(&format!(
-                "level {:+.2} dB peak-safe, assuming 44100 Hz)",
-                at(44_100.0)
+                "level {level:+.2} dB, peak {peak:+.2} dB, assuming 44100 Hz)"
             )),
             "{assumed}"
         );
-        assert_ne!(
-            format!("{:+.2}", at(44_100.0)),
-            format!("{:+.2}", at(96_000.0))
-        );
         assert_eq!(summarize_crossfeed(None, XfRate::Active(48_000)), "off");
+    }
+
+    #[test]
+    fn summarize_crossfeed_shows_the_width() {
+        let wide = CrossfeedConfig {
+            mode: CrossfeedMode::None,
+            width: 1.5,
+            ..Default::default()
+        };
+        assert_eq!(
+            summarize_crossfeed(Some(&wide), XfRate::Active(48_000)),
+            "no crossfeed (width 1.50: side +3.5 dB, level +0.00 dB, peak +3.52 dB)"
+        );
+        let linkwitz = CrossfeedConfig {
+            mode: CrossfeedMode::Linkwitz,
+            width: 0.0,
+            width_shape: StereoWidthShape::AboveBass,
+            ..Default::default()
+        };
+        let s = summarize_crossfeed(Some(&linkwitz), XfRate::Active(48_000));
+        assert!(
+            s.starts_with(
+                "linkwitz (796.4 Hz, 6.0 dB, width 0.00: mono above 700 Hz, level +0.21 dB, peak "
+            ),
+            "{s}"
+        );
+        let plain = CrossfeedConfig {
+            mode: CrossfeedMode::None,
+            ..Default::default()
+        };
+        assert_eq!(
+            summarize_crossfeed(Some(&plain), XfRate::Active(48_000)),
+            "off (no crossfeed, width 1)"
+        );
     }
 
     #[test]
@@ -5337,7 +7697,7 @@ mod tests {
             enabled: true,
         };
         let profile = EqProfile {
-            name: "Kali".into(),
+            name: "Desk".into(),
             version: EQ_PROFILE_VERSION,
             preamp_db: -3.0,
             linked_enabled: true,
@@ -5354,10 +7714,11 @@ mod tests {
             }),
             tilt: None,
             tilt_high: None,
+            tone: None,
         };
         assert_eq!(
             summarize_eq(Some(&profile)),
-            "Kali (L+R: 21 bands, L: off, R: 1 band, preamp -3.0 dB)"
+            "Desk (L+R: 21 bands, L: off, R: 1 band, preamp -3.0 dB)"
         );
 
         let mut linked_off = profile.clone();
@@ -5366,7 +7727,26 @@ mod tests {
         linked_off.preamp_db = -0.0;
         assert_eq!(
             summarize_eq(Some(&linked_off)),
-            "Kali (L+R: off, R: 1 band, preamp 0.0 dB)"
+            "Desk (L+R: off, R: 1 band, preamp 0.0 dB)"
+        );
+
+        let mut all_off = profile.clone();
+        all_off.left = None;
+        all_off.right = None;
+        for b in &mut all_off.bands {
+            b.enabled = false;
+        }
+        all_off.bands[3].enabled = true;
+        assert_eq!(
+            summarize_eq(Some(&all_off)),
+            "Desk (L+R: 1 of 21 bands on, preamp -3.0 dB)"
+        );
+        for b in &mut all_off.bands {
+            b.enabled = false;
+        }
+        assert_eq!(
+            summarize_eq(Some(&all_off)),
+            "Desk (L+R: 0 of 21 bands on, preamp -3.0 dB)"
         );
     }
 

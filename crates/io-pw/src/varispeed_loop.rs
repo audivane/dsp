@@ -558,6 +558,12 @@ impl VsDrain {
         *self.flush_left.get_or_insert(tail) > 0
     }
 
+    /// Padding frames still to pull once the ring is empty (`None` before
+    /// it is).
+    pub fn left(&self) -> Option<usize> {
+        self.flush_left
+    }
+
     /// A period of `n` nominal frames was pulled.
     pub fn pulled(&mut self, n: usize) {
         if let Some(left) = self.flush_left.as_mut() {

@@ -42,14 +42,14 @@ it("draws nothing until the daemon has reported a level", () => {
   expect(s).not.toContain("fine-fill");
   expect(s).not.toContain("aria-valuenow");
   expect(s).not.toContain("0.0");
-  expect(s).toContain("—");
+  expect(s).toMatch(/>-$/);
 });
 
 it("draws nothing for a status without volume", () => {
   fixture.state.status = { ...fixture.state.status!, volume: null };
   const s = volumeSlider();
   expect(s).not.toContain("fine-knob");
-  expect(s).toContain("—");
+  expect(s).toMatch(/>-$/);
 });
 
 it("shows the reported level once it is known", () => {
@@ -78,7 +78,7 @@ it("after a reconnect, volume, balance and mute wait for the new daemon's status
   expect(c.vol).not.toContain("fine-knob");
   expect(c.vol).not.toContain("12.0");
   expect(c.bal).not.toContain("fine-knob");
-  expect(c.bal).toContain("—");
+  expect(c.bal).toMatch(/>-$/);
   expect(c.mute).toContain("disabled");
   expect(renderToStaticMarkup(createElement(VolumeControls))).toContain("Waiting for the engine");
   fixture.state.volumeFresh = true;

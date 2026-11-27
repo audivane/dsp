@@ -6,7 +6,7 @@
 
 import type { BlockedVolumeChange, GuardMode, SinkVolumePolicy, VolumeConfig, VolumeMode } from "../api/types";
 import { fmtDb, fmtInt } from "../lib/format";
-import { volumeFieldProblem } from "../lib/volumeSettings";
+import { softwareMixerAttenuated, volumeFieldProblem, volumeModeChange } from "../lib/volumeSettings";
 import { store, useApp } from "../store/store";
 import { Seg } from "../components/Seg";
 import { InlineError, NumField } from "../components/StageParts";
@@ -50,7 +50,7 @@ export function VolumeSettings() {
         <Seg<VolumeMode>
           label="Volume control"
           value={vol.mode}
-          onChange={(mode) => set((v) => ({ ...v, mode, hardware_db: mode === "hybrid" && v.hardware_db === null ? Math.min(0, status?.hardware_db ?? -10) : v.hardware_db }))}
+          onChange={(mode) => set((v) => volumeModeChange(v, mode, status?.hardware_db))}
           options={[
             ["auto", "Auto", "Use the DAC's hardware volume when it has one, otherwise software."],
             ["software", "Software", "Always digital, in the engine. The DAC's own volume stays where it is, or at the fixed level below."],
@@ -79,6 +79,14 @@ export function VolumeSettings() {
             onCommit={(v) => set((x) => ({ ...x, hardware_db: v }))}
           />
           {status?.hardware_unavailable && <span className="hint">No hardware control on this DAC: this level has no effect.</span>}
+        </div>
+      )}
+      {softwareMixerAttenuated(vol, status?.hardware_db) && status?.hardware_db != null && (
+        <div className="notice warn" role="status">
+          <span>The DAC mixer is still at {fmtDb(status.hardware_db, 1)} dB, doubling attenuation.</span>
+          <button type="button" className="btn small" onClick={() => set((x) => ({ ...x, hardware_db: 0 }))}>
+            Set DAC to 0 dB
+          </button>
         </div>
       )}
       <div className="row">
@@ -112,7 +120,7 @@ export function VolumeSettings() {
           onChange={(mode) => set((v) => ({ ...v, guard: { ...v.guard, mode } }))}
           options={[
             ["off", "Off", "No protection."],
-            ["lock", "Lock", "Apps cannot raise their own volume, and the desktop slider cannot raise Audivane's. Turning down and mute still work."],
+            ["lock", "Lock", "Apps cannot raise their own volume, and the desktop slider cannot move Audivane's at all. Apps can still turn down, and mute works."],
             ["limit", "Limit", "Rises are capped, and slowed to the rate below unless there is no rise limit; turning down passes at once."],
           ]}
         />

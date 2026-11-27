@@ -236,8 +236,8 @@ mod tests {
         assert_eq!(file_stem("100%").unwrap(), "100%25");
         let dir = Path::new("/home/you/.config/audivane-dsp/overlays");
         assert_eq!(
-            file_path(dir, "Kali IN-5").unwrap(),
-            dir.join("Kali IN-5.json")
+            file_path(dir, "Monitor 5").unwrap(),
+            dir.join("Monitor 5.json")
         );
         assert_eq!(
             file_path(dir, "Tilt −0.7 dB/oct").unwrap(),
@@ -252,11 +252,11 @@ mod tests {
         assert_eq!(list(&dir).unwrap(), Vec::<Value>::new());
 
         save(&dir, "Flat", &sample("Flat")).unwrap();
-        save(&dir, "Kali IN-5", &sample("Kali IN-5")).unwrap();
+        save(&dir, "Monitor 5", &sample("Monitor 5")).unwrap();
         // Saving the same name again replaces the file.
-        let mut updated = sample("Kali IN-5");
+        let mut updated = sample("Monitor 5");
         updated["kind"] = json!("measurement");
-        save(&dir, "Kali IN-5", &updated).unwrap();
+        save(&dir, "Monitor 5", &updated).unwrap();
 
         let all = list(&dir).unwrap();
         assert_eq!(all.len(), 2);

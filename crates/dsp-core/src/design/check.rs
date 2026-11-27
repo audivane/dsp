@@ -33,6 +33,10 @@ pub const REFLECT_BETA_RANGE: (f64, f64) = (
     crate::minphase::MAX_MINIMUM_PHASE_BETA,
 );
 
+/// The DPSS time-bandwidth range (the window model's,
+/// [`super::window_model::DPSS_NW_RANGE`]).
+pub const NW_RANGE: (f64, f64) = super::window_model::DPSS_NW_RANGE;
+
 /// The Gaussian alpha range.
 pub const ALPHA_RANGE: (f64, f64) = (0.05, 0.5);
 
@@ -47,6 +51,17 @@ pub const REFLECT_MAX_SIDELOBE_DB: f64 = 190.0;
 /// output frames) at x2, its largest geometry. An `input` block stays
 /// within 2^10 ..= 2^16.
 pub const BLOCK_OUTPUT_MAX_INPUT: usize = 1 << 19;
+
+/// The deepest automatic budget of an optimal design, dB: where f64
+/// still resolves its error (the equiripple exchange places its extremals
+/// to about 1e-10 of the gain; a least-squares solve floors near 150 dB),
+/// measured by `paths::optimal::tests::measure_limits`.
+pub fn optimal_max_db(method: super::OptimalMethod) -> f64 {
+    match method {
+        super::OptimalMethod::Equiripple => super::paths::optimal::EQUIRIPPLE_MAX_DB,
+        super::OptimalMethod::LeastSquares => super::paths::optimal::LEAST_SQUARES_MAX_DB,
+    }
+}
 
 /// The automatic budget range, dB.
 pub const BUDGET_RANGE_DB: (f64, f64) = (55.0, 200.0);
@@ -149,6 +164,13 @@ pub fn refusal(e: &super::DesignError, d: &FilterDesign) -> FieldError {
         FilterDesign::BlockFft(_) => "design.block",
         _ => "design",
     };
+    let optimal = matches!(
+        d,
+        FilterDesign::Kernel(KernelDesign {
+            shape: Shape::Optimal { .. },
+            ..
+        })
+    );
     let path = match e {
         E::Field(f) => return f.clone(),
         E::Ratio { .. } => "design.rates",
@@ -158,6 +180,9 @@ pub fn refusal(e: &super::DesignError, d: &FilterDesign) -> FieldError {
         }
         E::Band(_) => "design.cutoff",
         E::Phase(_) => "design.phase",
+        // An optimal design has no window: what it cannot reach, and the
+        // limits of its length, are its length's.
+        E::Claim(_) | E::Unsupported(_) if optimal => length,
         E::Claim(_) => "design.window",
         E::Unsupported(_) | E::NotAKernel | E::Failed(_) | E::Unsafe(_) => "design",
     };
@@ -294,6 +319,36 @@ fn window(c: &mut Checker, path: &str, w: &Window, k: &KernelDesign) {
             }
             sampling
         }
+        Window::Dpss { nw, sampling } => {
+            if let Some(nw) = nw {
+                c.range(&p("nw"), nw, NW_RANGE);
+                // Kaiser's reflected limit at beta = pi NW.
+                let most = REFLECT_BETA_RANGE.1 / std::f64::consts::PI;
+                if reflect && nw.is_finite() && nw > most {
+                    c.fail(
+                        &p("nw"),
+                        format!(
+                            "a reflected phase takes NW up to {most:.2} (pi NW at most {}, as a \
+                             Kaiser beta; got {nw})",
+                            REFLECT_BETA_RANGE.1
+                        ),
+                    );
+                }
+            }
+            if standard {
+                c.fail(
+                    &p("type"),
+                    "this window is not on the standard path: use a preset path",
+                );
+            }
+            if sampling != Sampling::Symmetric {
+                // The periodic DPSS (N + 1 taps cut to N) is no longer
+                // the concentration optimum: up to 15 dB shallower.
+                c.fail(&p("sampling"), "the DPSS window is sampled symmetric only");
+                return;
+            }
+            sampling
+        }
         Window::Tukey { taper, sampling } => {
             if c.finite(&p("taper"), taper) && !(taper > 0.0 && taper <= 1.0) {
                 c.fail(&p("taper"), format!("must be in (0, 1] (got {taper})"));
@@ -392,6 +447,59 @@ fn kernel(c: &mut Checker, k: &KernelDesign) {
         window(c, "rates.fallback_window.window", &f.window, k);
     }
     match &k.shape {
+        Shape::Optimal {
+            method,
+            length,
+            passband_end,
+            stopband_start,
+        } => {
+            let (pe, se) = (*passband_end, *stopband_start);
+            if c.finite("passband_end", pe) & c.finite("stopband_start", se)
+                && (pe < BAND_MIN_PASSBAND_END
+                    || pe > 1.0
+                    || se <= pe
+                    || se > BAND_MAX_STOPBAND_START)
+            {
+                c.fail(
+                    "passband_end",
+                    format!(
+                        "needs {BAND_MIN_PASSBAND_END} <= passband end ({pe}) <= 1 and passband \
+                         end < stopband start ({se}) <= {BAND_MAX_STOPBAND_START}"
+                    ),
+                );
+            }
+            match length {
+                Length::Fixed(t) => c.count("length.taps", *t, 1, budget::MAX_KERNEL_TAPS),
+                Length::PerInput(t) => stepped_usize(c, "length.taps", t, 1, MAX_PER_INPUT),
+                Length::Auto(FilterErrorBudget::MatchOutput) => {}
+                Length::Auto(FilterErrorBudget::Db(a)) => {
+                    let max = optimal_max_db(*method);
+                    c.range("length.budget", *a, (BUDGET_RANGE_DB.0, max));
+                }
+                Length::OutputSpan(_) | Length::Band => c.fail(
+                    "length.rule",
+                    "an optimal design takes a fixed, per-input or automatic length",
+                ),
+            }
+            if !matches!(path, Fir | FirAfter) {
+                c.fail(
+                    "numerics.path",
+                    "an optimal design is built on the fir paths",
+                );
+            }
+            if k.preserve_samples {
+                c.fail(
+                    "preserve_samples",
+                    "an optimal low-pass is not a Nyquist filter: its zeros are off the input grid",
+                );
+            }
+            if k.rates.fallback_window.is_some() {
+                c.fail(
+                    "rates.fallback_window",
+                    "an optimal design has no window to fall back from",
+                );
+            }
+        }
         Shape::Lanczos { lobes } => {
             c.count("lobes", *lobes, 1, MAX_PER_INPUT);
             if !matches!(path, Fir | FirAfter) {
@@ -488,6 +596,18 @@ fn kernel(c: &mut Checker, k: &KernelDesign) {
                             ),
                         );
                     }
+                    // An absolute passband end replaces the fraction above,
+                    // which stays the fallback at a source rate where the
+                    // frequency does not fit the band
+                    // (`design::band_passband_end`).
+                    if let Some(hz) = b.passband_end_hz
+                        && !(hz.is_finite() && hz > 0.0)
+                    {
+                        c.fail(
+                            "cutoff.passband_end_hz",
+                            format!("must be a frequency above 0 Hz (got {hz})"),
+                        );
+                    }
                     if !matches!(length, Length::Auto(_)) {
                         c.range("cutoff.attenuation_db", a, BAND_ATTENUATION_RANGE_DB);
                         if reflect && a.is_finite() && a > REFLECT_MAX_BAND_DB {
@@ -529,5 +649,66 @@ mod tests {
             assert_eq!(check_all(&d), vec![], "{}", p.name());
         }
         assert_eq!(check_all(&catalogue::recommended()), vec![]);
+    }
+
+    /// A band's absolute passband end is a frequency above 0; it replaces
+    /// the fraction, which still has to hold its own bounds.
+    #[test]
+    fn a_band_passband_end_in_hz_is_a_frequency() {
+        let FilterDesign::Kernel(base) = catalogue::design(FilterPreset::CravenApod) else {
+            panic!("a kernel");
+        };
+        let with = |hz: Option<f64>| {
+            let mut k = base.clone();
+            let Shape::WindowedSinc {
+                cutoff: Cutoff::Band(band),
+                ..
+            } = &mut k.shape
+            else {
+                panic!("a band-length design");
+            };
+            band.passband_end_hz = hz;
+            FilterDesign::Kernel(k)
+        };
+        assert_eq!(check_all(&with(Some(20_000.0))), vec![]);
+        assert_eq!(check_all(&with(None)), vec![]);
+        let e = check_all(&with(Some(0.0)));
+        assert!(
+            e.iter().any(|e| e.path == "design.cutoff.passband_end_hz"),
+            "{e:?}"
+        );
+        let e = check_all(&with(Some(f64::NAN)));
+        assert!(
+            e.iter().any(|e| e.path == "design.cutoff.passband_end_hz"),
+            "{e:?}"
+        );
+    }
+
+    /// A reflected DPSS window takes NW up to Kaiser's limit, 20 / pi.
+    #[test]
+    fn reflected_dpss_stops_at_kaisers_limit() {
+        let FilterDesign::Kernel(base) = catalogue::design(FilterPreset::CravenApod) else {
+            panic!("a kernel");
+        };
+        let with = |nw: f64| {
+            FilterDesign::Kernel(KernelDesign {
+                shape: Shape::WindowedSinc {
+                    window: Window::Dpss {
+                        nw: Some(nw),
+                        sampling: Sampling::Symmetric,
+                    },
+                    length: Length::PerInput(Stepped::Fixed(255)),
+                    cutoff: Cutoff::NyquistStop,
+                },
+                ..base.clone()
+            })
+        };
+        assert_eq!(check_all(&with(6.3)), vec![]);
+        let e = check_all(&with(6.5));
+        assert!(
+            e.iter()
+                .any(|e| e.path == "design.window.nw" && e.message.contains("NW up to 6.37")),
+            "{e:?}"
+        );
     }
 }

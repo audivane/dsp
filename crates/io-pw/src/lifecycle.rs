@@ -94,6 +94,24 @@ impl RatePairMask {
         }
     }
 
+    /// `self`, with `other`'s pairs from each input where `self` allows
+    /// none of the pairs in `reach` but x1: a design that falls back per
+    /// rate plays its fallback there, so the ladder follows the fallback's
+    /// pairs.
+    pub fn or_where_none(self, other: Self, reach: Self) -> Self {
+        let mut rows = self.rows;
+        for (i, &input) in audivane_protocol::ALLOWED_RATES.iter().enumerate() {
+            let own = Self::bit(input, input).map_or(0, |(_, b)| b);
+            if rows[i] & reach.rows[i] & !own == 0 {
+                rows[i] |= other.rows[i];
+            }
+        }
+        Self {
+            rows,
+            unlisted: self.unlisted || other.unlisted,
+        }
+    }
+
     /// Whether `input -> output` can be built.
     pub fn allows(self, input: u32, output: u32) -> bool {
         if input == output {
@@ -1378,6 +1396,7 @@ mod tests {
             rate_min: 48_000,
             rate_max: 48_000,
             formats: vec![audivane_protocol::SampleFormat::S32],
+            modes: Vec::new(),
         };
         let rates = DeviceRates::playable(Some(&caps), &[]).unwrap();
         let base = |keep: RatePairMask| {
@@ -1487,6 +1506,7 @@ mod tests {
             rate_min: 48_000,
             rate_max: 48_000,
             formats: vec![audivane_protocol::SampleFormat::S32],
+            modes: Vec::new(),
         };
         let rates = DeviceRates::playable(Some(&caps), &[]).unwrap();
         let base = |keep: RatePairMask| {
@@ -2397,6 +2417,7 @@ mod tests {
             rate_min: 44_100,
             rate_max: 384_000,
             formats: vec![audivane_protocol::SampleFormat::S32],
+            modes: Vec::new(),
         };
         // The source family first: x4 (176.4 kHz) beats 192 kHz, which is
         // not twice as high.
@@ -2686,6 +2707,7 @@ mod tests {
             rate_min: rates.iter().copied().min().unwrap_or(0),
             rate_max: rates.iter().copied().max().unwrap_or(0),
             formats: vec![audivane_protocol::SampleFormat::S32],
+            modes: Vec::new(),
         }
     }
 

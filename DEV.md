@@ -30,8 +30,32 @@ python3 tests/reference/run.py    # numpy/scipy cross-checks (needs avdsp built)
 Rules for code on the audio thread: no allocation, no locks, no syscalls
 except the ALSA/PipeWire calls themselves. Long tests (> ~2 s) go behind
 `#[ignore]` and run with `cargo nextest run --run-ignored all`: tier B of the
-filter fingerprints, the measurement reports and the refactor pins (the ones
-that compare against removed code) live there.
+filter fingerprints, the design and drift simulations, the harmonics
+identity and speed checks, and the limiter and measurement reports.
+
+The daemon and IPC/CLI suites (driven with raw protocol lines and the real
+`avdsp` binary on a temporary socket, against a `MockEngine`; the binary is
+built on demand, override with `AVDSP_BIN`):
+
+```sh
+cargo nextest run -p audivane-dsp-daemon             # unit + IPC/CLI/MPRIS tests
+# Real PipeWire (two temporary f3_it_* null sinks, a pw-play stream):
+cargo nextest run -p audivane-dsp-daemon --run-ignored all -E 'test(graph_it)'
+# ... including the session-default parts (both metadata keys, normal stop and
+# a simulated kill -9; briefly changes the default and restores it exactly):
+AUDIVANE_IT_DEFAULT_SINK=1 cargo nextest run -p audivane-dsp-daemon \
+    --run-ignored all -E 'test(graph_it)'
+```
+
+The default-sink tests hold a file lock (`$TMPDIR/avdsp-f3-default-sink.lock`)
+so concurrent nextest processes cannot interleave their changes, and the
+original values are restored even if a test panics. The IPC/CLI suite covers
+the preset round trip (save/list/get/load/rename/delete, overwrite refusal,
+`modified`, active-preset tracking across a restart), APO import, device
+listing, `config`/`presets` events and the coalesced config writer (write
+counts and flush on shutdown). The ALSA device parser is unit-tested against
+canned `/proc/asound/pcm` and `/proc/asound/cards` text, so it needs no sound
+card.
 
 ## Build from source
 
@@ -52,7 +76,7 @@ That gives `target/release/{audivane-dsp,avdsp}` and
 `target/release-ui/audivane-dsp-ui`. On Arch, `packaging/arch/` builds a
 package with `makepkg` instead (see its README).
 
-## Release packages (.deb, .rpm, Arch)
+## Release packages (.deb, .rpm, Arch, AppImage)
 
 ```sh
 packaging/release/release.sh            # committed HEAD -> dist/release/<version>/
@@ -60,30 +84,33 @@ packaging/release/release.sh --worktree # include uncommitted changes
 packaging/release/release.sh --clean    # cold build (drops the cached target dir)
 ```
 
-One build makes all three formats. It compiles inside a rootless Ubuntu 24.04
-root (`packaging/release/baseline.sh`, set up once in ~6 minutes, no root or
-containers), so the binaries need only glibc 2.39 and run on Ubuntu/Debian
-24.04+, Fedora 40+ and Arch. nfpm (pinned, checksummed) wraps the same files
-into `.deb`, `.rpm` and `.pkg.tar.zst`, then the Arch package is installed in
-the Arch build root and the `.deb` in a throwaway copy of the Ubuntu root as
-smoke tests, each installed twice so the upgrade scriptlet runs too
-(`archroot.sh smoke <pkg> [<upgrade-pkg>]`, `baseline.sh deb-smoke <deb>
-[<upgrade-deb>]`). Output: the three packages and `SHA256SUMS`, ready to attach to a
-GitHub release. The `Release packages` GitHub workflow runs the same scripts
+One build makes all four artifacts: the three packages and the AppImage. It
+compiles inside a rootless Ubuntu 24.04 root (`packaging/release/baseline.sh`,
+set up once in ~6 minutes, no root or containers), so the binaries need only
+glibc 2.39 and run on Ubuntu/Debian 24.04+, Fedora 40+ and Arch. nfpm (pinned,
+checksummed) wraps the same files into `.deb`, `.rpm` and `.pkg.tar.zst`, then
+the Arch package is installed in the Arch build root and the `.deb` in a
+throwaway copy of the Ubuntu root as smoke tests, each installed twice so the
+upgrade scriptlet runs too (`archroot.sh smoke <pkg> [<upgrade-pkg>]`,
+`baseline.sh deb-smoke <deb> [<upgrade-deb>]`). `appimage.sh` then puts the
+same staged files into an AppImage (appimagetool and the static type 2
+runtime, both pinned and checksummed; see `packaging/appimage/README.md`).
+Output: the three packages, the AppImage and `SHA256SUMS`, ready to attach to
+a GitHub release. The `Release packages` GitHub workflow runs the same scripts
 on demand (manual trigger only) when no local machine is available.
 
 The engine uses the `release` profile (fat LTO, one codegen unit, no debug
 info: every packaged binary is stripped); the app uses `release-ui` (thin LTO,
-16 units). Both compile at the same time, and the protocol unit tests run in
-release mode in the engine's target dir afterwards (so the packages need one
-release build, not two).
+16 units). Both compile at the same time, and the protocol unit tests run
+alongside in release mode in a third target dir with thin LTO, so the packages
+need one build, not two.
 
 Scriptlets: `packaging/release/postinstall.sh` is the one post-install script
-for all three formats; `package.sh` appends a dispatch line per format (deb
-`configure <old>`, rpm `$1`, Arch `post_install`/`post_upgrade`). On upgrade
-it runs `systemctl --user -M <user>@ try-restart audivane-dsp.service` for
-each running user manager; `packaging/arch/audivane-dsp.install` (makepkg)
-mirrors it.
+for all three formats; `package.sh` wraps it with a dispatch line per format
+(deb `configure <old>`, rpm `$1`, Arch `post_install`), and Arch gets a
+separate `post_upgrade`. On upgrade it runs
+`systemctl --user -M <user>@ try-restart audivane-dsp.service` for each running
+user manager; `packaging/arch/audivane-dsp.install` (makepkg) mirrors it.
 
 `avdsp upgrade` can be tried against a local server instead of GitHub:
 `AUDIVANE_UPGRADE_API=http://127.0.0.1:8000` serves `releases/latest` (or
@@ -134,8 +161,8 @@ Config lives in `$XDG_CONFIG_HOME/audivane-dsp/config.json` (minimal:
 the daemon restores PipeWire's `settings` keys and the session default sink from
 `$XDG_RUNTIME_DIR/audivane-dsp/*-restore.json`.
 
-Offline tools (no daemon needed): `avdsp process`, `eq`, `levelmatch`,
-`kernel`, `nulltest`, `bypass-test`, `gen`, `bench` — see `avdsp --help`.
+Offline tools (no daemon needed): `avdsp process`, `render`, `eq`, `levelmatch`,
+`kernel`, `nulltest`, `bypass-test`, `gen`, `bench`: see `avdsp --help`.
 `avdsp upgrade` updates a packaged install (see the README).
 
 ## Rig tests (loopback card, run one at a time)
@@ -154,6 +181,7 @@ Offline tools (no daemon needed): `avdsp process`, `eq`, `levelmatch`,
 | `tests/daemon/engine_release.sh` | 20× rapid release/acquire with WirePlumber |
 | `tests/daemon/engine_device_switch.sh` | device handoff, error state, recovery |
 | `tests/daemon/engine_metadata.sh` | PipeWire settings restored, also after `kill -9` |
+| `tests/daemon/engine_volume.sh` | sink volume applied once (by the engine), ceiling, guard lock/limit, Direct held at unity |
 | `tests/daemon/engine_xrun.sh` | forced xrun recovers |
 | `tests/spike/test_*.sh` | driver spike tests (60 s drift, bit-perfect, rate switch) |
 | `tests/stress/direct_start.sh` | 30x fresh-start stress for the Direct bit-perfect path (not in the suite; `tests/stress/direct_start.sh 30`) |

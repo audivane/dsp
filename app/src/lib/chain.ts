@@ -1,7 +1,8 @@
 // Helpers over the chain/EQ wire types that hide the protocol's variants
 // (linked vs split EQ) and an older daemon's single-IR convolution shape.
 
-import type { Band, ChainConfig, ChannelEq, ConvolutionConfig, EqProfile } from "../api/types";
+import type { Band, ChainConfig, ChannelEq, ConvolutionConfig, ConvolutionSafety, EngineConfig, EqProfile } from "../api/types";
+import { toneOn } from "./tone";
 
 export type EqSection = "linked" | "left" | "right";
 
@@ -15,6 +16,11 @@ export function convList(chain: ChainConfig | null | undefined): ConvolutionConf
   const c = chain?.convolution as ConvolutionConfig[] | ConvolutionConfig | null | undefined;
   if (!c) return [];
   return Array.isArray(c) ? c : [c];
+}
+
+/** The convolution guards of `cfg` (left out of the config at their defaults). */
+export function convSafety(cfg: EngineConfig | null | undefined): ConvolutionSafety {
+  return cfg?.convolution_safety ?? { max_boost_db: 12, subsonic_hz: 20 };
 }
 
 export function emptyEq(name = ""): EqProfile {
@@ -43,6 +49,7 @@ export function normalizeEq(eq: EqProfile): EqProfile {
       },
       ...(raw.tilt ? { tilt: { ...raw.tilt } } : {}),
       ...(raw.tilt_high ? { tilt_high: { ...raw.tilt_high } } : {}),
+      ...(raw.tone ? { tone: { ...raw.tone } } : {}),
     };
   }
   const out: EqProfile = {
@@ -60,6 +67,7 @@ export function normalizeEq(eq: EqProfile): EqProfile {
   }
   if (raw.tilt) out.tilt = { ...raw.tilt };
   if (raw.tilt_high) out.tilt_high = { ...raw.tilt_high };
+  if (raw.tone) out.tone = { ...raw.tone };
   return out;
 }
 
@@ -139,7 +147,7 @@ export function eqIsActive(eq: EqProfile | null | undefined): boolean {
   const linkedOn = (eq.linked_enabled ?? true) && eq.bands.some((b) => b.enabled);
   const leftOn = !!eq.left?.enabled && (eq.left.preamp_db !== 0 || eq.left.bands.some((b) => b.enabled));
   const rightOn = !!eq.right?.enabled && (eq.right.preamp_db !== 0 || eq.right.bands.some((b) => b.enabled));
-  return eq.preamp_db !== 0 || linkedOn || leftOn || rightOn || !!eq.tilt?.enabled || !!eq.tilt_high?.enabled;
+  return eq.preamp_db !== 0 || linkedOn || leftOn || rightOn || !!eq.tilt?.enabled || !!eq.tilt_high?.enabled || toneOn(eq);
 }
 
 export function cloneBands(bands: readonly Band[]): Band[] {
@@ -172,7 +180,33 @@ export function fileName(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
-/** Display name of an IR: its `name`, else the file name. */
+/** Display name of an IR: its `name`, else the file name ("Filter matrix" for a matrix). */
 export function irName(c: ConvolutionConfig): string {
-  return c.name || fileName(c.ir_path);
+  return c.name || (isMatrix(c) ? "Filter matrix" : fileName(c.ir_path));
+}
+
+/** A convolution item that carries a FIR matrix in place of one IR file. */
+export function isMatrix(c: ConvolutionConfig): boolean {
+  return Array.isArray(c.matrix);
+}
+
+/** The WAV files an item reads: its IR, or each matrix entry's. */
+export function irPaths(c: ConvolutionConfig): string[] {
+  return c.matrix ? c.matrix.map((e) => e.ir_path) : [c.ir_path];
+}
+
+/** A stable identity for an item in the list (matrix items have no `ir_path`). */
+export function irKey(c: ConvolutionConfig): string {
+  return c.matrix ? "matrix:" + c.matrix.map((e) => `${e.in}>${e.out}:${e.channel ?? ""}=${e.ir_path}`).join("|") : c.ir_path;
+}
+
+const CHANNEL = ["L", "R"];
+const chName = (i: number) => CHANNEL[i] ?? `ch ${i + 1}`;
+
+/** A matrix item, read-only: "Matrix: 2 filters (L→L, R→L)"; null for a plain IR. */
+export function matrixText(c: ConvolutionConfig): string | null {
+  if (!c.matrix) return null;
+  const n = c.matrix.length;
+  const routes = c.matrix.map((e) => `${chName(e.in)}→${chName(e.out)}`).join(", ");
+  return `Matrix: ${n} ${n === 1 ? "filter" : "filters"}${n ? ` (${routes})` : ""}`;
 }

@@ -1,0 +1,430 @@
+[
+  {
+    "id": "triode",
+    "name": "Triode",
+    "origin": "hand_picked",
+    "reference": "0 dBFS sine",
+    "source": "Hand-picked levels: the stage's original triode character (dominant H2, faint H3 and H4)",
+    "layer": {
+      "kind": "chebyshev",
+      "levels_db": [
+        -40.0,
+        -58.0,
+        -72.0,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "signs": [
+        "+",
+        "-",
+        "+",
+        "+",
+        "+",
+        "+",
+        "+",
+        "+"
+      ],
+      "drive_db": 0.0,
+      "amount": 1.0
+    }
+  },
+  {
+    "id": "pentode",
+    "name": "Pentode",
+    "origin": "hand_picked",
+    "reference": "0 dBFS sine",
+    "source": "Hand-picked levels: the stage's original pentode character (dominant H3, faint H2 and H5)",
+    "layer": {
+      "kind": "chebyshev",
+      "levels_db": [
+        -56.0,
+        -42.0,
+        null,
+        -66.0,
+        null,
+        null,
+        null,
+        null
+      ],
+      "signs": [
+        "+",
+        "-",
+        "+",
+        "+",
+        "+",
+        "+",
+        "+",
+        "+"
+      ],
+      "drive_db": 0.0,
+      "amount": 1.0
+    }
+  },
+  {
+    "id": "se_triode_high_mu",
+    "name": "Single-ended triode, high-mu",
+    "origin": "computed",
+    "reference": "0 dBFS = grid swing of 1 V peak",
+    "source": "Computed by examples/harmonics_presetgen.rs (static curve projected onto T2..T9): Koren triode model for 12AX7 (mu=100, ex=1.4, kg1=1060, kp=600, kvb=300); common cathode with resistive load, supply 300 V, plate load 100 kohm, fixed bias -1.5 V, grid swing +/-1 V peak = 0 dBFS (grid current ignored); quiescent plate 204.7 V at 0.95 mA; https://www.normankoren.com/Audio/Tubemodspice_article.html (Table 1)",
+    "layer": {
+      "kind": "chebyshev",
+      "levels_db": [
+        -25.4,
+        -45.6,
+        -79.2,
+        -87.7,
+        -113.5,
+        null,
+        null,
+        null
+      ],
+      "signs": [
+        "+",
+        "-",
+        "+",
+        "-",
+        "-",
+        "+",
+        "+",
+        "+"
+      ],
+      "drive_db": 0.0,
+      "amount": 1.0
+    }
+  },
+  {
+    "id": "se_triode_low_mu",
+    "name": "Single-ended triode, low-mu",
+    "origin": "computed",
+    "reference": "0 dBFS = grid swing of 3 V peak",
+    "source": "Computed by examples/harmonics_presetgen.rs (static curve projected onto T2..T9): Koren triode model for 6DJ8 (mu=28, ex=1.3, kg1=330, kp=320, kvb=300); common cathode with resistive load, supply 250 V, plate load 10 kohm, fixed bias -3 V, grid swing +/-3 V peak = 0 dBFS (grid current ignored); quiescent plate 130.3 V at 11.97 mA; https://www.normankoren.com/Audio/Tubemodspice_article.html (Table 1)",
+    "layer": {
+      "kind": "chebyshev",
+      "levels_db": [
+        -36.5,
+        -46.3,
+        -77.5,
+        -76.6,
+        -88.6,
+        -96.6,
+        -109.9,
+        null
+      ],
+      "signs": [
+        "+",
+        "-",
+        "+",
+        "-",
+        "-",
+        "-",
+        "-",
+        "+"
+      ],
+      "drive_db": 0.0,
+      "amount": 1.0
+    }
+  },
+  {
+    "id": "se_pentode",
+    "name": "Single-ended pentode",
+    "origin": "computed",
+    "reference": "0 dBFS = grid swing of 4 V peak",
+    "source": "Computed by examples/harmonics_presetgen.rs (static curve projected onto T2..T9): Koren pentode model for 6550 (mu=7.9, ex=1.35, kg1=890, kg2=4800 [screen current, not used], kp=60, kvb=24); common cathode with resistive load, supply 400 V, screen 250 V, plate load 3 kohm, fixed bias -24 V, grid swing +/-4 V peak = 0 dBFS (grid current ignored); quiescent plate 229.0 V at 57.01 mA; https://www.normankoren.com/Audio/Tubemodspice_article.html (Table 1)",
+    "layer": {
+      "kind": "chebyshev",
+      "levels_db": [
+        -27.8,
+        -38.8,
+        -56.0,
+        -76.0,
+        -95.7,
+        -109.2,
+        -114.8,
+        null
+      ],
+      "signs": [
+        "+",
+        "-",
+        "-",
+        "-",
+        "-",
+        "+",
+        "+",
+        "+"
+      ],
+      "drive_db": 0.0,
+      "amount": 1.0
+    }
+  },
+  {
+    "id": "pp_triode",
+    "name": "Push-pull triode, balanced",
+    "origin": "computed",
+    "reference": "0 dBFS = grid swing of 8 V peak per half",
+    "source": "Computed by examples/harmonics_presetgen.rs (static curve projected onto T2..T9): Koren triode model for 12AU7 (mu=21.5, ex=1.3, kg1=1180, kp=84, kvb=300); two halves in difference, supply 300 V, 20 kohm per half, fixed bias -8 V, grid swing +/-8 V peak per half = 0 dBFS (grid current ignored); second-half gain +0.0 dB; quiescent plate 198.0 V at 5.10 mA per half; https://www.normankoren.com/Audio/Tubemodspice_article.html (Table 1)",
+    "layer": {
+      "kind": "chebyshev",
+      "levels_db": [
+        null,
+        -48.1,
+        null,
+        -68.8,
+        null,
+        -87.8,
+        null,
+        -110.5
+      ],
+      "signs": [
+        "+",
+        "-",
+        "+",
+        "-",
+        "+",
+        "-",
+        "+",
+        "-"
+      ],
+      "drive_db": 0.0,
+      "amount": 1.0
+    }
+  },
+  {
+    "id": "pp_triode_imbalanced",
+    "name": "Push-pull triode, 1 dB imbalance",
+    "origin": "computed",
+    "reference": "0 dBFS = grid swing of 8 V peak per half",
+    "source": "Computed by examples/harmonics_presetgen.rs (static curve projected onto T2..T9): Koren triode model for 12AU7 (mu=21.5, ex=1.3, kg1=1180, kp=84, kvb=300); two halves in difference, supply 300 V, 20 kohm per half, fixed bias -8 V, grid swing +/-8 V peak per half = 0 dBFS (grid current ignored); second-half gain +1.0 dB; quiescent plate 198.0 V at 5.10 mA per half; https://www.normankoren.com/Audio/Tubemodspice_article.html (Table 1)",
+    "layer": {
+      "kind": "chebyshev",
+      "levels_db": [
+        -44.1,
+        -48.1,
+        -92.0,
+        -68.8,
+        -100.3,
+        -87.8,
+        null,
+        -110.5
+      ],
+      "signs": [
+        "-",
+        "-",
+        "+",
+        "-",
+        "+",
+        "-",
+        "+",
+        "-"
+      ],
+      "drive_db": 0.0,
+      "amount": 1.0
+    }
+  },
+  {
+    "id": "diff_pair",
+    "name": "Differential pair (solid state)",
+    "origin": "computed",
+    "reference": "0 dBFS = 51.7 mV peak differential input",
+    "source": "Computed by examples/harmonics_presetgen.rs (static curve projected onto T2..T9): Ideal differential pair (exponential BJT pair), y = tanh(g x), g = 1, x = v_id / (2 V_T), 2 V_T = 51.70 mV at 300 K; full-scale input 51.7 mV peak = 0 dBFS; odd orders only, no DC",
+    "layer": {
+      "kind": "chebyshev",
+      "levels_db": [
+        null,
+        -23.5,
+        null,
+        -45.1,
+        null,
+        -66.5,
+        null,
+        -88.0
+      ],
+      "signs": [
+        "+",
+        "-",
+        "+",
+        "+",
+        "+",
+        "-",
+        "+",
+        "+"
+      ],
+      "drive_db": 0.0,
+      "amount": 1.0
+    }
+  },
+  {
+    "id": "solid_state_feedback",
+    "name": "High-feedback solid state",
+    "origin": "archetype",
+    "reference": "0 dBFS sine near full output, levels at 1 kHz",
+    "source": "Archetype: a class-AB transistor amplifier with heavy global feedback and dominant-pole compensation, near full output; mostly odd orders (soft clipping of a symmetrical output stage) with a little H2, about 0.05 % THD at 1 kHz; the loop gain falls 6 dB/oct above about 2 kHz, so the residual distortion rises 6 dB/oct toward the treble (about +17 dB by 20 kHz)",
+    "layer": {
+      "kind": "chebyshev",
+      "levels_db": [
+        -78.0,
+        -68.0,
+        -94.0,
+        -76.0,
+        null,
+        -86.0,
+        null,
+        -96.0
+      ],
+      "signs": [
+        "+",
+        "-",
+        "+",
+        "+",
+        "+",
+        "-",
+        "+",
+        "+"
+      ],
+      "drive_db": 0.0,
+      "amount": 1.0,
+      "tilt": {
+        "low": {
+          "hz": 100.0,
+          "db": 0.0
+        },
+        "high": {
+          "hz": 2000.0,
+          "db": 20.0
+        }
+      }
+    }
+  },
+  {
+    "id": "pp_pentode_feedback",
+    "name": "Push-pull pentode, feedback",
+    "origin": "archetype",
+    "reference": "0 dBFS sine near full output, levels at 1 kHz",
+    "source": "Archetype: a push-pull pentode output stage with moderate global feedback through an output transformer, near full output; mostly odd orders (about 0.6 % H3 at 1 kHz) with a little H2 from imbalance; the odd orders rise 12 dB/oct below about 60 Hz, up to +12 dB, as the transformer core nears saturation, and all orders rise 6 dB/oct above about 6 kHz, up to +6 dB, as the feedback falls",
+    "layer": {
+      "kind": "chebyshev",
+      "levels_db": [
+        -62.0,
+        -44.0,
+        -78.0,
+        -58.0,
+        null,
+        -72.0,
+        null,
+        -86.0
+      ],
+      "signs": [
+        "+",
+        "-",
+        "+",
+        "+",
+        "+",
+        "-",
+        "+",
+        "+"
+      ],
+      "drive_db": 0.0,
+      "amount": 1.0,
+      "tilt": {
+        "low": {
+          "hz": 60.0,
+          "db": 12.0
+        },
+        "high": {
+          "hz": 6000.0,
+          "db": 6.0
+        }
+      }
+    }
+  },
+  {
+    "id": "output_transformer",
+    "name": "Output transformer",
+    "origin": "archetype",
+    "reference": "H3 at 20 Hz for a 0 dBFS sine",
+    "source": "Archetype: output transformer core saturation; core flux rises 6 dB/oct below the 100 Hz corner (H3 about 12 dB/oct), and the 12 dB boost limit flattens it below 25 Hz as the winding resistance does; about 6 % H3 at 20 Hz, 3.5 % at 40 Hz and 0.4 % at 1 kHz at full scale",
+    "layer": {
+      "kind": "flux",
+      "corner_hz": 100.0,
+      "max_boost_db": 12.0,
+      "target_h3_db": -24.0,
+      "calibration_hz": 20.0
+    }
+  },
+  {
+    "id": "tape",
+    "name": "Tape, hot",
+    "origin": "archetype",
+    "reference": "H3 at 1 kHz for a 0 dBFS sine",
+    "source": "Archetype: tape saturation driven hot; about 3 % H3 at 1 kHz at full scale (near maximum output level), rising about 10 dB toward the bass (about 9 % at 40 Hz) below a 400 Hz corner with a 6 dB boost limit",
+    "layer": {
+      "kind": "flux",
+      "corner_hz": 400.0,
+      "max_boost_db": 6.0,
+      "target_h3_db": -30.0,
+      "calibration_hz": 1000.0
+    }
+  },
+  {
+    "id": "tape_master",
+    "name": "Mastering tape",
+    "origin": "archetype",
+    "reference": "H3 at 1 kHz for a 0 dBFS sine",
+    "source": "Archetype: well-aligned mastering tape (Jiles-Atherton hysteresis), fitted to measurements of a real reel-to-reel recorder at its maximum output level: about 3 % H3 at 1 kHz at full scale (narrow loop, width 0.25), falling about 2 dB per dB of level; a record/playback bass EQ pair (+3.5 dB below 100 Hz into the core, exact inverse after) lets the distortion rise toward the bass as measured (H3 about +8 dB at 40 Hz); a small field offset leaves only a trace of H2 (about -49 dBc at 1 kHz)",
+    "layer": {
+      "kind": "hysteresis",
+      "saturation": 0.35,
+      "width": 0.25,
+      "amount": 1.0,
+      "target_h3_db": -30.0,
+      "calibration_hz": 1000.0,
+      "bass_eq": {
+        "hz": 100.0,
+        "db": 3.5
+      },
+      "asymmetry": 0.03
+    }
+  },
+  {
+    "id": "tape_studio",
+    "name": "Studio tape",
+    "origin": "archetype",
+    "reference": "H3 at 1 kHz for a 0 dBFS sine",
+    "source": "Archetype: studio tape (Jiles-Atherton hysteresis) driven about 2 dB past the measured recorder's maximum output level: about 5.6 % H3 at 1 kHz at full scale (medium loop, width 0.35) with the measured level law; a record/playback bass EQ pair (+3.5 dB below 110 Hz into the core, exact inverse after) lets the distortion rise toward the bass; a moderate field offset gives H2 about -35 dBc at 1 kHz",
+    "layer": {
+      "kind": "hysteresis",
+      "saturation": 0.35,
+      "width": 0.35,
+      "amount": 1.0,
+      "target_h3_db": -25.0,
+      "calibration_hz": 1000.0,
+      "bass_eq": {
+        "hz": 110.0,
+        "db": 3.5
+      },
+      "asymmetry": 0.13
+    }
+  },
+  {
+    "id": "tape_vintage",
+    "name": "Vintage tape",
+    "origin": "archetype",
+    "reference": "H3 at 1 kHz for a 0 dBFS sine",
+    "source": "Archetype: vintage tape (Jiles-Atherton hysteresis) driven about 4 dB past the measured recorder's maximum output level: about 9 % H3 at 1 kHz at full scale (10 % calibrated on the symmetric core; wider loop, width 0.4) with the measured level law; a record/playback bass EQ pair (+4 dB below 110 Hz into the core, exact inverse after) lets the distortion rise toward the bass; the field offset fitted to the measured machine gives H2 about -23 dBc at 1 kHz, close to H3",
+    "layer": {
+      "kind": "hysteresis",
+      "saturation": 0.35,
+      "width": 0.4,
+      "amount": 1.0,
+      "target_h3_db": -20.0,
+      "calibration_hz": 1000.0,
+      "bass_eq": {
+        "hz": 110.0,
+        "db": 4.0
+      },
+      "asymmetry": 0.5
+    }
+  }
+]

@@ -2,8 +2,8 @@
 //! (`org.kde.plasmashell`, `/org/kde/osdService`), drawn by the shell, so it
 //! never takes the focus. For a level with a bar we call
 //! `mediaPlayerVolumeChanged(int percent, QString playerName, QString playerIconName)`
-//! — signature `(iss)` in Plasma 6's `plasma-workspace` (`shell/osd.h`,
-//! `shell/osd.cpp`) — and fall back to `showText(QString icon, QString text)`
+//! (signature `(iss)` in Plasma 6's `plasma-workspace`, `shell/osd.h`,
+//! `shell/osd.cpp`), and fall back to `showText(QString icon, QString text)`
 //! when the bar method fails (caching that choice for the session) or when no
 //! bar applies. Elsewhere, or when there is no osdService, the app shows its
 //! own small window instead.
@@ -127,7 +127,7 @@ pub fn format(
     let Some(db) = volume_db else {
         return Display {
             icon,
-            label: "Audivane DSP · —".into(),
+            label: "Audivane DSP · -".into(),
             percent: None,
         };
     };

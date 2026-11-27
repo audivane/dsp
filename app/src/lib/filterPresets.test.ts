@@ -117,6 +117,8 @@ describe("ratio rules", () => {
     expect(presetRatioNeed("cascade_fir", { up: 10, down: 1 })).toContain("even ratio");
     expect(presetRatioNeed("block_fft", { up: 16, down: 1 })).toBeNull();
     expect(presetRatioNeed("block_fft", { up: 6, down: 1 })).toContain("power-of-two");
+    expect(presetRatioNeed("nos", { up: 160, down: 147 })).toContain("integer");
+    expect(presetRatioNeed("nos", { up: 64, down: 1 })).toBeNull();
     expect(presetRatioNeed("cosine", { up: 160, down: 147 })).toContain("integer");
     expect(presetRatioNeed("lanczos2047", { up: 160, down: 147 })).toBeNull();
     expect(presetRatioNeed("lanczos2047", { up: 1, down: 2 })).toContain("at or above");

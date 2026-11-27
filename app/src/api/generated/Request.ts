@@ -2,15 +2,21 @@
 import type { AbConfig } from "./AbConfig";
 import type { AbSide } from "./AbSide";
 import type { ConvolutionConfig } from "./ConvolutionConfig";
+import type { ConvolutionSafety } from "./ConvolutionSafety";
 import type { CrossfeedConfig } from "./CrossfeedConfig";
 import type { DcBlockConfig } from "./DcBlockConfig";
+import type { DeviceAssignment } from "./DeviceAssignment";
 import type { EngineConfig } from "./EngineConfig";
 import type { EqProfile } from "./EqProfile";
 import type { FilterDesign } from "./FilterDesign";
 import type { HarmonicsConfig } from "./HarmonicsConfig";
+import type { HarmonicsSpectrumTrace } from "./HarmonicsSpectrumTrace";
 import type { LimiterConfig } from "./LimiterConfig";
+import type { MeasurePlayRequest } from "./MeasurePlayRequest";
+import type { OutputChannels } from "./OutputChannels";
 import type { OutputConfig } from "./OutputConfig";
 import type { PitchConfig } from "./PitchConfig";
+import type { PresetPart } from "./PresetPart";
 import type { RatePolicy } from "./RatePolicy";
 import type { RateTarget } from "./RateTarget";
 import type { ResponseWindowRequest } from "./ResponseWindowRequest";
@@ -21,7 +27,48 @@ import type { SinkChoice } from "./SinkChoice";
 import type { Topic } from "./Topic";
 import type { UpsamplerConfig } from "./UpsamplerConfig";
 
-export type Request = { id: number, } & ({ "method": "status" } | { "method": "get_config" } | { "method": "set_config", "params": EngineConfig } | { "method": "set_dc_block", "params": DcBlockConfig | null } | { "method": "set_crossfeed", "params": CrossfeedConfig | null } | { "method": "set_eq", "params": EqProfile | null } | { "method": "set_convolution", "params": Array<ConvolutionConfig> } | { "method": "set_upsampler", "params": UpsamplerConfig } | { "method": "set_pitch", "params": PitchConfig } | { "method": "set_harmonics", "params": HarmonicsConfig | null } | { "method": "set_limiter", "params": LimiterConfig } | { "method": "set_dsp_enabled", "params": { enabled: boolean, } } | { "method": "set_output", "params": OutputConfig } | { "method": "set_formats", "params": Array<SampleFormat> } | { "method": "set_rate", "params": RatePolicy } | { "method": "set_device", "params": { device: string, } } | { "method": "set_ab", "params": AbConfig | null } | { "method": "ab_select", "params": { side: AbSide, crossfade_ms: number, } } | { "method": "ab_measure", "params": { max_seconds?: number, cancel?: boolean, accept?: boolean, } } | { "method": "set_volume", "params": { volume_db: number, balance_db: number, muted: boolean, } } | { "method": "set_volume_guarded", "params": { volume_db?: number, balance_db?: number, muted?: boolean, if_instance: string, if_revision: number, } } | { "method": "set_varispeed", "params": { enabled?: boolean, speed?: number, ramp_ms?: number, keep_pitch?: boolean, } } | { "method": "set_follower", "params": { device: string, remove?: boolean, enabled?: boolean, trim_ms?: number, volume_db?: number, } } | { "method": "list_streams" } | { "method": "list_presets" } | { "method": "get_preset", "params": { name: string, } } | { "method": "save_preset", "params": { name: string, overwrite: boolean, } } | { "method": "load_preset", "params": { name: string, } } | { "method": "delete_preset", "params": { name: string, } } | { "method": "rename_preset", "params": { from: string, to: string, } } | { "method": "import_apo", "params": { name: string, text: string, } } | { "method": "list_devices" } | { "method": "route", "params": { target: RouteTarget, sink: SinkChoice, } } | { "method": "set_stream_volume", "params": { node: number, volume_db?: number, muted?: boolean, } } | { "method": "set_routing_mode", "params": RoutingMode } | { "method": "now_playing" } | { "method": "self_test" } | { "method": "upsampler_response", "params": { config: UpsamplerConfig | null, source_rate: number | null, 
+export type Request = { id: number, } & ({ "method": "status" } | { "method": "get_config" } | { "method": "set_config", "params": EngineConfig } | { "method": "set_dc_block", "params": DcBlockConfig | null } | { "method": "set_crossfeed", "params": CrossfeedConfig | null } | { "method": "set_eq", "params": EqProfile | null } | { "method": "set_convolution", "params": Array<ConvolutionConfig> } | { "method": "set_convolution_safety", "params": ConvolutionSafety } | { "method": "set_upsampler", "params": UpsamplerConfig } | { "method": "set_pitch", "params": PitchConfig } | { "method": "set_harmonics", "params": HarmonicsConfig | null } | { "method": "harmonics_presets" } | { "method": "harmonics_systems" } | { "method": "harmonics_readout", "params": { config?: HarmonicsConfig, 
+/**
+ * Also read sines every 2 dB from -40 to 0 dBFS (`sweep`), and
+ * harmonics against frequency (`freq_sweep`).
+ */
+sweep?: boolean, 
+/**
+ * With `sweep`: run the level sweeps (`sweep`, `under_load`) at
+ * this one tone, Hz (10..=20000; default 1 kHz and 40 Hz).
+ */
+sweep_freq_hz?: number, 
+/**
+ * With `sweep`: run `freq_sweep` at this one level, dBFS
+ * (−120..=0; default 0 and −18 dBFS).
+ */
+sweep_level_dbfs?: number, } } | { "method": "harmonics_spectrum", "params": { config?: HarmonicsConfig, freq_hz: number, level_dbfs: number, traces?: Array<HarmonicsSpectrumTrace>, } } | { "method": "harmonics_live" } | { "method": "set_limiter", "params": LimiterConfig } | { "method": "set_dsp_enabled", "params": { enabled: boolean, } } | { "method": "set_output", "params": OutputConfig } | { "method": "set_formats", "params": Array<SampleFormat> } | { "method": "set_rate", "params": RatePolicy } | { "method": "set_device", "params": { device: string, 
+/**
+ * Its output pair ([`EngineConfig::output_channels`]; `[0, 1]`:
+ * the first two). Left out: kept for the same device, the first
+ * two for another one.
+ */
+output_channels?: OutputChannels, } } | { "method": "set_ab", "params": AbConfig | null } | { "method": "ab_select", "params": { side: AbSide, crossfade_ms: number, } } | { "method": "ab_blind", "params": { enabled: boolean, } } | { "method": "ab_measure", "params": { max_seconds?: number, cancel?: boolean, accept?: boolean, } } | { "method": "set_volume", "params": { volume_db: number, balance_db: number, muted: boolean, } } | { "method": "set_volume_guarded", "params": { volume_db?: number, balance_db?: number, muted?: boolean, if_instance: string, if_revision: number, } } | { "method": "set_varispeed", "params": { enabled?: boolean, speed?: number, ramp_ms?: number, keep_pitch?: boolean, } } | { "method": "set_follower", "params": { device: string, remove?: boolean, enabled?: boolean, trim_ms?: number, volume_db?: number, 
+/**
+ * Its output pair ([`FollowerConfig::output_channels`]; `[0, 1]`:
+ * the first two).
+ */
+output_channels?: OutputChannels, 
+/**
+ * Whether it follows the master's level
+ * ([`FollowerConfig::follow_volume`]).
+ */
+follow_volume?: boolean, 
+/**
+ * The follower's own chain: a JSON merge patch over chain A
+ * ([`FollowerConfig::chain_patch`]); `{}` clears it (chain A).
+ */
+chain_patch?: Record<string, unknown>, 
+/**
+ * Its device period, ms ([`FollowerConfig::period_ms`]); `0`: the
+ * default again.
+ */
+period_ms?: number, } } | { "method": "list_streams" } | { "method": "list_presets" } | { "method": "get_preset", "params": { name: string, part?: PresetPart, } } | { "method": "save_preset", "params": { name: string, overwrite: boolean, part?: PresetPart, parts?: Array<PresetPart>, } } | { "method": "load_preset", "params": { name: string, part?: PresetPart, } } | { "method": "blank_preset", "params": { part: PresetPart, } } | { "method": "delete_preset", "params": { name: string, part?: PresetPart, } } | { "method": "rename_preset", "params": { from: string, to: string, part?: PresetPart, } } | { "method": "import_apo", "params": { name: string, text: string, } } | { "method": "list_devices" } | { "method": "assign_devices", "params": { assignments: Array<DeviceAssignment>, } } | { "method": "route", "params": { target: RouteTarget, sink: SinkChoice, } } | { "method": "set_stream_volume", "params": { node: number, volume_db?: number, muted?: boolean, } } | { "method": "set_routing_mode", "params": RoutingMode } | { "method": "now_playing" } | { "method": "self_test" } | { "method": "measure_play", "params": MeasurePlayRequest } | { "method": "measure_stop" } | { "method": "measure_status" } | { "method": "bundle_load", "params": { path: string, } } | { "method": "bundle_unload" } | { "method": "bundle_show" } | { "method": "bundle_ab", "params": { path: string | null, } } | { "method": "bundle_gain", "params": { device: string | null, gain_db: number | null, } } | { "method": "conv_response", "params": { side?: AbSide, device?: string, } } | { "method": "upsampler_response", "params": { config: UpsamplerConfig | null, source_rate: number | null, 
 /**
  * Also evaluate this frequency window directly from the measured
  * impulse (zoom). Reuses the cached measurement.

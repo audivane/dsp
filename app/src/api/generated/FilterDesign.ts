@@ -6,6 +6,7 @@ import type { Decimation } from "./Decimation";
 import type { InterpMethod } from "./InterpMethod";
 import type { Length } from "./Length";
 import type { Numerics } from "./Numerics";
+import type { OptimalMethod } from "./OptimalMethod";
 import type { Overlap } from "./Overlap";
 import type { Phase } from "./Phase";
 import type { Rates } from "./Rates";
@@ -15,4 +16,9 @@ import type { Window } from "./Window";
  * A custom filter design on the wire: the [`FilterDesign`] plus an optional
  * `based_on` catalogue name recorded when copying a preset into Custom.
  */
-export type FilterDesign = { based_on?: string, } & ({ "kind": "windowed_sinc", window: Window, length: Length, decimation: Decimation, cutoff: Cutoff, phase: Phase, preserve_samples: boolean, rates: Rates | null, numerics: Numerics, } | { "kind": "lanczos", lobes: number, decimation: Decimation, phase: Phase, preserve_samples: boolean, rates: Rates | null, numerics: Numerics, } | { "kind": "cascade", stage: CascadeStage, } | { "kind": "interpolator", method: InterpMethod, } | { "kind": "block_fft", block: BlockSize, overlap: Overlap, });
+export type FilterDesign = { based_on?: string, } & ({ "kind": "windowed_sinc", window: Window, length: Length, decimation: Decimation, cutoff: Cutoff, phase: Phase, preserve_samples: boolean, rates: Rates | null, numerics: Numerics, } | { "kind": "lanczos", lobes: number, decimation: Decimation, phase: Phase, preserve_samples: boolean, rates: Rates | null, numerics: Numerics, } | { "kind": "optimal", method: OptimalMethod, length: Length, passband_end: number, stopband_start: number, decimation: Decimation, phase: Phase, 
+/**
+ * Always false (an optimal low-pass is not a Nyquist filter); on
+ * the wire so the design kinds share their fields.
+ */
+preserve_samples: boolean, rates: Rates | null, numerics: Numerics, } | { "kind": "cascade", stage: CascadeStage, } | { "kind": "interpolator", method: InterpMethod, } | { "kind": "block_fft", block: BlockSize, overlap: Overlap, });

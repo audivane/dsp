@@ -52,6 +52,9 @@ impl CallError {
     }
 }
 
+/// The daemon's `RpcError::SUPERSEDED` (docs/control-plane.md).
+const DAEMON_SUPERSEDED: i32 = 5;
+
 impl std::fmt::Display for CallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} ({})", self.message, self.code)
@@ -80,30 +83,73 @@ impl Conn {
 
 pub type PathFn = Arc<dyn Fn() -> PathBuf + Send + Sync>;
 
-/// Request connection to the daemon, plus a dedicated lazily-opened analysis
-/// connection so heavy calls (`upsampler_response`) never stall controls.
+/// Request connection to the daemon, plus dedicated lazily-opened connections
+/// so heavy calls never stall controls: the analysis one (`upsampler_response`)
+/// and one per design call ([`BuildLane`]).
 pub struct DaemonClient {
     path: PathFn,
     conn: Mutex<Option<Arc<Conn>>>,
     analysis_conn: Mutex<Option<Arc<Conn>>>,
+    build_conns: [Mutex<Option<Arc<Conn>>>; BuildLane::COUNT],
     analysis_seq: AtomicU64,
     next_id: AtomicU64,
 }
 
-/// Default reply timeout. `self_test` plays a signal and gets longer;
-/// heavy analysis calls get 120 s on their own connection.
+/// Default reply timeout. `self_test` plays a signal and gets longer.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SLOW_CALL_TIMEOUT: Duration = Duration::from_secs(60);
-pub const ANALYSIS_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// The calls that may design a filter: the engine answers once the design is
+/// built (tens of seconds for the longest kernels it accepts), so a timeout
+/// here means a wedged engine, not a slow design.
+pub const BUILD_CALL_TIMEOUT: Duration = Duration::from_secs(600);
+/// `upsampler_response` designs the kernel it measures (when it is not
+/// cached): as long as a build.
+pub const ANALYSIS_CALL_TIMEOUT: Duration = BUILD_CALL_TIMEOUT;
 
 pub fn is_analysis_method(method: &str) -> bool {
     method == "upsampler_response"
 }
 
+/// The design calls that run on their own connection: the daemon answers
+/// one connection's requests in order, so a long build on the request
+/// connection would hold `status`, `get_config` and every edit behind it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildLane {
+    /// `set_upsampler`: the app sends one at a time (its edits queue).
+    Upsampler,
+    /// `check_design`: the editor's live check, beside a build.
+    Check,
+}
+
+impl BuildLane {
+    const COUNT: usize = 2;
+
+    pub fn of(method: &str) -> Option<Self> {
+        match method {
+            "set_upsampler" => Some(Self::Upsampler),
+            "check_design" => Some(Self::Check),
+            _ => None,
+        }
+    }
+
+    fn thread_name(self) -> &'static str {
+        match self {
+            Self::Upsampler => "avdsp-ui-build",
+            Self::Check => "avdsp-ui-check",
+        }
+    }
+}
+
 pub fn timeout_for(method: &str) -> Duration {
     match method {
         "upsampler_response" => ANALYSIS_CALL_TIMEOUT,
-        "self_test" | "acquire_device" | "release_device" | "set_config" => SLOW_CALL_TIMEOUT,
+        // Each may design the upsampler's kernel (`set_config`,
+        // `load_preset` and `set_ab` with an upsampler or a side B that
+        // needs one).
+        "set_upsampler" | "check_design" | "set_config" | "load_preset" | "set_ab" => {
+            BUILD_CALL_TIMEOUT
+        }
+        "self_test" | "acquire_device" | "release_device" => SLOW_CALL_TIMEOUT,
         _ => CALL_TIMEOUT,
     }
 }
@@ -146,19 +192,24 @@ impl DaemonClient {
             path,
             conn: Mutex::new(None),
             analysis_conn: Mutex::new(None),
+            build_conns: Default::default(),
             analysis_seq: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
         }
     }
 
-    fn connection(&self) -> Result<Arc<Conn>, CallError> {
-        let mut slot = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+    fn connection(&self, lane: Option<BuildLane>) -> Result<Arc<Conn>, CallError> {
+        let (slot, name) = match lane {
+            None => (&self.conn, "avdsp-ui-replies"),
+            Some(l) => (&self.build_conns[l as usize], l.thread_name()),
+        };
+        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = slot.as_ref()
             && c.alive.load(Ordering::SeqCst)
         {
             return Ok(c.clone());
         }
-        let conn = open_conn(&(self.path)(), "avdsp-ui-replies")?;
+        let conn = open_conn(&(self.path)(), name)?;
         *slot = Some(conn.clone());
         Ok(conn)
     }
@@ -176,6 +227,11 @@ impl DaemonClient {
         {
             c.kill();
         }
+        for slot in &self.build_conns {
+            if let Some(c) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                c.kill();
+            }
+        }
     }
 
     /// Call `method`. `params: None` omits the field (unit calls such as
@@ -191,7 +247,7 @@ impl DaemonClient {
         if is_analysis_method(method) {
             self.send_analysis(obj, timeout)
         } else {
-            self.send(obj, timeout)
+            self.send(obj, timeout, BuildLane::of(method))
         }
     }
 
@@ -220,19 +276,32 @@ impl DaemonClient {
                 message: "use the event channel instead of `subscribe`".into(),
             });
         }
+        // `"lane": "upsampler"` sends a read behind the upsampler's build (the
+        // daemon answers a connection in order), so its reply comes once that
+        // build is done: a client that stopped waiting learns its outcome
+        // without sending the change again.
+        let after_build = obj.get("lane").and_then(Value::as_str) == Some("upsampler");
         obj.retain(|k, _| k == "method" || k == "params");
+        if after_build {
+            return self.send(obj, BUILD_CALL_TIMEOUT, Some(BuildLane::Upsampler));
+        }
         let timeout = timeout_for(&method);
         if is_analysis_method(&method) {
             self.send_analysis(obj, timeout)
         } else {
-            self.send(obj, timeout)
+            self.send(obj, timeout, BuildLane::of(&method))
         }
     }
 
-    fn send(&self, mut obj: Map<String, Value>, timeout: Duration) -> Result<Value, CallError> {
+    fn send(
+        &self,
+        mut obj: Map<String, Value>,
+        timeout: Duration,
+        lane: Option<BuildLane>,
+    ) -> Result<Value, CallError> {
         // One retry: a connection that died since the last call is replaced.
         for attempt in 0..2 {
-            let conn = self.connection()?;
+            let conn = self.connection(lane)?;
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             obj.insert("id".into(), json!(id));
             let mut line = serde_json::to_vec(&obj).expect("JSON values always serialize");
@@ -421,12 +490,18 @@ fn outcome(v: &Value) -> Reply {
         return Ok(ok.clone());
     }
     if let Some(err) = v.get("error") {
+        let code = err
+            .get("code")
+            .and_then(Value::as_i64)
+            .and_then(|c| i32::try_from(c).ok())
+            .unwrap_or(-32603);
+        // The daemon dropped a queued slow call for a newer one of the same
+        // method: one superseded code for the webview, client- or daemon-side.
+        if code == DAEMON_SUPERSEDED {
+            return Err(CallError::superseded());
+        }
         return Err(CallError {
-            code: err
-                .get("code")
-                .and_then(Value::as_i64)
-                .and_then(|c| i32::try_from(c).ok())
-                .unwrap_or(-32603),
+            code,
             message: err
                 .get("message")
                 .and_then(Value::as_str)

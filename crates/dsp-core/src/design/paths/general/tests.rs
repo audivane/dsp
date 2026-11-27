@@ -86,6 +86,20 @@ pub(crate) fn windows() -> Vec<(&'static str, Window)> {
                 sampling: Periodic,
             },
         ),
+        (
+            "dpss",
+            Window::Dpss {
+                nw: Some(5.0),
+                sampling: Symmetric,
+            },
+        ),
+        (
+            "dpss_auto_nw",
+            Window::Dpss {
+                nw: None,
+                sampling: Symmetric,
+            },
+        ),
         ("nuttall", Window::Nuttall { sampling: Periodic }),
         (
             "hann",
@@ -117,6 +131,7 @@ fn band(pe: f64, se: f64, a: f64) -> Cutoff {
     Cutoff::Band(BandSpec {
         passband_end: pe,
         stopband_start: se,
+        passband_end_hz: None,
         attenuation_db: a,
     })
 }
@@ -225,7 +240,7 @@ fn windows_and_samplings_on_every_path() {
     use ArithmeticPath::*;
     let fc = Cutoff::Fraction(Stepped::Fixed(0.9));
     for (name, w) in windows() {
-        if name == "kaiser_auto_beta" {
+        if name.ends_with("_auto_beta") || name.ends_with("_auto_nw") {
             continue;
         }
         for path in [
@@ -268,6 +283,7 @@ fn band_lengths_keep_their_promise() {
             "hann" => 70.0,
             "nuttall" => 100.0,
             "kaiser" => 110.0,
+            "dpss" => 130.0,
             _ => 140.0,
         };
         let k = sinc(w, Length::Band, band(0.9, 1.0, a), Phase::Linear);
@@ -366,7 +382,7 @@ fn automatic_lengths_keep_their_budget() {
 #[test]
 fn nyquist_stop_keeps_the_nominal_stopband() {
     for (name, w) in windows() {
-        if name == "kaiser_auto_beta" {
+        if name.ends_with("_auto_beta") || name.ends_with("_auto_nw") {
             continue;
         }
         let k = sinc(
@@ -411,7 +427,7 @@ fn reflected_phases_on_every_window() {
     let fc = Cutoff::Fraction(Stepped::Fixed(0.9));
     let mut designs: Vec<(String, KernelDesign)> = windows()
         .into_iter()
-        .filter(|(n, _)| *n != "kaiser_auto_beta")
+        .filter(|(n, _)| !n.ends_with("_auto_beta") && !n.ends_with("_auto_nw"))
         .flat_map(|(name, w)| {
             let fc = fc.clone();
             [
@@ -464,7 +480,7 @@ fn reflected_phases_on_every_window() {
 #[test]
 fn preserve_samples_keeps_the_input() {
     for (name, w) in windows() {
-        if name == "kaiser_auto_beta" {
+        if name.ends_with("_auto_beta") || name.ends_with("_auto_nw") {
             continue;
         }
         let mut k = sinc(
@@ -562,7 +578,7 @@ fn cepstral_blends_and_fixed_lengths() {
 fn calibrate_phase_floors() {
     let fc = band(0.9, 1.0, 100.0);
     for (name, w) in windows() {
-        if name == "kaiser_auto_beta" {
+        if name.ends_with("_auto_beta") || name.ends_with("_auto_nw") {
             continue;
         }
         for t in [31usize, 127, 511] {
@@ -617,7 +633,7 @@ fn calibrate_phase_floors() {
 #[ignore]
 fn probe_reflect() {
     for (name, w) in windows() {
-        if name == "kaiser_auto_beta" {
+        if name.ends_with("_auto_beta") || name.ends_with("_auto_nw") {
             continue;
         }
         let w = symmetric(w);
@@ -663,11 +679,15 @@ fn calibrate_search_start() {
                 beta: Some(20.0),
                 sampling,
             },
+            Window::Dpss { nw: None, sampling } => Window::Dpss {
+                nw: Some(6.37),
+                sampling,
+            },
             w => w,
         })
         .unwrap();
         for a in [60.0, 90.0, 120.0, 150.0, 180.0] {
-            if name != "kaiser_auto_beta" && a > max {
+            if !name.contains("_auto_") && a > max {
                 continue;
             }
             for (pe, se) in [(0.9, 1.0), (0.8, 1.0), (0.95, 1.05)] {
@@ -856,4 +876,363 @@ fn the_length_rule_sets_the_grid_taps() {
     );
     d.numerics.path = ArithmeticPath::DoubleDouble;
     assert_eq!(taps(&d, 44_100, RateRatio::integer(8)), 4095);
+}
+
+/// An optimal design of `method` on the fir path.
+fn optimal(method: crate::design::OptimalMethod, length: Length, phase: Phase) -> KernelDesign {
+    KernelDesign {
+        shape: Shape::Optimal {
+            method,
+            length,
+            passband_end: 0.9,
+            stopband_start: 1.0,
+        },
+        ..sinc(
+            Window::Hann {
+                sampling: Sampling::Symmetric,
+            },
+            Length::PerInput(Stepped::Fixed(1)),
+            Cutoff::Fraction(Stepped::Fixed(1.0)),
+            phase,
+        )
+    }
+}
+
+/// The optimal designs build at integer, rational and decimating ratios
+/// with every phase, their automatic lengths keep the budget, and a
+/// length or depth past their limits is refused.
+#[test]
+fn optimal_designs_build_and_keep_their_budget() {
+    use crate::design::OptimalMethod::*;
+    let phases = [
+        Phase::Linear,
+        Phase::Minimum(PhaseMethod::Cepstral),
+        Phase::Minimum(PhaseMethod::Reflect),
+        Phase::Intermediate {
+            mix: 0.5,
+            method: PhaseMethod::Cepstral,
+        },
+        Phase::Intermediate {
+            mix: 0.5,
+            method: PhaseMethod::Reflect,
+        },
+    ];
+    for method in [Equiripple, LeastSquares] {
+        for phase in phases {
+            let k = optimal(method, Length::PerInput(Stepped::Fixed(96)), phase);
+            // 44.1 to 48 kHz puts 160 samples per input on the grid: an
+            // equiripple design that fits its tap limit there is too
+            // shallow for the safety gate (a known limit). 32 to 48 kHz
+            // is 3/2.
+            for (src, ratio) in [
+                (44_100, RateRatio::integer(8)),
+                (32_000, RateRatio::from_rates(32_000, 48_000)),
+                (96_000, RateRatio::from_rates(96_000, 48_000)),
+            ] {
+                let p = match prepare(&FilterDesign::Kernel(k.clone()), &cx(src, ratio)) {
+                    Ok(p) => p,
+                    // A short reflected blend can need more than four times
+                    // its length (the reflection's own refusal).
+                    Err(DesignError::Phase(e))
+                        if matches!(phase, Phase::Intermediate { .. })
+                            && e.to_string().contains("more than 4 times") =>
+                    {
+                        continue;
+                    }
+                    Err(e) => panic!("{method:?} {phase:?} at {ratio}: {e}"),
+                };
+                let h = p.kernel.unwrap().taps;
+                assert!(
+                    h.len() >= 95,
+                    "{method:?} {phase:?} at {ratio}: {}",
+                    h.len()
+                );
+                // The linear kernel is odd and symmetric.
+                if phase == Phase::Linear {
+                    assert_eq!(h.len() % 2, 1);
+                    assert_eq!(h[0], h[h.len() - 1]);
+                }
+            }
+        }
+        // Automatic: the budget kept, linear and minimum phase.
+        let a = match method {
+            Equiripple => 140.0,
+            LeastSquares => 120.0,
+        };
+        for phase in [Phase::Linear, Phase::Minimum(PhaseMethod::Reflect)] {
+            let k = optimal(method, Length::Auto(FilterErrorBudget::Db(a)), phase);
+            for (src, ratio) in [
+                (44_100, RateRatio::integer(8)),
+                (32_000, RateRatio::from_rates(32_000, 48_000)),
+            ] {
+                let p = prepare(&FilterDesign::Kernel(k.clone()), &cx(src, ratio))
+                    .unwrap_or_else(|e| panic!("{method:?} {phase:?} at {ratio}: {e}"));
+                let m = measured(
+                    &p,
+                    Claim {
+                        pass: 0.9,
+                        stop: 1.0,
+                        db: a,
+                    },
+                );
+                assert!(m >= a, "{method:?} {phase:?} at {ratio}: {m} dB");
+            }
+        }
+    }
+    // Past the limits: refused, before anything is designed.
+    let long = optimal(
+        Equiripple,
+        Length::PerInput(Stepped::Fixed(4096)),
+        Phase::Linear,
+    );
+    let e = crate::design::feasibility(
+        &FilterDesign::Kernel(long),
+        &cx(44_100, RateRatio::integer(8)),
+    )
+    .unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("is built (its cost grows with the square of the length) up to 4095"),
+        "{e}"
+    );
+    // A fixed length past what f64 levels, or (equiripple) short of the
+    // depth the branches' DC needs: refused cheaply, as the build would.
+    let refused = |k: KernelDesign, ratio: u32, want: &str| {
+        let e = crate::design::feasibility(
+            &FilterDesign::Kernel(k),
+            &cx(44_100, RateRatio::integer(ratio)),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains(want), "{e}");
+    };
+    refused(
+        optimal(Equiripple, Length::Fixed(1279), Phase::Linear),
+        2,
+        "past the 160 dB f64 levels its ripple to",
+    );
+    refused(
+        optimal(
+            Equiripple,
+            Length::PerInput(Stepped::Fixed(64)),
+            Phase::Linear,
+        ),
+        8,
+        "adds up in each of the 8 polyphase branches",
+    );
+    refused(
+        optimal(
+            LeastSquares,
+            Length::PerInput(Stepped::Fixed(512)),
+            Phase::Linear,
+        ),
+        2,
+        "far past its 137 to 153 dB floor",
+    );
+    refused(
+        optimal(
+            LeastSquares,
+            Length::PerInput(Stepped::Fixed(32)),
+            Phase::Linear,
+        ),
+        16,
+        "too shallow for the 16 polyphase branches",
+    );
+    // A shallow automatic equiripple design grows until its branches pass
+    // the gate.
+    for ratio in [2, 8, 16] {
+        let k = optimal(
+            Equiripple,
+            Length::Auto(FilterErrorBudget::Db(55.0)),
+            Phase::Linear,
+        );
+        prepare(
+            &FilterDesign::Kernel(k),
+            &cx(44_100, RateRatio::integer(ratio)),
+        )
+        .unwrap_or_else(|e| panic!("55 dB at x{ratio}: {e}"));
+    }
+    let deep = optimal(
+        LeastSquares,
+        Length::Auto(FilterErrorBudget::Db(150.0)),
+        Phase::Linear,
+    );
+    let e = crate::design::feasibility(
+        &FilterDesign::Kernel(deep),
+        &cx(44_100, RateRatio::integer(8)),
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("length.budget"), "{e}");
+    // Not on the standard path, nor with preserved samples.
+    let mut std_path = optimal(
+        Equiripple,
+        Length::PerInput(Stepped::Fixed(64)),
+        Phase::Linear,
+    );
+    std_path.numerics.path = ArithmeticPath::Standard;
+    std_path.numerics.grid_cutoff = GridCutoff::DesignRatio;
+    std_path.decimation = Decimation::Keep;
+    let e = crate::design::feasibility(
+        &FilterDesign::Kernel(std_path),
+        &cx(44_100, RateRatio::integer(8)),
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("numerics.path"), "{e}");
+}
+
+/// The new designs against Kaiser: the automatic length each needs for a
+/// budget over 0.9 ..= 1.0 of the Nyquist, and at one length the error over
+/// that band (Kaiser with its best beta, cutoff midway).
+#[test]
+#[ignore]
+fn compare_with_kaiser() {
+    use crate::design::OptimalMethod::*;
+    let sym = Sampling::Symmetric;
+    let claim = |a| Claim {
+        pass: 0.9,
+        stop: 1.0,
+        db: a,
+    };
+    let auto_len = |k: KernelDesign, ratio| {
+        let t = std::time::Instant::now();
+        let r = prepare(&FilterDesign::Kernel(k), &cx(44_100, ratio));
+        let s = t.elapsed().as_secs_f64();
+        match r {
+            Ok(p) => format!("{} taps ({s:.2} s)", p.kernel.unwrap().taps.len()),
+            Err(e) => format!("refused: {e}"),
+        }
+    };
+    for ratio in [RateRatio::integer(8), RateRatio::integer(64)] {
+        for a in [100.0, 120.0, 140.0, 160.0] {
+            let budget = Length::Auto(FilterErrorBudget::Db(a));
+            let band = band(0.9, 1.0, a);
+            let kaiser = sinc(
+                Window::Kaiser {
+                    beta: None,
+                    sampling: sym,
+                },
+                budget.clone(),
+                band.clone(),
+                Phase::Linear,
+            );
+            let dpss = sinc(
+                Window::Dpss {
+                    nw: None,
+                    sampling: sym,
+                },
+                budget.clone(),
+                band.clone(),
+                Phase::Linear,
+            );
+            println!(
+                "{ratio} {a} dB: kaiser {} | dpss {} | equiripple {} | least squares {}",
+                auto_len(kaiser, ratio),
+                auto_len(dpss, ratio),
+                auto_len(optimal(Equiripple, budget.clone(), Phase::Linear), ratio),
+                if a <= check::optimal_max_db(LeastSquares) {
+                    auto_len(optimal(LeastSquares, budget.clone(), Phase::Linear), ratio)
+                } else {
+                    "over its floor".into()
+                },
+            );
+        }
+    }
+    // One length: the error over the band.
+    let ratio = RateRatio::integer(8);
+    for t in [64usize, 96, 128, 160, 192] {
+        let per = Length::PerInput(Stepped::Fixed(t));
+        let err = |k: KernelDesign| match prepare(&FilterDesign::Kernel(k), &cx(44_100, ratio)) {
+            Ok(p) => format!("{:.1} dB", measured(&p, claim(0.0))),
+            Err(e) => format!("refused ({e})"),
+        };
+        let fc = Cutoff::Fraction(Stepped::Fixed(0.95));
+        let best = |w: &dyn Fn(f64) -> Window, lo: f64, hi: f64| {
+            let mut best = (f64::NEG_INFINITY, 0.0);
+            let mut x = lo;
+            while x <= hi {
+                let k = sinc(w(x), per.clone(), fc.clone(), Phase::Linear);
+                if let Ok(p) = prepare(&FilterDesign::Kernel(k), &cx(44_100, ratio)) {
+                    let m = measured(&p, claim(0.0));
+                    if m > best.0 {
+                        best = (m, x);
+                    }
+                }
+                x += (hi - lo) / 80.0;
+            }
+            best
+        };
+        let (kd, kb) = best(
+            &|b| Window::Kaiser {
+                beta: Some(b),
+                sampling: sym,
+            },
+            2.0,
+            30.0,
+        );
+        let (dd, dn) = best(
+            &|nw| Window::Dpss {
+                nw: Some(nw),
+                sampling: sym,
+            },
+            1.0,
+            9.5,
+        );
+        println!(
+            "x8 {t} per input ({} taps): kaiser {kd:.1} dB (beta {kb:.2}) | dpss {dd:.1} dB (nw \
+             {dn:.2}) | equiripple {} | least squares {}",
+            t * 8 - 1,
+            err(optimal(Equiripple, per.clone(), Phase::Linear)),
+            err(optimal(LeastSquares, per.clone(), Phase::Linear)),
+        );
+    }
+}
+
+/// A band with an absolute passband end (`passband_end_hz`) keeps that
+/// frequency at every source rate: the same fraction at 44.1 kHz (the
+/// fraction field, so the kernel's bits do not move), a shorter kernel at a
+/// higher rate, and the fraction where the frequency reaches the stopband.
+#[test]
+fn a_pinned_passband_does_not_scale_with_the_source_rate() {
+    let spec = |hz: Option<f64>| BandSpec {
+        passband_end: 20_000.0 / 22_050.0,
+        passband_end_hz: hz,
+        stopband_start: 1.0,
+        attenuation_db: 150.0,
+    };
+    let design = |hz| {
+        sinc(
+            Window::Kaiser {
+                beta: None,
+                sampling: Sampling::Symmetric,
+            },
+            Length::Band,
+            Cutoff::Band(spec(hz)),
+            Phase::Minimum(PhaseMethod::Reflect),
+        )
+    };
+    let taps = |rate: u32| {
+        let c = cx(rate, RateRatio::integer(2));
+        let p = prepare(&FilterDesign::Kernel(design(Some(20_000.0))), &c).unwrap();
+        p.kernel.unwrap().taps.len()
+    };
+    assert_eq!(taps(44_100), 477);
+    assert!(taps(96_000) < 477);
+    // 30 kHz is past the 22.05 kHz Nyquist at 44.1 kHz: not inside the
+    // band, so the fraction stands there, bit for bit.
+    let at = |hz| {
+        prepare(
+            &FilterDesign::Kernel(design(hz)),
+            &cx(44_100, RateRatio::integer(2)),
+        )
+        .unwrap()
+        .kernel
+        .unwrap()
+        .taps
+    };
+    assert_eq!(at(Some(30_000.0)), at(None));
+    // Without the Hz field the fraction stands, as every custom design's.
+    let e = prepare(
+        &FilterDesign::Kernel(design(None)),
+        &cx(44_100, RateRatio::integer(2)),
+    );
+    assert!(e.is_ok());
 }

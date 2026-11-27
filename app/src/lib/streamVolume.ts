@@ -54,7 +54,7 @@ export function streamLimitNote(r: StreamVolume): string | null {
 
 /** The readout: dB only (the desktop's percent is on another scale). */
 export function streamDbText(db: number | null): string {
-  if (db === null) return "—";
+  if (db === null) return "-";
   if (db <= -120) return "−∞ dB";
   return `${fmtDb(db, 1, false)} dB`;
 }

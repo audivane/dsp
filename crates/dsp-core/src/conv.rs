@@ -1,120 +1,18 @@
-//! Partitioned FFT convolution (non-uniform partitions for long IRs).
-//!
-//! # Partition schedule
-//!
-//! The IR is split into stages. Stage 0 is uniformly partitioned overlap-save
-//! (UPOLS) with the base block `B0` and runs immediately on every base block,
-//! so the convolver's latency is exactly `B0` frames (the FIFO pre-fill).
-//!
-//! Every later ("tail") stage `s` is UPOLS with a larger block `Bs` that covers
-//! IR samples `[Os, Os+1)`. Input block `k` of that stage (`Bs` frames) is
-//! complete at time `(k+1)·Bs`, and its sub-convolution belongs at output time
-//! `k·Bs + Os`. A tail stage computes block `k` during the whole next period
-//! `[(k+1)·Bs, (k+2)·Bs)` and plays it out during `[(k+2)·Bs, (k+3)·Bs)`, so its
-//! inherent delay is `2·Bs`. The schedule therefore requires `Os >= 2·Bs` and
-//! makes up the difference `Os - 2·Bs` (a multiple of `Bs`) exactly by reading
-//! older frequency-domain delay line slots. The default schedule grows blocks
-//! 4x per stage and starts every tail stage at exactly `Os = 2·Bs`:
-//!
-//! | stage | block  | IR range         | partitions |
-//! |-------|--------|------------------|------------|
-//! | 0     | `B0`   | `[0, 8·B0)`      | 8          |
-//! | 1     | `4·B0` | `[8·B0, 32·B0)`  | 6          |
-//! | s     | `B`    | `[2B, 8B)`       | 6          |
-//!
-//! Blocks are capped at 32768: the stage before the cap ends at IR offset
-//! 65536 (with 2 or 6 partitions depending on `B0`), and the last stage
-//! (`B = 32768`, `Os = 65536`) covers the rest of the IR.
-//!
-//! # Real-time cost
-//!
-//! Because each tail stage has a whole period of slack, its work (forward
-//! FFT, frequency-domain multiply-accumulate, inverse FFT) is time-sliced
-//! over the `Bs / B0` base blocks of that period, weighted by a measured
-//! per-job cost model, instead of running all at once on the block that
-//! completes it. Transforms with `Bs > DIRECT_FFT_MAX_BLOCK` use a four-step
-//! decomposition (`Bs = M·L`), so the biggest indivisible job is a few sub-FFTs
-//! of size ~`sqrt(Bs)` (a few µs); smaller stages use one real FFT per job.
-//! The worst single `process` call is therefore close to the mean.
+//! Partitioned FFT convolution (non-uniform partitions for long IRs), on
+//! the shared engine of `crate::nupc` with one branch per channel: the
+//! default schedule (`crate::nupc::plan_schedule`, blocks growing 4x per
+//! stage up to 32768, every tail stage at twice its block), stage 0 on the
+//! base block (the latency, `base_block` frames), the tail stages
+//! time-sliced over their periods. See `crate::nupc` for the schedule's
+//! rules and the slicing.
 
-use crate::Complex64;
 use crate::Stage;
-use crate::fft::{
-    RealFftPair, RingFifo, SplitSpectrum, complex_mac_split, complex_mac_split_range,
-    complex_mul_split, complex_mul_split_range,
-};
-use rustfft::{Fft, FftPlanner};
-use std::sync::Arc;
-
-/// Largest partition size of any stage.
-const MAX_PART: usize = 32_768;
-/// Block growth factor between consecutive stages.
-const GROWTH: usize = 4;
-/// Tail stages with blocks up to this size use one real FFT per transform;
-/// larger ones use the time-sliced four-step transform.
-const DIRECT_FFT_MAX_BLOCK: usize = 512;
-/// Frequency bins per multiply-accumulate job.
-const MAC_CHUNK: usize = 128;
-/// Target complex elements per batch of four-step sub-FFTs.
-const SUBFFT_BATCH: usize = 256;
-
-/// One stage of a partition schedule: UPOLS with `block`-frame partitions
-/// covering IR samples `[offset, end)` (`end == usize::MAX` for the last).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct StagePlan {
-    pub offset: usize,
-    pub block: usize,
-    pub end: usize,
-}
-
-/// The default schedule for a base block `base` and IR length `max_ir_len`.
-fn plan_schedule(base: usize, max_ir_len: usize) -> Vec<StagePlan> {
-    let mut plan = Vec::new();
-    let mut block = base;
-    let mut offset = 0;
-    loop {
-        let next_block = (block * GROWTH).min(MAX_PART);
-        // The next stage starts at exactly twice its block size.
-        let boundary = 2 * next_block;
-        let last = (block == MAX_PART && !plan.is_empty()) || boundary >= max_ir_len;
-        let end = if last { usize::MAX } else { boundary };
-        plan.push(StagePlan { offset, block, end });
-        if last {
-            return plan;
-        }
-        offset = end;
-        block = next_block;
-    }
-}
-
-fn validate_plan(plan: &[StagePlan], base: usize) {
-    assert!(!plan.is_empty(), "empty partition schedule");
-    assert_eq!(plan[0].offset, 0, "stage 0 must start at IR offset 0");
-    assert_eq!(plan[0].block, base, "stage 0 must use the base block");
-    assert_eq!(
-        plan.last().unwrap().end,
-        usize::MAX,
-        "the last stage must be open-ended"
-    );
-    for (s, st) in plan.iter().enumerate() {
-        assert!(st.end > st.offset, "stage {s} is empty: {st:?}");
-        if s == 0 {
-            continue;
-        }
-        assert_eq!(st.offset, plan[s - 1].end, "stage {s} is not contiguous");
-        assert!(
-            st.block.is_power_of_two() && st.block >= base && st.block.is_multiple_of(base),
-            "stage {s}: block {} must be a power-of-two multiple of {base}",
-            st.block
-        );
-        assert!(
-            st.offset >= 2 * st.block && st.offset.is_multiple_of(st.block),
-            "stage {s}: offset {} must be a multiple of the block {} and at least twice it",
-            st.offset,
-            st.block
-        );
-    }
-}
+#[cfg(test)]
+use crate::fft::complex_mul_split;
+use crate::fft::{RealFftPair, RingFifo, SplitSpectrum};
+use crate::nupc::{HeadChannel, HeadStage, StagePlan, TailChannel, TailStage, validate_plan};
+#[cfg(test)]
+use crate::nupc::{MAX_PART, plan_schedule};
 
 /// Pre-FFT'd IR partitions of `ir[offset..end)`, scaled by `1 / (2 * block)`.
 fn ir_partitions(
@@ -139,739 +37,37 @@ fn ir_partitions(
         .collect()
 }
 
-// ---------------------------------------------------------------- stage 0
-
-/// Stage 0: UPOLS on the base block, computed immediately.
-struct HeadStage {
-    block_size: usize,
-    /// Indexed `[ir_idx][partition_idx]`.
-    ir_spectra: Vec<Vec<SplitSpectrum>>,
-    fft: RealFftPair,
-    acc: SplitSpectrum,
-    time_out: Vec<f64>,
+/// Stage 0 of the convolver: one branch, partitions `[ir][part][0]`.
+fn head_stage(irs: &[Vec<f64>], block: usize, end: usize) -> HeadStage {
+    let mut fft = RealFftPair::new(2 * block);
+    let spectra = irs
+        .iter()
+        .map(|ir| {
+            ir_partitions(&mut fft, ir, 0, block, end)
+                .into_iter()
+                .map(|s| vec![s])
+                .collect()
+        })
+        .collect();
+    HeadStage::from_spectra(block, 1, spectra)
 }
 
-impl HeadStage {
-    fn new(irs: &[Vec<f64>], block_size: usize, end: usize) -> Self {
-        let mut fft = RealFftPair::new(2 * block_size);
-        let ir_spectra = irs
-            .iter()
-            .map(|ir| ir_partitions(&mut fft, ir, 0, block_size, end))
-            .collect();
-        Self {
-            block_size,
-            ir_spectra,
-            acc: SplitSpectrum::new(fft.spec_len()),
-            time_out: vec![0.0; 2 * block_size],
-            fft,
-        }
-    }
-
-    /// Process one base block; the result overwrites `out[..block_size]`.
-    fn process_block(
-        &mut self,
-        ir_idx: usize,
-        ch: &mut HeadChannel,
-        input: &[f64],
-        out: &mut [f64],
-    ) {
-        let parts = &self.ir_spectra[ir_idx];
-        let num_parts = parts.len();
-        if num_parts == 0 {
-            out.fill(0.0);
-            return;
-        }
-
-        ch.fdl_head = (ch.fdl_head + 1) % num_parts;
-        self.fft
-            .forward_pair_into_split(&ch.prev_in, input, &mut ch.fdl[ch.fdl_head]);
-
-        complex_mul_split(&mut self.acc, &ch.fdl[ch.fdl_head], &parts[0]);
-        for (p, part) in parts.iter().enumerate().skip(1) {
-            let fdl_idx = (ch.fdl_head + num_parts - p) % num_parts;
-            complex_mac_split(&mut self.acc, &ch.fdl[fdl_idx], part);
-        }
-
-        self.fft.inverse_from_split(&self.acc, &mut self.time_out);
-        out.copy_from_slice(&self.time_out[self.block_size..]);
-        ch.prev_in.copy_from_slice(input);
-    }
-
-    /// Rough cost of one `process_block` in flop-like units.
-    fn block_cost(&self, ir_idx: usize) -> f64 {
-        let parts = self.ir_spectra[ir_idx].len();
-        if parts == 0 {
-            return 0.0;
-        }
-        2.0 * real_fft_cost(self.block_size) + NS_MAC * (self.block_size + 1) as f64 * parts as f64
-    }
-}
-
-struct HeadChannel {
-    prev_in: Vec<f64>,
-    fdl: Vec<SplitSpectrum>,
-    fdl_head: usize,
-}
-
-impl HeadChannel {
-    fn new(block_size: usize, spec_len: usize, num_parts: usize) -> Self {
-        Self {
-            prev_in: vec![0.0; block_size],
-            fdl: (0..num_parts)
-                .map(|_| SplitSpectrum::new(spec_len))
-                .collect(),
-            fdl_head: 0,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.prev_in.fill(0.0);
-        for spec in &mut self.fdl {
-            spec.clear();
-        }
-        self.fdl_head = 0;
-    }
-}
-
-// ---------------------------------------------------------------- tail stages
-
-// Job costs, in nanoseconds per element, measured on one x86-64 core in a
-// release build. Only their ratios matter: they decide how the work of a
-// period is spread over its base blocks.
-
-/// Direct real FFT of `2B` points, per `B·log2(2B)`.
-const NS_REAL_FFT: f64 = 0.42;
-/// Spectral multiply-accumulate, per bin and partition.
-const NS_MAC: f64 = 0.75;
-/// Four-step forward step A (gather, sub-FFTs, twiddle, scatter), per element.
-const NS_FWD_A: f64 = 4.4;
-/// Four-step inverse step A (gather, sub-FFTs, unpack), per element.
-const NS_INV_A: f64 = 2.8;
-/// Four-step step B (contiguous sub-FFTs), per element and `log2(l)`.
-const NS_STEP_B: f64 = 0.22;
-/// Real-FFT split after the forward step B, per bin.
-const NS_SPLIT: f64 = 2.9;
-/// Hermitian pack and twiddle around the inverse step B, per bin.
-const NS_PACK: f64 = 3.8;
-
-fn real_fft_cost(block: usize) -> f64 {
-    NS_REAL_FFT * block as f64 * (2.0 * block as f64).log2()
-}
-
-/// Plans and tables of a time-sliced complex FFT of size `b = m * l`
-/// (four-step), used to build the length-`2b` real transforms of the large
-/// tail stages. All sizes are powers of two.
-///
-/// Forward, with `n = l*n1 + n2` and `k = k1 + m*k2`:
-/// `Z[k1 + m*k2] = Σ_n2 e^{-2πi n2 k2 / l} · w^{n2 k1} · Σ_n1 z[l*n1 + n2] e^{-2πi n1 k1 / m}`
-/// (`w = e^{-2πi / b}`). Step A does the inner size-`m` FFTs a few columns
-/// `n2` at a time and stores the twiddled result transposed
-/// (`work[k1*l + n2]`); step B does the size-`l` FFTs on contiguous rows,
-/// leaving `Z[k1 + m*k2]` in `work[k1*l + k2]`, and splits the packed
-/// complex transform into the real one row pair by row pair.
-///
-/// Spectra of four-step stages stay in that order: position `p = k1*l + k2`
-/// holds bin `k = k1 + m*k2`, and position `b` the Nyquist bin. The
-/// multiply-accumulate is elementwise, so the FDL and the IR spectra only
-/// need to agree, and no transpose back to natural order is ever needed.
-///
-/// The inverse runs the same decomposition backwards on that layout: size-`l`
-/// FFTs over `k2` on contiguous rows (after packing the Hermitian spectrum),
-/// twiddle, then size-`m` FFTs over `k1` per column, which produce
-/// `z[l*n1 + n2]`.
-struct FourStepTables {
-    b: usize,
-    m: usize,
-    l: usize,
-    fwd_m: Arc<dyn Fft<f64>>,
-    fwd_l: Arc<dyn Fft<f64>>,
-    inv_m: Arc<dyn Fft<f64>>,
-    inv_l: Arc<dyn Fft<f64>>,
-    /// Forward step-A twiddles `w^{n2 k1}` at `[n2 * m + k1]`.
-    tw_cols: Vec<Complex64>,
-    /// Inverse twiddles `w^{-n2 k1}` at `[k1 * l + n2]`.
-    tw_rows: Vec<Complex64>,
-    /// Forward split factor `-i/2 · e^{-iπ k / b}` at spectrum position `p`.
-    split: Vec<Complex64>,
-    /// Inverse pre-twiddle `i · e^{+iπ k / b}` at spectrum position `p`.
-    pre: Vec<Complex64>,
-    /// Columns per step-A job (forward and inverse).
-    cols_a: usize,
-    /// Rows per inverse step-B job.
-    rows_b: usize,
-}
-
-struct FourStep {
-    t: FourStepTables,
-    scratch: Vec<Complex64>,
-    gather: Vec<Complex64>,
-}
-
-impl FourStep {
-    fn new(b: usize) -> Self {
-        assert!(b.is_power_of_two() && b >= 16);
-        let bits = b.trailing_zeros();
-        let m = 1usize << (bits / 2);
-        let l = b / m;
-        let mut planner = FftPlanner::<f64>::new();
-        let fwd_m = planner.plan_fft_forward(m);
-        let fwd_l = planner.plan_fft_forward(l);
-        let inv_m = planner.plan_fft_inverse(m);
-        let inv_l = planner.plan_fft_inverse(l);
-        let scratch_len = [&fwd_m, &fwd_l, &inv_m, &inv_l]
-            .iter()
-            .map(|p| p.get_inplace_scratch_len())
-            .max()
-            .unwrap_or(0);
-        let tau = 2.0 * std::f64::consts::PI;
-        let cis = |num: usize, den: usize, sign: f64| {
-            Complex64::from_polar(1.0, sign * tau * num as f64 / den as f64)
-        };
-        let tw_cols = (0..b).map(|i| cis((i / m) * (i % m), b, -1.0)).collect();
-        let tw_rows = (0..b).map(|i| cis((i / l) * (i % l), b, 1.0)).collect();
-        let bin = |p: usize| p / l + m * (p % l);
-        let split = (0..b)
-            .map(|p| Complex64::new(0.0, -0.5) * cis(bin(p), 2 * b, -1.0))
-            .collect();
-        let pre = (0..b)
-            .map(|p| Complex64::i() * cis(bin(p), 2 * b, 1.0))
-            .collect();
-        let cols_a = (SUBFFT_BATCH / m).clamp(1, l);
-        Self {
-            t: FourStepTables {
-                b,
-                m,
-                l,
-                fwd_m,
-                fwd_l,
-                inv_m,
-                inv_l,
-                tw_cols,
-                tw_rows,
-                split,
-                pre,
-                cols_a,
-                rows_b: (SUBFFT_BATCH / l).clamp(1, m),
-            },
-            scratch: vec![Complex64::new(0.0, 0.0); scratch_len],
-            gather: vec![Complex64::new(0.0, 0.0); cols_a * m],
-        }
-    }
-}
-
-impl FourStepTables {
-    /// A natural-order spectrum (`b + 1` bins) in spectrum order.
-    fn permute(&self, nat: &SplitSpectrum) -> SplitSpectrum {
-        let mut out = SplitSpectrum::new(self.b + 1);
-        for p in 0..self.b {
-            let k = p / self.l + self.m * (p % self.l);
-            out.re[p] = nat.re[k];
-            out.im[p] = nat.im[k];
-        }
-        out.re[self.b] = nat.re[self.b];
-        out.im[self.b] = nat.im[self.b];
-        out
-    }
-
-    /// Row `k1`'s mirror: `Z[b - k]` for `k = k1 + m*k2` sits at
-    /// `base - k2` (row 0 mirrors onto itself shifted by one; its `k2 = 0`
-    /// entry pairs with itself / the Nyquist bin and is handled separately).
-    #[inline]
-    fn mirror_base(&self, k1: usize) -> usize {
-        if k1 == 0 {
-            self.l
-        } else {
-            (self.m - k1) * self.l + self.l - 1
-        }
-    }
-
-    /// Number of forward step-B jobs: row pairs `{k1, m - k1}` for
-    /// `k1 in 0..=m/2`.
-    fn fwd_b_jobs(&self) -> usize {
-        self.m / 2 + 1
-    }
-
-    /// Forward step A for columns `cols`: gather `z[l*n1 + n2]` from the
-    /// `2b`-sample real block `[prev, cur]` (`z[n] = x[2n] + i x[2n+1]`),
-    /// size-`m` FFTs, twiddle, and store transposed in `work`.
-    fn fwd_a(
-        &self,
-        g: &mut [Complex64],
-        scratch: &mut [Complex64],
-        work: &mut [Complex64],
-        cols: std::ops::Range<usize>,
-        prev: &[f64],
-        cur: &[f64],
-    ) {
-        let (m, l, b) = (self.m, self.l, self.b);
-        let r = cols.len();
-        let g = &mut g[..r * m];
-        // Row-major: every input row contributes `r` adjacent sample pairs,
-        // so each cache line is read once.
-        for n1 in 0..m {
-            let base = 2 * (l * n1 + cols.start);
-            let src = if base < b {
-                &prev[base..base + 2 * r]
-            } else {
-                &cur[base - b..base - b + 2 * r]
-            };
-            for (j, pair) in src.as_chunks::<2>().0.iter().enumerate() {
-                g[j * m + n1] = Complex64::new(pair[0], pair[1]);
-            }
-        }
-        self.fwd_m.process_with_scratch(g, scratch);
-        for (col, n2) in g.chunks_exact_mut(m).zip(cols.clone()) {
-            for (v, w) in col.iter_mut().zip(&self.tw_cols[n2 * m..(n2 + 1) * m]) {
-                *v *= w;
-            }
-        }
-        for k1 in 0..m {
-            let dst = &mut work[k1 * l + cols.start..k1 * l + cols.end];
-            for (j, d) in dst.iter_mut().enumerate() {
-                *d = g[j * m + k1];
-            }
-        }
-    }
-
-    /// Forward step B for the row pair `{k1, m - k1}`, then the real split
-    /// of both rows into `dst`:
-    /// `X[k] = (Z[k] + Z*[b-k]) / 2 + (-i/2) W^k (Z[k] - Z*[b-k])`.
-    fn fwd_b_split(
-        &self,
-        scratch: &mut [Complex64],
-        work: &mut [Complex64],
-        dst: &mut SplitSpectrum,
-        k1: usize,
-    ) {
-        let (m, l, b) = (self.m, self.l, self.b);
-        let pair = (m - k1) % m;
-        self.fwd_l
-            .process_with_scratch(&mut work[k1 * l..(k1 + 1) * l], scratch);
-        if pair != k1 {
-            self.fwd_l
-                .process_with_scratch(&mut work[pair * l..(pair + 1) * l], scratch);
-        }
-        for row in [k1, pair] {
-            let start = row * l;
-            let first = if row == 0 {
-                // X[0] and the Nyquist bin (W^b = -1) come from Z[0] alone.
-                let z0 = work[0];
-                dst.re[0] = z0.re + z0.im;
-                dst.im[0] = 0.0;
-                dst.re[b] = z0.re - z0.im;
-                dst.im[b] = 0.0;
-                1
-            } else {
-                0
-            };
-            let base = self.mirror_base(row);
-            for k2 in first..l {
-                let zk = work[start + k2];
-                let zc = work[base - k2].conj();
-                let x = (zk + zc) * 0.5 + self.split[start + k2] * (zk - zc);
-                dst.re[start + k2] = x.re;
-                dst.im[start + k2] = x.im;
-            }
-            if pair == k1 {
-                break;
-            }
-        }
-    }
-
-    /// Inverse step B for rows `rows`: pack the Hermitian spectrum `y`
-    /// (spectrum order) into the length-`b` complex spectrum whose inverse is
-    /// `y[2m] + i y[2m+1]`:
-    /// `C[k] = (Y[k] + Y*[b-k]) + i e^{+iπk/b} (Y[k] - Y*[b-k])`,
-    /// then size-`l` inverse FFTs on the rows and the inverse twiddle. DC and
-    /// Nyquist imaginary parts are treated as zero, as `realfft` does.
-    fn inv_b(
-        &self,
-        scratch: &mut [Complex64],
-        work: &mut [Complex64],
-        y: &SplitSpectrum,
-        rows: std::ops::Range<usize>,
-    ) {
-        let (l, b) = (self.l, self.b);
-        for k1 in rows.clone() {
-            let start = k1 * l;
-            let first = if k1 == 0 {
-                let y0 = Complex64::new(y.re[0], 0.0);
-                let yb = Complex64::new(y.re[b], 0.0);
-                work[0] = (y0 + yb) + self.pre[0] * (y0 - yb);
-                1
-            } else {
-                0
-            };
-            let base = self.mirror_base(k1);
-            for k2 in first..l {
-                let p = start + k2;
-                let q = base - k2;
-                let yk = Complex64::new(y.re[p], y.im[p]);
-                let yc = Complex64::new(y.re[q], -y.im[q]);
-                work[p] = (yk + yc) + self.pre[p] * (yk - yc);
-            }
-        }
-        let span = rows.start * l..rows.end * l;
-        self.inv_l
-            .process_with_scratch(&mut work[span.clone()], scratch);
-        for (v, w) in work[span.clone()].iter_mut().zip(&self.tw_rows[span]) {
-            *v *= w;
-        }
-    }
-
-    /// Inverse step A for columns `cols`: size-`m` inverse FFTs over `k1`,
-    /// giving `z[l*n1 + n2]`; the second half of the time block
-    /// (`n1 >= m/2`) is unpacked into `out` (`y[2n], y[2n+1]` at `2n - b`).
-    fn inv_a(
-        &self,
-        g: &mut [Complex64],
-        scratch: &mut [Complex64],
-        work: &[Complex64],
-        cols: std::ops::Range<usize>,
-        out: &mut [f64],
-    ) {
-        let (m, l, b) = (self.m, self.l, self.b);
-        let r = cols.len();
-        let g = &mut g[..r * m];
-        for k1 in 0..m {
-            let src = &work[k1 * l + cols.start..k1 * l + cols.end];
-            for (j, &v) in src.iter().enumerate() {
-                g[j * m + k1] = v;
-            }
-        }
-        self.inv_m.process_with_scratch(g, scratch);
-        for n1 in m / 2..m {
-            let base = 2 * (l * n1 + cols.start) - b;
-            let dst = &mut out[base..base + 2 * r];
-            for (j, pair) in dst.as_chunks_mut::<2>().0.iter_mut().enumerate() {
-                let z = g[j * m + n1];
-                pair[0] = z.re;
-                pair[1] = z.im;
-            }
-        }
-    }
-
-    fn step_a_cost(&self, cols: usize, inverse: bool) -> f64 {
-        let ns = if inverse { NS_INV_A } else { NS_FWD_A };
-        ns * (cols * self.m) as f64
-    }
-
-    fn step_b_cost(&self, rows: usize) -> f64 {
-        NS_STEP_B * (rows * self.l) as f64 * (self.l as f64).log2()
-    }
-
-    fn fwd_b_cost(&self, k1: usize) -> f64 {
-        let rows = if k1 == 0 || 2 * k1 == self.m { 1 } else { 2 };
-        self.step_b_cost(rows) + NS_SPLIT * (rows * self.l) as f64
-    }
-}
-
-enum TailFft {
-    Direct {
-        fft: RealFftPair,
-        time_out: Vec<f64>,
-    },
-    FourStep(Box<FourStep>),
-}
-
-/// One slice of a tail stage's per-period work. The index says which
-/// chunk (columns, row pair, rows or bins) the job covers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Job {
-    /// Whole forward real FFT of `[prev, cur]` (small stages).
-    FwdDirect,
-    /// Four-step forward: step A columns, then step B + real split per row
-    /// pair.
-    FwdA(usize),
-    FwdB(usize),
-    /// Multiply-accumulate of all partitions over a chunk of bins.
-    Mac(usize),
-    /// Four-step inverse: pack + step B rows, then step A columns + unpack.
-    InvB(usize),
-    InvA(usize),
-    /// Whole inverse real FFT (small stages).
-    InvDirect,
-    Done,
-}
-
-/// A tail stage: UPOLS on `block`-frame partitions starting at an IR offset
-/// `>= 2 * block`, computed in slices across one period.
-struct TailStage {
-    block: usize,
-    /// Base blocks per period (`block / base`).
-    ticks: usize,
-    /// Extra whole-partition delay: `(offset - 2 * block) / block`.
-    delay_parts: usize,
-    /// Indexed `[ir_idx][partition_idx]`.
-    ir_spectra: Vec<Vec<SplitSpectrum>>,
-    engine: TailFft,
-}
-
-struct TailChannel {
-    num_parts: usize,
-    /// `num_parts + delay_parts` slots.
-    fdl: Vec<SplitSpectrum>,
-    fdl_head: usize,
-    /// Input blocks: `input[slot]` is being filled; the previous two are
-    /// being transformed.
-    input: [Vec<f64>; 3],
-    slot: usize,
-    /// Output for the current period (block `k - 2`).
-    out_cur: Vec<f64>,
-    /// Output being computed this period (block `k - 1`).
-    out_next: Vec<f64>,
-    acc: SplitSpectrum,
-    /// Four-step work buffer (empty for direct stages).
-    work: Vec<Complex64>,
-    /// Base-block index within the current period.
-    tick: usize,
-    job: Job,
-    done: f64,
-    total: f64,
-}
-
-impl TailChannel {
-    fn reset(&mut self) {
-        for spec in &mut self.fdl {
-            spec.clear();
-        }
-        self.fdl_head = 0;
-        for buf in &mut self.input {
-            buf.fill(0.0);
-        }
-        self.slot = 0;
-        self.out_cur.fill(0.0);
-        self.out_next.fill(0.0);
-        self.acc.clear();
-        self.work.fill(Complex64::new(0.0, 0.0));
-        self.tick = 0;
-        self.job = Job::Done;
-        self.done = 0.0;
-    }
-}
-
-impl TailStage {
-    fn new(irs: &[Vec<f64>], plan: StagePlan, base: usize) -> Self {
-        let block = plan.block;
-        let mut fft = RealFftPair::new(2 * block);
-        let mut ir_spectra: Vec<Vec<SplitSpectrum>> = irs
-            .iter()
-            .map(|ir| ir_partitions(&mut fft, ir, plan.offset, block, plan.end))
-            .collect();
-        let engine = if block <= DIRECT_FFT_MAX_BLOCK {
-            TailFft::Direct {
-                fft,
-                time_out: vec![0.0; 2 * block],
-            }
-        } else {
-            let fs = FourStep::new(block);
-            for parts in &mut ir_spectra {
-                for spec in parts.iter_mut() {
-                    *spec = fs.t.permute(spec);
-                }
-            }
-            TailFft::FourStep(Box::new(fs))
-        };
-        Self {
-            block,
-            ticks: block / base,
-            delay_parts: (plan.offset - 2 * block) / block,
-            ir_spectra,
-            engine,
-        }
-    }
-
-    fn new_channel(&self, ir_idx: usize) -> Option<TailChannel> {
-        let num_parts = self.ir_spectra[ir_idx].len();
-        if num_parts == 0 {
-            return None;
-        }
-        let spec_len = self.block + 1;
-        let work_len = match self.engine {
-            TailFft::Direct { .. } => 0,
-            TailFft::FourStep(_) => self.block,
-        };
-        let mut ch = TailChannel {
-            num_parts,
-            fdl: (0..num_parts + self.delay_parts)
-                .map(|_| SplitSpectrum::new(spec_len))
-                .collect(),
-            fdl_head: 0,
-            input: std::array::from_fn(|_| vec![0.0; self.block]),
-            slot: 0,
-            out_cur: vec![0.0; self.block],
-            out_next: vec![0.0; self.block],
-            acc: SplitSpectrum::new(spec_len),
-            work: vec![Complex64::new(0.0, 0.0); work_len],
-            tick: 0,
-            job: Job::Done,
-            done: 0.0,
-            total: 0.0,
-        };
-        let mut job = self.first_job();
-        while job != Job::Done {
-            ch.total += self.job_cost(job, num_parts);
-            job = self.next_job(job);
-        }
-        Some(ch)
-    }
-
-    fn first_job(&self) -> Job {
-        match self.engine {
-            TailFft::Direct { .. } => Job::FwdDirect,
-            TailFft::FourStep(_) => Job::FwdA(0),
-        }
-    }
-
-    fn next_job(&self, job: Job) -> Job {
-        let bins = self.block + 1;
-        match (&self.engine, job) {
-            (_, Job::Done | Job::InvDirect) => Job::Done,
-            (_, Job::FwdDirect) => Job::Mac(0),
-            (_, Job::Mac(start)) if start + MAC_CHUNK < bins => Job::Mac(start + MAC_CHUNK),
-            (TailFft::Direct { .. }, Job::Mac(_)) => Job::InvDirect,
-            (TailFft::FourStep(_), Job::Mac(_)) => Job::InvB(0),
-            (TailFft::FourStep(fs), Job::FwdA(n2)) if n2 + fs.t.cols_a < fs.t.l => {
-                Job::FwdA(n2 + fs.t.cols_a)
-            }
-            (TailFft::FourStep(_), Job::FwdA(_)) => Job::FwdB(0),
-            (TailFft::FourStep(fs), Job::FwdB(k1)) if k1 + 1 < fs.t.fwd_b_jobs() => {
-                Job::FwdB(k1 + 1)
-            }
-            (TailFft::FourStep(_), Job::FwdB(_)) => Job::Mac(0),
-            (TailFft::FourStep(fs), Job::InvB(k1)) if k1 + fs.t.rows_b < fs.t.m => {
-                Job::InvB(k1 + fs.t.rows_b)
-            }
-            (TailFft::FourStep(_), Job::InvB(_)) => Job::InvA(0),
-            (TailFft::FourStep(fs), Job::InvA(n2)) if n2 + fs.t.cols_a < fs.t.l => {
-                Job::InvA(n2 + fs.t.cols_a)
-            }
-            (TailFft::FourStep(_), Job::InvA(_)) => Job::Done,
-            (TailFft::Direct { .. }, j) => unreachable!("job {j:?} on a direct stage"),
-        }
-    }
-
-    fn job_cost(&self, job: Job, num_parts: usize) -> f64 {
-        let bins = self.block + 1;
-        match (&self.engine, job) {
-            (_, Job::Done) => 0.0,
-            (_, Job::FwdDirect | Job::InvDirect) => real_fft_cost(self.block),
-            (_, Job::Mac(start)) => {
-                NS_MAC * ((start + MAC_CHUNK).min(bins) - start) as f64 * num_parts as f64
-            }
-            (TailFft::FourStep(fs), Job::FwdA(n2)) => {
-                fs.t.step_a_cost((n2 + fs.t.cols_a).min(fs.t.l) - n2, false)
-            }
-            (TailFft::FourStep(fs), Job::InvA(n2)) => {
-                fs.t.step_a_cost((n2 + fs.t.cols_a).min(fs.t.l) - n2, true)
-            }
-            (TailFft::FourStep(fs), Job::FwdB(k1)) => fs.t.fwd_b_cost(k1),
-            (TailFft::FourStep(fs), Job::InvB(k1)) => {
-                let rows = (k1 + fs.t.rows_b).min(fs.t.m) - k1;
-                fs.t.step_b_cost(rows) + NS_PACK * (rows * fs.t.l) as f64
-            }
-            (TailFft::Direct { .. }, j) => unreachable!("job {j:?} on a direct stage"),
-        }
-    }
-
-    /// Run `ch.job`, advance to the next job and return its cost.
-    fn run_job(&mut self, ir_idx: usize, ch: &mut TailChannel) -> f64 {
-        let job = ch.job;
-        let cost = self.job_cost(job, ch.num_parts);
-        let next = self.next_job(job);
-        let b = self.block;
-        let bins = b + 1;
-        let TailStage {
-            ir_spectra,
-            engine,
-            delay_parts,
-            ..
-        } = self;
-        let prev = &ch.input[(ch.slot + 1) % 3];
-        let cur = &ch.input[(ch.slot + 2) % 3];
-        match (engine, job) {
-            (_, Job::Done) => {}
-            (TailFft::Direct { fft, .. }, Job::FwdDirect) => {
-                fft.forward_pair_into_split(prev, cur, &mut ch.fdl[ch.fdl_head]);
-            }
-            (_, Job::Mac(start)) => {
-                let range = start..(start + MAC_CHUNK).min(bins);
-                let slots = ch.fdl.len();
-                for (p, part) in ir_spectra[ir_idx].iter().enumerate() {
-                    let idx = (ch.fdl_head + slots - p - *delay_parts) % slots;
-                    if p == 0 {
-                        complex_mul_split_range(&mut ch.acc, &ch.fdl[idx], part, range.clone());
-                    } else {
-                        complex_mac_split_range(&mut ch.acc, &ch.fdl[idx], part, range.clone());
-                    }
-                }
-            }
-            (TailFft::Direct { fft, time_out }, Job::InvDirect) => {
-                fft.inverse_from_split(&ch.acc, time_out);
-                ch.out_next.copy_from_slice(&time_out[b..]);
-            }
-            (TailFft::FourStep(fs), Job::FwdA(n2)) => {
-                let FourStep { t, scratch, gather } = &mut **fs;
-                let cols = n2..(n2 + t.cols_a).min(t.l);
-                t.fwd_a(gather, scratch, &mut ch.work, cols, prev, cur);
-            }
-            (TailFft::FourStep(fs), Job::FwdB(k1)) => {
-                let FourStep { t, scratch, .. } = &mut **fs;
-                t.fwd_b_split(scratch, &mut ch.work, &mut ch.fdl[ch.fdl_head], k1);
-            }
-            (TailFft::FourStep(fs), Job::InvB(k1)) => {
-                let FourStep { t, scratch, .. } = &mut **fs;
-                let rows = k1..(k1 + t.rows_b).min(t.m);
-                t.inv_b(scratch, &mut ch.work, &ch.acc, rows);
-            }
-            (TailFft::FourStep(fs), Job::InvA(n2)) => {
-                let FourStep { t, scratch, gather } = &mut **fs;
-                let cols = n2..(n2 + t.cols_a).min(t.l);
-                t.inv_a(gather, scratch, &ch.work, cols, &mut ch.out_next);
-            }
-            (_, j) => unreachable!("job {j:?} does not match the stage engine"),
-        }
-        ch.job = next;
-        cost
-    }
-
-    /// One base block for this stage: add this period's precomputed output
-    /// into `out`, store the input, and run this block's share of the work.
-    /// Returns the cost of the work done.
-    fn tick(&mut self, ir_idx: usize, ch: &mut TailChannel, input: &[f64], out: &mut [f64]) -> f64 {
-        let b0 = input.len();
-        if ch.tick == 0 {
-            debug_assert_eq!(ch.job, Job::Done, "previous period's work unfinished");
-            std::mem::swap(&mut ch.out_cur, &mut ch.out_next);
-            ch.slot = (ch.slot + 1) % 3;
-            ch.fdl_head = (ch.fdl_head + 1) % ch.fdl.len();
-            ch.job = self.first_job();
-            ch.done = 0.0;
-        }
-        let pos = ch.tick * b0;
-        for (o, &y) in out.iter_mut().zip(&ch.out_cur[pos..pos + b0]) {
-            *o += y;
-        }
-        ch.input[ch.slot][pos..pos + b0].copy_from_slice(input);
-
-        ch.tick += 1;
-        let last = ch.tick == self.ticks;
-        let target = ch.total * ch.tick as f64 / self.ticks as f64;
-        let mut spent = 0.0;
-        // Run jobs until this block's share is reached, rounding to the
-        // nearest job so the overshoot does not accumulate in one direction.
-        while ch.job != Job::Done
-            && (last || ch.done + 0.5 * self.job_cost(ch.job, ch.num_parts) <= target)
-        {
-            let cost = self.run_job(ir_idx, ch);
-            ch.done += cost;
-            spent += cost;
-        }
-        if last {
-            ch.tick = 0;
-        }
-        spent
-    }
+/// A tail stage of the convolver: one branch, partitions `[ir][0][part]`.
+fn tail_stage(irs: &[Vec<f64>], plan: StagePlan, base: usize) -> TailStage {
+    let mut fft = RealFftPair::new(2 * plan.block);
+    let spectra = irs
+        .iter()
+        .map(|ir| {
+            vec![ir_partitions(
+                &mut fft,
+                ir,
+                plan.offset,
+                plan.block,
+                plan.end,
+            )]
+        })
+        .collect();
+    TailStage::from_spectra(spectra, plan, base, 1)
 }
 
 // ---------------------------------------------------------------- convolver
@@ -889,6 +85,8 @@ pub struct Convolver {
     channels: usize,
     max_block: usize,
     base_block: usize,
+    /// The longest IR, taps: how long the output rings after the input ends.
+    ir_len: usize,
     head: Option<HeadStage>,
     tails: Vec<TailStage>,
     ch_states: Vec<ChannelState>,
@@ -896,6 +94,36 @@ pub struct Convolver {
     block_out_scratch: Vec<f64>,
     /// Estimated work (flop-like units) done by the last `process` call.
     last_cost: f64,
+    /// [`filter_id`] of the IRs and partition schedule: another convolver
+    /// with the same one runs the same filter ([`Self::inherit_state`]).
+    filter_id: u64,
+}
+
+/// A fingerprint of a convolver's filter: every IR tap's bits, the IR
+/// count and the partition schedule. Off the real-time thread (at build).
+fn filter_id(irs: &[Vec<f64>], plan: &[StagePlan], base_block: usize) -> u64 {
+    // splitmix64 over the words, chained.
+    let mut h: u64 = 0x243F_6A88_85A3_08D3;
+    let mut mix = |w: u64| {
+        let mut z = (h ^ w).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        h = z ^ (z >> 31);
+    };
+    mix(base_block as u64);
+    for p in plan {
+        mix(p.offset as u64);
+        mix(p.block as u64);
+        mix(p.end as u64);
+    }
+    mix(irs.len() as u64);
+    for ir in irs {
+        mix(ir.len() as u64);
+        for &x in ir {
+            mix(x.to_bits());
+        }
+    }
+    h
 }
 
 impl Convolver {
@@ -904,7 +132,12 @@ impl Convolver {
     pub fn new(irs: &[Vec<f64>], channels: usize, max_block: usize) -> Self {
         let base = Self::base_block_for(max_block);
         let max_ir_len = irs.iter().map(|ir| ir.len()).max().unwrap_or(0);
-        Self::with_plan(irs, channels, max_block, &plan_schedule(base, max_ir_len))
+        Self::with_plan(
+            irs,
+            channels,
+            max_block,
+            &crate::nupc::plan_schedule(base, max_ir_len),
+        )
     }
 
     fn base_block_for(max_block: usize) -> usize {
@@ -929,12 +162,14 @@ impl Convolver {
                 channels: 0,
                 max_block,
                 base_block,
+                ir_len: irs.iter().map(Vec::len).max().unwrap_or(0),
                 head: None,
                 tails: Vec::new(),
                 ch_states: Vec::new(),
                 block_in_scratch: Vec::new(),
                 block_out_scratch: Vec::new(),
                 last_cost: 0.0,
+                filter_id: 0,
             };
         }
         assert!(
@@ -944,10 +179,10 @@ impl Convolver {
         );
         validate_plan(plan, base_block);
 
-        let head = HeadStage::new(irs, base_block, plan[0].end);
+        let head = head_stage(irs, base_block, plan[0].end);
         let tails: Vec<TailStage> = plan[1..]
             .iter()
-            .map(|&p| TailStage::new(irs, p, base_block))
+            .map(|&p| tail_stage(irs, p, base_block))
             .collect();
 
         let mono = irs.len() == 1;
@@ -961,11 +196,7 @@ impl Convolver {
                     ir_idx,
                     in_fifo: RingFifo::with_capacity(fifo_cap),
                     out_fifo,
-                    head: HeadChannel::new(
-                        base_block,
-                        head.fft.spec_len(),
-                        head.ir_spectra[ir_idx].len(),
-                    ),
+                    head: head.new_channel(ir_idx),
                     tails: tails.iter().map(|t| t.new_channel(ir_idx)).collect(),
                 }
             })
@@ -975,19 +206,115 @@ impl Convolver {
             channels,
             max_block,
             base_block,
+            ir_len: irs.iter().map(Vec::len).max().unwrap_or(0),
             head: Some(head),
             tails,
             ch_states,
             block_in_scratch: vec![0.0; base_block],
             block_out_scratch: vec![0.0; base_block],
             last_cost: 0.0,
+            filter_id: filter_id(irs, plan, base_block),
         }
+    }
+
+    /// Frames the output still rings after its delay once the input ends:
+    /// the longest IR's length less one (a room IR's peak can sit far into
+    /// it). The stream-end flush adds it to [`Stage::latency_frames`].
+    pub fn ir_tail_frames(&self) -> usize {
+        self.ir_len.saturating_sub(1)
     }
 
     /// Estimated work of the last `process` call, in flop-like units. Lets
     /// tests check that tail-stage work is spread evenly without timing.
     pub fn last_process_cost(&self) -> f64 {
         self.last_cost
+    }
+
+    /// One single-channel convolver per channel, each running its channel
+    /// exactly as this one does (bit for bit), from this one's state. The
+    /// IR spectra and FFT tables are shared; each gets its own scratch.
+    /// Off the real-time thread (it allocates); `self` is left without
+    /// channels.
+    pub fn split_channels(&mut self) -> Vec<Convolver> {
+        let states = std::mem::take(&mut self.ch_states);
+        self.channels = 0;
+        states
+            .into_iter()
+            .map(|ch| Convolver {
+                channels: 1,
+                max_block: self.max_block,
+                base_block: self.base_block,
+                ir_len: self.ir_len,
+                head: self.head.clone(),
+                tails: self.tails.clone(),
+                ch_states: vec![ch],
+                block_in_scratch: self.block_in_scratch.clone(),
+                block_out_scratch: self.block_out_scratch.clone(),
+                last_cost: 0.0,
+                filter_id: self.filter_id,
+            })
+            .collect()
+    }
+
+    /// Bytes [`Self::inherit_state`] copies: every channel's FIFOs, delay
+    /// lines and tail-stage buffers.
+    pub fn state_bytes(&self) -> usize {
+        self.ch_states
+            .iter()
+            .map(|c| {
+                8 * (c.in_fifo.capacity() + c.out_fifo.capacity())
+                    + c.head.bytes()
+                    + c.tails.iter().flatten().map(|t| t.bytes()).sum::<usize>()
+            })
+            .sum()
+    }
+
+    /// Whether [`Self::inherit_state`] can take `from`'s state: the same
+    /// filter (IRs and schedule), block sizes and channels.
+    pub fn can_inherit(&self, from: &Convolver) -> bool {
+        self.channels > 0
+            && self.channels == from.channels
+            && self.max_block == from.max_block
+            && self.base_block == from.base_block
+            && self.ir_len == from.ir_len
+            && self.filter_id == from.filter_id
+            && self.tails.len() == from.tails.len()
+            && self.ch_states.iter().zip(&from.ch_states).all(|(d, s)| {
+                d.ir_idx == s.ir_idx
+                    && d.in_fifo.capacity() == s.in_fifo.capacity()
+                    && d.out_fifo.capacity() == s.out_fifo.capacity()
+                    && d.head.same_shape(&s.head)
+                    && d.tails.len() == s.tails.len()
+                    && d.tails.iter().zip(&s.tails).all(|t| match t {
+                        (Some(d), Some(s)) => d.same_shape(s),
+                        (None, None) => true,
+                        _ => false,
+                    })
+            })
+    }
+
+    /// Continue from `from`'s state, a convolver of the same filter
+    /// ([`Self::can_inherit`]; otherwise nothing changes and this returns
+    /// `false`): its input history, pending output and place in the tail
+    /// stages' sliced work, so this one plays on exactly as `from` would,
+    /// the filter's whole ring included. A chain swap that keeps the
+    /// convolution hands it over this way. Real-time safe: it copies into
+    /// buffers this convolver owns (bounded by the filter's size).
+    pub fn inherit_state(&mut self, from: &Convolver) -> bool {
+        if !self.can_inherit(from) {
+            return false;
+        }
+        for (d, s) in self.ch_states.iter_mut().zip(&from.ch_states) {
+            d.in_fifo.copy_from(&s.in_fifo);
+            d.out_fifo.copy_from(&s.out_fifo);
+            d.head.copy_from(&s.head);
+            for (d, s) in d.tails.iter_mut().zip(&s.tails) {
+                if let (Some(d), Some(s)) = (d, s) {
+                    d.copy_from(s);
+                }
+            }
+        }
+        true
     }
 }
 

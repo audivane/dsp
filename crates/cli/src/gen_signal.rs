@@ -1,4 +1,4 @@
-//! `avdsp gen` — deterministic test signals.
+//! `avdsp gen`: deterministic test signals.
 
 use crate::signal::Rng;
 use crate::wavio::{self, Container};

@@ -2,7 +2,7 @@
 // balance, and mute"), checked before anything is sent so the message sits
 // beside the field it is about.
 
-import type { VolumeConfig } from "../api/types";
+import type { VolumeConfig, VolumeMode } from "../api/types";
 
 export type VolumeSettings = Omit<VolumeConfig, "volume_db" | "balance_db" | "muted">;
 export type VolumeField = "hardware" | "ceiling" | "rise" | "stream";
@@ -52,4 +52,28 @@ export function guardRiseLimit<G extends { max_rise_db_per_s: number }>(guard: G
   if (guard.max_rise_db_per_s > 0) return guard;
   const r = restore !== null && Number.isFinite(restore) && restore > 0 && restore <= VOLUME_BOUNDS.rise.max ? restore : DEFAULT_RISE_DB_PER_S;
   return { ...guard, max_rise_db_per_s: r };
+}
+
+/**
+ * Next `VolumeConfig` when switching `mode` in the UI:
+ * - `hybrid` with no `hardware_db` prefills the current DAC level (or -10 dB).
+ * - `software` from another mode with no `hardware_db` defaults the DAC mixer
+ *   to 0 dB so attenuation is not silently doubled (the engine stages the raise).
+ */
+export function volumeModeChange(v: VolumeConfig, mode: VolumeMode, statusHardwareDb?: number | null): VolumeConfig {
+  let hardware_db = v.hardware_db;
+  if (mode === "hybrid" && hardware_db === null) {
+    hardware_db = Math.min(0, statusHardwareDb ?? -10);
+  } else if (mode === "software" && v.mode !== "software" && hardware_db === null) {
+    hardware_db = 0;
+  }
+  return { ...v, mode, hardware_db };
+}
+
+/**
+ * True when in `software` mode with no fixed `hardware_db` and the DAC mixer is
+ * still attenuated below 0 dB (doubling the digital attenuation).
+ */
+export function softwareMixerAttenuated(vol: Pick<VolumeConfig, "mode" | "hardware_db">, statusHardwareDb?: number | null): boolean {
+  return vol.mode === "software" && vol.hardware_db === null && statusHardwareDb != null && statusHardwareDb < -0.5;
 }

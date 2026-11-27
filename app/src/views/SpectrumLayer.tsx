@@ -5,13 +5,12 @@
 import { useEffect, useRef } from "react";
 import { Seg } from "../components/Seg";
 import {
-  SPEC_DB_MIN,
   SPECTRUM_SMOOTHINGS,
-  monotoneTangents,
+  SpectrumAnimator,
   smoothFractionalOctave,
-  spectrumBinFreq,
+  spectrumCurvePoints,
   spectrumDbToY,
-  stepSpectrumAnimation,
+  traceMonotone,
   type SpectrumSmoothing,
   type SpectrumTap,
 } from "../lib/spectrum";
@@ -20,36 +19,16 @@ import { store, useApp } from "../store/store";
 import { cssVar } from "../theme";
 import type { OverlayGeometry } from "./OverlayLayer";
 
-const F_GRAPH_MAX = 20000;
 const SCALE_TICKS = [0, -30, -60, -90];
 
-let smoothPre = new Float64Array(0);
-let smoothPost = new Float64Array(0);
-let peakVals = new Float64Array(0);
-let peakUntil = new Float64Array(0);
-let lastTickMs = 0;
-let lastFrameAt = -1;
+const anim = new SpectrumAnimator();
 let lastRate = -1;
 let animating = false;
 /** Smoothed targets of the latest frame, recomputed only when it changes. */
 let smoothedFor: { at: number; smoothing: number; pre: number[]; post: number[] } | null = null;
 
-function ensureBuffers(preLen: number, postLen: number, peakLen: number) {
-  if (smoothPre.length !== preLen) smoothPre = new Float64Array(preLen).fill(SPEC_DB_MIN);
-  if (smoothPost.length !== postLen) smoothPost = new Float64Array(postLen).fill(SPEC_DB_MIN);
-  if (peakVals.length !== peakLen) {
-    peakVals = new Float64Array(peakLen).fill(SPEC_DB_MIN);
-    peakUntil = new Float64Array(peakLen).fill(0);
-  }
-}
-
 function resetBuffers() {
-  smoothPre = new Float64Array(0);
-  smoothPost = new Float64Array(0);
-  peakVals = new Float64Array(0);
-  peakUntil = new Float64Array(0);
-  lastTickMs = 0;
-  lastFrameAt = -1;
+  anim.reset();
   lastRate = -1;
   animating = false;
   smoothedFor = null;
@@ -98,25 +77,14 @@ function traceSpectrumCurve(
   y1: number,
   plotH: number,
   closeToFloor: boolean,
+  topHz?: number,
 ): boolean {
-  const xs: number[] = [];
-  const ys: number[] = [];
-  for (let i = 0; i < bins.length; i++) {
-    const f = spectrumBinFreq(i, fMinHz, binsPerOctave);
-    if (f > F_GRAPH_MAX * 1.06) break;
-    xs.push(g.xOf(f));
-    ys.push(spectrumDbToY(bins[i], y0, plotH));
-  }
+  // Each trace runs to its own last bin (its tap's Nyquist or 100 kHz),
+  // or one bin past the graph's right edge, where the clip cuts it.
+  const { xs, ys } = spectrumCurvePoints(bins, fMinHz, binsPerOctave, g.xOf, (db) => spectrumDbToY(db, y0, plotH), g.w - g.right, topHz);
   const n = xs.length;
   if (n < 2) return false;
-  // A smooth curve through the bin centres (monotone cubic: no overshoot,
-  // so the drawing never shows a peak the data does not have).
-  const m = monotoneTangents(xs, ys);
-  ctx.moveTo(xs[0], ys[0]);
-  for (let i = 0; i < n - 1; i++) {
-    const h = (xs[i + 1] - xs[i]) / 3;
-    ctx.bezierCurveTo(xs[i] + h, ys[i] + m[i] * h, xs[i + 1] - h, ys[i + 1] - m[i + 1] * h, xs[i + 1], ys[i + 1]);
-  }
+  traceMonotone(ctx, xs, ys);
   if (closeToFloor) {
     ctx.lineTo(xs[n - 1], y1);
     ctx.lineTo(xs[0], y1);
@@ -182,7 +150,6 @@ export function paintSpectrum(ctx: CanvasRenderingContext2D, g: OverlayGeometry)
 
   const spec = frame.spectrum;
   const sm = smoothedTargets(frame.at, prefs.smoothing, spec.bins_per_octave, spec.pre, spec.post);
-  const primaryTarget = prefs.tap === "pre" ? sm.pre : sm.post;
   if (spec.pre.length < 2 && spec.post.length < 2) {
     animating = false;
     return;
@@ -193,26 +160,15 @@ export function paintSpectrum(ctx: CanvasRenderingContext2D, g: OverlayGeometry)
   }
   lastRate = spec.rate;
 
-  ensureBuffers(spec.pre.length, spec.post.length, primaryTarget.length);
   const now = typeof performance !== "undefined" ? performance.now() : Date.now();
-  const dt = lastTickMs > 0 ? Math.min(0.1, Math.max(0, (now - lastTickMs) / 1000)) : 1 / 60;
-  lastTickMs = now;
-  const newFrame = frame.at !== lastFrameAt;
-  lastFrameAt = frame.at;
-
-  const step = stepSpectrumAnimation({
-    frameAgeMs: Math.max(0, now - frame.at),
-    newFrame,
+  const step = anim.step({
+    frameKey: frame.at,
+    frameAtMs: frame.at,
+    nowMs: now,
     tap: prefs.tap,
     peakHold: prefs.peakHold,
     preTarget: sm.pre,
     postTarget: sm.post,
-    smoothPre,
-    smoothPost,
-    peakVals,
-    peakUntil,
-    nowMs: now,
-    dtSec: dt,
   });
 
   if (step.clearFrame) {
@@ -228,16 +184,18 @@ export function paintSpectrum(ctx: CanvasRenderingContext2D, g: OverlayGeometry)
   ctx.clip();
   ctx.lineJoin = "round";
 
-  const filledBins = prefs.tap === "pre" ? smoothPre : smoothPost;
+  const filledBins = prefs.tap === "pre" ? anim.pre : anim.post;
+  // Pre runs at the graph rate, whose Nyquist the graph shades from.
+  const preTop = spec.rate / 2;
   ctx.beginPath();
-  if (traceSpectrumCurve(ctx, filledBins, spec.f_min_hz, spec.bins_per_octave, g, y0, y1, plotH, true)) {
+  if (traceSpectrumCurve(ctx, filledBins, spec.f_min_hz, spec.bins_per_octave, g, y0, y1, plotH, true, prefs.tap === "pre" ? preTop : undefined)) {
     ctx.fillStyle = cssVar("--spec-fill");
     ctx.fill();
   }
 
   if (prefs.tap === "both") {
     ctx.beginPath();
-    if (traceSpectrumCurve(ctx, smoothPre, spec.f_min_hz, spec.bins_per_octave, g, y0, y1, plotH, false)) {
+    if (traceSpectrumCurve(ctx, anim.pre, spec.f_min_hz, spec.bins_per_octave, g, y0, y1, plotH, false, preTop)) {
       ctx.strokeStyle = cssVar("--spec-pre");
       ctx.lineWidth = 1.25;
       ctx.stroke();
@@ -248,7 +206,7 @@ export function paintSpectrum(ctx: CanvasRenderingContext2D, g: OverlayGeometry)
     ctx.save();
     ctx.globalAlpha *= step.peakAlpha;
     ctx.beginPath();
-    if (traceSpectrumCurve(ctx, peakVals, spec.f_min_hz, spec.bins_per_octave, g, y0, y1, plotH, false)) {
+    if (traceSpectrumCurve(ctx, anim.peak, spec.f_min_hz, spec.bins_per_octave, g, y0, y1, plotH, false, prefs.tap === "pre" ? preTop : undefined)) {
       ctx.strokeStyle = cssVar("--spec-peak");
       ctx.lineWidth = 1;
       ctx.setLineDash([3, 3]);
@@ -285,16 +243,7 @@ export function SpectrumControls() {
               ["both", "Both", "Post filled, pre thin line"],
             ]}
           />
-          <label className="spec-smooth" title="Spectrum smoothing in octaves: each point is the average power over that fraction of an octave. 1/3 is calm, 1/24 shows the most detail.">
-            <span className="sr-only">Spectrum smoothing</span>
-            <select value={spec.smoothing} aria-label="Spectrum smoothing" onChange={(e) => st.setSpectrumPrefs({ smoothing: Number(e.target.value) as SpectrumSmoothing })}>
-              {SPECTRUM_SMOOTHINGS.map((n) => (
-                <option key={n} value={n}>
-                  1/{n}
-                </option>
-              ))}
-            </select>
-          </label>
+          <SmoothingSelect value={spec.smoothing} onChange={(smoothing) => st.setSpectrumPrefs({ smoothing })} />
           <button
             className="tag"
             aria-pressed={spec.peakHold}
@@ -307,5 +256,21 @@ export function SpectrumControls() {
         </>
       )}
     </div>
+  );
+}
+
+/** An analyser's fractional-octave smoothing (1/3 … 1/24 octave). */
+export function SmoothingSelect({ value, onChange, finest = 24 }: { value: SpectrumSmoothing; onChange: (v: SpectrumSmoothing) => void; finest?: number }) {
+  return (
+    <label className="spec-smooth" title="Spectrum smoothing in octaves: each point is the average power over that fraction of an octave. 1/3 is calm, 1/24 shows the most detail.">
+      <span className="sr-only">Spectrum smoothing</span>
+      <select value={value} aria-label="Spectrum smoothing" onChange={(e) => onChange(Number(e.target.value) as SpectrumSmoothing)}>
+        {SPECTRUM_SMOOTHINGS.filter((n) => n <= finest).map((n) => (
+          <option key={n} value={n}>
+            1/{n}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }

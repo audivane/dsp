@@ -1,9 +1,10 @@
 import { useState } from "react";
 import type { DeviceInfo } from "../api/types";
 import { store, useApp } from "../store/store";
-import { deviceLabel } from "../components/TopBar";
+import { deviceLabel, nameOf } from "../lib/devices";
 import { ValueSlider } from "../components/ValueSlider";
 import { Close, Plus, Power, Trash } from "../components/Icons";
+import { OutputPairPicker } from "./OutputPairPicker";
 import {
   FOLLOWER_MIN_DB,
   FOLLOWER_TRIM_MS,
@@ -12,7 +13,10 @@ import {
   followerCandidates,
   followerChip,
   followerDetail,
+  followerLatencyTitle,
+  ownChainLabel,
   followerRows,
+  followsVolume,
   fmtTrim,
   speedCapNote,
   type FollowerRow,
@@ -20,11 +24,12 @@ import {
 
 const TRIM_TITLE =
   "Its delay behind the main device, −50 to +50 ms (negative plays it earlier). Use it for the DACs' own latencies or speaker distance: 1 ms is about 34 cm. A change makes it re-lock for a moment.";
-const VOLUME_TITLE = "Its own digital volume, −120 to 0 dB, after the main volume. Below 0 dB it is not bit-perfect (followers never are: each one corrects its clock).";
+const VOLUME_TITLE = "Its own digital volume, −120 to 0 dB. Below 0 dB it is not bit-perfect (followers never are: each one corrects its clock).";
+const TRIM_VOLUME_TITLE =
+  "Its own digital volume, −120 to 0 dB. It follows the main volume: a change of the main volume moves it by as much, so its level to the main device stays what you set here.";
+const FOLLOW_TITLE =
+  "Main volume changes (and its balance and mute) move this device too, on top of its own level, so the devices stay in balance: a subwoofer, a second pair in the same room. Off, its volume is its own, for a device in another room. A room calibration turns it on for the devices it calibrates.";
 
-function nameOf(devices: readonly DeviceInfo[], id: string): string {
-  return devices.find((d) => d.id === id)?.name ?? id;
-}
 
 function ErrorLine({ text, onClose }: { text: string; onClose: () => void }) {
   return (
@@ -41,9 +46,14 @@ function FollowerCard({ row, devices, epoch }: { row: FollowerRow; devices: read
   const st = store();
   const f = row.config;
   const error = useApp((s) => s.followerErrors[f.device]);
+  const mainLatency = useApp((s) => s.status?.latency_ms ?? null);
   const chip = followerChip(row.status);
-  const detail = followerDetail(row.status);
+  const detail = followerDetail(row.status, mainLatency);
+  const latencyTitle = followerLatencyTitle(row.status, mainLatency);
+  const own = ownChainLabel(f, row.status);
   const name = nameOf(devices, f.device);
+  const follows = followsVolume(f);
+  const volumeTitle = follows ? TRIM_VOLUME_TITLE : VOLUME_TITLE;
   return (
     <li className={"follower-card" + (f.enabled ? "" : " off")} aria-label={name}>
       <div className="follower-head">
@@ -60,7 +70,7 @@ function FollowerCard({ row, devices, epoch }: { row: FollowerRow; devices: read
           <div className="n" title={f.device}>
             {name}
           </div>
-          <div className="m mono" aria-live="polite">
+          <div className="m mono" aria-live="polite" title={detail ? latencyTitle : undefined}>
             {detail ?? f.device}
           </div>
         </div>
@@ -87,22 +97,43 @@ function FollowerCard({ row, devices, epoch }: { row: FollowerRow; devices: read
           onChange={(v, mode) => st.editFollower(f.device, { trim_ms: v }, mode)}
           onEnd={() => st.endFollowerDrag(f.device)}
         />
-        <label className="k" htmlFor={`vol-${f.device}`} title={VOLUME_TITLE}>
+        <label className="k" htmlFor={`vol-${f.device}`} title={volumeTitle}>
           Volume
         </label>
         <ValueSlider
           id={`vol-${f.device}`}
           label={`Volume of ${name}`}
-          value={f.volume_db}
+          value={row.level}
           min={FOLLOWER_MIN_DB}
           max={0}
           step={0.5}
           format={(v) => `${v === 0 ? "0" : v.toFixed(1).replace("-", "−")} dB`}
-          title={VOLUME_TITLE}
+          title={volumeTitle}
           onChange={(v, mode) => st.editFollower(f.device, { volume_db: v }, mode)}
           onEnd={() => st.endFollowerDrag(f.device)}
         />
+        {follows !== null && (
+          <label className="check" title={FOLLOW_TITLE}>
+            <input type="checkbox" checked={follows} aria-label={`${name} follows the main volume`} onChange={(e) => st.editFollower(f.device, { follow_volume: e.target.checked })} />
+            <span>Follow main volume</span>
+          </label>
+        )}
       </div>
+      {row.status && (
+        <OutputPairPicker
+          id={`pair-${f.device}`}
+          label={`Output channels of ${name}`}
+          opened={row.status.device_channels}
+          channels={row.status.device_channels_max}
+          pair={f.output_channels}
+          onChange={(p) => st.editFollower(f.device, { output_channels: p })}
+        />
+      )}
+      {own && (
+        <div className="follower-own" title="This device plays its own chain: the main chain with changes of its own (set with avdsp ctl follower DEVICE --chain-patch). It follows every other edit of the main chain.">
+          {own}
+        </div>
+      )}
       {error && <ErrorLine text={error} onClose={() => st.clearFollowerError(f.device)} />}
     </li>
   );
@@ -162,7 +193,7 @@ export function FollowersPanel() {
                 {candidates.length === 0 && <option value="">No device to add</option>}
                 {candidates.map((d) => (
                   <option key={d.id} value={d.id}>
-                    {deviceLabel(d.name, d.id)}
+                    {deviceLabel(d)}
                     {d.hdmi ? " (HDMI)" : d.loopback ? " (loopback)" : ""}
                   </option>
                 ))}

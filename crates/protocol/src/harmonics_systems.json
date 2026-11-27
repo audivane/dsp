@@ -1,0 +1,484 @@
+[
+  {
+    "id": "set_amp",
+    "name": "Single-ended triode amp",
+    "gear": "A small high-gain tube drives one big low-gain power triode into an output transformer: no feedback, a modest power supply.",
+    "sound": "A rich second-harmonic bloom and a thicker midrange; on loud notes the transformer rounds and loosens the bass, and the power stage breathes as its supply sags.",
+    "routing": "series",
+    "layers": [
+      {
+        "kind": "chebyshev",
+        "preset": "se_triode_high_mu",
+        "levels_db": [
+          -25.4,
+          -45.6,
+          -79.2,
+          -87.7,
+          -113.5,
+          null,
+          null,
+          null
+        ],
+        "signs": [
+          "+",
+          "-",
+          "+",
+          "-",
+          "-",
+          "+",
+          "+",
+          "+"
+        ],
+        "drive_db": -12.0,
+        "amount": 1.0
+      },
+      {
+        "kind": "chebyshev",
+        "preset": "se_triode_low_mu",
+        "levels_db": [
+          -36.5,
+          -46.3,
+          -77.5,
+          -76.6,
+          -88.6,
+          -96.6,
+          -109.9,
+          null
+        ],
+        "signs": [
+          "+",
+          "-",
+          "+",
+          "-",
+          "-",
+          "-",
+          "-",
+          "+"
+        ],
+        "drive_db": -6.0,
+        "amount": 1.0,
+        "sag": {
+          "depth_db": 1.5,
+          "attack_ms": 50.0,
+          "release_ms": 600.0
+        }
+      },
+      {
+        "kind": "flux",
+        "preset": "output_transformer",
+        "corner_hz": 100.0,
+        "max_boost_db": 12.0,
+        "target_h3_db": -30.0,
+        "calibration_hz": 20.0
+      }
+    ]
+  },
+  {
+    "id": "set_amp_cancel",
+    "name": "Single-ended triode amp, cancelling",
+    "gear": "The same single-ended amp, tuned so the power tube's second harmonic partly cancels the driver's, as many two-stage designs are on purpose.",
+    "sound": "Cleaner and less coloured than the plain single-ended amp: about 10 dB less second harmonic, the same breathing power stage and transformer bass.",
+    "routing": "series",
+    "layers": [
+      {
+        "kind": "chebyshev",
+        "preset": "se_triode_high_mu",
+        "levels_db": [
+          -25.4,
+          -45.6,
+          -79.2,
+          -87.7,
+          -113.5,
+          null,
+          null,
+          null
+        ],
+        "signs": [
+          "+",
+          "-",
+          "+",
+          "-",
+          "-",
+          "+",
+          "+",
+          "+"
+        ],
+        "drive_db": -12.0,
+        "amount": 1.0
+      },
+      {
+        "kind": "chebyshev",
+        "preset": "se_triode_low_mu",
+        "levels_db": [
+          -36.5,
+          -46.3,
+          -77.5,
+          -76.6,
+          -88.6,
+          -96.6,
+          -109.9,
+          null
+        ],
+        "signs": [
+          "+",
+          "-",
+          "+",
+          "-",
+          "-",
+          "-",
+          "-",
+          "+"
+        ],
+        "drive_db": -6.0,
+        "amount": 1.0,
+        "invert_even": true,
+        "sag": {
+          "depth_db": 1.5,
+          "attack_ms": 50.0,
+          "release_ms": 600.0
+        }
+      },
+      {
+        "kind": "flux",
+        "preset": "output_transformer",
+        "corner_hz": 100.0,
+        "max_boost_db": 12.0,
+        "target_h3_db": -30.0,
+        "calibration_hz": 20.0
+      }
+    ]
+  },
+  {
+    "id": "tube_pre_ss_power",
+    "name": "Tube preamp, solid-state power amp",
+    "gear": "A tube line stage in front of a big high-feedback transistor amp.",
+    "sound": "A little second-harmonic warmth on a clean, tight power stage; no output transformer, so the bass stays lean.",
+    "routing": "series",
+    "layers": [
+      {
+        "kind": "chebyshev",
+        "preset": "se_triode_high_mu",
+        "levels_db": [
+          -25.4,
+          -45.6,
+          -79.2,
+          -87.7,
+          -113.5,
+          null,
+          null,
+          null
+        ],
+        "signs": [
+          "+",
+          "-",
+          "+",
+          "-",
+          "-",
+          "+",
+          "+",
+          "+"
+        ],
+        "drive_db": -10.0,
+        "amount": 1.0
+      },
+      {
+        "kind": "chebyshev",
+        "preset": "solid_state_feedback",
+        "levels_db": [
+          -78.0,
+          -68.0,
+          -94.0,
+          -76.0,
+          null,
+          -86.0,
+          null,
+          -96.0
+        ],
+        "signs": [
+          "+",
+          "-",
+          "+",
+          "+",
+          "+",
+          "-",
+          "+",
+          "+"
+        ],
+        "drive_db": 0.0,
+        "amount": 1.0,
+        "tilt": {
+          "low": {
+            "hz": 100.0,
+            "db": 0.0
+          },
+          "high": {
+            "hz": 2000.0,
+            "db": 20.0
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": "pp_amp",
+    "name": "Push-pull tube power amp",
+    "gear": "Pairs of power pentodes in push-pull with global feedback and an output transformer (its bass rise is part of the layer).",
+    "sound": "Odd-leaning, tighter and more powerful than a single-ended amp; the push-pull pair cancels most of the second harmonic.",
+    "layers": [
+      {
+        "kind": "chebyshev",
+        "preset": "pp_pentode_feedback",
+        "levels_db": [
+          -62.0,
+          -44.0,
+          -78.0,
+          -58.0,
+          null,
+          -72.0,
+          null,
+          -86.0
+        ],
+        "signs": [
+          "+",
+          "-",
+          "+",
+          "+",
+          "+",
+          "-",
+          "+",
+          "+"
+        ],
+        "drive_db": 0.0,
+        "amount": 1.0,
+        "tilt": {
+          "low": {
+            "hz": 60.0,
+            "db": 12.0
+          },
+          "high": {
+            "hz": 6000.0,
+            "db": 6.0
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": "pp_triode_amp",
+    "name": "Push-pull triode amp",
+    "gear": "A matched pair of power triodes in push-pull into an output transformer: the halves cancel each other's even harmonics.",
+    "sound": "Odd-leaning and tight: mostly third harmonic, only a trace of second (a matched pair is never perfect), cleaner than a single-ended amp at normal levels; the transformer adds weight in the deep bass.",
+    "routing": "series",
+    "layers": [
+      {
+        "kind": "chebyshev",
+        "preset": "pp_triode",
+        "levels_db": [
+          -62.0,
+          -48.1,
+          null,
+          -68.8,
+          null,
+          -87.8,
+          null,
+          -110.5
+        ],
+        "signs": [
+          "-",
+          "-",
+          "+",
+          "-",
+          "+",
+          "-",
+          "+",
+          "-"
+        ],
+        "drive_db": 0.0,
+        "amount": 1.0
+      },
+      {
+        "kind": "flux",
+        "preset": "output_transformer",
+        "corner_hz": 100.0,
+        "max_boost_db": 12.0,
+        "target_h3_db": -32.0,
+        "calibration_hz": 20.0
+      }
+    ]
+  },
+  {
+    "id": "pp_triode_amp_mismatched",
+    "name": "Push-pull triode amp, mismatched tubes",
+    "gear": "The same push-pull triode amp with its two power tubes 1 dB apart, so their second harmonics no longer cancel.",
+    "sound": "Between push-pull and single-ended: near full scale the mismatch's second harmonic sits level with the third, a little sweeter and less tight than a matched pair; the transformer adds weight in the deep bass.",
+    "routing": "series",
+    "layers": [
+      {
+        "kind": "chebyshev",
+        "preset": "pp_triode_imbalanced",
+        "levels_db": [
+          -44.1,
+          -48.1,
+          -92.0,
+          -68.8,
+          -100.3,
+          -87.8,
+          null,
+          -110.5
+        ],
+        "signs": [
+          "-",
+          "-",
+          "+",
+          "-",
+          "+",
+          "-",
+          "+",
+          "-"
+        ],
+        "drive_db": 0.0,
+        "amount": 1.0
+      },
+      {
+        "kind": "flux",
+        "preset": "output_transformer",
+        "corner_hz": 100.0,
+        "max_boost_db": 12.0,
+        "target_h3_db": -32.0,
+        "calibration_hz": 20.0
+      }
+    ]
+  },
+  {
+    "id": "tube_output_stage",
+    "name": "Tube output stage",
+    "gear": "A DAC or buffer with one small tube in its output stage.",
+    "sound": "Barely there: a slightly denser midrange, a good always-on setting. Pair it with the NOS upsampler for the classic non-oversampling tube-DAC sound.",
+    "layers": [
+      {
+        "kind": "chebyshev",
+        "preset": "se_triode_high_mu",
+        "levels_db": [
+          -25.4,
+          -45.6,
+          -79.2,
+          -87.7,
+          -113.5,
+          null,
+          null,
+          null
+        ],
+        "signs": [
+          "+",
+          "-",
+          "+",
+          "-",
+          "-",
+          "+",
+          "+",
+          "+"
+        ],
+        "drive_db": -15.0,
+        "amount": 0.75
+      }
+    ]
+  },
+  {
+    "id": "tape_then_tubes",
+    "name": "Mastered on tape, played on tubes",
+    "gear": "A reel-to-reel tape machine in the studio, a tube amp at home: tape first, then the tube stage.",
+    "sound": "Softer transients, a thicker low end, peaks gently rounded; the tape's third harmonic leads, the tubes add second. The tape costs more CPU than the other systems and wants an output rate of 176.4 kHz or higher so it does not alias.",
+    "routing": "series",
+    "layers": [
+      {
+        "kind": "hysteresis",
+        "preset": "tape_master",
+        "saturation": 0.35,
+        "width": 0.25,
+        "amount": 1.0,
+        "target_h3_db": -30.0,
+        "calibration_hz": 1000.0,
+        "bass_eq": {
+          "hz": 100.0,
+          "db": 3.5
+        },
+        "asymmetry": 0.03
+      },
+      {
+        "kind": "chebyshev",
+        "preset": "se_triode_high_mu",
+        "levels_db": [
+          -25.4,
+          -45.6,
+          -79.2,
+          -87.7,
+          -113.5,
+          null,
+          null,
+          null
+        ],
+        "signs": [
+          "+",
+          "-",
+          "+",
+          "-",
+          "-",
+          "+",
+          "+",
+          "+"
+        ],
+        "drive_db": -12.0,
+        "amount": 1.0
+      }
+    ]
+  },
+  {
+    "id": "tape_hot_then_tubes",
+    "name": "Mastered on tape, played on tubes, hotter",
+    "gear": "The same chain with the tape driven harder: a wider loop and more asymmetry.",
+    "sound": "Everything the tape does, pushed further: a denser low end, rounder peaks, more of both third and second harmonic. Same CPU and output-rate needs.",
+    "routing": "series",
+    "layers": [
+      {
+        "kind": "hysteresis",
+        "preset": "tape_studio",
+        "saturation": 0.35,
+        "width": 0.35,
+        "amount": 1.0,
+        "target_h3_db": -25.0,
+        "calibration_hz": 1000.0,
+        "bass_eq": {
+          "hz": 110.0,
+          "db": 3.5
+        },
+        "asymmetry": 0.13
+      },
+      {
+        "kind": "chebyshev",
+        "preset": "se_triode_high_mu",
+        "levels_db": [
+          -25.4,
+          -45.6,
+          -79.2,
+          -87.7,
+          -113.5,
+          null,
+          null,
+          null
+        ],
+        "signs": [
+          "+",
+          "-",
+          "+",
+          "-",
+          "-",
+          "+",
+          "+",
+          "+"
+        ],
+        "drive_db": -12.0,
+        "amount": 1.0
+      }
+    ]
+  }
+]

@@ -1,16 +1,15 @@
-//! `avdsp process` — run the DSP chain on a WAV file.
+//! `avdsp process`: run the DSP chain on a WAV file.
 
 use crate::wavio::{self, Container, WavData};
 use crate::{ContainerArg, ProcessArgs};
 use anyhow::{Context, Result, bail};
 use audivane_dsp_core::biquad::Eq;
 use audivane_dsp_core::chain::{Chain, ChainSpec};
-use audivane_dsp_core::conv::{combine_irs, combined_ir_length};
 use audivane_dsp_core::dither::ClipStats;
-use audivane_dsp_core::resample::resample_offline;
+use audivane_dsp_core::matrix::{ConvIrs, LoadedConv, combine_conv, load_conv};
+use audivane_dsp_core::resample::resample_ir;
 use audivane_protocol::{
-    ChainConfig, ChannelEq, ConvolutionConfig, DitherKind, EqProfile, RateTarget,
-    resolve_rate_ratio,
+    ChainConfig, ChannelEq, DitherKind, EqProfile, RateTarget, resolve_rate_ratio,
 };
 use std::fs;
 use std::path::Path;
@@ -38,11 +37,16 @@ pub fn run(args: ProcessArgs) -> Result<i32> {
         .output_rate(wav.rate)
         .context("the output rate is not a whole number of Hz")?;
 
+    // The block the live engine builds this chain with at the file's rate,
+    // so the latency (the upsampler's convolution block included) is the
+    // one `status.filter_latency_ms` reports. Calls never exceed it.
+    let max_block = audivane_protocol::chain_max_block(args.quantum, wav.rate);
+    let call = args.block.min(max_block);
     let spec = ChainSpec {
         config,
         sample_rate: wav.rate,
         channels: wav.channels,
-        max_block: args.block,
+        max_block,
         irs,
     };
 
@@ -53,7 +57,7 @@ pub fn run(args: ProcessArgs) -> Result<i32> {
     let channels = wav.channels;
     let total_out = ratio.frames_out_total(wav.frames() as u64) as usize * channels;
     let mut out_buf = vec![0i32; chain.max_output_frames() * channels];
-    let zeros = vec![0.0f32; args.block * channels];
+    let zeros = vec![0.0f32; call * channels];
     let mut result: Vec<i32> = Vec::with_capacity(
         total_out
             + if args.trim_latency {
@@ -64,7 +68,7 @@ pub fn run(args: ProcessArgs) -> Result<i32> {
     );
     let mut stats = ClipStats::default();
 
-    for chunk in wav.samples.chunks(args.block * channels) {
+    for chunk in wav.samples.chunks(call * channels) {
         let frames = chunk.len() / channels;
         let produced = chain.output_frames(frames) * channels;
         stats.merge(chain.process_f32(chunk, &mut out_buf[..produced]));
@@ -90,7 +94,7 @@ pub fn run(args: ProcessArgs) -> Result<i32> {
         let flush_frames = (latency as f64 / per_in).ceil() as usize + kernel_frames + 4;
         let mut remaining = flush_frames;
         while remaining > 0 {
-            let frames = remaining.min(args.block);
+            let frames = remaining.min(call);
             let produced = chain.output_frames(frames) * channels;
             chain.process_f32(&zeros[..frames * channels], &mut out_buf[..produced]);
             result.extend_from_slice(&out_buf[..produced]);
@@ -146,10 +150,21 @@ pub fn run(args: ProcessArgs) -> Result<i32> {
         dither_name(dither)
     );
     println!(
-        "frames: {} in, {} out (ratio {ratio}, latency {latency} out frames, {})",
+        "frames: {} in, {} out (ratio {ratio}, {})",
         wav.frames(),
         result.len() / channels,
-        if args.trim_latency { "trimmed" } else { "kept" }
+        if args.trim_latency {
+            "latency trimmed"
+        } else {
+            "latency kept"
+        }
+    );
+    println!(
+        "latency: {latency} out frames ({:.3} ms), as the live engine reports it at quantum {} \
+         ({max_block}-frame chain block at {} Hz)",
+        latency as f64 * 1000.0 / f64::from(out_rate),
+        args.quantum,
+        wav.rate
     );
     println!("peak: {:.2} dBFS", crate::signal::peak_dbfs(stats.peak));
     println!("clipped: {}", stats.clipped);
@@ -235,16 +250,7 @@ fn build_config(args: &ProcessArgs, wav: &WavData) -> Result<(ChainConfig, Conta
         } else {
             0.0
         };
-        config.convolution = args
-            .conv
-            .iter()
-            .map(|path| ConvolutionConfig {
-                name: None,
-                enabled: true,
-                ir_path: path.clone(),
-                gain_db: single_gain,
-            })
-            .collect();
+        config.convolution = crate::conv_args::conv_items(&args.conv, single_gain, None)?;
     }
 
     if let Some(ratio) = args.upsample {
@@ -342,24 +348,11 @@ fn build_config(args: &ProcessArgs, wav: &WavData) -> Result<(ChainConfig, Conta
     Ok((config, container))
 }
 
-/// Load, resample, and combine all enabled impulse responses to the chain rate.
-pub fn load_irs(config: &ChainConfig, rate: u32, channels: usize) -> Result<Option<Vec<Vec<f64>>>> {
-    let enabled: Vec<&ConvolutionConfig> =
-        config.convolution.iter().filter(|c| c.enabled).collect();
-    if enabled.is_empty() {
-        return Ok(None);
-    }
-    let mut loaded: Vec<(Vec<Vec<f64>>, f64)> = Vec::with_capacity(enabled.len());
-    let mut lengths = Vec::with_capacity(enabled.len());
-    for conv in enabled {
-        let wav = wavio::read_wav(&conv.ir_path)?;
-        if wav.channels != 1 && wav.channels != channels {
-            bail!(
-                "impulse response {} has {} channels; expected 1 or {channels}",
-                conv.ir_path.display(),
-                wav.channels
-            );
-        }
+/// Load, resample, and combine all enabled impulse responses (and filter
+/// matrices) to the chain rate.
+pub fn load_irs(config: &ChainConfig, rate: u32, channels: usize) -> Result<Option<ConvIrs>> {
+    let loaded = load_conv(&config.convolution, channels, &mut |path| {
+        let wav = wavio::read_wav(path).map_err(|e| format!("{e:#}"))?;
         let mut ir = Vec::with_capacity(wav.channels);
         for c in 0..wav.channels {
             let mono: Vec<f64> = (0..wav.frames())
@@ -368,22 +361,21 @@ pub fn load_irs(config: &ChainConfig, rate: u32, channels: usize) -> Result<Opti
             let mono = if wav.rate == rate {
                 mono
             } else {
-                resample_offline(&mono, wav.rate, rate)
+                resample_ir(&mono, wav.rate, rate)
             };
             if mono.is_empty() {
-                bail!("impulse response {} is empty", conv.ir_path.display());
+                return Err(format!("impulse response {} is empty", path.display()));
             }
             ir.push(mono);
         }
-        lengths.push(ir.iter().map(Vec::len).max().unwrap_or(0));
-        loaded.push((ir, conv.gain_db));
+        Ok(ir)
+    })
+    .map_err(anyhow::Error::msg)?;
+    if loaded.is_empty() {
+        return Ok(None);
     }
-    combined_ir_length(&lengths).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let pairs: Vec<(&[Vec<f64>], f64)> = loaded
-        .iter()
-        .map(|(ir, gain)| (ir.as_slice(), *gain))
-        .collect();
-    let combined = combine_irs(&pairs, channels).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let items: Vec<_> = loaded.iter().map(LoadedConv::as_item).collect();
+    let combined = combine_conv(&items, channels).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(Some(combined))
 }
 

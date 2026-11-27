@@ -1,19 +1,30 @@
 // Pure helpers for the effect stages (DC block, pitch, crossfeed, harmonics,
 // limiter) and the dither list: defaults, sidebar summaries, and the small
 // pieces of the engine's maths the views show (crossfeed level and
-// response, harmonic THD, DC-block response). Ranges and formulas follow
+// response, harmonics layers, DC-block response). Ranges and formulas follow
 // docs/control-plane.md and crates/dsp-core.
 
 import type {
   ChainConfig,
   CrossfeedConfig,
-  CrossfeedLevel,
   CrossfeedMode,
+  StereoWidthShape,
   DcBlockConfig,
   DitherKind,
   EngineState,
-  HarmonicsCharacter,
+  ChebyshevLayer,
+  HarmonicSign,
+  HarmonicsBias,
   HarmonicsConfig,
+  HarmonicsLayer,
+  HysteresisBassEq,
+  HarmonicsPreset,
+  HarmonicsSystem,
+  HarmonicsReadoutPoint,
+  HarmonicsSag,
+  HarmonicsTilt,
+  OrderTilt,
+  TiltShelf,
   LimiterConfig,
   LimiterMode,
   LimiterStatus,
@@ -23,12 +34,15 @@ import type {
 } from "../api/types";
 import { fmtRate } from "./format";
 import { fmtSpeedPercent } from "./varispeed";
+import presetData from "../../../crates/protocol/src/harmonics_presets.json";
 
 // ---------------------------------------------------------------- ranges
 
 export const DC_CUTOFF = { min: 1, max: 20, def: 5 } as const;
 export const CROSSFEED_CUTOFF = { min: 300, max: 2000 } as const;
 export const CROSSFEED_FEED = { min: 1, max: 15 } as const;
+/** Stereo width: the side gain `k` (1 = unchanged). */
+export const STEREO_WIDTH = { min: 0, max: 2 } as const;
 export const HARMONIC_DB = { min: -120, max: -20 } as const;
 export const PITCH_CENTS = { min: -1200, max: 1200 } as const;
 export const LIMITER_CEILING = { min: -6, max: 0, def: -0.5 } as const;
@@ -58,7 +72,7 @@ export function dcBlockDb(cutoffHz: number, f: number): number {
 // ---------------------------------------------------------------- pitch
 
 export const PITCH_QUALITY: Record<PitchQuality, { label: string; latencyMs: number; title: string }> = {
-  low: { label: "Low", latencyMs: 120, title: "Fastest: 120 ms window, 30 ms hop. Least CPU; can smear transients." },
+  low: { label: "Low", latencyMs: 120, title: "Fastest: 120 ms window, 30 ms hop, least CPU. Adds an audible warble on pure tones (faint sidebands about 33 Hz either side, around −50 dB, and a few cents of pitch drift) and can smear transients. Fine for speech or a quick preview; High and Max are far cleaner." },
   high: { label: "High", latencyMs: 120, title: "The default: 120 ms window, 15 ms hop. Runs as Low above 192 kHz." },
   max: { label: "Max", latencyMs: 240, title: "240 ms window: the smoothest tone, twice the delay. Runs as High above 96 kHz." },
 };
@@ -162,6 +176,7 @@ export function pitchPageSummary(p: PitchConfig | null | undefined, v: Varispeed
 // ---------------------------------------------------------------- crossfeed
 
 export const CROSSFEED_MODES: { mode: CrossfeedMode; label: string; title: string }[] = [
+  { mode: "none", label: "None", title: "No crossfeed: only the width acts." },
   { mode: "bs2b_default", label: "Default", title: "bs2b default: 700 Hz, 4.5 dB. A gentle, natural blend." },
   { mode: "bs2b_chu_moy", label: "Chu Moy", title: "bs2b Chu Moy: 700 Hz, 6 dB. Closer to speakers in a room." },
   { mode: "bs2b_jan_meier", label: "Jan Meier", title: "bs2b Jan Meier: 650 Hz, 9.5 dB. The lightest blend." },
@@ -169,51 +184,46 @@ export const CROSSFEED_MODES: { mode: CrossfeedMode; label: string; title: strin
   { mode: "bs2b_custom", label: "Custom", title: "Choose the cutoff and the feed level yourself." },
 ];
 
-export const CROSSFEED_LEVELS: { level: CrossfeedLevel; label: string; title: string }[] = [
-  {
-    level: "matched",
-    label: "Matched loudness",
-    title:
-      "Music sounds as loud with crossfeed on as off. Rare worst-case peaks can go up to 5.6 dB over full scale and clip, unless the limiter is on or the digital volume is turned down enough. Hardware volume does not help.",
-  },
-  {
-    level: "peak_safe",
-    label: "Peak-safe",
-    title: "Lowered just enough that nothing can ever go over full scale, whatever the music. Plays 1.4 to 5.6 dB quieter than with crossfeed off.",
-  },
-];
-
 /** Inter-channel correlation of the stereo reference the engine matches loudness for (`MATCHED_CORRELATION`). */
 export const CROSSFEED_MATCHED_CORRELATION = 0.5;
 
 export function defaultCrossfeed(): CrossfeedConfig {
-  return { enabled: true, mode: "bs2b_default", cutoff_hz: 700, feed_db: 4.5, level: "matched" };
+  return { enabled: true, mode: "bs2b_default", cutoff_hz: 700, feed_db: 4.5, width: 1, width_shape: "flat", width_corner_hz: 700 };
 }
 
-/**
- * The level policy. A config without `level` comes from an engine that
- * predates it, and those scale by the worst-case peak gain: `peak_safe`.
- */
-export function crossfeedLevel(c: CrossfeedConfig): CrossfeedLevel {
-  return c.level ?? "peak_safe";
+/** The width's named steps: Mono, two narrower, unchanged, two wider. */
+export const STEREO_WIDTH_DETENTS: { value: number; label: string }[] = [
+  { value: 0, label: "Mono" },
+  { value: 0.5, label: "−2" },
+  { value: 0.75, label: "−1" },
+  { value: 1, label: "0" },
+  { value: 1.25, label: "+1" },
+  { value: 1.5, label: "+2" },
+];
+
+export const STEREO_WIDTH_SHAPES: { shape: StereoWidthShape; label: string; title: string }[] = [
+  { shape: "flat", label: "Flat", title: "The same width at every frequency, as on an M/S side level control." },
+  { shape: "above_bass", label: "Above the bass", title: "The bass keeps its width; the width acts above about 700 Hz. Spares the ears inverted, wide bass." },
+];
+
+/** Side gain `k` of a config (an engine before the width has none: 1). */
+export function stereoWidth(c: CrossfeedConfig): number {
+  return c.width ?? 1;
 }
 
-/**
- * The config as the engine runs it: an engine known to lack the level
- * policy (`levelCap === false`) runs peak-safe whatever a draft says.
- */
-export function crossfeedAsRun(c: CrossfeedConfig, levelCap: boolean | null): CrossfeedConfig {
-  if (levelCap !== false) return c;
-  const { level: _level, ...rest } = c;
-  return rest as CrossfeedConfig;
+/** The detent's name for `k` ("+1", "Mono"), else the number. */
+export function stereoWidthLabel(k: number): string {
+  return STEREO_WIDTH_DETENTS.find((d) => Math.abs(d.value - k) < 1e-9)?.label ?? k.toFixed(2);
 }
 
-/**
- * Choose the level policy, keeping the power state: with no config yet the
- * result is the default stage, off, with that level.
- */
-export function withCrossfeedLevel(c: CrossfeedConfig | null | undefined, level: CrossfeedLevel): CrossfeedConfig {
-  return { ...(c ?? { ...defaultCrossfeed(), enabled: false }), level };
+/** The side gain in dB ("+1.9 dB"; "−∞ dB" for mono). */
+export function stereoWidthSideDb(k: number): string {
+  return k <= 0 ? "−∞ dB" : `${sign(20 * Math.log10(k), 1)} dB`;
+}
+
+/** True when the stage changes the signal (as `CrossfeedConfig::is_active`). */
+export function crossfeedActive(c: CrossfeedConfig | null | undefined): boolean {
+  return !!c && c.enabled && (c.mode !== "none" || stereoWidth(c) !== 1);
 }
 
 /** Effective `(cutoff_hz, feed_db)` (same as `CrossfeedConfig::effective_params`). */
@@ -243,8 +253,12 @@ export function crossfeedLabel(mode: CrossfeedMode): string {
 export function crossfeedSummary(c: CrossfeedConfig | null | undefined): string {
   if (!crossfeedOn(c)) return "Off";
   const { cutoffHz, feedDb } = crossfeedParams(c!);
-  const safe = crossfeedLevel(c!) === "peak_safe" ? " · peak-safe" : "";
-  return `${crossfeedLabel(c!.mode)} · ${Math.round(cutoffHz)} Hz, ${trim(feedDb)} dB${safe}`;
+  const k = stereoWidth(c!);
+  const width = k === 1 ? "" : k === 0 ? "Mono" : `Width ${stereoWidthLabel(k)}`;
+  const shaped = width && c!.width_shape === "above_bass" ? `${width} above bass` : width;
+  if (c!.mode === "none") return shaped ? shaped : "No crossfeed, width 0";
+  const xf = `${crossfeedLabel(c!.mode)} · ${Math.round(cutoffHz)} Hz, ${trim(feedDb)} dB`;
+  return shaped ? `${xf} · ${shaped}` : xf;
 }
 
 interface OnePole {
@@ -262,6 +276,7 @@ function l1(c: OnePole): number {
 /** Direct and cross paths, unscaled (ports `bs2b_design` / `complementary_design`). */
 function crossfeedDesign(c: CrossfeedConfig, fs: number): { direct: OnePole; cross: OnePole } {
   const { cutoffHz, feedDb } = crossfeedParams(c);
+  if (c.mode === "none") return { direct: { b0: 1, b1: 0, a1: 0 }, cross: { b0: 0, b1: 0, a1: 0 } };
   if (c.mode === "linkwitz") {
     const fc = Math.min(cutoffHz, 0.49 * fs);
     const r = Math.pow(10, feedDb / 20);
@@ -301,6 +316,87 @@ function onePoleResponse(c: OnePole, f: number, fs: number): [number, number] {
   return [(nr * dr + ni * di) / den, (ni * dr - nr * di) / den];
 }
 
+type Cx = [number, number];
+
+/**
+ * The whole stage as dsp-core builds it (`Kernel`): the crossfeed paths
+ * scaled by `scale`, then the width `u = g·d` (or `g·HP₁(d)`), `L′ = L + u`.
+ */
+interface XfStage {
+  direct: OnePole;
+  cross: OnePole;
+  crossfeed: boolean;
+  scale: number;
+  g: number;
+  hp: OnePole | null;
+}
+
+function highPass(fc: number, fs: number): OnePole {
+  const k = Math.tan((Math.PI * Math.min(fc, 0.49 * fs)) / fs);
+  const inv = 1 / (k + 1);
+  return { b0: inv, b1: -inv, a1: (k - 1) * inv };
+}
+
+function stageOf(c: CrossfeedConfig, fs: number, scale: number): XfStage {
+  const { direct, cross } = crossfeedDesign(c, fs);
+  const s = (p: OnePole): OnePole => ({ b0: p.b0 * scale, b1: p.b1 * scale, a1: p.a1 });
+  return {
+    direct: s(direct),
+    cross: s(cross),
+    crossfeed: c.mode !== "none",
+    scale,
+    g: (stereoWidth(c) - 1) / 2,
+    hp: c.width_shape === "above_bass" ? highPass(c.width_corner_hz ?? 700, fs) : null,
+  };
+}
+
+/** Direct and cross responses of the stage at `f`: `D′ = d + w`, `C′ = c − w`, `w = g·H·(d − c)`. */
+function stagePaths(st: XfStage, f: number, fs: number): [Cx, Cx] {
+  const d: Cx = st.crossfeed ? onePoleResponse(st.direct, f, fs) : [st.scale, 0];
+  const c: Cx = st.crossfeed ? onePoleResponse(st.cross, f, fs) : [0, 0];
+  if (st.g === 0) return [d, c];
+  const [hr, hi] = st.hp ? onePoleResponse(st.hp, f, fs) : [1, 0];
+  const er = d[0] - c[0];
+  const ei = d[1] - c[1];
+  const wr = st.g * (hr * er - hi * ei);
+  const wi = st.g * (hr * ei + hi * er);
+  return [
+    [d[0] + wr, d[1] + wi],
+    [c[0] - wr, c[1] - wi],
+  ];
+}
+
+/** Exact worst-case peak gain of the stage, summed from its impulse response (as `Kernel::l1_bound`). */
+function stageL1(st: XfStage): number {
+  let p = 0;
+  if (st.crossfeed) p = Math.max(Math.abs(st.direct.a1), Math.abs(st.cross.a1));
+  if (st.hp && st.g !== 0) p = Math.max(p, Math.abs(st.hp.a1));
+  const n = p > 0 ? Math.min(1e7, Math.max(1, Math.ceil(Math.log(1e-20) / Math.log(p)))) : 1;
+  const z = [0, 0, 0, 0, 0];
+  const step = (c: OnePole, i: number, x: number) => {
+    const y = c.b0 * x + z[i];
+    z[i] = c.b1 * x - c.a1 * y;
+    return y;
+  };
+  let sum = 0;
+  for (let i = 0; i <= n; i++) {
+    const xl = i === 0 ? 1 : 0;
+    let yl = xl * st.scale;
+    let yr = 0;
+    if (st.crossfeed) {
+      yl = step(st.direct, 0, xl) + step(st.cross, 1, 0);
+      yr = step(st.direct, 2, 0) + step(st.cross, 3, xl);
+    }
+    if (st.g !== 0) {
+      const d = st.hp ? step(st.hp, 4, yl - yr) : yl - yr;
+      yl += st.g * d;
+      yr -= st.g * d;
+    }
+    sum += Math.abs(yl) + Math.abs(yr);
+  }
+  return sum;
+}
+
 /** IEC 61672 A-weighting power at `f` (1 at 1 kHz), as `loudness::a_weighting_db`. */
 function aWeightPower(f: number): number {
   const f2 = f * f;
@@ -314,7 +410,7 @@ function aWeightPower(f: number): number {
  * input with inter-channel correlation `rho` (as dsp-core's
  * `analytic_offset_db` over `|H_d|² + |H_c|² + 2ρ·Re(H_d·conj H_c)`).
  */
-function stereoLoudnessGain(direct: OnePole, cross: OnePole, fs: number, rho: number): number {
+function stereoLoudnessGain(st: XfStage, fs: number, rho: number): number {
   const fMax = Math.min(0.5 * fs, 20000);
   const points = 2048;
   const u0 = Math.log(20);
@@ -324,89 +420,434 @@ function stereoLoudnessGain(direct: OnePole, cross: OnePole, fs: number, rho: nu
   for (let i = 0; i < points; i++) {
     const f = Math.exp(u0 + (i + 0.5) * du);
     const w = aWeightPower(f);
-    const [dr, di] = onePoleResponse(direct, f, fs);
-    const [cr, ci] = onePoleResponse(cross, f, fs);
+    const [[dr, di], [cr, ci]] = stagePaths(st, f, fs);
     ref += w;
     out += w * (dr * dr + di * di + cr * cr + ci * ci + 2 * rho * (dr * cr + di * ci));
   }
   return out / ref;
 }
 
-/** The constant gain the stage applies to both paths (linear), per its level policy. */
+/**
+ * The constant gain the stage applies (linear): the crossfeed part's
+ * loudness match (1 without crossfeed; the width is never compensated).
+ * No cut for safety: the limiter and the output headroom handle the peaks.
+ */
 function crossfeedScale(c: CrossfeedConfig, fs: number): number {
-  const { direct, cross } = crossfeedDesign(c, fs);
-  return crossfeedLevel(c) === "peak_safe" ? 1 / (l1(direct) + l1(cross)) : 1 / Math.sqrt(stereoLoudnessGain(direct, cross, fs, CROSSFEED_MATCHED_CORRELATION));
+  const unscaled = stageOf(c, fs, 1);
+  if (!unscaled.crossfeed) return 1;
+  return 1 / Math.sqrt(stereoLoudnessGain({ ...unscaled, g: 0 }, fs, CROSSFEED_MATCHED_CORRELATION));
 }
 
-/** The constant gain (dB) the stage applies: about 0 for `matched`, −1.4 to −5.6 dB for `peak_safe`. */
+/** The constant gain (dB) the stage applies: about 0 (its loudness match). */
 export function crossfeedLevelDb(c: CrossfeedConfig, fs: number): number {
   return 20 * Math.log10(crossfeedScale(c, fs));
 }
 
-/** How far over the input's peak a worst-case signal can go, dB (0 for `peak_safe`). */
+/** How far over the input's peak a worst-case signal can go, dB, width included. */
 export function crossfeedPeakDb(c: CrossfeedConfig, fs: number): number {
-  const { direct, cross } = crossfeedDesign(c, fs);
-  return 20 * Math.log10(crossfeedScale(c, fs) * (l1(direct) + l1(cross)));
+  const st = stageOf(c, fs, crossfeedScale(c, fs));
+  return 20 * Math.log10(st.g === 0 ? l1(st.direct) + l1(st.cross) : stageL1(st));
 }
 
-function onePoleDb(c: OnePole, f: number, fs: number, scale: number): number {
-  const w = (2 * Math.PI * f) / fs;
-  const cr = Math.cos(w);
-  const si = Math.sin(w);
-  const nr = c.b0 + c.b1 * cr;
-  const ni = -c.b1 * si;
-  const dr = 1 + c.a1 * cr;
-  const di = -c.a1 * si;
-  const m = Math.sqrt((nr * nr + ni * ni) / (dr * dr + di * di)) * scale;
-  return 20 * Math.log10(Math.max(m, 1e-12));
+/** The stage's loudness change (dB) on typical stereo music (pink noise, correlation 0.5, A-weighted), width and level included. */
+export function crossfeedLoudnessDb(c: CrossfeedConfig, fs: number): number {
+  return 10 * Math.log10(stereoLoudnessGain(stageOf(c, fs, crossfeedScale(c, fs)), fs, CROSSFEED_MATCHED_CORRELATION));
 }
 
-/** Direct (own ear) and cross (other ear) path levels in dB at `freqs`, the stage's level included. */
+const cxDb = ([re, im]: Cx) => 20 * Math.log10(Math.max(Math.hypot(re, im), 1e-12));
+
+/** Direct (own ear) and cross (other ear) path levels in dB at `freqs`, the stage's level and width included. */
 export function crossfeedResponse(c: CrossfeedConfig, fs: number, freqs: readonly number[]): { direct: number[]; cross: number[] } {
-  const { direct, cross } = crossfeedDesign(c, fs);
-  const s = crossfeedScale(c, fs);
-  return {
-    direct: freqs.map((f) => onePoleDb(direct, f, fs, s)),
-    cross: freqs.map((f) => onePoleDb(cross, f, fs, s)),
-  };
+  const st = stageOf(c, fs, crossfeedScale(c, fs));
+  const paths = freqs.map((f) => stagePaths(st, f, fs));
+  return { direct: paths.map((p) => cxDb(p[0])), cross: paths.map((p) => cxDb(p[1])) };
 }
 
 // ---------------------------------------------------------------- harmonics
 
-export const HARMONIC_CHARACTERS: { character: HarmonicsCharacter; label: string; title: string }[] = [
-  { character: "triode", label: "Triode", title: "Warm: a strong 2nd harmonic (−40 dB), a faint 3rd (−58 dB) and 4th (−72 dB)." },
-  { character: "pentode", label: "Pentode", title: "Edgier: a strong 3rd harmonic (−42 dB), a faint 2nd (−56 dB) and 5th (−66 dB)." },
-  { character: "custom", label: "Custom", title: "Set each harmonic's level yourself." },
-];
+/** Ranges of the layer parameters (docs/control-plane.md). */
+export const HARMONIC_DRIVE = { min: -40, max: 0 } as const;
+export const FLUX_CORNER = { min: 1, max: 5000 } as const;
+export const FLUX_BOOST = { min: 0, max: 40 } as const;
+export const FLUX_H3 = { min: -120, max: -12 } as const;
+export const FLUX_CAL = { min: 5, max: 1000 } as const;
+export const HYSTERESIS_H3 = { min: -120, max: -12 } as const;
+export const HYSTERESIS_CAL = { min: 20, max: 5000 } as const;
+export const HYSTERESIS_MIN_CLEAN_RATE_HZ = 176400;
+/** Hysteresis bass EQ pair (corner Hz, boost into the core dB) and field offset (in units of the core's saturation knee). */
+export const HYSTERESIS_EQ_HZ = { min: 20, max: 500 } as const;
+export const HYSTERESIS_EQ_DB = { min: 0, max: 12 } as const;
+export const HYSTERESIS_ASYMMETRY = { min: -1, max: 1 } as const;
+/** The most layers a stage holds. */
+export const HARMONIC_LAYERS_MAX = 8;
+/** Tilt shelf ranges: corners as fundamental frequencies, Hz; rise in dB. */
+export const TILT_LOW_HZ = { min: 20, max: 2000 } as const;
+export const TILT_HIGH_HZ = { min: 200, max: 20000 } as const;
+export const TILT_DB = { min: -24, max: 24 } as const;
+/** Tilt shelf slopes on offer, dB/oct (shelf order 1–4), and each shelf's slope when `slope` is omitted. */
+export const TILT_SLOPES = [6, 12, 18, 24] as const;
+export const TILT_LOW_DEFAULT_SLOPE = 12;
+export const TILT_HIGH_DEFAULT_SLOPE = 6;
+
+/** `s` at slope `v` dB/oct; the default slope is stored as no `slope` at all. */
+export function withShelfSlope(s: TiltShelf, v: number, defaultSlope: number): TiltShelf {
+  const { slope: _old, ...rest } = s;
+  return v === defaultSlope ? rest : { ...rest, slope: v };
+}
+/** Sag and bias ranges: sag depth in dB, bias depth as a fraction of full scale, envelope times in ms. */
+export const SAG_DB = { min: 0, max: 6 } as const;
+export const BIAS_DEPTH = { min: -0.25, max: 0.25 } as const;
+export const ENVELOPE_MS = { min: 0.1, max: 10000 } as const;
+
+/** Default signs for H2..H9: H3 negative (compressive), the others positive. */
+export const HARMONIC_DEFAULT_SIGNS: ChebyshevLayer["signs"] = ["+", "-", "+", "+", "+", "+", "+", "+"];
+
+/** The preset a new stage starts from (as the engine's `HarmonicsConfig::default()`). */
+export const DEFAULT_HARMONICS_PRESET = "se_triode_high_mu";
 
 export function defaultHarmonics(): HarmonicsConfig {
-  return { enabled: true, character: "triode", h2_db: -40, h3_db: -58, h4_db: null, h5_db: null, dc_block: true };
+  const p = (presetData as unknown as HarmonicsPreset[]).find((x) => x.id === DEFAULT_HARMONICS_PRESET);
+  if (!p) throw new Error(`missing harmonics preset ${DEFAULT_HARMONICS_PRESET}`);
+  return { enabled: true, dc_block: true, layers: [layerFromPreset(p)] };
 }
 
-/** Effective `[h2, h3, h4, h5]` in dB (null = off), as `effective_levels_db`. */
-export function harmonicLevels(c: HarmonicsConfig): [number, number, number | null, number | null] {
-  if (c.character === "triode") return [-40, -58, -72, null];
-  if (c.character === "pentode") return [-56, -42, null, -66];
-  return [c.h2_db, c.h3_db, c.h4_db ?? null, c.h5_db ?? null];
-}
-
-/** THD of a full-scale sine through the stage, % (levels are exact at full scale). */
-export function harmonicsThdPercent(c: HarmonicsConfig): number {
-  const p = harmonicLevels(c).reduce<number>((sum, db) => (db === null ? sum : sum + Math.pow(10, db / 10)), 0);
-  return 100 * Math.sqrt(p);
+/** A new layer from a preset: its parameters, on, with `preset` set. */
+export function layerFromPreset(p: HarmonicsPreset): HarmonicsLayer {
+  return { ...structuredClone(p.layer), enabled: true, preset: p.id } as HarmonicsLayer;
 }
 
 /**
- * Level change at full scale, dB (≤ 0): the stage scales its output so a
- * full-scale input stays within full scale. A grid estimate of the
- * engine's certified bound (its DC blocker's first tap taken as 1).
+ * The stage a system preset stands for: its layers (each an ordinary layer
+ * from its layer preset, on) and routing, remembering the system (`system`,
+ * the editor's baseline); `enabled` as given, DC blocker on.
  */
-export function harmonicsLevelDb(c: HarmonicsConfig): number {
-  const [h2, h3, h4, h5] = harmonicLevels(c);
-  const a2 = Math.pow(10, h2 / 20);
-  const a3 = -Math.pow(10, h3 / 20);
-  const a4 = h4 === null ? 0 : Math.pow(10, h4 / 20);
-  const a5 = h5 === null ? 0 : Math.pow(10, h5 / 20);
+export function configFromSystem(s: HarmonicsSystem, enabled = true): HarmonicsConfig {
+  const layers = s.layers.map((l) => ({ ...structuredClone(l), enabled: true }) as HarmonicsLayer);
+  return s.routing && s.routing !== "parallel" ? { enabled, dc_block: true, layers, routing: s.routing, system: s.id } : { enabled, dc_block: true, layers, system: s.id };
+}
+
+/** The system the stage was started from (undefined: built by hand, or one this engine does not list). */
+export function stageSystem(c: HarmonicsConfig, systems: readonly HarmonicsSystem[] | null | undefined): HarmonicsSystem | undefined {
+  return c.system ? systems?.find((s) => s.id === c.system) : undefined;
+}
+
+/**
+ * The system's version of each layer of `c` (undefined for a layer added
+ * by hand): layers pair with the system's by preset, in order, so moving or
+ * removing one keeps the others paired.
+ */
+export function systemLayers(c: HarmonicsConfig, system: HarmonicsSystem | undefined): (HarmonicsLayer | undefined)[] {
+  if (!system) return c.layers.map(() => undefined);
+  const free: (HarmonicsLayer | undefined)[] = [...system.layers];
+  return c.layers.map((l) => {
+    const i = free.findIndex((x) => x !== undefined && x.kind === l.kind && (x.preset ?? null) === (l.preset ?? null));
+    if (i < 0) return undefined;
+    const x = free[i];
+    free[i] = undefined;
+    return x;
+  });
+}
+
+/** Whether a layer differs from `base` (its system's version), parameters only. */
+export function layerDiffers(l: HarmonicsLayer, base: HarmonicsLayer): boolean {
+  return JSON.stringify(layerParams(l)) !== JSON.stringify(layerParams(base));
+}
+
+/** Whether the stage differs from the system it was started from: its layers (which, in what order, on or off, their settings), routing or DC blocker. */
+export function stageModified(c: HarmonicsConfig, system: HarmonicsSystem): boolean {
+  const routing = (r: HarmonicsConfig["routing"]) => r ?? "parallel";
+  if (routing(c.routing) !== routing(system.routing) || !c.dc_block || c.layers.length !== system.layers.length) return true;
+  return c.layers.some((l, i) => {
+    const b = system.layers[i];
+    return !l.enabled || l.kind !== b.kind || (l.preset ?? null) !== (b.preset ?? null) || layerDiffers(l, b);
+  });
+}
+
+/** The layer presets a system chains, by name (an unknown id as itself), e.g. "Single-ended triode, high-mu → Output transformer". */
+export function systemChain(s: HarmonicsSystem, presets: readonly HarmonicsPreset[]): string {
+  return s.layers.map((l) => (l.preset ? (presets.find((p) => p.id === l.preset)?.name ?? l.preset) : LAYER_KINDS[l.kind].tag)).join(s.routing && s.routing !== "parallel" ? " → " : " + ");
+}
+
+/** A flat tilt (both shelves at 0 dB, low corner 100 Hz, high corner 2 kHz), as the engine's default. */
+export function defaultTilt(): HarmonicsTilt {
+  return { low: { hz: 100, db: 0 }, high: { hz: 2000, db: 0 } };
+}
+
+/** The shelves order `k` (2..9) gets: its override, else the layer's (low shelf on odd orders unless `low_even`). */
+export function orderShelves(t: HarmonicsTilt, k: number): OrderTilt {
+  const o = t.orders?.[k - 2];
+  if (o) return o;
+  return { low: { ...t.low, db: k % 2 === 1 || t.low_even ? t.low.db : 0 }, high: t.high };
+}
+
+/** Whether every order's shelves are at 0 dB (sounds as no tilt). */
+export function tiltFlat(t: HarmonicsTilt | null | undefined): boolean {
+  if (!t) return true;
+  for (let k = 2; k <= 9; k++) {
+    const o = orderShelves(t, k);
+    if (o.low.db !== 0 || o.high.db !== 0) return false;
+  }
+  return true;
+}
+
+/** Sag at depth 0 with the engine's default times: what a layer without sag shows. */
+export function defaultSag(): HarmonicsSag {
+  return { depth_db: 0, attack_ms: 20, release_ms: 200 };
+}
+
+/** Bias at depth 0 with the engine's default times. */
+export function defaultBias(): HarmonicsBias {
+  return { depth: 0, attack_ms: 300, release_ms: 2000 };
+}
+
+export const sagOn = (s: HarmonicsSag | null | undefined): boolean => !!s && s.depth_db > 0;
+export const biasOn = (b: HarmonicsBias | null | undefined): boolean => !!b && b.depth !== 0;
+
+/** Whether a Chebyshev layer has sag or bias set (a depth other than 0), whatever the amount. */
+export function chebyshevHasDynamics(l: ChebyshevLayer): boolean {
+  return sagOn(l.sag) || biasOn(l.bias);
+}
+
+/** Whether sag or bias is set and the amount above 0 (both depths scale with it): the layer runs on its own. */
+export function chebyshevDynamic(l: ChebyshevLayer): boolean {
+  return l.amount > 0 && chebyshevHasDynamics(l);
+}
+
+/** Whether the layer is a Chebyshev layer with sag or bias on. */
+export function layerDynamic(l: HarmonicsLayer): boolean {
+  return l.kind === "chebyshev" && chebyshevDynamic(l);
+}
+
+/** `c` with the sag of Chebyshev layer `i` replaced by `fn` of it (depth 0 when it has none). */
+export function withSag(c: HarmonicsConfig, i: number, fn: (s: HarmonicsSag) => HarmonicsSag): HarmonicsConfig {
+  return withLayer(c, i, (l) => (l.kind === "chebyshev" ? { ...l, sag: fn(l.sag ?? defaultSag()) } : l));
+}
+
+/** `c` with the bias of Chebyshev layer `i` replaced by `fn` of it (depth 0 when it has none). */
+export function withBias(c: HarmonicsConfig, i: number, fn: (b: HarmonicsBias) => HarmonicsBias): HarmonicsConfig {
+  return withLayer(c, i, (l) => (l.kind === "chebyshev" ? { ...l, bias: fn(l.bias ?? defaultBias()) } : l));
+}
+
+/** The tilt with defaults filled in for comparing (`null` when flat). */
+function tiltParams(t: HarmonicsTilt | null | undefined): unknown {
+  if (!t || tiltFlat(t)) return null;
+  // A 0 dB shelf's slope changes nothing.
+  const shelf = (s: TiltShelf, d: number) => ({ hz: s.hz, db: s.db, slope: s.db === 0 ? null : (s.slope ?? d) });
+  const pair = (o: OrderTilt) => ({ low: shelf(o.low, TILT_LOW_DEFAULT_SLOPE), high: shelf(o.high, TILT_HIGH_DEFAULT_SLOPE) });
+  return { ...pair(t), low_even: !!t.low_even, orders: Array.from({ length: 8 }, (_, i) => { const o = t.orders?.[i]; return o ? pair(o) : null; }) };
+}
+
+/** The layer's parameters only (no `enabled`, no `preset`), with defaults filled in, for comparing. */
+function layerParams(l: HarmonicsLayer): unknown {
+  if (l.kind === "chebyshev") {
+    return {
+      kind: l.kind,
+      levels_db: l.levels_db.map((x) => x ?? null),
+      signs: [...l.signs],
+      invert_even: !!l.invert_even,
+      drive_db: l.drive_db,
+      amount: l.amount,
+      tilt: tiltParams(l.tilt),
+      // Depth 0 sounds as none.
+      sag: sagOn(l.sag) ? l.sag : null,
+      bias: biasOn(l.bias) ? l.bias : null,
+    };
+  }
+  if (l.kind === "flux") {
+    return { kind: l.kind, corner_hz: l.corner_hz, max_boost_db: l.max_boost_db, target_h3_db: l.target_h3_db, calibration_hz: l.calibration_hz };
+  }
+  return {
+    kind: l.kind,
+    saturation: l.saturation,
+    width: l.width,
+    amount: l.amount,
+    target_h3_db: l.target_h3_db,
+    calibration_hz: l.calibration_hz,
+    // Switched off, or at 0 dB / 0, sounds as none.
+    bass_eq: hysteresisEqOn(l.bass_eq) ? { hz: l.bass_eq!.hz, db: l.bass_eq!.db } : null,
+    asymmetry: l.asymmetry ? l.asymmetry : null,
+  };
+}
+
+/** Whether a hysteresis layer's bass EQ pair changes the sound. */
+export function hysteresisEqOn(eq: HysteresisBassEq | null | undefined): boolean {
+  // `enabled` defaults to true (the preset data leaves it out).
+  return !!eq && eq.enabled !== false && eq.db !== 0;
+}
+
+/** The bass EQ a hysteresis layer starts from when switched on (as the studio tape preset's). */
+export function defaultHysteresisEq(): HysteresisBassEq {
+  return { enabled: true, hz: 110, db: 3.5 };
+}
+
+/**
+ * Whether the layer differs from the preset it started from (`null`: it
+ * names no preset, or one this engine does not list).
+ */
+export function layerModified(l: HarmonicsLayer, presets: readonly HarmonicsPreset[]): boolean | null {
+  const p = l.preset ? presets.find((x) => x.id === l.preset) : undefined;
+  if (!p) return null;
+  return JSON.stringify(layerParams(l)) !== JSON.stringify(layerParams(p.layer));
+}
+
+/** The layer back at its preset's parameters (kept on or off); unchanged when it has none. */
+export function resetLayer(l: HarmonicsLayer, presets: readonly HarmonicsPreset[]): HarmonicsLayer {
+  const p = l.preset ? presets.find((x) => x.id === l.preset) : undefined;
+  return p ? { ...layerFromPreset(p), enabled: l.enabled } : l;
+}
+
+/** Per-kind labels: the tag shown on a layer, and the name of one built by hand. */
+export const LAYER_KINDS: Record<HarmonicsLayer["kind"], { tag: string; customName: string }> = {
+  chebyshev: { tag: "Chebyshev", customName: "Custom Chebyshev" },
+  flux: { tag: "Flux", customName: "Custom flux" },
+  hysteresis: { tag: "Hysteresis", customName: "Custom hysteresis" },
+};
+
+/** The layer's display name: its preset's, else "Custom" and its kind. */
+export function layerName(l: HarmonicsLayer, presets: readonly HarmonicsPreset[] = []): string {
+  const p = l.preset ? presets.find((x) => x.id === l.preset) : undefined;
+  if (p) return p.name;
+  if (l.preset) return l.preset;
+  return LAYER_KINDS[l.kind].customName;
+}
+
+export const PRESET_ORIGINS: { origin: string; label: string; title: string }[] = [
+  { origin: "hand_picked", label: "Hand-picked", title: "The stage's original characters, levels picked by ear." },
+  { origin: "computed", label: "Computed", title: "From device equations at a stated operating point." },
+  { origin: "archetype", label: "Archetypes", title: "Typical behaviour of a kind of device, not one model." },
+];
+
+/** Presets grouped by origin, in the order of `PRESET_ORIGINS` (unknown origins last). */
+export function presetGroups(presets: readonly HarmonicsPreset[]): { origin: string; label: string; title: string; presets: HarmonicsPreset[] }[] {
+  const known = PRESET_ORIGINS.map((o) => ({ ...o, presets: presets.filter((p) => p.origin === o.origin) }));
+  const rest = presets.filter((p) => !PRESET_ORIGINS.some((o) => o.origin === p.origin));
+  const groups = rest.length ? [...known, { origin: "other", label: "Other", title: "", presets: rest }] : known;
+  return groups.filter((g) => g.presets.length > 0);
+}
+
+/** `c` with layer `i` replaced by `fn` of it. */
+export function withLayer(c: HarmonicsConfig, i: number, fn: (l: HarmonicsLayer) => HarmonicsLayer): HarmonicsConfig {
+  return { ...c, layers: c.layers.map((l, j) => (j === i ? fn(l) : l)) };
+}
+
+/** `c` with layer `i` moved to position `to` (the others keep their order); `c` itself when either is out of range. */
+export function moveLayer(c: HarmonicsConfig, i: number, to: number): HarmonicsConfig {
+  const n = c.layers.length;
+  if (i === to || i < 0 || to < 0 || i >= n || to >= n) return c;
+  const layers = [...c.layers];
+  const [l] = layers.splice(i, 1);
+  layers.splice(to, 0, l);
+  return { ...c, layers };
+}
+
+/** Where the open layer card goes after layer `i` moves to `to`. */
+export function movedIndex(open: number | null, i: number, to: number): number | null {
+  if (open === null) return null;
+  if (open === i) return to;
+  if (i < open && to >= open) return open - 1;
+  if (i > open && to <= open) return open + 1;
+  return open;
+}
+
+/** Whether the stage runs its layers in series. */
+export function harmonicsSeries(c: HarmonicsConfig | null | undefined): boolean {
+  return c?.routing === "series";
+}
+
+/** `c` with one Chebyshev order of layer `i` set (index 0 is H2; null = off). */
+export function withOrderLevel(c: HarmonicsConfig, i: number, order: number, db: number | null): HarmonicsConfig {
+  return withLayer(c, i, (l) => {
+    if (l.kind !== "chebyshev") return l;
+    const levels_db = [...l.levels_db] as ChebyshevLayer["levels_db"];
+    levels_db[order] = db;
+    return { ...l, levels_db };
+  });
+}
+
+/** `c` with one Chebyshev order's sign of layer `i` set. */
+export function withOrderSign(c: HarmonicsConfig, i: number, order: number, sign: HarmonicSign): HarmonicsConfig {
+  return withLayer(c, i, (l) => {
+    if (l.kind !== "chebyshev") return l;
+    const signs = [...l.signs] as ChebyshevLayer["signs"];
+    signs[order] = sign;
+    return { ...l, signs };
+  });
+}
+
+/** `c` with the tilt of Chebyshev layer `i` replaced by `fn` of it (a flat default when it has none). */
+export function withTilt(c: HarmonicsConfig, i: number, fn: (t: HarmonicsTilt) => HarmonicsTilt): HarmonicsConfig {
+  return withLayer(c, i, (l) => (l.kind === "chebyshev" ? { ...l, tilt: fn(l.tilt ?? defaultTilt()) } : l));
+}
+
+/** `t` with order `k`'s (2..9) override set (`null`: back to the layer's shelves); `orders` dropped when none is left. */
+export function withOrderTilt(t: HarmonicsTilt, k: number, o: OrderTilt | null): HarmonicsTilt {
+  const orders = Array.from({ length: 8 }, (_, i) => (i === k - 2 ? o : (t.orders?.[i] ?? null))) as NonNullable<HarmonicsTilt["orders"]>;
+  const { orders: _old, ...rest } = t;
+  return orders.some((x) => x) ? { ...rest, orders } : rest;
+}
+
+/** Orders in a readout point, H2..H15 (the protocol's `HARMONICS_READOUT_ORDERS`). */
+export const HARMONICS_READOUT_ORDERS = 14;
+
+/** The lowest frequency of a readout's `freq_sweep` at one input level whose orders fold past Nyquist (`aliased`), if any. */
+export function firstAliasedFreq(freqSweep: readonly HarmonicsReadoutPoint[] | undefined, levelDbfs: number): number | undefined {
+  const f = (freqSweep ?? []).filter((p) => p.input_dbfs === levelDbfs && (p.aliased?.length ?? 0) > 0).map((p) => p.freq_hz);
+  return f.length ? Math.min(...f) : undefined;
+}
+
+/**
+ * THD and each order against frequency at one input level, from a readout's
+ * `freq_sweep`. `above[k][i]`: order k + 2 lands above Nyquist at point i
+ * (listed in its `aliased`, so not a level of that harmonic).
+ */
+export function freqCurves(
+  freqSweep: readonly HarmonicsReadoutPoint[] | undefined,
+  levelDbfs: number,
+): { freqs: number[]; thd: number[]; orders: number[][]; above: boolean[][]; gain: number[] } {
+  const pts = (freqSweep ?? []).filter((p) => p.input_dbfs === levelDbfs).sort((a, b) => a.freq_hz - b.freq_hz);
+  return {
+    freqs: pts.map((p) => p.freq_hz),
+    thd: pts.map((p) => p.thd_db),
+    orders: Array.from({ length: HARMONICS_READOUT_ORDERS }, (_, k) => pts.map((p) => p.harmonics_db[k])),
+    above: Array.from({ length: HARMONICS_READOUT_ORDERS }, (_, k) => pts.map((p) => (p.aliased ?? []).some((a) => a.order === k + 2))),
+    gain: pts.map((p) => p.gain_db),
+  };
+}
+
+/** Harmonic levels against input level, per order, from a readout's `sweep` at one tone. */
+export function sweepCurves(sweep: readonly HarmonicsReadoutPoint[] | undefined, freqHz: number): { levels: number[]; orders: number[][] } {
+  const pts = (sweep ?? []).filter((p) => p.freq_hz === freqHz).sort((a, b) => a.input_dbfs - b.input_dbfs);
+  return { levels: pts.map((p) => p.input_dbfs), orders: Array.from({ length: HARMONICS_READOUT_ORDERS }, (_, k) => pts.map((p) => p.harmonics_db[k])) };
+}
+
+/**
+ * Signed amplitudes a2..a9 of the enabled Chebyshev layers, summed (signs,
+ * `invert_even` and `amount`; drive taken as 0 dB). Flux layers are not
+ * counted: the engine's `harmonics_readout` has the exact figures.
+ */
+function harmonicAmplitudes(c: HarmonicsConfig): number[] {
+  const a = [0, 0, 0, 0, 0, 0, 0, 0];
+  for (const l of c.layers) {
+    if (l.kind !== "chebyshev" || !l.enabled) continue;
+    l.levels_db.forEach((db, i) => {
+      if (db === null || db === undefined) return;
+      let sign = l.signs[i] === "-" ? -1 : 1;
+      if (l.invert_even && i % 2 === 0) sign = -sign;
+      a[i] += sign * l.amount * Math.pow(10, db / 20);
+    });
+  }
+  return a;
+}
+
+/**
+ * Worst-case peak gain for a full-scale input, dB: how far over full scale
+ * the stage can go (it is not turned down for it; the limiter and the
+ * output headroom are). A grid estimate of the engine's certified bound
+ * (its DC blocker's first tap taken as 1) for the Chebyshev layers.
+ */
+export function harmonicsPeakDb(c: HarmonicsConfig): number {
+  // a[k] for k = 2..9, signed.
+  const a = [0, 0, ...harmonicAmplitudes(c)];
   let maxO = -Infinity;
   let minO = Infinity;
   let maxE = -Infinity;
@@ -415,13 +856,18 @@ export function harmonicsLevelDb(c: HarmonicsConfig): number {
   const N = 4096;
   for (let i = 0; i <= N; i++) {
     const x = -1 + (2 * i) / N;
-    const x2 = x * x;
-    const t2 = 2 * x2 - 1;
-    const t3 = 4 * x2 * x - 3 * x;
-    const t4 = 8 * x2 * x2 - 8 * x2 + 1;
-    const t5 = 16 * x2 * x2 * x - 20 * x2 * x + 5 * x;
-    const e = a2 * (t2 + 1) + a4 * (t4 - 1);
-    const o = x + a3 * t3 + a5 * t5;
+    // x + Σ a_k (T_k(x) − T_k(0)), T_k by the recurrence; T_k(0) = ±1 for even k.
+    let prev = 1;
+    let t = x;
+    let e = 0;
+    let o = x;
+    for (let k = 2; k <= 9; k++) {
+      const next = 2 * x * t - prev;
+      prev = t;
+      t = next;
+      if (k % 2 === 0) e += a[k] * (t - (k % 4 === 0 ? 1 : -1));
+      else o += a[k] * t;
+    }
     maxO = Math.max(maxO, o + e);
     minO = Math.min(minO, o + e);
     maxE = Math.max(maxE, e);
@@ -429,17 +875,20 @@ export function harmonicsLevelDb(c: HarmonicsConfig): number {
     maxAll = Math.max(maxAll, Math.abs(o + e));
   }
   const bound = c.dc_block ? Math.max(maxO - minE, maxE - minO) : maxAll;
-  return bound > 1 ? -20 * Math.log10(bound) : 0;
+  return 20 * Math.log10(bound);
 }
 
 export function harmonicsOn(c: HarmonicsConfig | null | undefined): boolean {
   return !!c && c.enabled;
 }
 
-export function harmonicsSummary(c: HarmonicsConfig | null | undefined): string {
+/** "Triode", "Triode + Tape, hot", "Triode + 2 more", or "Off" (names from `presets` when known). */
+export function harmonicsSummary(c: HarmonicsConfig | null | undefined, presets: readonly HarmonicsPreset[] = []): string {
   if (!harmonicsOn(c)) return "Off";
-  const label = HARMONIC_CHARACTERS.find((x) => x.character === c!.character)?.label ?? c!.character;
-  return `${label} · THD ${fmtPercent(harmonicsThdPercent(c!))}`;
+  const on = c!.layers.filter((l) => l.enabled);
+  if (on.length === 0) return "No layers on";
+  const names = on.map((l) => layerName(l, presets));
+  return names.length <= 2 ? names.join(" + ") : `${names[0]} + ${names.length - 1} more`;
 }
 
 export function fmtPercent(p: number): string {

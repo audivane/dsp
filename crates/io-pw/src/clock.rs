@@ -71,7 +71,7 @@ impl EventFd {
 /// reader sees the new pointer and never touches the old mapping.
 ///
 /// While holding the guard, the ALSA thread performs no syscalls, locks or
-/// waits — only ~20 ns of non-blocking loads/stores on `spa_io_clock`.
+/// waits: only ~20 ns of non-blocking loads/stores on `spa_io_clock`.
 pub(crate) struct SynchronizedIo {
     io_position: AtomicPtr<spa::sys::spa_io_position>,
     io_clock: AtomicPtr<spa::sys::spa_io_clock>,
@@ -607,10 +607,12 @@ mod tests {
         io.store_clock(initial);
 
         let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(false));
         let reads = Arc::new(AtomicU64::new(0));
 
         let io_r = Arc::clone(&io);
         let stop_r = Arc::clone(&stop);
+        let ready_r = Arc::clone(&ready);
         let reads_r = Arc::clone(&reads);
         let reader = std::thread::spawn(move || {
             while !stop_r.load(Ordering::Relaxed) {
@@ -618,8 +620,13 @@ mod tests {
                 assert!(r == 48_000 || r == 96_000 || r == 44_100);
                 assert!(d == 1024 || d == 2048 || d == 512);
                 reads_r.fetch_add(1, Ordering::Relaxed);
+                ready_r.store(true, Ordering::Release);
             }
         });
+
+        while !ready.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
 
         let mut current = initial;
         for iter in 0..20_000u64 {
@@ -751,10 +758,12 @@ mod tests {
         io.store_clock(init_clk);
 
         let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(false));
         let reads = Arc::new(AtomicU64::new(0));
 
         let io_r = Arc::clone(&io);
         let stop_r = Arc::clone(&stop);
+        let ready_r = Arc::clone(&ready);
         let reads_r = Arc::clone(&reads);
         let reader = std::thread::spawn(move || {
             let mut count = 0u64;
@@ -782,9 +791,14 @@ mod tests {
                     }
                 });
                 count += 1;
+                ready_r.store(true, Ordering::Release);
             }
             reads_r.store(count, Ordering::Relaxed);
         });
+
+        while !ready.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
 
         let mut cur_clk: Option<*mut spa::sys::spa_io_clock> = Some(init_clk);
         let mut cur_pos: Option<*mut spa::sys::spa_io_position> = None;

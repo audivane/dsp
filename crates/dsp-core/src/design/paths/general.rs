@@ -30,15 +30,17 @@
 //! The band, stop-at-Nyquist and automatic designs promise an attenuation
 //! ([`Claim`]): the window model ([`crate::design::window_model`]) sets
 //! their lengths and cutoffs, and [`crate::design::claim`] measures the
-//! finished kernel against the promise before it is accepted.
+//! finished kernel against the promise before it is accepted; a `band`
+//! length whose measured promise falls short grows a tap at a time
+//! (`claimed`).
 
 use super::fir::{self, Recipe};
 use super::{double_double, exact};
 use crate::design::phase::cepstral::{self, Target};
 use crate::design::{
-    ArithmeticPath, BuildContext, Cutoff, Decimation, DesignError, FilterDesign, FilterErrorBudget,
-    Grid, GridCutoff, Kernel, KernelDesign, Length, Phase, PhaseMethod, Plan, Shape, Window,
-    budget, check, claim, length, rates, search, window_model,
+    ArithmeticPath, BandSpec, BuildContext, Cutoff, Decimation, DesignError, FilterDesign,
+    FilterErrorBudget, Grid, GridCutoff, Kernel, KernelDesign, Length, Phase, PhaseMethod, Plan,
+    Shape, Window, budget, check, claim, length, rates, search, window_model,
 };
 use crate::minphase::Contract;
 
@@ -107,6 +109,7 @@ pub(crate) fn legacy(k: &KernelDesign) -> bool {
         Err(_) => false,
     };
     let shape_ok = match &k.shape {
+        Shape::Optimal { .. } => false,
         Shape::Lanczos { .. } => matches!(path, Fir | FirAfter),
         Shape::WindowedSinc {
             window,
@@ -141,17 +144,39 @@ fn auto_budget(b: FilterErrorBudget) -> Result<f64, DesignError> {
     }
 }
 
-/// The attenuation `k` promises and its band, if it promises one.
-fn target(k: &KernelDesign) -> Result<Option<(f64, f64, f64)>, DesignError> {
+/// The attenuation `k` promises and its band (the passband end and the
+/// stopband start as fractions of the Nyquist at `band_rate`, the lower of
+/// the input and output rates: [`crate::design::band_rate`]), if it
+/// promises one.
+fn target(k: &KernelDesign, band_rate: u32) -> Result<Option<(f64, f64, f64)>, DesignError> {
+    if let Shape::Optimal {
+        length,
+        passband_end,
+        stopband_start,
+        ..
+    } = &k.shape
+    {
+        return match length {
+            Length::Auto(budget) => Ok(Some((
+                *passband_end,
+                *stopband_start,
+                auto_budget(*budget)?,
+            ))),
+            Length::Fixed(_) | Length::PerInput(_) => Ok(None),
+            _ => unsupported("an optimal design takes a fixed, per-input or automatic length"),
+        };
+    }
     let Shape::WindowedSinc { length, cutoff, .. } = &k.shape else {
         return Ok(None);
     };
     Ok(match (length, cutoff) {
         (Length::Band, Cutoff::Band(b)) => {
-            Some((b.passband_end, b.stopband_start, b.attenuation_db))
+            let pass = band_target(b, band_rate)?;
+            Some((pass, b.stopband_start, b.attenuation_db))
         }
         (Length::Auto(budget), Cutoff::Band(b)) => {
-            Some((b.passband_end, b.stopband_start, auto_budget(*budget)?))
+            let pass = band_target(b, band_rate)?;
+            Some((pass, b.stopband_start, auto_budget(*budget)?))
         }
         (Length::Band | Length::Auto(_), _) => {
             return unsupported("a band or automatic length needs a band cutoff");
@@ -161,6 +186,13 @@ fn target(k: &KernelDesign) -> Result<Option<(f64, f64, f64)>, DesignError> {
         }
         _ => None,
     })
+}
+
+/// The passband end of band `b` as a fraction of the Nyquist at
+/// `band_rate` (an absolute one that does not fit there falls back to the
+/// band's fraction: [`crate::design::band_passband_end`]).
+fn band_target(b: &BandSpec, band_rate: u32) -> Result<f64, DesignError> {
+    Ok(crate::design::band_passband_end(b, band_rate))
 }
 
 /// The refusal of a promise deeper than the window goes.
@@ -194,6 +226,16 @@ fn resolve_beta(w: Window, a: Option<f64>) -> Result<Window, DesignError> {
             None => unsupported(
                 "a Kaiser window without a beta needs a band or automatic length (the beta \
                  comes from the attenuation)",
+            ),
+        },
+        Window::Dpss { nw: None, sampling } => match a {
+            Some(a) => Ok(Window::Dpss {
+                nw: Some(window_model::dpss_nw_for(a)),
+                sampling,
+            }),
+            None => unsupported(
+                "a DPSS window without NW needs a band or automatic length (NW comes from the \
+                 attenuation)",
             ),
         },
         w => Ok(w),
@@ -256,7 +298,7 @@ pub(crate) fn recipe(
              the source rate",
         );
     }
-    let target = target(k)?;
+    let target = target(k, crate::design::band_rate(source_rate, grid.ratio))?;
     let per_input = |k: &KernelDesign| -> Result<usize, DesignError> {
         let mut t = length::per_input(k, grid.up, source_rate)?;
         if grid.decimating && k.numerics.grid_cutoff == GridCutoff::Scaled {
@@ -264,7 +306,34 @@ pub(crate) fn recipe(
         }
         Ok(t)
     };
+    // A decimating `scaled` grid builds at L with every frequency times
+    // out / in.
+    let freq_scale = if grid.decimating && k.numerics.grid_cutoff == GridCutoff::Scaled {
+        grid.ratio.as_f64()
+    } else {
+        1.0
+    };
     let (window, fir_win, fc) = match &k.shape {
+        Shape::Optimal {
+            method,
+            passband_end,
+            stopband_start,
+            ..
+        } => {
+            if k.rates.fallback_window.is_some() {
+                return unsupported("an optimal design has no window to fall back from");
+            }
+            (
+                None,
+                fir::Window::Optimal {
+                    method: optimal_method(*method),
+                    pass: passband_end * freq_scale,
+                    stop: stopband_start * freq_scale,
+                    retry: true,
+                },
+                0.5 * (passband_end + stopband_start),
+            )
+        }
         Shape::Lanczos { lobes } => (
             None,
             fir::Window::Lanczos { a: *lobes },
@@ -280,7 +349,10 @@ pub(crate) fn recipe(
                         return unsupported("the stepped cutoff has no step for this source rate");
                     }
                 },
-                Cutoff::Band(spec) => 0.5 * (spec.passband_end + spec.stopband_start),
+                Cutoff::Band(_) => {
+                    let (pass, stop, _) = target.expect("a band cutoff has a target");
+                    0.5 * (pass + stop)
+                }
                 // Set from the length below.
                 Cutoff::NyquistStop => f64::NAN,
             };
@@ -291,6 +363,20 @@ pub(crate) fn recipe(
     let n = match (&k.shape, taps) {
         (_, Some(n)) => n,
         (Shape::Lanczos { .. }, None) => per_input(k)? * grid.up,
+        (Shape::Optimal { length, .. }, None) => match length {
+            Length::PerInput(_) => per_input(k)? * grid.up,
+            Length::Fixed(n) => n * grid.down,
+            _ => {
+                let (pe, se, a) = target.expect("an automatic length has a target");
+                let fir::Window::Optimal { method, .. } = fir_win else {
+                    unreachable!("an optimal shape has an optimal recipe")
+                };
+                // The search starts from the depth the branches' DC needs
+                // when that is deeper.
+                let a = a.max(optimal_dc_floor_db(method, k, grid));
+                optimal_estimate(method, a, pe, se, r).min(max)
+            }
+        },
         (Shape::WindowedSinc { length, .. }, None) => match length {
             Length::PerInput(_) | Length::OutputSpan(_) => per_input(k)? * grid.up,
             Length::Fixed(n) => n * grid.down,
@@ -316,6 +402,43 @@ pub(crate) fn recipe(
     if n == 0 {
         return unsupported("the kernel has no taps");
     }
+    // An optimal design is odd (type I): an even length one tap shorter.
+    let n = if matches!(fir_win, fir::Window::Optimal { .. }) {
+        if n < 3 {
+            return unsupported(format!(
+                "an optimal design needs at least 3 taps on the grid (got {n})"
+            ));
+        }
+        let n = n - (1 - n % 2);
+        let fir::Window::Optimal { method, .. } = fir_win else {
+            unreachable!("checked above")
+        };
+        let (most, name, instead) = match method {
+            super::optimal::Method::Equiripple => (
+                super::optimal::EQUIRIPPLE_MAX_TAPS,
+                "an equiripple design is built (its cost grows with the square of the length)",
+                "least squares or a windowed sinc",
+            ),
+            super::optimal::Method::LeastSquares => (
+                super::optimal::LEAST_SQUARES_MAX_TAPS,
+                "a least-squares design is built",
+                "a windowed sinc",
+            ),
+        };
+        if n > most {
+            return unsupported(format!(
+                "{name} up to {most} taps on the grid (this one needs {n} at {}): use {instead} \
+                 for longer kernels",
+                grid.ratio
+            ));
+        }
+        if taps.is_none() && target.is_none() {
+            optimal_depth(k, method, fir_win, n, b, grid)?;
+        }
+        n
+    } else {
+        n
+    };
     let mut claim = target.map(|(pass, stop, db)| Claim { pass, stop, db });
     let fc = if fc.is_nan() {
         // Stop at Nyquist: the window's nominal stopband from the lower
@@ -354,11 +477,7 @@ pub(crate) fn recipe(
     if fc.is_nan() || fc <= 0.0 {
         return unsupported("the cutoff must be above 0");
     }
-    let cutoff = if grid.decimating && k.numerics.grid_cutoff == GridCutoff::Scaled {
-        fc * grid.ratio.as_f64()
-    } else {
-        fc
-    };
+    let cutoff = fc * freq_scale;
     if let (Some(c), Some(w)) = (claim, window)
         && !window_model::reaches(&w, c.db)
     {
@@ -415,6 +534,9 @@ fn reflected(k: &KernelDesign) -> bool {
 /// with 20 % slack on the half transition, in cycles per sample of the
 /// build grid. Lanczos: the magnitude only (no stopband edge).
 pub(crate) fn contract(g: &General, n: usize) -> Contract {
+    if let fir::Window::Optimal { .. } = g.recipe.window {
+        return optimal_contract(g, g.claim.map_or(OPTIMAL_CONTRACT_DB, |c| c.db));
+    }
     let Some(w) = g.window else {
         return Contract {
             kaiser_beta: window_model::contract_beta(LANCZOS_CONTRACT_DB),
@@ -433,6 +555,47 @@ pub(crate) fn contract(g: &General, n: usize) -> Contract {
     Contract {
         kaiser_beta: window_model::contract_beta(a),
         stopband_edge: g.recipe.cutoff / (2.0 * g.build as f64) + 1.2 * half_bins / n as f64,
+    }
+}
+
+/// The attenuation a reflected optimal design's contract assumes before
+/// its prototype is measured (pricing its blend): a typical design's.
+const OPTIMAL_CONTRACT_DB: f64 = 120.0;
+
+/// The contract of a reflected optimal design of `a` dB: that attenuation
+/// (clamped to what the reflection holds) from its stopband edge, with
+/// the windows' 20 % slack on the transition.
+fn optimal_contract(g: &General, a: f64) -> Contract {
+    let fir::Window::Optimal { pass, stop, .. } = g.recipe.window else {
+        unreachable!("an optimal recipe")
+    };
+    let edge = 2.0 * g.build as f64;
+    Contract {
+        kaiser_beta: window_model::contract_beta(a.clamp(REFLECT_MIN_DB, REFLECT_MAX_DB)),
+        stopband_edge: (stop + 0.2 * (stop - pass)) / edge,
+    }
+}
+
+/// The attenuation of the optimal prototype `h` on its build grid (its
+/// largest error over both bands), dB: what a fixed-length design's
+/// reflected phase is held to.
+fn optimal_measured_db(g: &General, h: &[f64]) -> f64 {
+    let fir::Window::Optimal { pass, stop, .. } = g.recipe.window else {
+        unreachable!("an optimal recipe")
+    };
+    let edge = 2.0 * g.build as f64;
+    let gain: f64 = h.iter().sum();
+    let e = crate::design::auto::protected_error_with(
+        &mut realfft::RealFftPlanner::new(),
+        h,
+        gain,
+        pass / edge,
+        (stop / edge).min(0.5),
+    );
+    if e > 0.0 {
+        -20.0 * e.log10()
+    } else {
+        REFLECT_MAX_DB
     }
 }
 
@@ -464,6 +627,12 @@ fn prototype(
 ) -> Result<Vec<f64>, DesignError> {
     use ArithmeticPath::*;
     use exact::SincForm::*;
+    if matches!(r.window, fir::Window::Optimal { .. }) {
+        if !matches!(path, Fir | FirAfter) {
+            return unsupported("an optimal design is built on the fir paths");
+        }
+        return optimal_prototype(r, n, b);
+    }
     let lanczos = matches!(r.window, fir::Window::Lanczos { .. });
     if n != b * r.taps {
         return match path {
@@ -538,6 +707,10 @@ fn symmetric_prototype(
             "a reflected phase is built on the fir paths (or the standard path), not the {path:?} \
              path"
         ));
+    }
+    if matches!(r.window, fir::Window::Optimal { .. }) {
+        // Odd and symmetric about its centre tap already.
+        return optimal_prototype(r, n, b);
     }
     let c = (n as f64 - 1.0) / 2.0;
     let l = b as f64;
@@ -651,16 +824,22 @@ pub(crate) fn kernel(k: &KernelDesign, g: &General, grid: &Grid) -> Result<Kerne
     }
     if transformed {
         let n = h.len();
+        // A reflected optimal design of a fixed length is held to what its
+        // prototype measures.
+        let reflect_contract = match (g.recipe.window, g.claim) {
+            (fir::Window::Optimal { .. }, None) => optimal_contract(g, optimal_measured_db(g, &h)),
+            _ => contract(g, n),
+        };
         h = match transform {
             Transform::Cepstral(t) => cepstral::transform(&h, t)?,
             Transform::Reflect(_) if n < 2 => h,
             Transform::Reflect(None) => {
-                crate::minphase::minimum_phase(&h, &contract(g, n))
+                crate::minphase::minimum_phase(&h, &reflect_contract)
                     .map_err(DesignError::Phase)?
                     .kernel
             }
             Transform::Reflect(Some(mix)) => {
-                crate::minphase::intermediate_phase(&h, &contract(g, n), mix)
+                crate::minphase::intermediate_phase(&h, &reflect_contract, mix)
                     .map_err(DesignError::Phase)?
                     .kernel
             }
@@ -706,6 +885,46 @@ pub(crate) fn method(k: &KernelDesign) -> Option<PhaseMethod> {
     }
 }
 
+/// How many taps a band length may grow past the window formula's shortest
+/// to keep its promise: the formula is an estimate, and at a very short
+/// kernel (a passband pinned far below the Nyquist at a high source rate)
+/// it can sit a tap or two short.
+const BAND_LENGTH_GROWTH_TAPS: usize = 8;
+
+/// The kernel of `k` for `g` on `grid`, its promise measured ([`claim`]): a
+/// `band` length whose measured promise falls short grows a tap at a time
+/// (up to [`BAND_LENGTH_GROWTH_TAPS`]) until it holds, so the promise
+/// decides the length where the formula's estimate is a tap short. An
+/// automatic length is the search's to size.
+pub(crate) fn claimed(
+    k: &KernelDesign,
+    g: &mut General,
+    grid: &Grid,
+) -> Result<Kernel, DesignError> {
+    let grows = matches!(
+        k.shape,
+        Shape::WindowedSinc {
+            length: Length::Band,
+            ..
+        }
+    ) && g.claim.is_some();
+    let most = g.len + BAND_LENGTH_GROWTH_TAPS;
+    loop {
+        let kernel = kernel(k, g, grid)?;
+        let Some(c) = g.claim else {
+            return Ok(kernel);
+        };
+        match claim::verify(&kernel, &c, grid) {
+            Ok(_) => return Ok(kernel),
+            Err(_) if grows && g.len < most => {
+                g.len += 1;
+                g.recipe.taps = g.len.div_ceil(g.build);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Whether `k` has an automatic length.
 fn automatic(k: &KernelDesign) -> bool {
     matches!(
@@ -713,8 +932,146 @@ fn automatic(k: &KernelDesign) -> bool {
         Shape::WindowedSinc {
             length: Length::Auto(_),
             ..
+        } | Shape::Optimal {
+            length: Length::Auto(_),
+            ..
         }
     )
+}
+
+/// The optimal-design method of the wire's.
+fn optimal_method(m: crate::design::OptimalMethod) -> super::optimal::Method {
+    match m {
+        crate::design::OptimalMethod::Equiripple => super::optimal::Method::Equiripple,
+        crate::design::OptimalMethod::LeastSquares => super::optimal::Method::LeastSquares,
+    }
+}
+
+/// The estimated length of an optimal design of `a` dB over the band
+/// `pe ..= se` on a grid of `r` samples per lower-rate sample: Kaiser's
+/// equiripple estimate `N = (a - 7.95) / (14.36 df) + 1` (`df` the
+/// transition in cycles per sample), a quarter longer for least squares
+/// (its error peaks at the band edges).
+fn optimal_estimate(method: super::optimal::Method, a: f64, pe: f64, se: f64, r: usize) -> usize {
+    let df = (se - pe) / (2.0 * r.max(1) as f64);
+    let n = ((a - 7.95).max(1.0) / (14.36 * df) + 1.0).ceil();
+    let n = match method {
+        super::optimal::Method::Equiripple => n,
+        super::optimal::Method::LeastSquares => 1.25 * n,
+    };
+    (n as usize).max(3)
+}
+
+/// The estimated depth ([`super::optimal::estimate_db`]) the DC gains of
+/// `grid`'s polyphase branches need from an optimal design of `k`, dB,
+/// against the safety gate's tolerance `tol`
+/// ([`crate::design::safety::dc_tol_db`]). An equiripple stopband is
+/// flat, so the images it leaves add up in each branch, up to
+/// `(L - 1) delta` off unity: `20 log10((L - 1) / tol)` (measured 3 to 7 dB
+/// conservative). A least-squares stopband falls away from its edge: it
+/// failed up to an estimated 61 dB at any ratio (x2 to x64, linear phase),
+/// so `20 log10(1 / tol) + 6`.
+pub(crate) fn optimal_dc_floor_db(
+    method: super::optimal::Method,
+    k: &KernelDesign,
+    grid: &Grid,
+) -> f64 {
+    let l = grid.up.max(1);
+    if l < 2 {
+        return f64::NEG_INFINITY;
+    }
+    let tol = 10f64.powf(crate::design::safety::dc_tol_db(k.phase) / 20.0) - 1.0;
+    match method {
+        super::optimal::Method::Equiripple => 20.0 * ((l - 1) as f64 / tol).log10(),
+        super::optimal::Method::LeastSquares => 20.0 * (1.0 / tol).log10() + 6.0,
+    }
+}
+
+/// The refusal of a fixed or per-input optimal length that cannot build:
+/// its estimated depth ([`super::optimal::estimate_db`]) past what f64
+/// levels, or short of the depth the branches' DC needs
+/// ([`optimal_dc_floor_db`]). Cheap, so the config check refuses what the
+/// build would.
+fn optimal_depth(
+    k: &KernelDesign,
+    method: super::optimal::Method,
+    w: fir::Window,
+    n: usize,
+    b: usize,
+    grid: &Grid,
+) -> Result<(), DesignError> {
+    let fir::Window::Optimal { pass, stop, .. } = w else {
+        return Ok(());
+    };
+    let edge = 2.0 * b.max(1) as f64;
+    let est = super::optimal::estimate_db(n, pass / edge, stop / edge);
+    let ratio = grid.ratio;
+    match method {
+        super::optimal::Method::Equiripple => {
+            let level = super::optimal::EQUIRIPPLE_LEVEL_DB;
+            if est > level {
+                return unsupported(format!(
+                    "an equiripple design of {n} taps over this band at {ratio} would be about \
+                     {est:.0} dB deep, past the {level} dB f64 levels its ripple to: shorten it, \
+                     narrow the transition or use an automatic length"
+                ));
+            }
+            let floor = optimal_dc_floor_db(method, k, grid);
+            if est < floor {
+                return unsupported(format!(
+                    "an equiripple design of {n} taps over this band at {ratio} is about \
+                     {est:.0} dB deep, but its flat stopband adds up in each of the {} polyphase \
+                     branches, whose DC gains need about {floor:.0} dB here: lengthen it, widen \
+                     the transition or use an automatic length",
+                    grid.up
+                ));
+            }
+        }
+        super::optimal::Method::LeastSquares => {
+            let level = super::optimal::LEAST_SQUARES_LEVEL_DB;
+            if est > level {
+                return unsupported(format!(
+                    "a least-squares design of {n} taps over this band at {ratio} would be about \
+                     {est:.0} dB deep, far past its 137 to 153 dB floor, where the solve no \
+                     longer holds the passband: shorten it or use an automatic length"
+                ));
+            }
+            let floor = optimal_dc_floor_db(method, k, grid);
+            if est < floor {
+                return unsupported(format!(
+                    "a least-squares design of {n} taps over this band at {ratio} is about \
+                     {est:.0} dB deep, too shallow for the {} polyphase branches' DC gains \
+                     (about {floor:.0} dB): lengthen it, widen the transition or use an \
+                     automatic length",
+                    grid.up
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The prototype of the optimal recipe `r` with `n` taps on a build grid
+/// of `b` samples per lower-rate sample (unit DC gain, odd `n`).
+fn optimal_prototype(r: &Recipe, n: usize, b: usize) -> Result<Vec<f64>, DesignError> {
+    let fir::Window::Optimal {
+        method,
+        pass,
+        stop,
+        retry,
+    } = r.window
+    else {
+        return unsupported("not an optimal design");
+    };
+    let edge = 2.0 * b.max(1) as f64;
+    let (p, s) = (pass / edge, stop / edge);
+    if s >= 0.5 {
+        return unsupported(format!(
+            "the stopband edge ({stop} of the lower Nyquist) is past the grid's Nyquist at this \
+             ratio"
+        ));
+    }
+    super::optimal::design(method, n, p, s, retry)
 }
 
 /// The plan of `k` built from `g` in `cx` (`exact`: the length is known,
@@ -806,16 +1163,17 @@ pub(crate) fn admit(
 }
 
 /// [`crate::design::prepare`] of the new combination `k` up to the safety
-/// gate: [`feasibility`] with the length searched, the kernel, the budgets
-/// on its final length, and its promise measured ([`claim::verify`]).
+/// gate: [`feasibility`] with the length searched, the kernel (a band
+/// length grown until its promise holds, `claimed`), the budgets on its
+/// final length, and its promise measured ([`claim::verify`]).
 pub(crate) fn prepare(
     d: &FilterDesign,
     k: &KernelDesign,
     cx: &BuildContext,
 ) -> Result<(Plan, Kernel), DesignError> {
-    let (plan, g) = feasibility(d, k, cx, true)?;
+    let (_, mut g) = feasibility(d, k, cx, true)?;
     let grid = cx.grid();
-    let kernel = kernel(k, &g, &grid)?;
+    let kernel = claimed(k, &mut g, &grid)?;
     let len = kernel.taps.len();
     if cx.ratio.is_integer() {
         budget::check_kernel_taps(len, cx.ratio, false)?;
@@ -828,16 +1186,13 @@ pub(crate) fn prepare(
             cx.pipelines,
         )?;
     }
-    if let Some(c) = g.claim {
-        claim::verify(&kernel, &c, &grid)?;
-    }
     let plan = Plan {
         grid_taps: len,
         grid_taps_exact: true,
         resident_bytes: budget::kernel_resident(len, cx),
-        ..plan
+        ..plan(k, &g, cx, true)
     };
-    Ok((plan, kernel))
+    Ok((plan.check_workspace(cx)?, kernel))
 }
 
 /// The kernel of the new combination `k` from `source_rate` at `ratio`, an
@@ -852,12 +1207,8 @@ pub(crate) fn kernel_at(
     } else {
         None
     };
-    let g = recipe(k, source_rate, grid, t)?;
-    let kernel = kernel(k, &g, grid)?;
-    if let Some(c) = g.claim {
-        claim::verify(&kernel, &c, grid)?;
-    }
-    Ok(kernel)
+    let mut g = recipe(k, source_rate, grid, t)?;
+    claimed(k, &mut g, grid)
 }
 
 /// The grid taps of `k` (an automatic length searched) and the taps its

@@ -166,7 +166,13 @@ export function StatusBar() {
           {status.error}
         </span>
       )}
-      <Meters />
+      {status.ab?.blind ? (
+        <span className="stats meters-hidden" title="Different settings show different peaks, so the level meters are hidden while a blind test runs.">
+          Meters hidden: blind test
+        </span>
+      ) : (
+        <Meters />
+      )}
     </footer>
   );
 }

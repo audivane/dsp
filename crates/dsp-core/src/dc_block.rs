@@ -162,6 +162,16 @@ impl DcBlock {
         }
     }
 
+    /// How long the filter's start-up rings, frames (`fs / (2 pi fc)`, the
+    /// time constant of its corner); 0 when off.
+    pub fn decay_frames(&self) -> f64 {
+        if self.enabled && self.cutoff_hz > 0.0 {
+            self.sample_rate / (2.0 * std::f64::consts::PI * self.cutoff_hz)
+        } else {
+            0.0
+        }
+    }
+
     /// Copy the four-word filter history per channel from `from` when both
     /// stages are enabled with the same cutoff, sample rate, and channel count.
     /// Returns `true` when state was carried over. Allocation-free.

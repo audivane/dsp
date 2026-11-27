@@ -3,4 +3,4 @@
 /**
  * What the engine did about a DSP overload.
  */
-export type OverloadAction = "varispeed_budget" | "varispeed_unity" | "varispeed_off" | "ab_off" | "reverted" | "upsampler_off" | "light_upsampler" | "bypass" | "none";
+export type OverloadAction = "varispeed_budget" | "varispeed_unity" | "varispeed_off" | "ab_off" | "reverted" | "upsampler_off" | "light_upsampler" | "bypass" | "none" | "recommended";

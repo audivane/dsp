@@ -1,4 +1,5 @@
-//! Headphone crossfeed stage (bs2b and Linkwitz-style).
+//! Headphone crossfeed stage (bs2b and Linkwitz-style) with a stereo width
+//! control.
 //!
 //! Stereo only (`channels == 2`), at the source sample rate, placed before the
 //! parametric EQ so headphone correction EQ remains last before the
@@ -12,32 +13,39 @@
 //! - **Linkwitz mode** is a complementary pair designed with the prewarped
 //!   bilinear transform: `H_D + H_C = 1`, so mono is exactly flat. The corner
 //!   (`f_c = 796.4 Hz`) gives a 0.3 ms low-frequency interaural delay.
+//! - **`none`**: no crossfeed; the stage runs for its width alone.
 //!
-//! **Level (`CrossfeedConfig.level`):** the stage scales both paths by one
-//! constant `s`, which keeps the direct/cross ratio and replaces the bs2b
-//! library's own level normalisation. The EQ preamp is a plain number and is
-//! not adjusted for crossfeed, so nothing compensates twice.
+//! **Width (`CrossfeedConfig.width`, side gain `k`):** after the crossfeed
+//! sums, the side `d = L − R` is scaled by `k` and the mid left alone:
+//! `L′ = L + u`, `R′ = R − u` with `u = g·d`, `g = (k − 1)/2`. Written this
+//! way, mono (`d = 0`) passes bit-exact at every `k`. The `above_bass` shape
+//! takes `u = g·HP₁(d)`, a first-order high-pass at `width_corner_hz`: side
+//! gain 1 in the bass, `k` above the corner. Crossfeed and width are both a
+//! filter on the mid and one on the side, so they commute.
 //!
-//! - `matched` (default): `s` makes the A-weighted loudness of the output
-//!   equal to the input's for a stereo pink-noise reference with
-//!   inter-channel correlation [`MATCHED_CORRELATION`], the same weighting and
-//!   match as [`crate::loudness::analytic_offset_db`]. Worst-case signals can
-//!   then exceed the input's peak by +1.4 to +5.6 dB; the chain is f64 to the
-//!   quantizer, so such a signal clips only there: unless the limiter is on,
-//!   or enough output headroom (`output.headroom_db`) or digital attenuation
-//!   comes first. Hardware volume gives no headroom.
-//! - `peak_safe`: `s = 1 / (‖h_direct‖₁ + ‖h_cross‖₁)`, the exact worst-case
-//!   peak gain for inputs bounded by `|x| <= 1`, so the output never exceeds
-//!   the input's peak bound (but is quieter).
+//! **Level:** one constant `s` scales the output, keeping the direct/cross
+//! ratio in place of the bs2b library's own normalisation: `s` makes the
+//! A-weighted loudness of the crossfeed part equal to the input's for a
+//! stereo pink-noise reference with inter-channel correlation
+//! [`MATCHED_CORRELATION`] (the weighting and match of
+//! [`crate::loudness::analytic_offset_db`]; `s = 1` without crossfeed). The
+//! EQ preamp is not adjusted for crossfeed, so nothing compensates twice;
+//! the width is never loudness-compensated (wider is also louder).
 //!
-//! Both are computed when the stage is built, never on the audio thread.
+//! No cut for safety: worst-case signals can exceed the input's peak by +1.4
+//! to +5.6 dB from the crossfeed, more with widening
+//! ([`Crossfeed::peak_gain_bound`], exact). The chain is f64 to the
+//! quantizer; the limiter and the output headroom (`output.headroom_db`)
+//! handle what goes over, as for every stage. All of it is computed at
+//! build, never on the audio thread.
 
 use crate::biquad::Coeffs;
 use crate::loudness::analytic_offset_db;
 use crate::{Complex64, Stage, db_to_lin, lin_to_db};
 use audivane_protocol::{
     CROSSFEED_CUTOFF_MAX_HZ, CROSSFEED_CUTOFF_MIN_HZ, CROSSFEED_FEED_MAX_DB, CROSSFEED_FEED_MIN_DB,
-    CrossfeedConfig, CrossfeedLevel, CrossfeedMode,
+    CrossfeedConfig, CrossfeedMode, STEREO_WIDTH_CORNER_MAX_HZ, STEREO_WIDTH_CORNER_MIN_HZ,
+    STEREO_WIDTH_MAX, STEREO_WIDTH_MIN, StereoWidthShape,
 };
 use std::f64::consts::PI;
 use std::fmt;
@@ -46,7 +54,7 @@ use std::fmt;
 pub const LINKWITZ_DELAY_S: f64 = 0.3e-3;
 
 /// Inter-channel correlation of the stereo reference signal that the
-/// `matched` level is defined for: the middle of the 0.3..0.6 range typical
+/// level match is defined for: the middle of the 0.3..0.6 range typical
 /// of mixed music; the `matched` gain moves between uncorrelated (0), typical
 /// and mono (1) material.
 pub const MATCHED_CORRELATION: f64 = 0.5;
@@ -76,6 +84,10 @@ impl fmt::Display for CrossfeedError {
 
 impl std::error::Error for CrossfeedError {}
 
+/// Denormal flush threshold for the filter states (`2^-100` ≈ −602 dBFS, as
+/// in `dc_block`).
+const FLUSH_BELOW: f64 = 7.888_609_052_210_118e-31;
+
 /// Single-pole TDF-II filter state (`b2 == 0, a2 == 0`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct OnePoleState {
@@ -87,6 +99,11 @@ impl OnePoleState {
     fn step(&mut self, c: &Coeffs, x: f64) -> f64 {
         let y = c.b0 * x + self.z1;
         self.z1 = c.b1 * x - c.a1 * y;
+        // A decaying tail would otherwise settle in IEEE 754 subnormals
+        // (slow on x86) and stay there; same threshold as the DC block.
+        if self.z1.abs() < FLUSH_BELOW {
+            self.z1 = 0.0;
+        }
         y
     }
 }
@@ -113,18 +130,16 @@ fn scaled(c: &Coeffs, s: f64) -> Coeffs {
     first_order(c.b0 * s, c.b1 * s, c.a1)
 }
 
-/// Power response of one output channel at `f_hz` for equal-power stereo
-/// input with inter-channel correlation `rho`.
-fn stereo_power(direct: &Coeffs, cross: &Coeffs, f_hz: f64, fs: f64, rho: f64) -> f64 {
-    let d = direct.response(f_hz, fs);
-    let c = cross.response(f_hz, fs);
+/// Power of one output channel with direct response `d` and cross response
+/// `c`, for equal-power stereo input with inter-channel correlation `rho`.
+fn stereo_power(d: Complex64, c: Complex64, rho: f64) -> f64 {
     d.norm_sqr() + c.norm_sqr() + 2.0 * rho * (d * c.conj()).re
 }
 
 /// Linear gain that gives `direct`/`cross` the same A-weighted loudness as
 /// their input for stereo pink noise with correlation `rho`.
 fn matched_gain(direct: &Coeffs, cross: &Coeffs, fs: f64, rho: f64) -> f64 {
-    let out = |f: f64| stereo_power(direct, cross, f, fs, rho);
+    let out = |f: f64| stereo_power(direct.response(f, fs), cross.response(f, fs), rho);
     db_to_lin(analytic_offset_db(&|_| 1.0, &out, fs))
 }
 
@@ -157,33 +172,168 @@ fn complementary_design(cutoff_hz: f64, feed_db: f64, fs: f64) -> (Coeffs, Coeff
     (direct, cross)
 }
 
-/// Stereo headphone crossfeed stage.
+/// First-order high-pass at `fc_hz` (prewarped bilinear), the `above_bass`
+/// width shape's filter on the side.
+fn high_pass(fc_hz: f64, fs: f64) -> Coeffs {
+    let k = (PI * fc_hz.min(0.49 * fs) / fs).tan();
+    let inv = 1.0 / (k + 1.0);
+    first_order(inv, -inv, (k - 1.0) * inv)
+}
+
+/// The stage's arithmetic: crossfeed paths, the width step after them, and
+/// their filter states.
 #[derive(Clone, Debug)]
-pub struct Crossfeed {
-    enabled: bool,
-    sample_rate: f64,
-    /// Scaled by `scale` (applied to both paths).
+struct Kernel {
+    /// Scaled by `scale` (applied to both paths); used only with crossfeed.
     direct: Coeffs,
     cross: Coeffs,
+    /// False for `none`: the output is the input times `scale`.
+    crossfeed: bool,
     scale: f64,
-    level: CrossfeedLevel,
+    /// `(k − 1)/2`; 0 leaves the side alone (no width step at all).
+    width_g: f64,
+    /// `Some(HP₁)` for the `above_bass` shape.
+    side_hp: Option<Coeffs>,
     direct_l: OnePoleState,
     direct_r: OnePoleState,
     cross_l: OnePoleState,
     cross_r: OnePoleState,
+    side: OnePoleState,
+}
+
+impl Kernel {
+    #[inline]
+    fn frame(&mut self, xl: f64, xr: f64) -> (f64, f64) {
+        let (mut yl, mut yr) = if self.crossfeed {
+            let dl = self.direct_l.step(&self.direct, xl);
+            let cl = self.cross_l.step(&self.cross, xr);
+            let dr = self.direct_r.step(&self.direct, xr);
+            let cr = self.cross_r.step(&self.cross, xl);
+            (dl + cl, dr + cr)
+        } else {
+            (xl * self.scale, xr * self.scale)
+        };
+        if self.width_g != 0.0 {
+            // Exactly 0 for mono (yl == yr), so mono is unchanged.
+            let d = yl - yr;
+            let d = match &self.side_hp {
+                Some(hp) => self.side.step(hp, d),
+                None => d,
+            };
+            let u = self.width_g * d;
+            yl += u;
+            yr -= u;
+        }
+        (yl, yr)
+    }
+
+    fn reset(&mut self) {
+        self.direct_l = OnePoleState::default();
+        self.direct_r = OnePoleState::default();
+        self.cross_l = OnePoleState::default();
+        self.cross_r = OnePoleState::default();
+        self.side = OnePoleState::default();
+    }
+
+    /// Direct and cross responses of the whole stage at `f_hz`: with the
+    /// crossfeed's `d`, `c` and the width's `w = g·H(f)·(d − c)` (`H` = 1 or
+    /// the high-pass), `D′ = d + w` and `C′ = c − w`.
+    fn paths(&self, f_hz: f64, fs: f64) -> (Complex64, Complex64) {
+        let (d, c) = if self.crossfeed {
+            (
+                self.direct.response(f_hz, fs),
+                self.cross.response(f_hz, fs),
+            )
+        } else {
+            (Complex64::new(self.scale, 0.0), Complex64::new(0.0, 0.0))
+        };
+        if self.width_g == 0.0 {
+            return (d, c);
+        }
+        let h = self
+            .side_hp
+            .map_or(Complex64::new(1.0, 0.0), |hp| hp.response(f_hz, fs));
+        let w = h * (d - c) * self.width_g;
+        (d + w, c - w)
+    }
+
+    /// Exact worst-case peak gain `‖h_D′‖₁ + ‖h_C′‖₁` for `|L|, |R| <= 1`,
+    /// summed from the impulse response of this very arithmetic until the
+    /// slowest pole has decayed below 1e-20.
+    fn l1_bound(&self) -> f64 {
+        let mut k = self.clone();
+        k.reset();
+        let mut p: f64 = 0.0;
+        if k.crossfeed {
+            p = p.max(k.direct.a1.abs()).max(k.cross.a1.abs());
+        }
+        if let Some(hp) = &k.side_hp
+            && k.width_g != 0.0
+        {
+            p = p.max(hp.a1.abs());
+        }
+        let n = if p > 0.0 {
+            ((1e-20f64).ln() / p.ln()).ceil().clamp(1.0, 1e7) as usize
+        } else {
+            1
+        };
+        let mut sum = 0.0;
+        for i in 0..=n {
+            let (l, r) = k.frame(if i == 0 { 1.0 } else { 0.0 }, 0.0);
+            sum += l.abs() + r.abs();
+        }
+        // The unsummed tail is below 1e-20 of the first terms times
+        // 1/(1 − p) (≤ ~1e4 at the slowest corner), and processing rounds
+        // a few ulps per sample: a 1e-9 relative margin (≈ 1e-8 dB) covers
+        // both, so the peak bound and A/B headroom hold exactly.
+        sum * (1.0 + 1e-9)
+    }
+}
+
+/// Stereo headphone crossfeed and width stage.
+#[derive(Clone, Debug)]
+pub struct Crossfeed {
+    active: bool,
+    sample_rate: f64,
+    width: f64,
+    width_shape: StereoWidthShape,
+    peak_bound: f64,
+    kernel: Kernel,
 }
 
 impl Crossfeed {
+    /// Carry `from`'s filter state over when it runs the same kernel (every
+    /// coefficient bit for bit); otherwise nothing changes. Returns whether
+    /// it did. Real-time safe.
+    pub fn inherit_state(&mut self, from: &Crossfeed) -> bool {
+        let (d, s) = (&mut self.kernel, &from.kernel);
+        let same = self.active == from.active
+            && d.direct == s.direct
+            && d.cross == s.cross
+            && d.crossfeed == s.crossfeed
+            && d.scale == s.scale
+            && d.width_g == s.width_g
+            && d.side_hp == s.side_hp;
+        if same {
+            d.direct_l = s.direct_l;
+            d.direct_r = s.direct_r;
+            d.cross_l = s.cross_l;
+            d.cross_r = s.cross_r;
+            d.side = s.side;
+        }
+        same
+    }
+
     /// Build a crossfeed stage for `sample_rate` and `channels`.
     ///
-    /// Returns [`CrossfeedError::RequiresStereo`] when `config.enabled` is true
+    /// Returns [`CrossfeedError::RequiresStereo`] when the config is active
     /// and `channels != 2`.
     pub fn try_new(
         config: &CrossfeedConfig,
         sample_rate: f64,
         channels: usize,
     ) -> Result<Self, CrossfeedError> {
-        if config.enabled && channels != 2 {
+        if config.is_active() && channels != 2 {
             return Err(CrossfeedError::RequiresStereo { channels });
         }
         if !sample_rate.is_finite() || sample_rate <= 0.0 {
@@ -205,90 +355,153 @@ impl Crossfeed {
                 "feed_db must be between {CROSSFEED_FEED_MIN_DB} and {CROSSFEED_FEED_MAX_DB} dB (got {feed_db})"
             )));
         }
+        let width = config.width;
+        if !width.is_finite() || !(STEREO_WIDTH_MIN..=STEREO_WIDTH_MAX).contains(&width) {
+            return Err(CrossfeedError::InvalidParams(format!(
+                "width must be between {STEREO_WIDTH_MIN} and {STEREO_WIDTH_MAX} (got {width})"
+            )));
+        }
+        let corner = config.width_corner_hz;
+        if !corner.is_finite()
+            || !(STEREO_WIDTH_CORNER_MIN_HZ..=STEREO_WIDTH_CORNER_MAX_HZ).contains(&corner)
+        {
+            return Err(CrossfeedError::InvalidParams(format!(
+                "width_corner_hz must be between {STEREO_WIDTH_CORNER_MIN_HZ} and {STEREO_WIDTH_CORNER_MAX_HZ} Hz (got {corner})"
+            )));
+        }
 
+        let crossfeed = config.crossfeed_active();
         let (direct, cross) = match config.mode {
             CrossfeedMode::Linkwitz => complementary_design(cutoff_hz, feed_db, sample_rate),
+            CrossfeedMode::None => (first_order(1.0, 0.0, 0.0), first_order(0.0, 0.0, 0.0)),
             _ => {
                 let (d, c, _) = bs2b_design(cutoff_hz, feed_db, sample_rate);
                 (d, c)
             }
         };
-        let scale = match config.level {
-            CrossfeedLevel::Matched => {
-                matched_gain(&direct, &cross, sample_rate, MATCHED_CORRELATION)
-            }
-            CrossfeedLevel::PeakSafe => 1.0 / (l1_norm(&direct) + l1_norm(&cross)),
+        let width_g = (width - 1.0) / 2.0;
+        let side_hp = match config.width_shape {
+            StereoWidthShape::Flat => None,
+            StereoWidthShape::AboveBass => Some(high_pass(corner, sample_rate)),
         };
-        Ok(Self {
-            enabled: config.enabled,
-            sample_rate,
-            direct: scaled(&direct, scale),
-            cross: scaled(&cross, scale),
-            scale,
-            level: config.level,
+        let unscaled = Kernel {
+            direct,
+            cross,
+            crossfeed,
+            scale: 1.0,
+            width_g,
+            side_hp,
             direct_l: OnePoleState::default(),
             direct_r: OnePoleState::default(),
             cross_l: OnePoleState::default(),
             cross_r: OnePoleState::default(),
+            side: OnePoleState::default(),
+        };
+        // The crossfeed part only: the width is never compensated.
+        let scale = if crossfeed {
+            matched_gain(&direct, &cross, sample_rate, MATCHED_CORRELATION)
+        } else {
+            1.0
+        };
+        let kernel = Kernel {
+            direct: scaled(&direct, scale),
+            cross: scaled(&cross, scale),
+            scale,
+            ..unscaled
+        };
+        let peak_bound = if width_g == 0.0 {
+            l1_norm(&kernel.direct) + l1_norm(&kernel.cross)
+        } else {
+            kernel.l1_bound()
+        };
+        Ok(Self {
+            active: config.is_active(),
+            sample_rate,
+            width,
+            width_shape: config.width_shape,
+            peak_bound,
+            kernel,
         })
     }
 
-    /// Direct-path coefficients (headroom scale included).
+    /// Crossfeed direct-path coefficients (level scale included; without
+    /// crossfeed, the scale alone). The width is not in them.
     pub fn direct_coeffs(&self) -> Coeffs {
-        self.direct
+        self.kernel.direct
     }
 
-    /// Crossfeed-path coefficients (headroom scale included).
+    /// Crossfeed cross-path coefficients (level scale included; zero
+    /// without crossfeed). The width is not in them.
     pub fn cross_coeffs(&self) -> Coeffs {
-        self.cross
+        self.kernel.cross
     }
 
-    /// Complex frequency response of the direct path at `f_hz`.
+    /// Complex frequency response of the stage's direct path (own channel
+    /// to own ear, width included) at `f_hz`.
     pub fn direct_response(&self, f_hz: f64) -> Complex64 {
-        self.direct.response(f_hz, self.sample_rate)
+        self.kernel.paths(f_hz, self.sample_rate).0
     }
 
-    /// Complex frequency response of the crossfeed path at `f_hz`.
+    /// Complex frequency response of the stage's cross path (other channel
+    /// to this ear, width included) at `f_hz`.
     pub fn cross_response(&self, f_hz: f64) -> Complex64 {
-        self.cross.response(f_hz, self.sample_rate)
+        self.kernel.paths(f_hz, self.sample_rate).1
     }
 
-    /// Complex frequency response for a mono signal (`L == R`) at `f_hz`.
+    /// Complex frequency response for a mono signal (`L == R`) at `f_hz`;
+    /// the width does not change it.
     pub fn mono_response(&self, f_hz: f64) -> Complex64 {
-        self.direct_response(f_hz) + self.cross_response(f_hz)
+        let (d, c) = self.kernel.paths(f_hz, self.sample_rate);
+        d + c
     }
 
-    /// Level policy the stage was built with.
-    pub fn level(&self) -> CrossfeedLevel {
-        self.level
+    /// The stage's direct and cross paths at `f_hz` as built (level and
+    /// width included): output `L = d L + c R`, `R = c L + d R`. `(1, 0)`
+    /// when inactive.
+    pub fn stereo_paths(&self, f_hz: f64) -> (Complex64, Complex64) {
+        if !self.active {
+            return (Complex64::new(1.0, 0.0), Complex64::new(0.0, 0.0));
+        }
+        self.kernel.paths(f_hz, self.sample_rate)
     }
 
-    /// Constant gain (dB) the stage applies to both paths: the loudness
-    /// match for `matched`, the worst-case peak gain for `peak_safe` (then
-    /// the stage's peak gain is exactly 0 dB). 0 when disabled.
+    /// Side gain `k` the stage was built with.
+    pub fn width(&self) -> f64 {
+        self.width
+    }
+
+    /// Width shape the stage was built with.
+    pub fn width_shape(&self) -> StereoWidthShape {
+        self.width_shape
+    }
+
+    /// Constant gain (dB) the stage applies: the crossfeed's loudness match
+    /// (0 without crossfeed). 0 when inactive.
     pub fn level_db(&self) -> f64 {
-        if self.enabled {
-            lin_to_db(self.scale)
+        if self.active {
+            lin_to_db(self.kernel.scale)
         } else {
             0.0
         }
     }
 
-    /// Worst-case peak gain of the stage as built (`‖h_d‖₁ + ‖h_c‖₁`; 1 up to
-    /// rounding for `peak_safe`) for inputs with `|L|, |R| <= 1`.
+    /// Worst-case peak gain of the stage as built, width included
+    /// (`‖h_D′‖₁ + ‖h_C′‖₁`) for inputs
+    /// with `|L|, |R| <= 1`.
     pub fn peak_gain_bound(&self) -> f64 {
-        l1_norm(&self.direct) + l1_norm(&self.cross)
+        self.peak_bound
     }
 
-    /// Power response of one output channel at `f_hz` as built (level
-    /// included) for equal-power stereo input with inter-channel correlation
-    /// `rho`; 1 when disabled. The A/B analytic level match uses it with
-    /// [`MATCHED_CORRELATION`].
+    /// Power response of one output channel at `f_hz` as built (level and
+    /// width included) for equal-power stereo input with inter-channel
+    /// correlation `rho`; 1 when inactive. The A/B analytic level match uses
+    /// it with [`MATCHED_CORRELATION`].
     pub fn stereo_power_response(&self, f_hz: f64, rho: f64) -> f64 {
-        if !self.enabled {
+        if !self.active {
             return 1.0;
         }
-        stereo_power(&self.direct, &self.cross, f_hz, self.sample_rate, rho)
+        let (d, c) = self.kernel.paths(f_hz, self.sample_rate);
+        stereo_power(d, c, rho)
     }
 
     /// [`Self::peak_gain_bound`] in dB: how far over the input's peak a
@@ -297,18 +510,21 @@ impl Crossfeed {
         lin_to_db(self.peak_gain_bound())
     }
 
-    /// Gain change (dB) of the stage as built for a stereo pink-noise input
-    /// with inter-channel correlation `rho`, A-weighted (0 for `matched` at
-    /// [`MATCHED_CORRELATION`]).
+    /// Gain change (dB) of the stage as built (width included) for a stereo
+    /// pink-noise input with inter-channel correlation `rho`, A-weighted (0
+    /// at [`MATCHED_CORRELATION`] and width 1).
     pub fn loudness_change_db(&self, rho: f64) -> f64 {
-        let out = |f: f64| stereo_power(&self.direct, &self.cross, f, self.sample_rate, rho);
+        let out = |f: f64| {
+            let (d, c) = self.kernel.paths(f, self.sample_rate);
+            stereo_power(d, c, rho)
+        };
         -analytic_offset_db(&|_| 1.0, &out, self.sample_rate)
     }
 }
 
 impl Stage for Crossfeed {
     fn process(&mut self, chans: &mut [&mut [f64]]) {
-        if !self.enabled || chans.len() != 2 {
+        if !self.active || chans.len() != 2 {
             return;
         }
         let (left_slice, right_slice) = chans.split_at_mut(1);
@@ -316,26 +532,19 @@ impl Stage for Crossfeed {
         let right = &mut right_slice[0];
         let frames = left.len().min(right.len());
 
-        let d = &self.direct;
-        let c = &self.cross;
+        let k = &mut self.kernel;
         for i in 0..frames {
             // Non-finite input would poison the recursive state forever.
             let xl = if left[i].is_finite() { left[i] } else { 0.0 };
             let xr = if right[i].is_finite() { right[i] } else { 0.0 };
-            let dl = self.direct_l.step(d, xl);
-            let cl = self.cross_l.step(c, xr);
-            let dr = self.direct_r.step(d, xr);
-            let cr = self.cross_r.step(c, xl);
-            left[i] = dl + cl;
-            right[i] = dr + cr;
+            let (yl, yr) = k.frame(xl, xr);
+            left[i] = yl;
+            right[i] = yr;
         }
     }
 
     fn reset(&mut self) {
-        self.direct_l = OnePoleState::default();
-        self.direct_r = OnePoleState::default();
-        self.cross_l = OnePoleState::default();
-        self.cross_r = OnePoleState::default();
+        self.kernel.reset();
     }
 }
 
@@ -345,14 +554,14 @@ mod tests {
 
     const RATES: [f64; 4] = [44_100.0, 48_000.0, 96_000.0, 192_000.0];
 
-    /// Peak-safe config (the tests below check its exact peak bound).
+    /// A custom config (the tests below check its exact peak bound).
     fn cfg(mode: CrossfeedMode) -> CrossfeedConfig {
         CrossfeedConfig {
             enabled: true,
             mode,
             cutoff_hz: 1200.0,
             feed_db: 7.5,
-            level: CrossfeedLevel::PeakSafe,
+            ..CrossfeedConfig::default()
         }
     }
 
@@ -430,15 +639,17 @@ mod tests {
         for fs in RATES {
             for (mode, fc, level) in presets {
                 let mut cf = Crossfeed::try_new(&cfg(mode), fs, 2).unwrap();
-                // Reference headroom scale from the reference responses' L1
-                // norms (closed form: direct 1 - G_hi + 2 G_hi x_h, cross G_lo).
+                // The reference responses' L1 norms in closed form (direct
+                // 1 - G_hi + 2 G_hi x_h, cross G_lo), times the level, are the
+                // stage's peak bound.
                 let gb_hi = level / 6.0 - 3.0;
                 let g_hi = 1.0 - 10f64.powf(gb_hi / 20.0);
                 let g_lo = 10f64.powf((level * -5.0 / 6.0 - 3.0) / 20.0);
                 let (_, _, fc_hi) = bs2b_design(fc, level, fs);
                 let xh = (-2.0 * PI * fc_hi / fs).exp();
-                let s = 1.0 / (1.0 - g_hi + 2.0 * g_hi * xh + g_lo);
-                assert!((lin_to_db(s) - cf.level_db()).abs() < 1e-9);
+                let s = db_to_lin(cf.level_db());
+                let l1 = 1.0 - g_hi + 2.0 * g_hi * xh + g_lo;
+                assert!((cf.peak_gain_bound() / (s * l1) - 1.0).abs() < 1e-9);
 
                 let meas = measured(&mut cf, &freqs, fs);
                 for (&f, (d, c)) in freqs.iter().zip(meas) {
@@ -497,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn output_never_exceeds_input_peak_for_worst_case_signals() {
+    fn output_stays_within_the_peak_bound_for_worst_case_signals() {
         for fs in RATES {
             for mode in [
                 CrossfeedMode::Bs2bDefault,
@@ -506,16 +717,17 @@ mod tests {
                 CrossfeedMode::Linkwitz,
             ] {
                 let mut cf = Crossfeed::try_new(&cfg(mode), fs, 2).unwrap();
-                assert!((cf.peak_gain_bound() - 1.0).abs() < 1e-12);
-                // The worst case for peak safety: L=-1, R=+1 for 256 samples,
-                // then flipped.
+                let bound = cf.peak_gain_bound();
+                // No cut for safety: the matched level goes over.
+                assert!(bound > 1.0, "{mode:?} {fs}: bound {bound}");
+                // A hard case: L=-1, R=+1 for 256 samples, then flipped.
                 let mut l: Vec<f64> = (0..1024)
                     .map(|i| if i < 256 { -1.0 } else { 1.0 })
                     .collect();
                 let mut r: Vec<f64> = l.iter().map(|x| -x).collect();
                 cf.process(&mut [&mut l, &mut r]);
                 let peak = l.iter().chain(&r).fold(0.0_f64, |m, x| m.max(x.abs()));
-                assert!(peak <= 1.0 + 1e-12, "{mode:?} {fs}: peak {peak}");
+                assert!(peak <= bound * (1.0 + 1e-12), "{mode:?} {fs}: peak {peak}");
 
                 // The input that attains the L1 bound for the left output at
                 // sample N: L = sign(h_d[N-n]), R = sign(h_c[N-n]).
@@ -526,8 +738,8 @@ mod tests {
                 l[n - 1] = 1.0;
                 cf.process(&mut [&mut l, &mut r]);
                 assert!(
-                    l[n - 1] <= 1.0 + 1e-12 && l[n - 1] > 0.99,
-                    "{mode:?}: {}",
+                    l[n - 1] <= bound * (1.0 + 1e-12) && l[n - 1] > 0.99 * bound,
+                    "{mode:?}: {} of {bound}",
                     l[n - 1]
                 );
             }
@@ -678,7 +890,6 @@ mod tests {
         for fs in [44_100.0, 48_000.0] {
             for (name, config) in level_cases() {
                 let mut cf = Crossfeed::try_new(&config, fs, 2).unwrap();
-                assert_eq!(cf.level(), CrossfeedLevel::Matched);
                 assert!(cf.loudness_change_db(MATCHED_CORRELATION).abs() < 1e-9);
                 let change = measured_loudness_change_db(&mut cf, fs, MATCHED_CORRELATION);
                 assert!(change.abs() < 0.1, "{name} @{fs}: {change:+.3} dB");
@@ -690,48 +901,463 @@ mod tests {
     fn loudness_change_prediction_matches_measurement_at_other_correlations() {
         let fs = 48_000.0;
         for (name, config) in level_cases() {
-            for level in [CrossfeedLevel::Matched, CrossfeedLevel::PeakSafe] {
-                for rho in [0.0, 1.0] {
-                    let config = CrossfeedConfig {
-                        level,
-                        ..config.clone()
+            for rho in [0.0, 1.0] {
+                let mut cf = Crossfeed::try_new(&config, fs, 2).unwrap();
+                let predicted = cf.loudness_change_db(rho);
+                let measured = measured_loudness_change_db(&mut cf, fs, rho);
+                assert!(
+                    (predicted - measured).abs() < 0.1,
+                    "{name} rho {rho}: predicted {predicted:+.3}, measured {measured:+.3}"
+                );
+            }
+        }
+    }
+
+    /// No cut for safety: the matched level is the level, and its
+    /// worst case goes over the input's peak by the filters' own L1 norm.
+    #[test]
+    fn matched_level_goes_over_by_its_peak_bound() {
+        for fs in RATES {
+            for (name, config) in level_cases() {
+                let cf = Crossfeed::try_new(&config, fs, 2).unwrap();
+                let (fc, feed) = config.effective_params();
+                let (d, c) = match config.mode {
+                    CrossfeedMode::Linkwitz => complementary_design(fc, feed, fs),
+                    _ => {
+                        let (d, c, _) = bs2b_design(fc, feed, fs);
+                        (d, c)
+                    }
+                };
+                let unscaled = lin_to_db(l1_norm(&d) + l1_norm(&c));
+                let over = cf.peak_gain_db();
+                assert!(
+                    (over - (cf.level_db() + unscaled)).abs() < 1e-9,
+                    "{name} @{fs}"
+                );
+                assert!(over > 1.0 && over < 6.0, "{name} @{fs}: +{over:.2} dB");
+            }
+        }
+    }
+
+    fn width_cfg(
+        mode: CrossfeedMode,
+        width: f64,
+        width_shape: StereoWidthShape,
+    ) -> CrossfeedConfig {
+        CrossfeedConfig {
+            mode,
+            width,
+            width_shape,
+            ..CrossfeedConfig::default()
+        }
+    }
+
+    const WIDTHS: [f64; 8] = [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+    const SHAPES: [StereoWidthShape; 2] = [StereoWidthShape::Flat, StereoWidthShape::AboveBass];
+    const WIDTH_MODES: [CrossfeedMode; 4] = [
+        CrossfeedMode::None,
+        CrossfeedMode::Linkwitz,
+        CrossfeedMode::Bs2bDefault,
+        CrossfeedMode::Bs2bJanMeier,
+    ];
+
+    /// Run `l`, `r` through `cf` in odd-sized blocks.
+    fn run(cf: &mut Crossfeed, l: &mut [f64], r: &mut [f64]) {
+        let mut i = 0;
+        let mut b = 1;
+        while i < l.len() {
+            let e = (i + b).min(l.len());
+            cf.process(&mut [&mut l[i..e], &mut r[i..e]]);
+            i = e;
+            b = b % 97 + 13;
+        }
+    }
+
+    #[test]
+    fn mono_is_bit_exact_at_every_width_and_shape() {
+        let sig: Vec<f64> = (0..4096)
+            .map(|i| 0.9 * (i as f64 * 0.013).sin() + 0.05 * (i as f64 * 1.7).cos())
+            .collect();
+        for fs in [44_100.0, 192_000.0] {
+            for mode in WIDTH_MODES {
+                for shape in SHAPES {
+                    let reference = {
+                        let c = width_cfg(mode, 1.0, shape);
+                        let mut cf = Crossfeed::try_new(&c, fs, 2).unwrap();
+                        let (mut l, mut r) = (sig.clone(), sig.clone());
+                        run(&mut cf, &mut l, &mut r);
+                        l
                     };
-                    let mut cf = Crossfeed::try_new(&config, fs, 2).unwrap();
-                    let predicted = cf.loudness_change_db(rho);
-                    let measured = measured_loudness_change_db(&mut cf, fs, rho);
+                    for k in WIDTHS {
+                        let c = width_cfg(mode, k, shape);
+                        let mut cf = Crossfeed::try_new(&c, fs, 2).unwrap();
+                        let (mut l, mut r) = (sig.clone(), sig.clone());
+                        run(&mut cf, &mut l, &mut r);
+                        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                        assert_eq!(bits(&l), bits(&r), "{mode:?} {shape:?} k {k}");
+                        if mode == CrossfeedMode::None {
+                            // No stage at k = 1: the input itself.
+                            assert_eq!(bits(&l), bits(&sig), "{shape:?} k {k}");
+                        } else {
+                            assert_eq!(bits(&l), bits(&reference), "{mode:?} {shape:?} k {k}");
+                        }
+                        // The model agrees: mono response is the crossfeed's.
+                        let fresh =
+                            Crossfeed::try_new(&width_cfg(mode, 1.0, shape), fs, 2).unwrap();
+                        for f in [20.0, 700.0, 10_000.0] {
+                            let dev = (cf.mono_response(f) - fresh.mono_response(f)).norm();
+                            assert!(dev < 1e-12, "{mode:?} {shape:?} k {k} {f} Hz");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Width 1 runs the crossfeed exactly as before the width existed: the
+    /// scale and arithmetic of that version, written out here.
+    #[test]
+    fn width_one_is_bit_identical_to_plain_crossfeed() {
+        let fs = 48_000.0;
+        let mut noise = Noise(7);
+        let (l0, r0): (Vec<f64>, Vec<f64>) = (0..8192)
+            .map(|_| (noise.next() * 2.0 - 1.0, noise.next() * 2.0 - 1.0))
+            .unzip();
+        for (name, config) in level_cases() {
+            for shape in SHAPES {
+                let config = CrossfeedConfig {
+                    width_shape: shape,
+                    ..config.clone()
+                };
+                let (fc, feed) = config.effective_params();
+                let (d, c) = match config.mode {
+                    CrossfeedMode::Linkwitz => complementary_design(fc, feed, fs),
+                    _ => {
+                        let (d, c, _) = bs2b_design(fc, feed, fs);
+                        (d, c)
+                    }
+                };
+                let s = matched_gain(&d, &c, fs, MATCHED_CORRELATION);
+                let (d, c) = (scaled(&d, s), scaled(&c, s));
+                let mut st = [OnePoleState::default(); 4];
+                let (el, er): (Vec<f64>, Vec<f64>) = l0
+                    .iter()
+                    .zip(&r0)
+                    .map(|(&xl, &xr)| {
+                        let dl = st[0].step(&d, xl);
+                        let cl = st[1].step(&c, xr);
+                        let dr = st[2].step(&d, xr);
+                        let cr = st[3].step(&c, xl);
+                        (dl + cl, dr + cr)
+                    })
+                    .unzip();
+                let mut cf = Crossfeed::try_new(&config, fs, 2).unwrap();
+                assert_eq!(cf.level_db().to_bits(), lin_to_db(s).to_bits(), "{name}");
+                let bound = l1_norm(&d) + l1_norm(&c);
+                assert_eq!(cf.peak_gain_bound().to_bits(), bound.to_bits(), "{name}");
+                let (mut l, mut r) = (l0.clone(), r0.clone());
+                run(&mut cf, &mut l, &mut r);
+                assert!(
+                    l.iter().zip(&el).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{name} {shape:?}: left"
+                );
+                assert!(
+                    r.iter().zip(&er).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{name} {shape:?}: right"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_crossfeed_and_width_one_is_no_stage() {
+        let c = width_cfg(CrossfeedMode::None, 1.0, SHAPES[1]);
+        assert!(!c.is_active());
+        let mut cf = Crossfeed::try_new(&c, 48_000.0, 1).unwrap();
+        let mut a = vec![0.5, -0.25];
+        let mut b = vec![-0.75, 1.5];
+        cf.process(&mut [&mut a, &mut b]);
+        assert_eq!((a, b), (vec![0.5, -0.25], vec![-0.75, 1.5]));
+        assert_eq!(cf.level_db(), 0.0);
+        assert_eq!(cf.stereo_power_response(1000.0, 0.0), 1.0);
+    }
+
+    /// A tone test at width 1.5: right 100 Hz + 1 kHz, left 1 kHz + 5 kHz.
+    /// The shared tone does not move; each panned tone rises
+    /// +1.94 dB and leaks into the other ear at −12.0 dB, inverted.
+    #[test]
+    fn hard_panned_tones_at_width_1_5() {
+        let fs = 48_000.0;
+        let c = width_cfg(CrossfeedMode::None, 1.5, SHAPES[0]);
+        let mut cf = Crossfeed::try_new(&c, fs, 2).unwrap();
+        assert_eq!(cf.level_db(), 0.0);
+        let n = 48_000;
+        let tone = |f: f64, i: usize| (2.0 * PI * f * i as f64 / fs).sin();
+        let mut l: Vec<f64> = (0..n)
+            .map(|i| 0.3 * tone(1000.0, i) + 0.3 * tone(5000.0, i))
+            .collect();
+        let mut r: Vec<f64> = (0..n)
+            .map(|i| 0.3 * tone(1000.0, i) + 0.3 * tone(100.0, i))
+            .collect();
+        run(&mut cf, &mut l, &mut r);
+        // Complex amplitude of `f` in `x` (whole cycles, so exact).
+        let amp = |x: &[f64], f: f64| {
+            let mut z = Complex64::new(0.0, 0.0);
+            for (i, &v) in x.iter().enumerate() {
+                z += Complex64::from_polar(v, -2.0 * PI * f * i as f64 / fs);
+            }
+            z * (2.0 / x.len() as f64) / 0.3
+        };
+        let db = |z: Complex64| lin_to_db(z.norm());
+        for (own, other, f) in [(&l, &r, 5000.0), (&r, &l, 100.0)] {
+            let (a_own, a_other) = (amp(own, f), amp(other, f));
+            assert!(
+                (db(a_own) - 1.938).abs() < 0.005,
+                "{f} Hz own {}",
+                db(a_own)
+            );
+            assert!(
+                (db(a_other) + 12.04).abs() < 0.005,
+                "{f} Hz leak {}",
+                db(a_other)
+            );
+            // Inverted: the leak is opposite in phase to the own channel.
+            assert!((a_other / a_own).re < 0.0, "{f} Hz leak not inverted");
+        }
+        assert!(db(amp(&l, 1000.0)).abs() < 1e-9 && db(amp(&r, 1000.0)).abs() < 1e-9);
+    }
+
+    /// Impulse responses of the stage's direct and cross paths.
+    fn paths_ir(cf: &Crossfeed, n: usize) -> (Vec<f64>, Vec<f64>) {
+        let mut cf = cf.clone();
+        cf.reset();
+        let mut l = vec![0.0; n];
+        let mut r = vec![0.0; n];
+        l[0] = 1.0;
+        run(&mut cf, &mut l, &mut r);
+        (l, r)
+    }
+
+    #[test]
+    fn width_filter_state_flushes_instead_of_going_subnormal() {
+        // An impulse then silence left the above-bass high-pass state
+        // stuck in subnormals (slow on x86).
+        let c = width_cfg(CrossfeedMode::None, 2.0, StereoWidthShape::AboveBass);
+        let mut cf = Crossfeed::try_new(&c, 768_000.0, 2).unwrap();
+        let n = 768_000 / 2;
+        let mut l = vec![0.0; n];
+        let mut r = vec![0.0; n];
+        l[0] = 1.0;
+        run(&mut cf, &mut l, &mut r);
+        for x in l.iter().chain(&r) {
+            assert!(*x == 0.0 || x.is_normal(), "{x:e}");
+        }
+        assert_eq!((l[n - 1], r[n - 1]), (0.0, 0.0));
+    }
+
+    #[test]
+    fn peak_bound_holds_on_an_antiphase_step() {
+        // With no margin, a full-scale antiphase step went a few ulps
+        // past the bound at the slowest corner.
+        for corner in [200.0, 700.0, 2000.0] {
+            let mut c = width_cfg(CrossfeedMode::None, 2.0, StereoWidthShape::AboveBass);
+            c.width_corner_hz = corner;
+            for fs in [44_100.0, 48_000.0] {
+                let mut cf = Crossfeed::try_new(&c, fs, 2).unwrap();
+                let n = 16_384;
+                let mut l: Vec<f64> = (0..n).map(|i| if i < n / 2 { 1.0 } else { -1.0 }).collect();
+                let mut r: Vec<f64> = l.iter().map(|x| -x).collect();
+                run(&mut cf, &mut l, &mut r);
+                let peak = l.iter().chain(&r).fold(0.0_f64, |m, x| m.max(x.abs()));
+                let bound = cf.peak_gain_bound();
+                assert!(peak <= bound, "{corner} Hz @{fs}: {peak} > {bound}");
+            }
+        }
+    }
+
+    #[test]
+    fn width_peak_bound_is_reached_and_not_exceeded() {
+        let n = 8192;
+        for fs in [44_100.0, 96_000.0] {
+            for mode in WIDTH_MODES {
+                for shape in SHAPES {
+                    for k in WIDTHS {
+                        let c = width_cfg(mode, k, shape);
+                        if !c.is_active() {
+                            continue;
+                        }
+                        let tag = format!("{mode:?} {shape:?} k {k} @{fs}");
+                        let cf = Crossfeed::try_new(&c, fs, 2).unwrap();
+                        let bound = cf.peak_gain_bound();
+                        let (hd, hc) = paths_ir(&cf, n);
+                        let l1: f64 = hd.iter().chain(&hc).map(|x| x.abs()).sum();
+                        assert!((l1 - bound).abs() < 2e-9 * bound, "{tag}: {l1} vs {bound}");
+                        // The input that reaches the bound at the last
+                        // sample: L = sign(h_D′[N−1−n]), R = sign(h_C′[N−1−n]).
+                        let sign = |x: f64| if x < 0.0 { -1.0 } else { 1.0 };
+                        let mut l: Vec<f64> = (0..n).map(|i| sign(hd[n - 1 - i])).collect();
+                        let mut r: Vec<f64> = (0..n).map(|i| sign(hc[n - 1 - i])).collect();
+                        let mut run_cf = cf.clone();
+                        run(&mut run_cf, &mut l, &mut r);
+                        let peak = l.iter().chain(&r).fold(0.0_f64, |m, x| m.max(x.abs()));
+                        assert!(peak <= bound + 1e-12, "{tag}: {peak} > {bound}");
+                        assert!(
+                            l[n - 1] > bound * (1.0 - 2e-9),
+                            "{tag}: {} < {bound}",
+                            l[n - 1]
+                        );
+                        // Random full-scale ±1 never goes over it.
+                        let mut noise = Noise(3);
+                        let mut l: Vec<f64> = (0..n).map(|_| sign(noise.next() - 0.5)).collect();
+                        let mut r: Vec<f64> = (0..n).map(|_| sign(noise.next() - 0.5)).collect();
+                        let mut run_cf = cf.clone();
+                        run(&mut run_cf, &mut l, &mut r);
+                        let peak = l.iter().chain(&r).fold(0.0_f64, |m, x| m.max(x.abs()));
+                        assert!(peak <= bound + 1e-12, "{tag}: noise {peak} > {bound}");
+                    }
+                }
+            }
+        }
+        // Width alone, flat: max(1, k).
+        for k in WIDTHS {
+            let c = width_cfg(CrossfeedMode::None, k, SHAPES[0]);
+            let cf = Crossfeed::try_new(&c, 48_000.0, 2).unwrap();
+            assert!(
+                (cf.peak_gain_bound() - k.max(1.0)).abs() < 2e-9 * k.max(1.0),
+                "k {k}"
+            );
+        }
+    }
+
+    /// The A/B and `matched` loudness model counts the width: the analytic
+    /// change matches a measurement on stereo pink noise, mono is 0 dB, and
+    /// width alone follows `(1+ρ)/2 + (1−ρ)/2·k²` per channel.
+    #[test]
+    fn width_loudness_model_matches_measurement() {
+        let fs = 48_000.0;
+        for mode in [
+            CrossfeedMode::None,
+            CrossfeedMode::Linkwitz,
+            CrossfeedMode::Bs2bDefault,
+        ] {
+            for shape in SHAPES {
+                for k in [0.0, 0.5, 1.5, 2.0] {
+                    let c = width_cfg(mode, k, shape);
+                    let mut cf = Crossfeed::try_new(&c, fs, 2).unwrap();
+                    let base = Crossfeed::try_new(&width_cfg(mode, 1.0, shape), fs, 2).unwrap();
+                    // Mono content: the width changes nothing.
+                    let mono = cf.loudness_change_db(1.0) - base.loudness_change_db(1.0);
+                    assert!(mono.abs() < 1e-9, "{mode:?} {shape:?} k {k}: mono {mono}");
+                    if mode == CrossfeedMode::None && shape == StereoWidthShape::Flat {
+                        let rho = MATCHED_CORRELATION;
+                        let expect = 10.0 * ((1.0 + rho) / 2.0 + (1.0 - rho) / 2.0 * k * k).log10();
+                        let got = cf.loudness_change_db(rho);
+                        assert!((got - expect).abs() < 1e-9, "k {k}: {got} vs {expect}");
+                    }
+                    let predicted = cf.loudness_change_db(MATCHED_CORRELATION);
+                    let measured = measured_loudness_change_db(&mut cf, fs, MATCHED_CORRELATION);
                     assert!(
                         (predicted - measured).abs() < 0.1,
-                        "{name} {level:?} rho {rho}: predicted {predicted:+.3}, measured {measured:+.3}"
+                        "{mode:?} {shape:?} k {k}: predicted {predicted:+.3}, measured {measured:+.3}"
                     );
                 }
             }
         }
     }
 
+    /// A width change while playing goes through the engine's chain swap:
+    /// the new stage starts cold and the two crossfade over 10 ms. The
+    /// output has no step: its largest sample-to-sample change stays within
+    /// that of the steady output on either side.
     #[test]
-    fn matched_is_louder_than_peak_safe_and_bounded() {
-        for fs in RATES {
-            for (name, config) in level_cases() {
-                let matched = Crossfeed::try_new(&config, fs, 2).unwrap();
-                let safe = Crossfeed::try_new(
-                    &CrossfeedConfig {
-                        level: CrossfeedLevel::PeakSafe,
-                        ..config.clone()
-                    },
-                    fs,
-                    2,
-                )
-                .unwrap();
-                assert!((safe.peak_gain_db()).abs() < 1e-9);
-                assert!(matched.level_db() > safe.level_db(), "{name} @{fs}");
-                // Same filters, other constant: the peak bound moves by the
-                // difference of the two gains.
-                let over = matched.peak_gain_db();
+    fn width_change_through_a_crossfade_has_no_step() {
+        let fs = 48_000.0;
+        let n = 9600;
+        let at = 4000;
+        let fade = (fs * 0.010) as usize;
+        let tone = |f: f64, i: usize| (2.0 * PI * f * i as f64 / fs).sin();
+        let l0: Vec<f64> = (0..n)
+            .map(|i| 0.45 * tone(80.0, i) + 0.1 * tone(3000.0, i))
+            .collect();
+        let r0: Vec<f64> = (0..n)
+            .map(|i| -0.45 * tone(80.0, i) + 0.1 * tone(4100.0, i))
+            .collect();
+        let max_step = |x: &[f64]| {
+            x.windows(2)
+                .fold(0.0_f64, |m, w| m.max((w[1] - w[0]).abs()))
+        };
+        for (from, to) in [
+            (
+                width_cfg(CrossfeedMode::Linkwitz, 1.0, SHAPES[0]),
+                width_cfg(CrossfeedMode::Linkwitz, 1.5, SHAPES[1]),
+            ),
+            (
+                width_cfg(CrossfeedMode::None, 0.5, SHAPES[1]),
+                width_cfg(CrossfeedMode::None, 2.0, SHAPES[0]),
+            ),
+            (
+                width_cfg(CrossfeedMode::None, 2.0, SHAPES[0]),
+                width_cfg(CrossfeedMode::None, 2.0, SHAPES[1]),
+            ),
+        ] {
+            let steady = |c: &CrossfeedConfig| {
+                let mut cf = Crossfeed::try_new(c, fs, 2).unwrap();
+                let (mut l, mut r) = (l0.clone(), r0.clone());
+                run(&mut cf, &mut l, &mut r);
+                (l, r)
+            };
+            let (ol, or) = steady(&from);
+            // The incoming stage is cold at the swap.
+            let mut new = Crossfeed::try_new(&to, fs, 2).unwrap();
+            let (mut nl, mut nr) = (l0[at..].to_vec(), r0[at..].to_vec());
+            run(&mut new, &mut nl, &mut nr);
+            let (sl, sr) = steady(&to);
+            for (old, new, after) in [(&ol, &nl, &sl), (&or, &nr, &sr)] {
+                let out: Vec<f64> = (0..n)
+                    .map(|i| {
+                        if i < at {
+                            return old[i];
+                        }
+                        let j = i - at;
+                        let w = if j >= fade {
+                            1.0
+                        } else {
+                            0.5 - 0.5 * (PI * j as f64 / fade as f64).cos()
+                        };
+                        (1.0 - w) * old[i] + w * new[j]
+                    })
+                    .collect();
+                let limit = max_step(&old[..at]).max(max_step(&after[at..]));
+                let got = max_step(&out[at - 1..at + 2 * fade]);
                 assert!(
-                    (over - (matched.level_db() - safe.level_db())).abs() < 1e-9,
-                    "{name} @{fs}"
+                    got <= 1.05 * limit,
+                    "{from:?} -> {to:?}: step {got} vs {limit}"
                 );
-                assert!(over > 1.0 && over < 6.0, "{name} @{fs}: +{over:.2} dB");
+            }
+        }
+    }
+
+    /// Prints the width table: peak bounds and loudness per step.
+    /// `cargo test -p audivane-dsp-core crossfeed::tests::width_report -- --nocapture --ignored`
+    #[test]
+    #[ignore]
+    fn width_report() {
+        let fs = 48_000.0;
+        for mode in [
+            CrossfeedMode::None,
+            CrossfeedMode::Linkwitz,
+            CrossfeedMode::Bs2bDefault,
+        ] {
+            for shape in SHAPES {
+                for k in [0.0, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
+                    let m = Crossfeed::try_new(&width_cfg(mode, k, shape), fs, 2).unwrap();
+                    println!(
+                        "| {mode:?} | {shape:?} | {k} | level {:+.2} dB, peak {:+.2} dB, loudness {:+.2} dB |",
+                        m.level_db(),
+                        m.peak_gain_db(),
+                        m.loudness_change_db(MATCHED_CORRELATION),
+                    );
+                }
             }
         }
     }
@@ -745,21 +1371,9 @@ mod tests {
             println!("@{fs}");
             for (name, config) in level_cases() {
                 let matched = Crossfeed::try_new(&config, fs, 2).unwrap();
-                let safe = Crossfeed::try_new(
-                    &CrossfeedConfig {
-                        level: CrossfeedLevel::PeakSafe,
-                        ..config.clone()
-                    },
-                    fs,
-                    2,
-                )
-                .unwrap();
                 let rho = [0.0, 0.3, 0.5, 0.6, 1.0].map(|r| matched.loudness_change_db(r));
-                let safe_rho = safe.loudness_change_db(MATCHED_CORRELATION);
                 println!(
-                    "| {name} | {:+.2} dB | {:+.2} dB | {:+.2} dB | {:+.2} dB | {:+.2} / {:+.2} / {:+.2} / {:+.2} / {:+.2} dB |",
-                    safe.level_db(),
-                    safe_rho,
+                    "| {name} | {:+.2} dB | {:+.2} dB | {:+.2} / {:+.2} / {:+.2} / {:+.2} / {:+.2} dB |",
                     matched.level_db(),
                     matched.peak_gain_db(),
                     rho[0],

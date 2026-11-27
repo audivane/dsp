@@ -13,7 +13,7 @@ import { useSyncExternalStore } from "react";
 import { toggleRate, withDefaultRate } from "../lib/rates";
 import { fmtRate } from "../lib/format";
 import { hasRateRatio, normalizeStatus, normalizeUpsamplerResponse } from "../api/legacy";
-import { DaemonError, ErrorCode, isUnknownMethod, type ConnState, type IrInfo, type Transport } from "../api/transport";
+import { type AppImageSetup, type AppUpdateState, DaemonError, ErrorCode, isUnknownMethod, type ConnState, type IrInfo, type Transport } from "../api/transport";
 import type {
   AbB,
   AbConfig,
@@ -21,9 +21,12 @@ import type {
   Band,
   ChainConfig,
   ConvolutionConfig,
+  ConvolutionSafety,
   DaemonEvent,
+  DeviceAssignment,
   DeviceInfo,
   DeviceLostAction,
+  DitherKind,
   EngineConfig,
   EqProfile,
   FilterPreset,
@@ -32,6 +35,7 @@ import type {
   OutputConfig,
   Preset,
   PresetInfo,
+  PresetPart,
   RateTarget,
   RoutingMode,
   RateConflict,
@@ -52,11 +56,15 @@ import type {
   VolumeStatus,
 } from "../api/types";
 import { parseApo, presetNameFromFile, toApo } from "../lib/apo";
+import { applyPreset, PART_NAME, PRESET_PARTS, presetCovers } from "../lib/presetParts";
 import {
   EQ_PROFILE_VERSION,
   addSection,
   clearSection,
   convList,
+  convSafety,
+  irKey,
+  irPaths,
   deepEqual,
   emptyEq,
   hasSection,
@@ -68,7 +76,7 @@ import {
   withSectionBands,
   type EqSection,
 } from "../lib/chain";
-import { profileAutoPreampDb } from "../lib/eqmath";
+import { freeBandFreq, profileAutoPreampDb } from "../lib/eqmath";
 import { History } from "../lib/history";
 import {
   OVERLAY_COLOURS,
@@ -86,32 +94,57 @@ import {
 } from "../lib/overlays";
 import { MutationQueue } from "../lib/queue";
 import { rateKind, targetForEngine, type RateKind } from "../lib/upsamplerRate";
+import { loadEqRange, loadHarmGraph, saveEqRange, saveHarmGraph, type EqRange, type HarmGraphPrefs } from "../lib/graphPrefs";
 import { loadSpectrumPrefs, saveSpectrumPrefs, type SpectrumPrefs } from "../lib/spectrum";
 import { throttleLatest, type Throttle } from "../lib/throttle";
 import { DEFAULT_VARISPEED } from "../lib/varispeed";
 import { followerOn, type FollowerPatch } from "../lib/followers";
+import { DEFAULT_PAIR, isDefaultPair } from "../lib/outputChannels";
 import { FLAT_PATCH } from "../lib/abPatch";
 import { MEASURE_MAX_DEFAULT } from "../lib/abMeasure";
-import { comparing, filterPatch, stagePatch, type BPatch, type CompareMemory, type CompareStage } from "../lib/abCompare";
-import type { FollowerConfig, OutputsStatus } from "../api/types";
+import { clampTrials, scoreRun, scoreTrial, sideFor, EXPORT_FORMAT, MODE_TEXT, type BlindButton, type BlindChoice, type BlindExport, type BlindPlan, type TrialRecord } from "../lib/abBlind";
+import { commitSecret, createSecret, secretToHex, xSequence } from "../lib/abx/commitment";
+import { loadSaved, storeSaved, withSaved, type CustomSel, type SavedCustomB } from "../lib/abCustom";
+import { abStoppedByOverload, comparing, filterDesignPatch, filterPatch, outputPatch, stagePatch, type BPatch, type CompareMemory, type CompareStage } from "../lib/abCompare";
+import type { ConvResponse, FollowerConfig, HarmonicsConfig, HarmonicsLive, HarmonicsPreset, HarmonicsReadout, HarmonicsSpectrum, HarmonicsSpectrumTrace, HarmonicsSystem, OutputChannels, OutputsStatus } from "../api/types";
 import { STREAM_VOLUME_NEEDS_UPDATE, reportsStreamLevels, streamLimitNote, type StreamLevelEdit, type StreamMessage } from "../lib/streamVolume";
 import { meterStore } from "./meters";
-import { defaultLimiter, harmonicLevels } from "../lib/effects";
+import { defaultCrossfeed, defaultHarmonics, defaultLimiter, withOrderLevel } from "../lib/effects";
+import { liveHistory } from "../lib/harmonicsLive";
 import { guardRiseLimit, volumeSettingsProblem } from "../lib/volumeSettings";
 import { RECOMMENDED_TARGET, recommendedUpsampler } from "../lib/upsamplerRecommended";
 import { defaultDesign, designKey, patchUpsampler, RECOMMENDED_PRESET } from "../lib/filterDesign";
 import type { DesignCheck, FilterDesign } from "../api/types";
+
+/** Reads behind a timed-out `set_upsampler` (each with the build timeout)
+ *  before its outcome is left to later config updates. */
+const UPS_OUTCOME_WAITS = 3;
+
+/** Two upsampler settings are the same (key order aside). */
+function sameUpsampler(a: UpsamplerConfig, b: UpsamplerConfig): boolean {
+  return stableJson(a) === stableJson(b);
+}
+
+function stableJson(v: unknown): string {
+  return JSON.stringify(v, (_, x: unknown) =>
+    x && typeof x === "object" && !Array.isArray(x)
+      ? Object.fromEntries(Object.entries(x as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+      : x,
+  );
+}
+
+/** A queued upsampler edit, with the results of every edit folded into it. */
+interface UpsEdit {
+  fn: (cur: UpsamplerConfig) => UpsamplerConfig;
+  okText?: string;
+  results: { ok: boolean }[];
+}
 
 /** An upsampler edit: the fields to change (a preset clears the design, a design the preset). */
 export type UpsamplerPatch = Partial<UpsamplerConfig>;
 import { keyPatch, osdPayload, volumeOnDac } from "../lib/volumeKeys";
 import type { KeyAction, OsdPayload } from "../api/shell";
 
-/** A preset's harmonic levels as the custom fields. */
-function harmonicLevelsOf(c: NonNullable<ChainConfig["harmonics"]>) {
-  const [h2_db, h3_db, h4_db, h5_db] = harmonicLevels(c);
-  return { h2_db, h3_db, h4_db, h5_db };
-}
 import { spectrumStore } from "./spectrum";
 
 /** An EQ edit as a function of the EQ it applies to. */
@@ -147,7 +180,7 @@ const STAGE_METHOD: Record<StageId, string> = {
 export const STAGE_NAME: Record<StageId, string> = {
   dc_block: "DC block",
   pitch: "Pitch",
-  crossfeed: "Crossfeed",
+  crossfeed: "Stereo image",
   harmonics: "Harmonics",
   limiter: "Limiter",
 };
@@ -214,10 +247,9 @@ export interface VolumeGesture {
 
 /** A line of volume writes, each conditional on the one before: the
  *  (instance, revision) captured when its first gesture began, then each
- *  accepted echo. A gesture that begins from a draft continues that
- *  draft's chain (its value includes the draft); one that begins from the
- *  status starts a new chain. A refusal kills the chain: its queued and
- *  later changes are dropped, and nothing else reads its base. */
+ *  accepted echo. A gesture from a draft continues that draft's chain (its
+ *  value includes the draft), one from the status starts a new chain. A
+ *  refusal kills the chain: its queued and later changes are dropped. */
 interface VolumeChain {
   readonly id: number;
   readonly epoch: number;
@@ -283,6 +315,10 @@ export interface AppState {
   irInfo: Record<string, IrInfo | null>;
   view: ViewId;
   spectrum: SpectrumPrefs;
+  /** The Harmonics page's plot settings (tone, level, ranges, zoom, sweeps). */
+  harmGraph: HarmGraphPrefs;
+  /** The EQ graph's frequency range. */
+  eqRange: EqRange;
   eqMode: EqSection;
   selectedBand: number;
   eqDraft: EqProfile | null;
@@ -334,7 +370,7 @@ export interface AppState {
   /** The daemon's refusal of the last edit, shown next to its controls. */
   stageErrors: Partial<Record<ErrorSlot, string>>;
   /** Per stage: the engine has it (true), lacks it (false), or not known yet (null). */
-  stageCaps: Record<StageId | "tilt" | "volumeSettings" | "ditherKinds" | "crossfeedLevel", boolean | null>;
+  stageCaps: Record<StageId | "tilt" | "volumeSettings" | "ditherKinds", boolean | null>;
   selfTest: SelfTestState;
   starting: boolean;
   startError: string | null;
@@ -343,13 +379,30 @@ export interface AppState {
   engineAtLoginError: string | null;
   /** This app's version (null until known, or in an app that cannot tell). */
   appVersion: string | null;
-  /** The update banner was closed for this engine version. */
+  /** An upgrade of the app: "ready" relaunches once the user leaves the
+   *  window, "failed" could not relaunch (restart by hand). */
+  updatePending: AppUpdateState | null;
+  /** Running from the AppImage: its per-user setup offer (null otherwise). */
+  appImage: AppImageSetup | null;
+  /** The AppImage's setup is running. */
+  installing: boolean;
+  /** The update banner was closed for this engine version ("pending": the
+   *  restart notice without a version difference). */
   updateDismissed: string | null;
   /** "Restart" in the update banner is in progress. */
   restarting: boolean;
   /** The daemon's refusal of the last upsampler edit, shown next to the
    *  controls; cleared by the next edit that goes through. */
   upsamplerError: string | null;
+  /** An upsampler change the engine is still working on: a custom
+   *  design's check, then the `set_upsampler` the engine answers once the
+   *  filter is designed (up to tens of seconds for the longest kernels).
+   *  `since`: when it started (ms, `Date.now()`); `waiting`: the call
+   *  timed out, so the app is asking again for the outcome. */
+  upsBuilding: { since: number; waiting: boolean } | null;
+  /** Counts finished upsampler builds: a design check that failed while
+   *  one ran is made again once it is done. */
+  upsBuilds: number;
   /** The last filter preset used, so Custom → Preset returns to it (the
    *  manual design stays in the config while a preset runs). */
   lastUpsPreset: FilterPreset | null;
@@ -363,6 +416,53 @@ export interface AppState {
   /** Catalogue expansions read with `resolve_design`, by name: what a
    *  custom design's `based_on` is compared against ("Modified from"). */
   designBases: Record<string, FilterDesign>;
+  /** The built-in harmonics presets, once fetched (`[]`: the engine has none). */
+  harmonicsPresets: HarmonicsPreset[] | null;
+  /** The built-in harmonics system presets (whole stages), once fetched (`[]`: the engine has none). */
+  harmonicsSystems: HarmonicsSystem[] | null;
+  /** The blind test in the A/B view: running, or its result until closed. */
+  blindRun: BlindRun | null;
+  /**
+   * The A/B view's side-B editor: changes not applied yet, or null when
+   * the rows show side B as it plays.
+   */
+  abCustomSel: CustomSel | null;
+  /** Named custom Bs this viewer saved (browser storage, not the engine config). */
+  abCustomSaved: SavedCustomB[];
+}
+
+/** A blind test (ABX or blind A/B) and, once over, its outcome. */
+export interface BlindRun {
+  phase: "running" | "done" | "abandoned";
+  plan: BlindPlan;
+  /** What sides A and B are, as the view names them. */
+  sideA: string;
+  sideB: string;
+  level: LevelMatch;
+  secretHex: string;
+  commitment: string;
+  /** The hidden side of each trial; never shown before the run ends. */
+  truths: readonly ("A" | "B")[];
+  /** 0-based index of the trial being answered. */
+  trial: number;
+  /** The button playing in this trial (null: none pressed yet). */
+  playing: BlindButton | null;
+  trialStart: number;
+  switches: number;
+  records: TrialRecord[];
+  startedAt: string;
+  endedAt: string | null;
+  /** Why the run ended early (abandoned runs are never scored). */
+  reason: string | null;
+  /** Chains and A/B config at the start: any change voids the run. */
+  fingerprint: string;
+  /** Status has shown the mask set; later losing it ends the run. */
+  maskSeen: boolean;
+}
+
+/** What a config change must leave alone for a blind run to stand. */
+function blindFingerprint(cfg: EngineConfig): string {
+  return JSON.stringify([cfg.chain, cfg.ab, cfg.dsp_enabled, cfg.device, cfg.rate]);
 }
 
 const UI_KEY = "avdsp-ui";
@@ -452,10 +552,10 @@ export class AppStore {
   private overlayChains = new Map<string, Promise<void>>();
 
   /**
-   * `secondary`: a store for the tray popup's own window. It reads and
-   * writes the volume like the main window (its own guarded chains), but
-   * leaves what belongs to the main window alone: the spectrum
-   * subscription, the remembered view, presets, devices and overlays.
+   * `secondary`: a store for the tray popup's own window. It reads and writes
+   * the volume like the main window (its own guarded chains) but leaves what
+   * belongs to the main window alone: the spectrum subscription, the
+   * remembered view, presets, devices and overlays.
    */
   constructor(
     private transport: Transport,
@@ -477,6 +577,8 @@ export class AppStore {
       irInfo: {},
       view: ui.view ?? "eq",
       spectrum: loadSpectrumPrefs(),
+      harmGraph: loadHarmGraph(),
+      eqRange: loadEqRange(),
       eqMode: "linked",
       selectedBand: 0,
       eqDraft: null,
@@ -502,20 +604,30 @@ export class AppStore {
       followerErrors: {},
       deviceConflict: null,
       stageErrors: {},
-      stageCaps: { dc_block: null, pitch: null, crossfeed: null, harmonics: null, limiter: null, tilt: null, volumeSettings: null, ditherKinds: null, crossfeedLevel: null },
+      stageCaps: { dc_block: null, pitch: null, crossfeed: null, harmonics: null, limiter: null, tilt: null, volumeSettings: null, ditherKinds: null },
       selfTest: { state: "idle" },
       starting: false,
       startError: null,
       engineAtLogin: null,
       engineAtLoginError: null,
       appVersion: null,
+      updatePending: null,
+      appImage: null,
+      installing: false,
       updateDismissed: null,
       restarting: false,
       upsamplerError: null,
+      upsBuilding: null,
+      upsBuilds: 0,
       lastUpsPreset: stash<FilterPreset>("ups-preset"),
       lastUpsTargets: stash<Partial<Record<RateKind, RateTarget>>>("ups-targets") ?? {},
       upsDraft: null,
       designBases: {},
+      harmonicsPresets: null,
+      harmonicsSystems: null,
+      blindRun: null,
+      abCustomSel: null,
+      abCustomSaved: loadSaved(),
     };
     this.eqThrottle = throttleLatest(() => this.flushEq(), EQ_INTERVAL_MS);
     this.volThrottle = throttleLatest((job) => {
@@ -628,6 +740,16 @@ export class AppStore {
       .appVersion()
       .then((appVersion) => this.set({ appVersion }))
       .catch(() => undefined);
+    void this.transport
+      .appImageSetup()
+      .then((appImage) => this.set({ appImage }))
+      .catch(() => undefined);
+    void this.transport
+      .appUpdatePending()
+      .then((pending) => {
+        if (pending) this.markUpdatePending(pending);
+      })
+      .catch(() => undefined);
     this.stop = this.transport.start({
       onEvent: (e) => this.onEvent(e),
       onConnection: (state, detail) => this.onConnection(state, detail),
@@ -644,6 +766,11 @@ export class AppStore {
 
   private onConnection(state: ConnState, detail?: string) {
     if (state !== this.state.conn) this.endVolumeGesture();
+    if (state !== "up" && this.state.blindRun?.phase === "running") {
+      // The engine may still hold the mask: clear it once connected again.
+      this.blindMaskStale = true;
+      this.blindAbandon("The connection to the engine was lost (engine restarted or stopped).", false);
+    }
     if (state === "up") {
       meterStore.clear();
       spectrumStore.clear();
@@ -756,12 +883,19 @@ export class AppStore {
     if (phase4a || Array.isArray(config.chain.convolution)) caps.convChain = true;
     if (phase4a || config.chain.eq?.right || config.chain.eq?.left) caps.perChannel = true;
     const patch: Partial<AppState> = { config, caps };
+    const run = this.state.blindRun;
+    if (run?.phase === "running") {
+      if (!config.ab) queueMicrotask(() => this.blindAbandon("A/B was turned off."));
+      else if (blindFingerprint(config) !== run.fingerprint) queueMicrotask(() => this.blindAbandon("Side A or side B changed during the run."));
+    }
     if (this.state.clipNoLimiter && config.chain.limiter && config.chain.limiter.mode !== "off") patch.clipNoLimiter = false;
     const ups = config.chain.upsampler;
-    // A new custom design runs (set elsewhere, or applied): no draft to keep.
-    // A draft of the running design that does not pass yet stays.
-    const prev = this.state.config?.chain.upsampler;
-    if (ups && !ups.preset && this.state.upsDraft && (!prev || prev.preset || !prev.design || !ups.design || designKey(prev.design) !== designKey(ups.design))) patch.upsDraft = null;
+    // Cleared only by the draft itself arriving: a build of an older
+    // design that lands while a newer draft waits (failing its check,
+    // say) leaves the draft and its errors.
+    const draft = this.state.upsDraft?.design;
+    if (ups && !ups.preset && draft && ups.design && designKey(ups.design) === designKey(draft)) patch.upsDraft = null;
+    this.reconcileUps(ups, patch);
     if (ups && !ups.preset && ups.design) this.lastCustomDesign = ups.design;
     if (ups?.preset && ups.preset !== RECOMMENDED_PRESET && ups.preset !== this.state.lastUpsPreset) {
       patch.lastUpsPreset = ups.preset as FilterPreset;
@@ -784,7 +918,7 @@ export class AppStore {
     this.set(patch);
     // `active` in the device list follows the configured device; re-read it when that changes.
     if (this.state.caps.devices && config.device !== this.devicesFor) void this.refreshDevices();
-    for (const c of convList(config.chain)) void this.loadIrInfo(c.ir_path);
+    for (const c of convList(config.chain)) for (const p of irPaths(c)) void this.loadIrInfo(p);
   }
 
   /**
@@ -821,6 +955,7 @@ export class AppStore {
     const tilt = "eq_tilt" in status;
     if (this.state.stageCaps.tilt !== tilt) patch.stageCaps = { ...this.state.stageCaps, tilt };
     this.set(patch);
+    this.blindWatchStatus(status);
   }
 
   private async loadIrInfo(path: string) {
@@ -869,6 +1004,18 @@ export class AppStore {
     }
   }
 
+  /** The AppImage's per-user setup; on success the app relaunches into the
+   *  installed copy (with the engine started), so this returns only on failure. */
+  async installAppImage(loginStart: boolean) {
+    this.set({ installing: true, startError: null });
+    try {
+      await this.transport.installAppImage(loginStart);
+    } catch (e) {
+      this.set({ startError: errorText(e) });
+    }
+    this.set({ installing: false });
+  }
+
   /** Relaunch the app so it runs the newly installed code. */
   async restartApp() {
     this.set({ restarting: true });
@@ -894,13 +1041,22 @@ export class AppStore {
     }
   }
 
-  dismissUpdate() {
-    this.set({ updateDismissed: this.state.status?.version ?? null });
+  /** Close the update banner: for this engine version, or ("pending")
+   *  the restart notice shown without a version difference. */
+  dismissUpdate(key: string | null = this.state.status?.version ?? null) {
+    this.set({ updateDismissed: key });
+  }
+
+  markUpdatePending(state: AppUpdateState) {
+    // A failure is final; "ready" never replaces it.
+    if (this.state.updatePending === "failed") return;
+    this.set({ updatePending: state });
   }
 
   // ------------------------------------------------------------ navigation
 
   setView(view: ViewId) {
+    if (view !== "ab" && this.state.blindRun?.phase === "running") this.blindAbandon("You left the A/B view.");
     this.set({ view });
   }
 
@@ -908,6 +1064,17 @@ export class AppStore {
     const spectrum = { ...this.state.spectrum, ...patch };
     saveSpectrumPrefs(spectrum);
     this.set({ spectrum });
+  }
+
+  setHarmGraph(patch: Partial<HarmGraphPrefs>) {
+    const harmGraph = { ...this.state.harmGraph, ...patch };
+    saveHarmGraph(harmGraph);
+    this.set({ harmGraph });
+  }
+
+  setEqRange(eqRange: EqRange) {
+    saveEqRange(eqRange);
+    this.set({ eqRange });
   }
 
   // ------------------------------------------------------------ EQ
@@ -1062,8 +1229,7 @@ export class AppStore {
   }
 
   addBand(band: Partial<Band> = {}) {
-    const added: Band = { kind: "peaking" as const, freq_hz: 1000, gain_db: 0, q: 1, enabled: true, ...band };
-    this.editBands((bands) => [...bands, added]);
+    this.editBands((bands) => [...bands, { kind: "peaking" as const, freq_hz: freeBandFreq(bands), gain_db: 0, q: 1, enabled: true, ...band }]);
     this.set({ selectedBand: this.editedSet().bands.length - 1 });
   }
 
@@ -1228,22 +1394,44 @@ export class AppStore {
     }
   }
 
-  /** Queue an edit of the IR chain, applied to the chain the daemon holds when it runs. */
+  /** Queue an edit of the IR chain, applied to the chain the daemon holds when it
+   *  runs. The room calibration's item is not the user's to edit: the daemon keeps
+   *  it in place. */
   private editConvolution(fn: (list: ConvolutionConfig[]) => ConvolutionConfig[], okText?: string) {
     return this.mutate(async () => {
       const cfg = await this.freshConfig();
-      await this.sendConvolution(fn(convList(cfg.chain)));
+      await this.sendConvolution(fn(convList(cfg.chain).filter((c) => !c.calibration)));
     }, okText);
   }
 
-  /** Index of the IR shown at `i` (by path) in `list`, which may have changed since. */
-  private irIndex(list: ConvolutionConfig[], i: number, path: string | undefined): number {
-    if (path === undefined) return -1;
-    return list[i]?.ir_path === path ? i : list.findIndex((c) => c.ir_path === path);
+  /** Pick a room-calibration bundle manifest and load it (replacing the loaded one). */
+  async loadCalibration() {
+    const path = await this.transport.pickCalibrationBundle();
+    if (!path) return;
+    await this.mutate(async () => {
+      const reply = await this.call<{ label?: string; warnings?: string[] } | null>("bundle_load", { path });
+      for (const w of reply?.warnings ?? []) this.toast(w, "info");
+    }, "Room calibration loaded");
   }
 
+  unloadCalibration() {
+    return this.mutate(() => this.call("bundle_unload"), "Room calibration removed");
+  }
+
+  /** One room-calibration part's level, dB: `device` a follower part (`null`: the main one); `gain_db` `null` goes back to the bundle's. */
+  setCalibrationGain(device: string | null, gain_db: number | null) {
+    return this.mutate(() => this.call("bundle_gain", { ...(device ? { device } : {}), gain_db }));
+  }
+
+  /** Index of the IR shown at `i` (by `irKey`) in `list`, which may have changed since. */
+  private irIndex(list: ConvolutionConfig[], i: number, key: string | undefined): number {
+    if (key === undefined) return -1;
+    return list[i] && irKey(list[i]) === key ? i : list.findIndex((c) => irKey(c) === key);
+  }
+
+  /** The user's impulse responses (the room calibration's item is shown on its own). */
   convolution(): ConvolutionConfig[] {
-    return convList(this.state.config?.chain);
+    return convList(this.state.config?.chain).filter((c) => !c.calibration);
   }
 
   setConvEnabled(on: boolean) {
@@ -1265,15 +1453,17 @@ export class AppStore {
   }
 
   setIr(i: number, patch: Partial<ConvolutionConfig>) {
-    const path = this.convolution()[i]?.ir_path;
-    void this.editConvolution((list) => {
+    const c = this.convolution()[i];
+    const path = c && irKey(c);
+    return this.editConvolution((list) => {
       const at = this.irIndex(list, i, path);
       return list.map((c, j) => (j === at ? { ...c, ...patch } : c));
     });
   }
 
   removeIr(i: number) {
-    const path = this.convolution()[i]?.ir_path;
+    const c = this.convolution()[i];
+    const path = c && irKey(c);
     void this.editConvolution((list) => {
       const at = this.irIndex(list, i, path);
       return list.filter((_, j) => j !== at);
@@ -1286,25 +1476,107 @@ export class AppStore {
 
   /**
    * Queue an upsampler edit, applied to the daemon's upsampler when it runs.
-   * A refusal is shown next to the controls (`upsamplerError`), not as a
-   * toast; the next edit that goes through clears it.
+   * A refusal is shown next to the controls (`upsamplerError`), not as a toast;
+   * the next edit that goes through clears it. Edits made while one waits in
+   * the queue (a build is out) are folded into it: only the latest is
+   * designed, and every caller gets its outcome.
    */
-  private editUpsampler(fn: (cur: UpsamplerConfig) => UpsamplerConfig, okText?: string) {
+  private editUpsampler(fn: (cur: UpsamplerConfig) => UpsamplerConfig, okText?: string): Promise<boolean> {
     if (!this.upsampler()) return Promise.resolve(false);
-    return this.mutate(
-      async () => {
-        const cfg = await this.freshConfig();
-        await this.call("set_upsampler", fn(cfg.chain.upsampler));
-      },
-      okText,
-      () => {
-        if (this.state.upsamplerError !== null) this.set({ upsamplerError: null });
-      },
-      (e) => {
-        this.set({ upsamplerError: errorText(e) });
-        return true;
-      },
-    );
+    const result = { ok: false };
+    const edit: UpsEdit = { fn, okText, results: [result] };
+    return this.queue
+      .latest("upsampler", edit, (e) => this.runUpsamplerEdit(e), (older, newer) => ({
+        fn: (c) => newer.fn(older.fn(c)),
+        okText: newer.okText ?? older.okText,
+        results: [...older.results, ...newer.results],
+      }))
+      .then(() => result.ok);
+  }
+
+  /** One (folded) upsampler edit, as `mutate` runs a job. */
+  private async runUpsamplerEdit(edit: UpsEdit): Promise<void> {
+    let ok = false;
+    try {
+      const cfg = await this.freshConfig();
+      const outcome = await this.sendUpsampler(edit.fn(cfg.chain.upsampler), cfg.chain.upsampler);
+      await this.refreshConfig();
+      if (this.state.upsamplerError !== null) this.set({ upsamplerError: null });
+      if (outcome === "applied") {
+        if (edit.okText) this.toast(edit.okText);
+        ok = true;
+      }
+    } catch (e) {
+      this.set({ upsamplerError: errorText(e) });
+      await this.refreshConfig().catch(() => undefined);
+    } finally {
+      for (const r of edit.results) r.ok = ok;
+    }
+  }
+
+  /**
+   * `set_upsampler`, shown as building while it is out (the engine designs the
+   * filter before it answers). A call that timed out is never sent again (by
+   * then it may undo a newer change): the engine answers a connection in
+   * order, so a read sent behind it there (`afterUpsamplerBuild`) answers once
+   * it is done, and the config then says how it went: the ask plays (applied),
+   * something else than before plays (superseded by a later change), or what
+   * played before still plays (refused; the reason went with the lost reply).
+   * If even that read times out, the request stays unresolved and later config
+   * updates settle it (`reconcileUps`).
+   */
+  private async sendUpsampler(next: UpsamplerConfig, before: UpsamplerConfig): Promise<"applied" | "superseded"> {
+    this.upsBusyStart();
+    // A newer change settles what an unresolved older one left showing.
+    this.upsUnresolved = null;
+    try {
+      try {
+        await this.call("set_upsampler", next);
+        return "applied";
+      } catch (e) {
+        if (!(e instanceof DaemonError && e.code === ErrorCode.TIMEOUT)) throw e;
+      }
+      for (let wait = 0; wait < UPS_OUTCOME_WAITS; wait++) {
+        const building = this.state.upsBuilding;
+        if (building && !building.waiting) this.set({ upsBuilding: { ...building, waiting: true } });
+        let now: UpsamplerConfig;
+        try {
+          now = (await this.transport.afterUpsamplerBuild()).chain.upsampler;
+        } catch (e) {
+          if (e instanceof DaemonError && e.code === ErrorCode.TIMEOUT) continue;
+          throw e;
+        }
+        if (sameUpsampler(now, next)) return "applied";
+        if (!sameUpsampler(now, before)) return "superseded";
+        throw new DaemonError(ErrorCode.INTERNAL, "The engine did not apply the filter (its reason was lost when the app stopped waiting). Try it again to see why.");
+      }
+      this.upsUnresolved = { next, before };
+      throw new DaemonError(ErrorCode.INTERNAL, "The engine has not finished the filter yet; the one before plays until it does.");
+    } finally {
+      this.upsBusyEnd();
+    }
+  }
+
+  /** A change whose outcome the app stopped waiting for: config updates settle it. */
+  private upsUnresolved: { next: UpsamplerConfig; before: UpsamplerConfig } | null = null;
+
+  /** Settle [`upsUnresolved`] from a config update: applied or superseded, its error goes. */
+  private reconcileUps(ups: UpsamplerConfig | undefined, patch: Partial<AppState>) {
+    const open = this.upsUnresolved;
+    if (!open || !ups || sameUpsampler(ups, open.before)) return;
+    this.upsUnresolved = null;
+    patch.upsamplerError = null;
+  }
+
+  /** Upsampler applies under way (a custom design's check, then its build). */
+  private upsBusy = 0;
+
+  private upsBusyStart() {
+    if (this.upsBusy++ === 0) this.set({ upsBuilding: { since: Date.now(), waiting: false } });
+  }
+
+  private upsBusyEnd() {
+    if (--this.upsBusy === 0) this.set({ upsBuilding: null, upsBuilds: this.state.upsBuilds + 1 });
   }
 
   setUpsampler(patch: UpsamplerPatch, okText?: string) {
@@ -1393,17 +1665,24 @@ export class AppStore {
     if (!cur) return false;
     const seq = ++this.designSeq;
     this.set({ upsDraft: { ...cur, preset: null, design }, upsamplerError: null });
-    let check: DesignCheck | null = null;
+    // Shown as building from the check on: an automatic length's check
+    // searches it at every rate the device lands on.
+    this.upsBusyStart();
     try {
-      check = await this.checkDesign(design);
-    } catch {
-      // An engine without check_design: let set_upsampler say.
+      let check: DesignCheck | null = null;
+      try {
+        check = await this.checkDesign(design);
+      } catch {
+        // An engine without check_design: let set_upsampler say.
+      }
+      if (seq !== this.designSeq) return false;
+      if (check && check.errors.length > 0) return false;
+      const ok = await this.editUpsampler((c) => ({ ...c, preset: null, design }), okText);
+      if (ok && seq === this.designSeq) this.set({ upsDraft: null });
+      return ok;
+    } finally {
+      this.upsBusyEnd();
     }
-    if (seq !== this.designSeq) return false;
-    if (check && check.errors.length > 0) return false;
-    const ok = await this.editUpsampler((c) => ({ ...c, preset: null, design }), okText);
-    if (ok && seq === this.designSeq) this.set({ upsDraft: null });
-    return ok;
   }
 
   /** Drop the draft: the design that plays stays as it is. */
@@ -1430,15 +1709,18 @@ export class AppStore {
   async setUpsamplerMode(mode: "preset" | "custom", preset: FilterPreset | null = null): Promise<boolean> {
     const cur = this.upsampler();
     if (!cur) return false;
+    // While a change is being checked or built, what plays now is not what
+    // will play: the pick is sent (after it) so the last one wins.
+    const settled = this.upsBusy === 0 && this.queue.waiting("upsampler") === 0;
     if (mode === "custom") {
-      if (!cur.preset && cur.design) return true;
-      this.presetBeforeCustom = cur.preset ?? RECOMMENDED_PRESET;
+      if (settled && !cur.preset && cur.design) return true;
+      if (cur.preset || !cur.design) this.presetBeforeCustom = cur.preset ?? RECOMMENDED_PRESET;
       const design = this.lastCustomDesign;
       return this.editCustomDesign(design ?? defaultDesign());
     }
     if (this.state.upsDraft) this.discardUpsDraft();
     // A preset (Recommended included) already plays.
-    if (cur.preset) return true;
+    if (settled && cur.preset) return true;
     if (cur.design) this.lastCustomDesign = cur.design;
     const back = preset ?? this.presetBeforeCustom ?? this.state.lastUpsPreset ?? RECOMMENDED_PRESET;
     return this.setUpsampler({ preset: back, design: null });
@@ -1539,6 +1821,15 @@ export class AppStore {
     });
   }
 
+  /** The convolution guards (`convolution_safety`): boost cap and subsonic limit. */
+  setConvolutionSafety(patch: Partial<ConvolutionSafety>) {
+    if (!this.state.config) return Promise.resolve(false);
+    return this.mutate(async () => {
+      const cur = await this.freshConfig();
+      await this.call("set_convolution_safety", { ...convSafety(cur), ...patch });
+    });
+  }
+
   setRateConflict(conflict: RateConflict) {
     void this.editRate((r) => ({ ...r, conflict }));
   }
@@ -1566,10 +1857,6 @@ export class AppStore {
     // them; without the field the engine predates the stage.
     if (chain.pitch === undefined) next.pitch = false;
     if (chain.limiter === undefined) next.limiter = false;
-    // The crossfeed level policy: an engine that has it always sends `level`
-    // with a crossfeed config; a null crossfeed says nothing.
-    const xf = chain.crossfeed as Record<string, unknown> | null | undefined;
-    if (xf) next.crossfeedLevel = xf.level !== undefined;
     // The noise-shaping dither kinds came with the limiter (both after 0.9.4).
     next.ditherKinds = chain.limiter !== undefined;
     const vol = config.volume as Partial<VolumeConfig> | null | undefined;
@@ -1705,10 +1992,10 @@ export class AppStore {
         this.setPitchPageEnabled(on);
         break;
       case "crossfeed":
-        this.editStage("crossfeed", (c) => ({ ...(c ?? { mode: "bs2b_default" as const, cutoff_hz: 700, feed_db: 4.5, level: "matched" as const }), enabled: on }));
+        this.editStage("crossfeed", (c) => ({ ...(c ?? defaultCrossfeed()), enabled: on }));
         break;
       case "harmonics":
-        this.editStage("harmonics", (c) => ({ ...(c ?? { character: "triode" as const, h2_db: -40, h3_db: -58, h4_db: null, h5_db: null, dc_block: true }), enabled: on }));
+        this.editStage("harmonics", (c) => ({ ...(c ?? defaultHarmonics()), enabled: on }));
         break;
       case "limiter":
         if (this.state.stageCaps.limiter === false) return;
@@ -1771,21 +2058,105 @@ export class AppStore {
   }
 
   /**
-   * Turn the 4th or 5th harmonic on or off. Off remembers its level, so it
-   * comes back where it was. Switches the character to Custom (from the
-   * levels shown).
+   * Turn one Chebyshev order of harmonics layer `layer` on or off (index 0
+   * is H2). Off remembers its level, so it comes back where it was.
    */
-  setOptionalHarmonic(key: "h4_db" | "h5_db", on: boolean) {
+  setHarmonicOrder(layer: number, order: number, on: boolean) {
     this.editStage("harmonics", (c) => {
-      const base = c ?? { enabled: false, character: "triode" as const, h2_db: -40, h3_db: -58, h4_db: null, h5_db: null, dc_block: true };
-      const custom = base.character === "custom" ? base : { ...base, character: "custom" as const, ...harmonicLevelsOf(base) };
+      const base = c ?? { ...defaultHarmonics(), enabled: false };
+      const l = base.layers[layer];
+      if (l?.kind !== "chebyshev") return base;
+      const cur = l.levels_db[order] ?? null;
+      const key = `harmonics-${layer}-${order}`;
       if (!on) {
-        const cur = custom[key];
-        if (cur != null) stash(`harmonics-${key}`, cur);
-        return { ...custom, [key]: null };
+        if (cur !== null) stash(key, cur);
+        return withOrderLevel(base, layer, order, null);
       }
-      return { ...custom, [key]: custom[key] ?? stash<number>(`harmonics-${key}`) ?? -70 };
+      return withOrderLevel(base, layer, order, cur ?? stash<number>(key) ?? -70);
     });
+  }
+
+  /** The built-in harmonics presets (`harmonics_presets`), fetched once; [] from an engine without them. */
+  async loadHarmonicsPresets(): Promise<HarmonicsPreset[]> {
+    if (this.state.harmonicsPresets) return this.state.harmonicsPresets;
+    try {
+      const list = await this.call<HarmonicsPreset[]>("harmonics_presets");
+      this.set({ harmonicsPresets: list });
+      return list;
+    } catch (e) {
+      if (isUnknownMethod(e)) {
+        this.set({ harmonicsPresets: [] });
+        return [];
+      }
+      throw e;
+    }
+  }
+
+  /** The built-in harmonics system presets (`harmonics_systems`), fetched once; [] from an engine without them. */
+  async loadHarmonicsSystems(): Promise<HarmonicsSystem[]> {
+    if (this.state.harmonicsSystems) return this.state.harmonicsSystems;
+    try {
+      const list = await this.call<HarmonicsSystem[]>("harmonics_systems");
+      this.set({ harmonicsSystems: list });
+      return list;
+    } catch (e) {
+      if (isUnknownMethod(e)) {
+        this.set({ harmonicsSystems: [] });
+        return [];
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * `harmonics_readout` of `config` with the sweeps (the level sweep at
+   * `sweepFreq` Hz, the sweep against frequency at `sweepLevel` dBFS; each
+   * omitted: the engine's fixed tones): computed by the engine, nothing changes.
+   */
+  harmonicsReadout(config: HarmonicsConfig, sweepFreq?: number, sweepLevel?: number): Promise<HarmonicsReadout> {
+    return this.call<HarmonicsReadout>("harmonics_readout", { config, sweep: true, sweep_freq_hz: sweepFreq, sweep_level_dbfs: sweepLevel });
+  }
+
+  /**
+   * `harmonics_live`: the latest frame of what chain A's harmonics stage
+   * does to the music playing (cheap; each call keeps the engine's
+   * analysis on for a few seconds).
+   */
+  harmonicsLive(): Promise<HarmonicsLive> {
+    return this.call<HarmonicsLive>("harmonics_live");
+  }
+
+  private spectrumQueue: Promise<unknown> = Promise.resolve();
+
+  /**
+   * `harmonics_spectrum` of `config` for one sine, one line per trace. Calls
+   * run one at a time (the engine answers a call that waits behind another
+   * `SUPERSEDED`); a queued call whose `current()` has turned false is
+   * dropped unsent and rejects with `"stale"`.
+   */
+  harmonicsSpectrum(config: HarmonicsConfig, freqHz: number, levelDbfs: number, traces: HarmonicsSpectrumTrace[], current: () => boolean = () => true): Promise<HarmonicsSpectrum> {
+    const run = () => (current() ? this.call<HarmonicsSpectrum>("harmonics_spectrum", { config, freq_hz: freqHz, level_dbfs: levelDbfs, traces }) : Promise.reject(new Error("stale")));
+    const p = this.spectrumQueue.then(run, run);
+    this.spectrumQueue = p.catch(() => undefined);
+    return p;
+  }
+
+  private convResponseQueue: Promise<unknown> = Promise.resolve();
+
+  /**
+   * `conv_response`: the convolution's frequency response of chain A (or
+   * A/B side B, or a follower's own chain). One call at a time, as
+   * `harmonicsSpectrum`; a queued call whose `current()` has turned false
+   * is dropped unsent and rejects with `"stale"`.
+   */
+  convResponse(side: AbSide | null, device: string | null, current: () => boolean = () => true): Promise<ConvResponse> {
+    const params: { side?: AbSide; device?: string } = {};
+    if (side) params.side = side;
+    if (device) params.device = device;
+    const run = () => (current() ? this.call<ConvResponse>("conv_response", params) : Promise.reject(new Error("stale")));
+    const p = this.convResponseQueue.then(run, run);
+    this.convResponseQueue = p.catch(() => undefined);
+    return p;
   }
 
   // ------------------------------------------------------------ varispeed
@@ -2096,9 +2467,8 @@ export class AppStore {
    * Volume/balance/mute. `drag` keeps a local draft and throttles; `commit`
    * sends now and ends the gesture. `gesture` is the one the control began
    * (`beginVolumeGesture`); without one the last gesture continues, or one
-   * begins from the current view. Returns false when the change was
-   * dropped (the gesture's chain was refused, or there is nothing to
-   * write from).
+   * begins from the current view. False when the change was dropped (its chain
+   * was refused, or there is nothing to write from).
    */
   setVolume(patch: Partial<VolumeDraft>, mode: "drag" | "commit" = "commit", gesture?: VolumeGesture | null): boolean {
     let g = gesture as Gesture | null | undefined;
@@ -2160,11 +2530,10 @@ export class AppStore {
 
   /**
    * One volume key or tray-wheel step, as a gesture of its own through the
-   * same guarded write as the sliders (it continues a draft that is still
-   * on its way, so quick presses add up). Mute toggles only the mute; up
-   * and down only the volume, within the engine's range and ceiling.
-   * Returns what the on-screen display shows, or null while the level is
-   * not known (nothing is written then).
+   * same guarded write as the sliders (it continues a draft still on its way,
+   * so quick presses add up). Mute toggles only the mute; up and down only the
+   * volume, within the engine's range and ceiling. Returns what the on-screen
+   * display shows, or null while the level is not known (nothing is written).
    */
   volumeKey(action: KeyAction, stepDb: number): OsdPayload | null {
     const view = this.volumeView();
@@ -2295,72 +2664,107 @@ export class AppStore {
   }
 
   // ------------------------------------------------------------ presets
+  //
+  // `part` picks a page's presets (docs/control-plane.md "Presets"); without
+  // it, the global ones in the top bar.
 
-  activePreset(): string | null {
+  activePreset(part?: PresetPart): string | null {
+    if (part) return this.state.status?.part_presets?.find((x) => x.part === part)?.name ?? this.state.config?.active_part_presets?.[part] ?? null;
     return this.state.status?.preset?.name ?? this.state.config?.active_preset ?? null;
   }
 
-  presetModified(): boolean {
+  presetModified(part?: PresetPart): boolean {
+    if (part) return !!this.state.status?.part_presets?.find((x) => x.part === part)?.modified;
     return !!this.state.status?.preset?.modified;
   }
 
-  private afterPresetLoad() {
+  /** The list entries of one picker: a page's presets, or the global ones. */
+  presetsOf(part?: PresetPart): PresetInfo[] {
+    return this.state.presets.filter((p) => (p.part ?? undefined) === part);
+  }
+
+  /** The EQ editor's undo history and draft belong to the EQ: a load that replaces it drops them. */
+  private afterPresetLoad(parts: PresetPart[] = ["eq"]) {
+    if (!parts.includes("eq")) return;
     this.history.clear();
     this.syncHistory();
     this.set({ selectedBand: 0, eqDraft: null });
   }
 
-  async loadPreset(name: string) {
-    await this.mutate(() => this.call("load_preset", { name }), `Loaded “${name}”`, () => this.afterPresetLoad());
+  private partsOfPreset(name: string, part?: PresetPart): PresetPart[] {
+    if (part) return [part];
+    const info = this.state.presets.find((p) => !p.part && p.name === name);
+    return info ? presetCovers(info) : [...PRESET_PARTS];
+  }
+
+  async loadPreset(name: string, part?: PresetPart) {
+    const parts = this.partsOfPreset(name, part);
+    await this.mutate(() => this.call("load_preset", part ? { name, part } : { name }), `Loaded “${name}”`, () => this.afterPresetLoad(parts));
+  }
+
+  /** "New (blank)": the page's part back to its defaults, with no preset active, so "Save as" names it. */
+  async blankPreset(part: PresetPart) {
+    await this.mutate(() => this.call("blank_preset", { part }), `${PART_NAME[part]} reset to defaults, not saved yet`, () => this.afterPresetLoad([part]));
   }
 
   /** Put a `PresetInfo` reply into the list now; the `presets` event confirms it. */
   private upsertPreset(info: PresetInfo, replaces?: string) {
-    const list = this.state.presets.filter((p) => p.name !== info.name && p.name !== replaces);
+    const same = (p: PresetInfo) => (p.part ?? undefined) === (info.part ?? undefined);
+    const list = this.state.presets.filter((p) => !(same(p) && (p.name === info.name || p.name === replaces)));
     list.push(info);
-    list.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    const order = (p: PresetInfo) => (p.part ? PRESET_PARTS.indexOf(p.part) + 1 : 0);
+    list.sort((a, b) => order(a) - order(b) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     this.set({ presets: list });
   }
 
-  async savePreset() {
-    const name = this.activePreset();
+  async savePreset(part?: PresetPart) {
+    const name = this.activePreset(part);
     if (!name) return;
-    await this.mutate(async () => this.upsertPreset(await this.call<PresetInfo>("save_preset", { name, overwrite: true })), `Saved “${name}”`);
+    // Saving over a global preset keeps the parts it holds.
+    const info = part ? undefined : this.state.presets.find((p) => !p.part && p.name === name);
+    const parts = info && info.parts?.length && info.parts.length < PRESET_PARTS.length ? info.parts : undefined;
+    await this.mutate(
+      async () => this.upsertPreset(await this.call<PresetInfo>("save_preset", { name, overwrite: true, ...(part ? { part } : {}), ...(parts ? { parts } : {}) })),
+      `Saved “${name}”`,
+    );
   }
 
-  async savePresetAs(name: string): Promise<boolean> {
+  /** Save as a new (or replaced) preset; `parts` (global presets only) defaults to every part. */
+  async savePresetAs(name: string, part?: PresetPart, parts?: PresetPart[]): Promise<boolean> {
     const n = name.trim();
     if (!n) return false;
+    const subset = !part && parts && parts.length < PRESET_PARTS.length ? parts : undefined;
     return this.mutate(async () => {
-      const exists = this.state.presets.some((p) => p.name === n);
-      this.upsertPreset(await this.call<PresetInfo>("save_preset", { name: n, overwrite: exists }));
+      const exists = this.presetsOf(part).some((p) => p.name === n);
+      this.upsertPreset(await this.call<PresetInfo>("save_preset", { name: n, overwrite: exists, ...(part ? { part } : {}), ...(subset ? { parts: subset } : {}) }));
     }, `Saved “${n}”`);
   }
 
-  async renamePreset(from: string, to: string): Promise<boolean> {
+  async renamePreset(from: string, to: string, part?: PresetPart): Promise<boolean> {
     const t = to.trim();
     if (!t || t === from) return false;
-    return this.mutate(async () => this.upsertPreset(await this.call<PresetInfo>("rename_preset", { from, to: t }), from), `Renamed to “${t}”`);
+    return this.mutate(async () => this.upsertPreset(await this.call<PresetInfo>("rename_preset", { from, to: t, ...(part ? { part } : {}) }), from), `Renamed to “${t}”`);
   }
 
-  async deletePreset(name: string) {
+  async deletePreset(name: string, part?: PresetPart) {
     await this.mutate(async () => {
-      await this.call("delete_preset", { name });
-      this.set({ presets: this.state.presets.filter((p) => p.name !== name) });
+      await this.call("delete_preset", part ? { name, part } : { name });
+      this.set({ presets: this.state.presets.filter((p) => !((p.part ?? undefined) === part && p.name === name)) });
     }, `Deleted “${name}”`);
   }
 
-  async revertPreset() {
-    const name = this.activePreset();
+  async revertPreset(part?: PresetPart) {
+    const name = this.activePreset(part);
     if (!name) return;
-    await this.mutate(() => this.call("load_preset", { name }), `Reverted to “${name}”`, () => this.afterPresetLoad());
+    const parts = this.partsOfPreset(name, part);
+    await this.mutate(() => this.call("load_preset", part ? { name, part } : { name }), `Reverted to “${name}”`, () => this.afterPresetLoad(parts));
   }
 
   /**
-   * Preset menu import: the daemon stores the file as a new preset, then we
-   * load it. An imported preset is EQ only (no convolution, default
-   * upsampling and output), so loading it can switch those stages off; the
-   * toast says so.
+   * ParametricEQ.txt import: the daemon stores the file as a new EQ preset,
+   * then we load it. It changes the EQ only (an older engine without page
+   * presets stores a whole-chain preset: the toast then says which stages
+   * it turned off).
    */
   async importApoPreset(text: string, fileName: string) {
     if (this.state.caps.presets === false) {
@@ -2369,7 +2773,8 @@ export class AppStore {
     }
     // The daemon stores text without filters as an empty preset; catch that here.
     try {
-      if (parseApo(text, "x").profile.bands.length === 0) {
+      const parsed = parseApo(text, "x").profile;
+      if (parsed.bands.length === 0 && !parsed.tone) {
         this.toast(`No filters found in ${fileName}.`, "error");
         return;
       }
@@ -2378,20 +2783,22 @@ export class AppStore {
       return;
     }
     await this.queue.run(async () => {
-      let name = presetNameFromFile(fileName);
-      const taken = new Set(this.state.presets.map((p) => p.name));
-      for (let i = 2; taken.has(name); i++) name = `${presetNameFromFile(fileName).slice(0, 58)} (${i})`;
+      const base = presetNameFromFile(fileName);
       try {
         const before = (await this.freshConfig()).chain;
+        // Names are unique per picker; an older engine keeps them all global.
+        const taken = new Set(this.state.presets.filter((p) => !p.part || p.part === "eq").map((p) => p.name));
+        let name = base;
+        for (let i = 2; taken.has(name); i++) name = `${base.slice(0, 58)} (${i})`;
         const info = await this.call<PresetInfo>("import_apo", { name, text });
         this.upsertPreset(info);
-        await this.call("load_preset", { name: info.name });
+        await this.call("load_preset", info.part ? { name: info.name, part: info.part } : { name: info.name });
         await this.refreshConfig();
         await this.refreshPresets();
         this.afterPresetLoad();
         const after = this.state.config?.chain;
         const off: string[] = [];
-        if (after) {
+        if (after && !info.part) {
           if (convList(before).some((c) => c.enabled) && !convList(after).some((c) => c.enabled)) off.push("convolution");
           if (before.upsampler.target !== "off" && after.upsampler.target === "off") off.push("upsampling");
         }
@@ -2423,8 +2830,9 @@ export class AppStore {
   }
 
   /** Side B: a stored preset, flat (no processing besides A's upsampling), or off. */
-  async setAbSource(source: { preset: string } | "flat" | "off") {
+  async setAbSource(source: { preset: string; part?: PresetPart } | "flat" | "off") {
     if (!this.state.config) return;
+    this.set({ abCustomSel: null });
     if (source === "off") {
       await this.mutate(() => this.call("set_ab", null), "A/B compare is off");
       return;
@@ -2438,8 +2846,9 @@ export class AppStore {
         // A patch on chain A: B keeps following A's other stages.
         ab = { b: { patch: FLAT_PATCH }, label: "Flat", level, headroom };
       } else {
-        const preset = await this.call<Preset>("get_preset", { name: source.preset });
-        const chain = preset.chain as ChainConfig;
+        const preset = await this.call<Preset>("get_preset", source.part ? { name: source.preset, part: source.part } : { name: source.preset });
+        // B is chain A with the preset's parts: a partial preset compares only what it holds.
+        const chain = applyPreset(cfg.chain, preset);
         if (chain.eq) chain.eq = { ...chain.eq, name: source.preset };
         else chain.eq = emptyEq(source.preset);
         // An engine without the IR chain takes one object or null.
@@ -2448,6 +2857,62 @@ export class AppStore {
       }
       await this.call("set_ab", ab);
     });
+  }
+
+  /** The side-B editor's draft (kept while the view is closed); null drops it. */
+  setAbCustomSel(sel: CustomSel | null) {
+    this.set({ abCustomSel: sel });
+  }
+
+  /** Save a selection under a name (replacing one of that name); the name is its label. */
+  saveCustomB(name: string, sel: CustomSel) {
+    const list = withSaved(this.state.abCustomSaved, { name, sel: { ...sel, label: name } });
+    storeSaved(list);
+    this.set({ abCustomSaved: list });
+  }
+
+  deleteCustomB(name: string) {
+    const list = this.state.abCustomSaved.filter((s) => s.name !== name);
+    storeSaved(list);
+    this.set({ abCustomSaved: list });
+  }
+
+  /** The custom filter design the builder can pin as B: A's own, else the last one run. */
+  customDesignForB(): FilterDesign | null {
+    const u = this.state.config?.chain.upsampler;
+    return u && !u.preset && u.design ? u.design : this.lastCustomDesign;
+  }
+
+  /**
+   * Side B from the custom builder: one merge patch with every change,
+   * turning A/B on. Resolves to the engine's refusal, or null.
+   */
+  async setAbCustom(patch: Record<string, unknown>, label: string): Promise<string | null> {
+    if (!this.state.config) return "Not connected to the engine.";
+    let err: string | null = null;
+    await this.mutate(
+      async () => {
+        const cfg = await this.freshConfig();
+        const ab: AbConfig = {
+          b: { patch } as AbB,
+          label,
+          level: cfg.ab?.level ?? { mode: "analytic", weighting: "k" },
+          headroom: cfg.ab?.headroom ?? { mode: "auto" },
+        };
+        await this.call("set_ab", ab);
+      },
+      undefined,
+      () => {
+        this.set({ abCustomSel: null });
+        this.toast(`Comparing with B: ${label}. Press \` to flip.`);
+      },
+      (e) => {
+        err = errorText(e);
+        return true;
+      },
+    );
+    await this.queue.run(() => this.refreshStatusNow());
+    return err;
   }
 
   /** What an "on" stage compare starts from when chain A has dropped the stage's settings. */
@@ -2467,6 +2932,16 @@ export class AppStore {
   /** The Upsampling view's Compare: side B is chain A with another filter preset. */
   async compareFilter(preset: string) {
     await this.comparePatch(() => filterPatch(preset));
+  }
+
+  /** Pin a custom filter design as side B (so A can be edited or switched freely). */
+  async compareFilterDesign(design: FilterDesign, label?: string) {
+    await this.comparePatch(() => filterDesignPatch(design, label));
+  }
+
+  /** The Output view's Compare: side B is chain A with another bit depth and/or dither. */
+  async compareOutput(bits: number, dither: DitherKind) {
+    await this.comparePatch(() => outputPatch(bits, dither));
   }
 
   private async comparePatch(make: (chain: ChainConfig) => BPatch | { error: string }) {
@@ -2490,8 +2965,175 @@ export class AppStore {
         headroom: cfg.ab?.headroom ?? { mode: "auto" },
       };
       await this.call("set_ab", ab);
-    }, undefined, () => this.toast(stopped ? "A/B compare is off" : `Comparing with B: ${label}. Press \` to flip.`));
+    }, undefined, () => {
+      this.set({ abCustomSel: null });
+      this.toast(stopped ? "A/B compare is off" : `Comparing with B: ${label}. Press \` to flip.`);
+    });
     await this.queue.run(() => this.refreshStatusNow());
+  }
+
+  // ------------------------------------------------------------ blind tests
+
+  /** The engine kept a blind mask from a run this app lost (a dropped connection). */
+  private blindMaskStale = false;
+
+  private setBlind(patch: Partial<BlindRun>) {
+    const run = this.state.blindRun;
+    if (run) this.set({ blindRun: { ...run, ...patch } });
+  }
+
+  /**
+   * Start a blind run: draw and commit the hidden sides, set the engine's
+   * blind mask (which also stops a level measurement), and wait for the
+   * first button. Resolves to an error message, or null.
+   */
+  async blindStart(plan: BlindPlan, sideA: string, sideB: string): Promise<string | null> {
+    const cfg = this.state.config;
+    if (!cfg?.ab || this.state.conn !== "up") return "Turn A/B on first.";
+    if (this.state.blindRun?.phase === "running") return null;
+    plan = { ...plan, trials: clampTrials(plan.trials) };
+    const secret = createSecret();
+    const [commitment, truths] = await Promise.all([commitSecret(secret), xSequence(secret, plan.trials)]);
+    try {
+      await this.queue.run(() => this.call("ab_blind", { enabled: true }));
+    } catch (e) {
+      return errorText(e);
+    }
+    // The live harmonics view keeps nothing across the run (the engine
+    // forgets its side too).
+    liveHistory.clear();
+    const now = this.state.config ?? cfg;
+    this.set({
+      blindRun: {
+        phase: "running",
+        plan,
+        sideA,
+        sideB,
+        level: now.ab?.level ?? { mode: "analytic", weighting: "k" },
+        secretHex: secretToHex(secret),
+        commitment,
+        truths,
+        trial: 0,
+        playing: null,
+        trialStart: Date.now(),
+        switches: 0,
+        records: [],
+        startedAt: new Date().toISOString(),
+        endedAt: null,
+        reason: null,
+        fingerprint: blindFingerprint(now),
+        maskSeen: false,
+      },
+    });
+    await this.queue.run(() => this.refreshStatusNow());
+    return null;
+  }
+
+  /** Play a button of the current trial (A, B or X; 1 or 2). */
+  async blindPlay(button: BlindButton) {
+    const run = this.state.blindRun;
+    if (run?.phase !== "running") return;
+    if (!(run.plan.mode === "abx" ? ["a", "b", "x"] : ["1", "2"]).includes(button)) return;
+    const side = sideFor(run.plan.mode, run.truths[run.trial], button);
+    this.setBlind({ playing: button, switches: run.switches + (run.playing === button ? 0 : 1) });
+    await this.queue.run(async () => {
+      try {
+        // The crossfade every A/B switch uses.
+        await this.call("ab_select", { side, crossfade_ms: 10 });
+      } catch (e) {
+        if (this.state.blindRun?.phase === "running") this.blindAbandon(`The engine refused a switch: ${errorText(e)}`);
+      }
+    });
+  }
+
+  /** Answer the current trial; after the last one the run ends and is scored. */
+  blindAnswer(choice: BlindChoice) {
+    const run = this.state.blindRun;
+    // Listen at least once in each trial before answering.
+    if (run?.phase !== "running" || !run.playing) return;
+    if (!(run.plan.mode === "abx" ? ["A", "B"] : ["1", "2"]).includes(choice)) return;
+    const truth = run.truths[run.trial];
+    const record: TrialRecord = { index: run.trial + 1, truth, choice, ...scoreTrial(run.plan.mode, truth, choice), ms: Date.now() - run.trialStart, switches: run.switches };
+    const records = [...run.records, record];
+    if (records.length >= run.plan.trials) {
+      this.setBlind({ records, phase: "done", endedAt: new Date().toISOString(), playing: null });
+      void this.blindClearMask();
+      return;
+    }
+    this.setBlind({ records, trial: run.trial + 1, playing: null, switches: 0, trialStart: Date.now() });
+  }
+
+  /** End a running test early: it is reported as abandoned and never scored. */
+  blindAbandon(reason: string, clearMask = true) {
+    if (this.state.blindRun?.phase !== "running") return;
+    this.setBlind({ phase: "abandoned", reason, endedAt: new Date().toISOString(), playing: null });
+    if (clearMask) void this.blindClearMask();
+  }
+
+  /** Back to the A/B view (the result is dropped). */
+  blindClose() {
+    if (this.state.blindRun?.phase === "running") this.blindAbandon("Stopped.");
+    this.set({ blindRun: null });
+  }
+
+  private async blindClearMask() {
+    if (this.state.conn !== "up") return;
+    await this.queue.run(async () => {
+      await this.call("ab_blind", { enabled: false }).catch(() => undefined);
+      liveHistory.clear();
+      await this.refreshStatusNow();
+    });
+  }
+
+  private blindWatchStatus(status: Status) {
+    const run = this.state.blindRun;
+    const blind = !!status.ab?.blind;
+    if (run?.phase === "running") {
+      if (blind) {
+        if (!run.maskSeen) this.setBlind({ maskSeen: true });
+      } else if (run.maskSeen) {
+        this.blindAbandon(status.ab ? "The blind mask was cleared: side B was set again elsewhere." : "A/B was turned off.");
+      }
+      if (abStoppedByOverload(this.state.config?.ab, status.overload)) this.blindAbandon("A DSP overload stopped A/B.");
+    } else if (blind && this.blindMaskStale) {
+      this.blindMaskStale = false;
+      void this.blindClearMask();
+    }
+  }
+
+  /** The run as JSON, with the secret revealed, for checking it later (`verifyExport`). */
+  blindExport(): BlindExport | null {
+    const run = this.state.blindRun;
+    if (!run || run.phase === "running") return null;
+    return {
+      format: EXPORT_FORMAT,
+      mode: run.plan.mode,
+      question: MODE_TEXT[run.plan.mode].question,
+      feedback: run.plan.feedback,
+      planned_trials: run.plan.trials,
+      outcome: run.phase === "done" ? "completed" : "abandoned",
+      abandoned_reason: run.reason,
+      started_at: run.startedAt,
+      ended_at: run.endedAt ?? new Date().toISOString(),
+      side_a: run.sideA,
+      side_b: run.sideB,
+      level: run.level,
+      commitment: run.commitment,
+      secret: run.secretHex,
+      trials: run.records,
+      result: run.phase === "done" ? scoreRun(run.plan.mode, run.records) : null,
+    };
+  }
+
+  async blindCopyExport() {
+    const e = this.blindExport();
+    if (!e) return;
+    try {
+      await this.transport.copyText(JSON.stringify(e, null, 2) + "\n");
+      this.toast("Copied the run as JSON. Its secret and commitment let anyone check the hidden sides.");
+    } catch {
+      this.toast("Copying is blocked here.", "error");
+    }
   }
 
   /** The flip key: the other side. */
@@ -2746,6 +3388,21 @@ export class AppStore {
     void this.refreshDevices();
   }
 
+  /**
+   * The device channels the main output's left and right play on, for a
+   * device with more than two (`[0, 1]`: the first two). The engine reopens
+   * the device at the channel count the pair needs.
+   */
+  async setOutputChannels(pair: OutputChannels) {
+    await this.editField(
+      "set_device",
+      (c) => ({ device: c.device, output_channels: c.output_channels ?? DEFAULT_PAIR }),
+      (cur) => ({ device: cur.device, output_channels: pair }),
+      (c, d) => ({ ...c, output_channels: isDefaultPair(d.output_channels) ? undefined : d.output_channels }),
+      "Output channels changed",
+    );
+  }
+
   /** Remove the follower on `id`, then move the main device there. */
   async moveDeviceToFollower(id: string) {
     this.set({ deviceConflict: null });
@@ -2758,6 +3415,14 @@ export class AppStore {
 
   clearDeviceConflict() {
     this.set({ deviceConflict: null });
+  }
+
+  /** Say which card each held output is (identical DACs that moved USB ports): every output at once. */
+  assignDevices(assignments: DeviceAssignment[]) {
+    return this.mutate(async () => {
+      await this.call("assign_devices", { assignments });
+      await this.refreshDevices();
+    }, "Outputs assigned");
   }
 
   // ------------------------------------------------------------ followers (multi-device)

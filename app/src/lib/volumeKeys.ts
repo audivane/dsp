@@ -51,6 +51,6 @@ export function osdPayload(level: Pick<Level, "volume_db" | "muted">, vs: Pick<V
 /** The display's text for a level: "−23.5 dB", "Muted", or the note. */
 export function osdText(p: OsdPayload, fmt: (db: number) => string): string {
   if (p.note) return p.note;
-  if (p.volume_db === null) return "—";
+  if (p.volume_db === null) return "-";
   return p.muted ? `Muted · ${fmt(p.volume_db)} dB` : `${fmt(p.volume_db)} dB`;
 }

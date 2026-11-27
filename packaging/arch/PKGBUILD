@@ -4,7 +4,7 @@
 # first with ./make-source.sh, then `makepkg -si` (see README.md).
 
 pkgname=audivane-dsp
-pkgver=0.9.4
+pkgver=0.11.0
 pkgrel=1
 pkgdesc="Bit-perfect system-wide DSP engine for PipeWire, with CLI and desktop UI"
 arch=(x86_64)
@@ -128,7 +128,8 @@ package() {
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   local lic="$pkgdir/usr/share/licenses/$pkgname"
   install -Dm644 "$ws/packaging/THIRD_PARTY_LICENSES.txt" "$lic/THIRD_PARTY_LICENSES.txt"
-  install -Dm644 "$ws/app/src/assets/fonts/OFL.txt" "$lic/OFL-IBM-Plex.txt"
+  install -Dm644 "$ws/app/src/assets/fonts/OFL-IBM-Plex.txt" "$lic/OFL-IBM-Plex.txt"
+  install -Dm644 "$ws/app/src/assets/fonts/OFL-Geist.txt" "$lic/OFL-Geist.txt"
   install -Dm644 "$ws/docs/font-licensing.md" "$lic/font-licensing.md"
   install -Dm644 "$ws/app/src/assets/targets/SOURCES.md" "$lic/targets-SOURCES.md"
   install -Dm644 "$ws/app/src/assets/research-targets/SOURCES.md" "$lic/research-targets-SOURCES.md"

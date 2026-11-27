@@ -1,18 +1,24 @@
 {
   "license": "OFL-1.1",
   "tool": "fonttools[woff]==4.61.1",
-  "toolUse": "fonttools rewrote the name table of the IBM Plex Sans and Mono Latin subsets only (tools/rename-subset-fonts.py); glyphs and metrics are unchanged.",
+  "toolUse": "fonttools rewrote the name table of the IBM Plex Mono Latin subsets only (tools/rename-subset-fonts.py; glyphs and metrics unchanged) and made the Geist subset (instancer and pyftsubset, command below).",
   "families": [
     {
-      "family": "Audivane Sans Latin",
-      "upstream": "IBM Plex Sans",
-      "copyrightHolder": "IBM",
-      "reservedFontNames": [
-        "Plex"
-      ],
-      "notice": "OFL.txt",
-      "modification": "Latin subset renamed (primary name records only) because of the Reserved Font Name; glyphs and metrics unchanged.",
-      "use": "App interface text"
+      "family": "Geist",
+      "upstream": "Geist",
+      "source": "geist@1.9.2",
+      "copyrightHolder": "The Geist Project Authors",
+      "reservedFontNames": [],
+      "modification": "Latin subset of the variable font, weight axis limited to 400-600; names, glyph outlines and metrics as upstream.",
+      "notice": "OFL-Geist.txt",
+      "use": "App interface text",
+      "subset": {
+        "from": "dist/fonts/geist-sans/Geist-Variable.ttf",
+        "fromSha256": "b34955a09f71d9ac4b67e54cedb1825d3d5264c7992dbbafa0802080d617e241",
+        "axes": "wght=400:600",
+        "unicodes": "U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2190-2193,U+2212,U+2215,U+FEFF,U+FFFD",
+        "command": "fonttools varLib.instancer Geist-Variable.ttf wght=400:600 -o Geist-400-600.ttf && pyftsubset Geist-400-600.ttf --unicodes=<unicodes> --layout-features='*' --name-IDs='*' --flavor=woff2 --output-file=geist-latin-wght.woff2"
+      }
     },
     {
       "family": "Audivane Mono Latin",
@@ -21,12 +27,19 @@
       "reservedFontNames": [
         "Plex"
       ],
-      "notice": "OFL.txt",
+      "notice": "OFL-IBM-Plex.txt",
       "modification": "Latin subset renamed (primary name records only) because of the Reserved Font Name; glyphs and metrics unchanged.",
       "use": "App numbers, values and keyboard hints"
     }
   ],
   "files": [
+    {
+      "path": "app/src/assets/fonts/geist-latin-wght.woff2",
+      "family": "Geist",
+      "upstreamFile": "dist/fonts/geist-sans/Geist-Variable.ttf",
+      "sha256": "03ff934200e1a80f68456e8e1424d7bb771e7d5748413a12ffe2ebaa27fbcee5",
+      "contentSha256": "0760cb1e46ba5f508c08b7fe8b854fce177e9896e1fe1f70bb7cc2b9699ce212"
+    },
     {
       "path": "app/src/assets/fonts/ibm-plex-mono-latin-400-normal.woff2",
       "family": "Audivane Mono Latin",
@@ -42,30 +55,6 @@
       "sha256": "9a7b36b2fd1c01f3cc653723559eca1549480adaafef478df27490664517743d",
       "originalContentSha256": "d41e9930f3d98d876a05dacb76b741a82e0032fe9f4392d02f20d2ff38ebd425",
       "contentSha256": "d41e9930f3d98d876a05dacb76b741a82e0032fe9f4392d02f20d2ff38ebd425"
-    },
-    {
-      "path": "app/src/assets/fonts/ibm-plex-sans-latin-400-normal.woff2",
-      "family": "Audivane Sans Latin",
-      "originalSha256": "3b646991d30055a93a4ecc499713d4347953a74a947ecab435ab72070cbdab0e",
-      "sha256": "33423d21f03922af127238311050c636bd3b0cda212ce4a6013458655c049b67",
-      "originalContentSha256": "38123c6cb11608f7c31481c9bbdfff0ec4dbd0a4561c6d1969ed071713f5478e",
-      "contentSha256": "38123c6cb11608f7c31481c9bbdfff0ec4dbd0a4561c6d1969ed071713f5478e"
-    },
-    {
-      "path": "app/src/assets/fonts/ibm-plex-sans-latin-500-normal.woff2",
-      "family": "Audivane Sans Latin",
-      "originalSha256": "0717336fb31fcdcde4b8deb3675bb4a0f7f6d484864afcd6751ac29975962203",
-      "sha256": "778b0e60de4df0160222935d98b0c47e5a05ea51f27bc778cb170b15a1f54bc4",
-      "originalContentSha256": "41c7d4f63a45254e5ce31be2bfab4de5016ae3e7d2875b67a3ca17cf6795b0ca",
-      "contentSha256": "41c7d4f63a45254e5ce31be2bfab4de5016ae3e7d2875b67a3ca17cf6795b0ca"
-    },
-    {
-      "path": "app/src/assets/fonts/ibm-plex-sans-latin-600-normal.woff2",
-      "family": "Audivane Sans Latin",
-      "originalSha256": "8960851d691c054ed38e259bdcf1a6190d157b4203ed5bb32c632a863fb8ec2f",
-      "sha256": "c059d01628f80f79d5781fd698fbf4e80a73629ed71259efea33781c1838f219",
-      "originalContentSha256": "5bdb2782e1439815da41a08cf7e63054b6e6b53448feada9132f5c56a4ea393b",
-      "contentSha256": "5bdb2782e1439815da41a08cf7e63054b6e6b53448feada9132f5c56a4ea393b"
     }
   ]
 }

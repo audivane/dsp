@@ -22,7 +22,7 @@ export function NumField({ label, unit, value, format, parse = parseNumber, onCo
     <label className={className ? "field " + className : "field"} title={title}>
       <span className="lbl">{label}</span>
         <input
-          value={disabled ? "—" : text}
+          value={disabled ? "-" : text}
           disabled={disabled}
           inputMode={parse === parseNumber ? "decimal" : "text"}
           autoComplete="off"

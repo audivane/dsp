@@ -36,4 +36,11 @@ episode: number,
 /**
  * The audio thread runs the fallback (false: accepted, still landing).
  */
-applied: boolean, };
+applied: boolean, 
+/**
+ * The source (graph) rate it was made for, Hz; 0 when unknown. The
+ * fallback is per rate: it ends when playback moves to another source
+ * rate, and that rate is then priced as over budget
+ * ([`RateFallbackCause::Overload`] in [`Status::upsampler_rates`]).
+ */
+source_rate: number, };

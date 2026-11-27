@@ -32,7 +32,7 @@ export function Osd({ transport }: { transport: Transport }) {
   const hasLevel = p.volume_db !== null && !p.note;
   const taper = volumeSliderTaper(p.min_db, p.max_db, p.volume_db, VOLUME_MIN_DB, VOLUME_MAX_DB);
   const pct = hasLevel ? Math.max(0, Math.min(100, taper.pos(p.volume_db!) * 100)) : 0;
-  const valueText = p.note ? p.note : p.volume_db === null ? "—" : `${fmtDb(p.volume_db, 1, false)} dB`;
+  const valueText = p.note ? p.note : p.volume_db === null ? "-" : `${fmtDb(p.volume_db, 1, false)} dB`;
   const aria = osdText(p, (db) => fmtDb(db, 1, false));
 
   return (

@@ -46,13 +46,13 @@ export function fmtInt(n: number): string {
 }
 
 export function fmtMs(ms: number): string {
-  if (!Number.isFinite(ms)) return "—";
+  if (!Number.isFinite(ms)) return "-";
   return (ms < 10 ? ms.toFixed(1) : ms.toFixed(0)) + " ms";
 }
 
 const FORMAT_NAMES: Record<string, string> = { s16: "S16", s24: "S24", s24_3: "S24 (3-byte)", s32: "S32" };
 export function fmtSampleFormat(f: string | null | undefined): string {
-  if (!f) return "—";
+  if (!f) return "-";
   return FORMAT_NAMES[f] ?? f.toUpperCase();
 }
 

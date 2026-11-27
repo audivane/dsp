@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { convList, irName } from "../lib/chain";
+import { useEffect, useState } from "react";
+import { convList, irKey, irName, irPaths } from "../lib/chain";
 import { abStoppedByOverload, describeB } from "../lib/abCompare";
 import { fmtTaps } from "../lib/format";
 import { convSummary, irTaps, outputSummary, upsamplingSummary } from "../lib/summary";
@@ -7,6 +7,7 @@ import { crossfeedSummary, dcBlockSummary, harmonicsSummary, limiterSummary, pit
 import { tiltStageSummary } from "../lib/tilt";
 import { STAGE_NAME, store, useApp, type StageId, type ViewId } from "../store/store";
 import { Chevron, Power } from "./Icons";
+import { deviceName } from "../lib/devices";
 
 /** One of the effect stages: its power button turns it on/off and keeps its settings. */
 function StageItem({ id, sub, on }: { id: StageId; sub: string; on: boolean }) {
@@ -49,6 +50,12 @@ export function Sidebar() {
   const devices = useApp((s) => s.devices);
   const presetsCap = useApp((s) => s.caps.presets);
   const [convOpen, setConvOpen] = useState(true);
+  const harmonicsPresets = useApp((s) => s.harmonicsPresets);
+  // Layer names for the harmonics summary.
+  const harmonicsOn = !!cfg?.chain.harmonics?.enabled;
+  useEffect(() => {
+    if (harmonicsOn) void st.loadHarmonicsPresets().catch(() => undefined);
+  }, [harmonicsOn, st]);
   if (!cfg) return <nav className="side" aria-label="Signal path" />;
   const bypass = !cfg.dsp_enabled;
   const eq = cfg.chain.eq;
@@ -83,7 +90,7 @@ export function Sidebar() {
       ? `B: ${describeB(ab).title} · stopped (overload)`
       : `B: ${describeB(ab).title} · ${ab.level.mode === "manual" ? "manual level" : ab.level.mode === "measured" ? "measured match" : ab.level.mode === "off" ? "no level match" : "analytic match"}`;
   const followers = cfg.outputs?.followers?.length ?? 0;
-  const devSub = `${dev?.name ?? cfg.device}${status?.format ? " · " + status.format.toUpperCase().replace("_3", " 3-byte") : ""}${followers ? ` · +${followers} ${followers === 1 ? "device" : "devices"}` : ""}`;
+  const devSub = `${dev ? deviceName(dev) : cfg.device}${status?.format ? " · " + status.format.toUpperCase().replace("_3", " 3-byte") : ""}${followers ? ` · +${followers} ${followers === 1 ? "device" : "devices"}` : ""}`;
 
   return (
     <nav className={"side" + (bypass ? " bypassed" : "")} aria-label="Signal path">
@@ -110,11 +117,11 @@ export function Sidebar() {
           {irs.map((c, i) => {
             const taps = irTaps(c, irInfo);
             return (
-              <div key={c.ir_path + i} className={"slot" + (c.enabled ? "" : " off")}>
+              <div key={irKey(c) + i} className={"slot" + (c.enabled ? "" : " off")}>
                 <button className="pwr" aria-pressed={c.enabled} aria-label={`${irName(c)} on`} onClick={() => st.setIr(i, { enabled: !c.enabled })}>
                   <Power />
                 </button>
-                <span className="slot-name" title={c.ir_path}>
+                <span className="slot-name" title={irPaths(c).join("\n")}>
                   {irName(c)}
                 </span>
                 {taps !== null && <span className="slot-len mono">{fmtTaps(taps)}</span>}
@@ -127,7 +134,7 @@ export function Sidebar() {
         </div>
       )}
       <Item id="ups" stage name="Upsampling" sub={upsamplingSummary(ups, upsLive)} power={ups.target !== "off"} onPower={() => st.setUpsamplingEnabled(ups.target === "off")} />
-      <StageItem id="harmonics" sub={harmonicsSummary(cfg.chain.harmonics)} on={on.harmonics} />
+      <StageItem id="harmonics" sub={harmonicsSummary(cfg.chain.harmonics, harmonicsPresets ?? undefined)} on={on.harmonics} />
       <StageItem id="limiter" sub={clipNoLimiter ? "Off · the output clipped" : limiterSummary(cfg.chain.limiter, cfg.chain.output.headroom_db)} on={on.limiter} />
       <Item id="out" name="Output" sub={outputSummary(cfg, status?.format)} />
       {bypass && <p className="bypass-note">Bypass is on: all stages are skipped.</p>}

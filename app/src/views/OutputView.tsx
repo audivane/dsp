@@ -1,10 +1,13 @@
+import { useState } from "react";
 import type { DitherKind, SampleFormat } from "../api/types";
+import { comparing, outputLabel, outputPatch } from "../lib/abCompare";
 import { NOT_SUPPORTED_BY_DEVICE, effectiveDitherBits, formatBits, ditherAdvice, formatUnavailableReason, supportsFormat, usedBits } from "../lib/deviceCaps";
 import { fmtSampleFormat } from "../lib/format";
 import { store, useApp } from "../store/store";
 import { Seg } from "../components/Seg";
 import { ClipWarning } from "../components/ClipWarning";
 import { DITHERS, ditherInfo, ditherRateWarning } from "../lib/effects";
+import { PresetControl } from "../components/PresetMenu";
 
 const ORIGINAL_DITHERS: readonly DitherKind[] = ["none", "tpdf", "shaped"];
 
@@ -15,8 +18,22 @@ export function OutputView() {
   const caps = useApp((s) => s.status?.device_caps ?? null);
   const outputRate = useApp((s) => s.status?.output_rate ?? null);
   const statusDitherBits = useApp((s) => s.status?.dither_bits ?? null);
+  const ab = useApp((s) => s.config?.ab ?? null);
+  const [cmpBits, setCmpBits] = useState<number | null>(null);
+  const [cmpDither, setCmpDither] = useState<DitherKind | null>(null);
   if (!cfg) return null;
   const out = cfg.chain.output;
+  const runningOut = ab && "patch" in ab.b ? ((ab.b.patch as { output?: { bits?: number; dither?: DitherKind } } | null)?.output ?? null) : null;
+  const isComparingOut =
+    runningOut !== null &&
+    runningOut.bits !== undefined &&
+    runningOut.dither !== undefined &&
+    comparing(ab, outputPatch(runningOut.bits, runningOut.dither).patch);
+  const bBits = cmpBits ?? runningOut?.bits ?? out.bits;
+  const bDither = cmpDither ?? runningOut?.dither ?? out.dither;
+  const bEffectiveBits = effectiveDitherBits(bBits, negotiated);
+  const bSameAsA = bBits === out.bits && bDither === out.dither;
+  const bMatchesRunning = isComparingOut && runningOut!.bits === bBits && runningOut!.dither === bDither;
   const dither = ditherInfo(out.dither);
   // An engine without the limiter predates the newer dither kinds: only none, TPDF and shaped exist there.
   const oldDither = useApp((s) => s.stageCaps.ditherKinds === false);
@@ -49,6 +66,19 @@ export function OutputView() {
     <section className="view" aria-labelledby="out-title">
       <div className="view-head">
         <h1 id="out-title">Output</h1>
+        {isComparingOut && runningOut?.bits !== undefined && runningOut?.dither !== undefined && (
+          <button
+            type="button"
+            className="btn small compare-btn on"
+            aria-pressed
+            title={`Stop comparing with ${ab?.label || outputLabel(runningOut.bits, runningOut.dither)}: turns A/B off and plays A.`}
+            onClick={() => void st.compareOutput(runningOut.bits!, runningOut.dither!)}
+          >
+            Stop compare
+          </button>
+        )}
+        <div className="spacer" />
+        <PresetControl part="output" />
       </div>
       <ClipWarning />
       <div className="panel">
@@ -140,6 +170,63 @@ export function OutputView() {
           {rateWarning && (
             <span className="dither-desc warn" role="status">
               {rateWarning}
+            </span>
+          )}
+        </div>
+        <div className="row">
+          <span className="k" title="Compare A with side B using another bit depth or dither mode. Both quantizers run at once.">
+            Compare B
+          </span>
+          <label className="chip compare-chip">
+            <span>Bits</span>
+            <select
+              aria-label="Compare side B bit depth"
+              value={bBits}
+              onChange={(e) => setCmpBits(Number(e.target.value))}
+            >
+              {[16, 20, 24, 32].map((b) => (
+                <option key={b} value={b} disabled={maxBits !== null && b > maxBits}>
+                  {b}-bit
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="chip compare-chip">
+            <span>Dither</span>
+            <select
+              aria-label="Compare side B dither"
+              value={bDither}
+              onChange={(e) => setCmpDither(e.target.value as DitherKind)}
+            >
+              {DITHERS.map((d) => {
+                const unavailable = oldDither && !ORIGINAL_DITHERS.includes(d.kind);
+                return (
+                  <option key={d.kind} value={d.kind} disabled={unavailable}>
+                    {d.label}
+                  </option>
+                );
+              })}
+            </select>
+          </label>
+          <button
+            type="button"
+            className={`btn small compare-btn${bMatchesRunning ? " on" : ""}`}
+            aria-pressed={bMatchesRunning || undefined}
+            disabled={!bMatchesRunning && bSameAsA}
+            title={
+              bMatchesRunning
+                ? "Stop output compare: turns A/B off and plays A."
+                : bSameAsA
+                  ? "Pick a different bit depth or dither from A to compare."
+                  : `Compare A with B = ${outputLabel(bBits, bDither)}.`
+            }
+            onClick={() => void st.compareOutput(bBits, bDither)}
+          >
+            {bMatchesRunning ? "Stop compare" : isComparingOut ? "Update B" : "Compare"}
+          </button>
+          {negotiated !== null && bEffectiveBits < bBits && (
+            <span className="hint">
+              B dithers to {bEffectiveBits} bits ({fmtSampleFormat(negotiated)})
             </span>
           )}
         </div>

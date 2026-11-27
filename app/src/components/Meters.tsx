@@ -122,7 +122,7 @@ export function Meters() {
         hrSmooth = null;
       }
       const hrText =
-        hrSmooth === null ? "chain —" : `chain ${fmtDb(Math.max(-READOUT_MAX_DB, Math.min(READOUT_MAX_DB, hrSmooth)), 1)} dB`;
+        hrSmooth === null ? "chain -" : `chain ${fmtDb(Math.max(-READOUT_MAX_DB, Math.min(READOUT_MAX_DB, hrSmooth)), 1)} dB`;
       const hrWarn = hrSmooth !== null && hrSmooth > 0.05;
       if ((hrText !== lastHrText || hrWarn !== lastHrWarn) && headroom.current) {
         headroom.current.textContent = hrText;
@@ -257,7 +257,7 @@ export function Meters() {
         ref={headroom}
         title="Chain gain at the peaks: what EQ, convolution and the upsampler add (output peak before the volume minus input peak). A relative gain, not a level: +2 dB only clips if the music already peaks within 2 dB of full scale. The volume is not included."
       >
-        {"chain —"}
+        {"chain -"}
       </span>
       <span
         className="gr-mini mono idle"

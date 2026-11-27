@@ -36,6 +36,12 @@ impl SplitSpectrum {
         self.im.fill(0.0);
     }
 
+    /// Take `other`'s bins (the same length). Never allocates.
+    pub fn copy_from(&mut self, other: &Self) {
+        self.re.copy_from_slice(&other.re);
+        self.im.copy_from_slice(&other.im);
+    }
+
     pub fn from_complex(src: &[Complex64]) -> Self {
         let mut out = Self::new(src.len());
         out.copy_from_complex(src);
@@ -155,6 +161,23 @@ pub struct RealFftPair {
     inv_scratch: Vec<Complex64>,
     time_buf: Vec<f64>,
     spec_buf: Vec<Complex64>,
+}
+
+impl Clone for RealFftPair {
+    /// The same plans (shared) with fresh scratch: a copy for another
+    /// thread, whose transforms are bit for bit this one's.
+    fn clone(&self) -> Self {
+        Self {
+            fft_len: self.fft_len,
+            spec_len: self.spec_len,
+            fwd: Arc::clone(&self.fwd),
+            inv: Arc::clone(&self.inv),
+            fwd_scratch: self.fwd_scratch.clone(),
+            inv_scratch: self.inv_scratch.clone(),
+            time_buf: self.time_buf.clone(),
+            spec_buf: self.spec_buf.clone(),
+        }
+    }
 }
 
 impl RealFftPair {
@@ -320,6 +343,13 @@ impl RingFifo {
     pub fn clear(&mut self) {
         self.head = 0;
         self.len = 0;
+    }
+
+    /// Take `other`'s contents (the same capacity). Never allocates.
+    pub fn copy_from(&mut self, other: &Self) {
+        self.buf.copy_from_slice(&other.buf);
+        self.head = other.head;
+        self.len = other.len;
     }
 
     /// Reset to `count` zero samples.

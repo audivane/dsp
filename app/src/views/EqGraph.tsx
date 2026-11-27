@@ -6,7 +6,8 @@ import { tiltStageDb, tiltStageOn } from "../lib/tilt";
 import { clamp, fmtDb, fmtFreq, minus } from "../lib/format";
 import { store, useApp } from "../store/store";
 import { cssVar, useSkin } from "../theme";
-import { BandEditor, EDITOR_H, EDITOR_W } from "./BandEditor";
+import { BAND_F_MAX, BAND_F_MIN, BandEditor, EDITOR_H, EDITOR_W, Q_MAX, Q_MIN } from "./BandEditor";
+import { xPresetSpan } from "../lib/graphPrefs";
 import { bandColor, hexA } from "./eqColors";
 import { paintOverlays, useOverlayRedraw } from "./OverlayLayer";
 import { paintSpectrum, spectrumAnimating, useSpectrumLayer } from "./SpectrumLayer";
@@ -17,20 +18,81 @@ const PL = 42;
 const PR = 40;
 const PT = 14;
 const PB = 26;
-const F_MIN = 20;
-const F_MAX = 20000;
-const GRID_F = [20, 30, 40, 50, 60, 70, 80, 90, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 20000];
-const LABELS: Record<number, string> = { 20: "20", 50: "50", 100: "100", 200: "200", 500: "500", 1000: "1k", 2000: "2k", 5000: "5k", 10000: "10k", 20000: "20k" };
+
+/** Grid lines (1–9 per decade) and labels (1, 2, 5) over [lo, hi] Hz. */
+export function eqGrid(lo: number, hi: number): { f: number; label: string | null }[] {
+  const out: { f: number; label: string | null }[] = [];
+  for (let e = Math.floor(Math.log10(lo)); Math.pow(10, e) <= hi; e++)
+    for (let m = 1; m <= 9; m++) {
+      const f = m * Math.pow(10, e);
+      if (f < lo * 0.999 || f > hi * 1.001) continue;
+      const label = m === 1 || m === 2 || m === 5 || f === lo || f === hi ? (f >= 1000 ? `${f / 1000}k` : String(f)) : null;
+      out.push({ f, label });
+    }
+  return out;
+}
 
 interface Geo {
   w: number;
   h: number;
 }
-const xOf = (g: Geo, f: number) => PL + (Math.log10(f / F_MIN) / 3) * (g.w - PL - PR);
-const fOf = (g: Geo, x: number) => F_MIN * Math.pow(10, (3 * (x - PL)) / (g.w - PL - PR));
+/** The graph's frequency span (the range choice), read at paint and input time. */
+const span = () => {
+  const st = store().getState();
+  return xPresetSpan(st.eqRange, (st.status?.graph_rate || 48000) / 2);
+};
+const xOf = (g: Geo, f: number) => {
+  const { lo, hi } = span();
+  return PL + (Math.log(f / lo) / Math.log(hi / lo)) * (g.w - PL - PR);
+};
+const fOf = (g: Geo, x: number) => {
+  const { lo, hi } = span();
+  return lo * Math.pow(hi / lo, (x - PL) / (g.w - PL - PR));
+};
+/** Where a band frequency can go: what the editor takes, inside the graph's span. */
+const fLimits = () => {
+  const { lo, hi } = span();
+  return [Math.max(lo, BAND_F_MIN), Math.min(hi, BAND_F_MAX)] as const;
+};
+const clampF = (f: number) => {
+  const [a, b] = fLimits();
+  return clamp(f, a, b);
+};
 const yOf = (g: Geo, db: number) => PT + ((DBR - db) / (2 * DBR)) * (g.h - PT - PB);
 const dbOf = (g: Geo, y: number) => DBR - ((y - PT) / (g.h - PT - PB)) * 2 * DBR;
 const handleY = (g: Geo, b: Band) => (isGainless(b.kind) ? yOf(g, 0) : yOf(g, clamp(b.gain_db, -DBR, DBR)));
+
+/** Handle radius (the selected one is drawn at 9) and how far off a press still catches the nearest. */
+const HANDLE_R = 9;
+const HIT_R = 14;
+
+/** Handles in paint order: by index, the selected one last (on top). */
+export function paintOrder(n: number, selected: number): number[] {
+  const order = Array.from({ length: n }, (_, i) => i).filter((i) => i !== selected);
+  if (selected >= 0 && selected < n) order.push(selected);
+  return order;
+}
+
+/**
+ * The band a press at (x, y) takes: the topmost handle drawn under the
+ * pointer, as the user sees it (stacked bands, such as several added at
+ * the same spot, give the one on top); else the nearest within reach.
+ */
+export function pickHandle(pts: readonly { x: number; y: number }[], x: number, y: number, selected: number): number {
+  const order = paintOrder(pts.length, selected);
+  let best = -1;
+  let bd = HIT_R;
+  for (let k = order.length - 1; k >= 0; k--) {
+    const i = order[k];
+    const d = Math.hypot(pts[i].x - x, pts[i].y - y);
+    if (d <= HANDLE_R) return i;
+    if (d < bd) {
+      bd = d;
+      best = i;
+    }
+  }
+  return best;
+}
 
 const roundF = (f: number) => (f < 100 ? Math.round(f * 10) / 10 : Math.round(f));
 const roundG = (g: number) => Math.round(g * 10) / 10;
@@ -38,7 +100,7 @@ const roundQ = (q: number) => Math.round(q * 100) / 100;
 
 /** Float the editor beside the selected handle, never on top of it. */
 function editorPos(g: Geo, b: Band): React.CSSProperties {
-  const hx = xOf(g, clamp(b.freq_hz, F_MIN, F_MAX));
+  const hx = xOf(g, clampF(b.freq_hz));
   const hy = handleY(g, b);
   const w = Math.min(EDITOR_W, g.w - 16);
   const left = clamp(hx - w / 2, 8, Math.max(8, g.w - w - 8));
@@ -68,6 +130,7 @@ export function EqGraph() {
   const sel = useApp((s) => s.selectedBand);
   const dsp = useApp((s) => s.config?.dsp_enabled ?? true);
   const rate = useApp((s) => s.status?.graph_rate ?? 48000);
+  useApp((s) => s.eqRange);
   void eqDraft;
   void eqCfg;
   void skin;
@@ -132,18 +195,34 @@ export function EqGraph() {
     ctx.font = "11px " + mono;
     ctx.textBaseline = "middle";
     ctx.lineWidth = 1;
-    for (const f of GRID_F) {
+    const { lo, hi } = span();
+    const nyq = fs / 2;
+    for (const { f, label } of eqGrid(lo, hi)) {
       const x = Math.round(xOf(g, f)) + 0.5;
       ctx.strokeStyle = f === 100 || f === 1000 || f === 10000 ? gridS : grid;
       ctx.beginPath();
       ctx.moveTo(x, PT);
       ctx.lineTo(x, g.h - PB);
       ctx.stroke();
-      if (LABELS[f]) {
+      if (label) {
         ctx.fillStyle = muted;
-        ctx.textAlign = f === 20 ? "left" : f === 20000 ? "right" : "center";
-        ctx.fillText(LABELS[f], x, g.h - PB / 2);
+        ctx.textAlign = f === lo ? "left" : f === hi ? "right" : "center";
+        ctx.fillText(label, x, g.h - PB / 2);
       }
+    }
+    // Above the output's Nyquist: shaded, no response.
+    const nx = nyq < hi ? xOf(g, nyq) : g.w - PR;
+    if (nyq < hi) {
+      ctx.save();
+      ctx.fillStyle = muted;
+      ctx.globalAlpha = 0.1;
+      ctx.fillRect(nx, PT, g.w - PR - nx, g.h - PT - PB);
+      ctx.globalAlpha = 1;
+      if (g.w - PR - nx >= 90) {
+        ctx.textAlign = "center";
+        ctx.fillText("above Nyquist", (nx + g.w - PR) / 2, PT + 12);
+      }
+      ctx.restore();
     }
     const plotH = g.h - PT - PB;
     const dbStep = plotH >= 780 ? 1 : plotH >= 360 ? 2.5 : 5;
@@ -170,9 +249,13 @@ export function EqGraph() {
     const secActive = active && hasSection(eqNow, m) && secOn;
     const xs: number[] = [];
     const fsAt: number[] = [];
-    for (let x = PL; x <= g.w - PR; x += 1.5) {
+    for (let x = PL; x <= nx; x += 1.5) {
       xs.push(x);
       fsAt.push(fOf(g, x));
+    }
+    if (xs.length && xs[xs.length - 1] < nx - 0.01) {
+      xs.push(nx);
+      fsAt.push(Math.min(fOf(g, nx), nyq * 0.9999));
     }
     const ks = set.bands.map((b) => design(b, fs));
     const fillAlpha = secActive ? 1 : 0.35;
@@ -230,9 +313,10 @@ export function EqGraph() {
       drawDb(sectionShapeDb(eqNow, m, fs, fsAt), secColor, 1.75, [5, 4], active ? (secOn ? 0.85 : 0.45) : 0.3);
     }
 
-    // handles for the selected section
-    set.bands.forEach((b, i) => {
-      const x = xOf(g, clamp(b.freq_hz, F_MIN, F_MAX));
+    // handles for the selected section, the selected one on top
+    for (const i of paintOrder(set.bands.length, state.selectedBand)) {
+      const b = set.bands[i];
+      const x = xOf(g, clampF(b.freq_hz));
       const y = handleY(g, b);
       const col = bandColor(i);
       const selected = i === state.selectedBand;
@@ -257,7 +341,7 @@ export function EqGraph() {
       ctx.textBaseline = "middle";
       ctx.fillText(String(i + 1), x, y + 0.5);
       ctx.restore();
-    });
+    }
   }
 
   // ---------------------------------------------------------------- input
@@ -267,18 +351,9 @@ export function EqGraph() {
     return { x: e.clientX - r.left, y: e.clientY - r.top };
   };
   const hit = (x: number, y: number) => {
-    let best = -1;
-    let bd = 14;
-    store()
-      .editedSet()
-      .bands.forEach((b, i) => {
-        const d = Math.hypot(xOf(geo.current, clamp(b.freq_hz, F_MIN, F_MAX)) - x, handleY(geo.current, b) - y);
-        if (d < bd) {
-          bd = d;
-          best = i;
-        }
-      });
-    return best;
+    const s = store();
+    const pts = s.editedSet().bands.map((b) => ({ x: xOf(geo.current, clampF(b.freq_hz)), y: handleY(geo.current, b) }));
+    return pickHandle(pts, x, y, s.getState().selectedBand);
   };
 
   const onPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -305,7 +380,7 @@ export function EqGraph() {
     cv.style.cursor = "grabbing";
     const b = st.editedSet().bands[drag.current.i];
     if (!b) return;
-    const patch: Partial<Band> = { freq_hz: roundF(clamp(fOf(geo.current, p.x), F_MIN, F_MAX)) };
+    const patch: Partial<Band> = { freq_hz: roundF(clampF(fOf(geo.current, p.x))) };
     if (!isGainless(b.kind)) patch.gain_db = roundG(clamp(dbOf(geo.current, p.y), -DBR, DBR));
     st.updateBand(drag.current.i, patch, "drag");
   };
@@ -318,7 +393,7 @@ export function EqGraph() {
     if (!eq) return;
     const p = local(e);
     if (hit(p.x, p.y) >= 0) return;
-    st.addBand({ freq_hz: roundF(clamp(fOf(geo.current, p.x), F_MIN, F_MAX)), gain_db: roundG(clamp(dbOf(geo.current, p.y), -DBR, DBR)), q: 1 });
+    st.addBand({ freq_hz: roundF(clampF(fOf(geo.current, p.x))), gain_db: roundG(clamp(dbOf(geo.current, p.y), -DBR, DBR)), q: 1 });
   };
 
   useEffect(() => {
@@ -339,7 +414,7 @@ export function EqGraph() {
         store().endEqDrag();
       }, 400);
       s.selectBand(i);
-      s.updateBand(i, { q: roundQ(clamp(b.q * (e.deltaY < 0 ? 1.08 : 1 / 1.08), 0.1, 20)) }, "drag");
+      s.updateBand(i, { q: roundQ(clamp(b.q * (e.deltaY < 0 ? 1.08 : 1 / 1.08), Q_MIN, Q_MAX)) }, "drag");
     };
     cv.addEventListener("wheel", onWheel, { passive: false });
     return () => cv.removeEventListener("wheel", onWheel);
@@ -352,12 +427,12 @@ export function EqGraph() {
     if (!b) return;
     const step = e.shiftKey ? 4 : 1;
     let patch: Partial<Band> | null = null;
-    if (e.key === "ArrowLeft") patch = { freq_hz: roundF(clamp(b.freq_hz / Math.pow(2, step / 24), F_MIN, F_MAX)) };
-    else if (e.key === "ArrowRight") patch = { freq_hz: roundF(clamp(b.freq_hz * Math.pow(2, step / 24), F_MIN, F_MAX)) };
+    if (e.key === "ArrowLeft") patch = { freq_hz: roundF(clamp(b.freq_hz / Math.pow(2, step / 24), BAND_F_MIN, BAND_F_MAX)) };
+    else if (e.key === "ArrowRight") patch = { freq_hz: roundF(clamp(b.freq_hz * Math.pow(2, step / 24), BAND_F_MIN, BAND_F_MAX)) };
     else if (e.key === "ArrowUp" && !isGainless(b.kind)) patch = { gain_db: roundG(clamp(b.gain_db + 0.5 * step, -DBR, DBR)) };
     else if (e.key === "ArrowDown" && !isGainless(b.kind)) patch = { gain_db: roundG(clamp(b.gain_db - 0.5 * step, -DBR, DBR)) };
-    else if (e.key === "PageUp") patch = { q: roundQ(clamp(b.q * 1.1, 0.1, 20)) };
-    else if (e.key === "PageDown") patch = { q: roundQ(clamp(b.q / 1.1, 0.1, 20)) };
+    else if (e.key === "PageUp") patch = { q: roundQ(clamp(b.q * 1.1, Q_MIN, Q_MAX)) };
+    else if (e.key === "PageDown") patch = { q: roundQ(clamp(b.q / 1.1, Q_MIN, Q_MAX)) };
     else if (e.key === "Tab" && !e.shiftKey && i < bands.length - 1) {
       e.preventDefault();
       st.selectBand(i + 1);

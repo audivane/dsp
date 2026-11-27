@@ -206,8 +206,9 @@ let doc = `Audivane DSP: third-party software notices
 Audivane DSP is licensed under the GNU Affero General Public License v3.0 only.
 Its binaries (audivane-dsp, avdsp, audivane-dsp-ui) include the third-party
 software listed below, each under its own license. The fonts and target-curve
-data bundled in the app have their own notices: OFL-IBM-Plex.txt,
-font-licensing.md and the targets SOURCES.md files installed beside this file.
+data bundled in the app have their own notices: OFL-Geist.txt,
+OFL-IBM-Plex.txt, font-licensing.md and the targets SOURCES.md files installed
+beside this file.
 
 The source code of every package is available from crates.io or npmjs.com at
 the version listed, and from the repository shown; this includes the Source
@@ -222,7 +223,7 @@ ${rule}
 
 `;
 for (const p of packages) {
-  doc += `${p.eco.padEnd(5)}  ${p.name} ${p.version}  —  ${p.license}${p.url ? `\n       ${p.url}` : ""}\n`;
+  doc += `${p.eco.padEnd(5)}  ${p.name} ${p.version}  |  ${p.license}${p.url ? `\n       ${p.url}` : ""}\n`;
 }
 if (missing.length > 0) {
   doc += `\nThese packages ship no license file of their own. They are distributed

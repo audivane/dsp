@@ -28,7 +28,7 @@ use audivane_io_alsa::{
     alsa_lib_errors, card_index_from_device, probe_rates, silence_alsa_lib_on_this_thread,
 };
 use audivane_protocol::ipc::{
-    BypassResampler, DeviceCapabilities, EngineState, RatePolicy, SinkChoice,
+    BypassResampler, DeviceCapabilities, EngineState, OutputChannels, RatePolicy, SinkChoice,
 };
 use audivane_protocol::{ALLOWED_RATES, MAX_OUTPUT_RATE, RateRatio, RateTarget, SampleFormat};
 use pipewire as pw;
@@ -53,6 +53,9 @@ const PW_DSP_SESSION_PRIORITY: &str = "2000";
 const PW_DIRECT_SESSION_PRIORITY: &str = "1900";
 const PW_DAC_GROUP: &str = "audivane-dac";
 const FADE_MS: usize = 25;
+/// The fade that ends the stream-end flush: over its last frames, or
+/// sooner when a new stream or a device release arrives during it.
+const DRAIN_CUT_MS: usize = 5;
 
 /// Real-time audio processing hook invoked on the ALSA RT thread for every
 /// DAC period. Implementations must be strictly allocation-free and lock-free.
@@ -102,6 +105,20 @@ pub trait EngineAudioProcessor: Send + 'static {
 
     /// Return current DSP algorithmic latency in output frames (`0` on Direct or bypass).
     fn latency_out_frames(&self, active_sink: SinkChoice) -> usize;
+
+    /// The part of [`Self::latency_out_frames`] that is the multi-device
+    /// alignment (the master's delay for its followers), output frames: in
+    /// the total latency, not filter delay.
+    fn align_out_frames(&self, _active_sink: SinkChoice) -> usize {
+        0
+    }
+
+    /// The convolution's own delay in the active chain, graph-rate frames
+    /// (its IRs' bulk delay plus the convolver's block; `0` without
+    /// convolution, on Direct or bypass). Part of the filter delay.
+    fn conv_latency_frames(&self, _active_sink: SinkChoice) -> usize {
+        0
+    }
 
     /// Reset internal filter/convolver state cleanly when playback stops.
     fn reset_dsp_state(&mut self);
@@ -172,6 +189,16 @@ pub trait EngineAudioProcessor: Send + 'static {
     /// (the stream-end flush budgets it).
     fn alignment_max_frames(&self, active_sink: SinkChoice) -> usize {
         self.alignment_frames(active_sink)
+    }
+
+    /// Graph frames of silence the chain needs after the last source frame
+    /// on the path `active_sink` plays so its delayed output (the
+    /// upsampler's latency, convolution, the limiter's lookahead) plays
+    /// out: the stream-end flush feeds this many after the ring and any
+    /// alignment line. Not the varispeed stage's own tail
+    /// ([`VarispeedPort::tail_frames`]). 0: nothing is held back.
+    fn chain_tail_frames(&self, _active_sink: SinkChoice) -> usize {
+        0
     }
 
     /// The PCM was prepared for a new stream (a start, a reopen, a
@@ -854,6 +881,9 @@ pub struct EngineDriverConfig {
     pub device: String,
     pub formats: Vec<SampleFormat>,
     pub channels: u32,
+    /// The device channels the engine's channels play on (`None`: the
+    /// first ones); the device opens at the fewest channels that hold them.
+    pub output_channels: Option<OutputChannels>,
     /// PipeWire quantum at 48 kHz (scaled for other sample rates).
     pub quantum: u32,
     pub buffer_periods: u32,
@@ -881,6 +911,24 @@ pub struct EngineDriverConfig {
 }
 
 impl EngineDriverConfig {
+    /// [`Self::output_channels`] as the ALSA open's channel map.
+    pub fn channel_map(&self) -> Vec<u32> {
+        self.output_channels
+            .map(|p| p.0.to_vec())
+            .unwrap_or_default()
+    }
+
+    /// The fewest channels the device opens at.
+    pub fn min_device_channels(&self) -> u32 {
+        audivane_io_alsa::min_device_channels(self.channels.max(1), &self.channel_map())
+    }
+
+    /// The probe's view for this config's output pair and formats
+    /// ([`DeviceCapabilities::for_output`]).
+    pub fn caps_view(&self, caps: &DeviceCapabilities) -> DeviceCapabilities {
+        caps.for_output(self.min_device_channels(), &self.formats)
+    }
+
     pub fn desired_dsp(&self, generation: u64) -> DesiredDspConfig {
         DesiredDspConfig {
             dsp_enabled: self.dsp_enabled,
@@ -908,6 +956,7 @@ impl Default for EngineDriverConfig {
                 SampleFormat::S16,
             ],
             channels: 2,
+            output_channels: None,
             quantum: 1024,
             buffer_periods: 3,
             dsp_enabled: true,
@@ -1040,6 +1089,12 @@ pub struct EngineDriverSnapshot {
     pub direct_node: Option<u32>,
     pub frames_out: u64,
     pub dsp_latency_out_frames: usize,
+    /// The part of `dsp_latency_out_frames` that is the multi-device
+    /// alignment.
+    pub dsp_align_out_frames: usize,
+    /// The convolution's own delay, graph-rate frames
+    /// ([`EngineAudioProcessor::conv_latency_frames`]).
+    pub dsp_conv_graph_frames: usize,
     pub gaps: DriverGapCounters,
     /// Probed capabilities of the open device.
     pub device_caps: Option<DeviceCapabilities>,
@@ -1127,29 +1182,7 @@ fn sink_from_u8(v: u8) -> Option<SinkChoice> {
     }
 }
 
-/// Scale a 48 kHz base quantum to `rate` the way PipeWire does, so the ALSA
-/// period the engine opens with is the quantum the graph actually runs.
-///
-/// PipeWire turns `node.latency = q/rate` into `q * graph_rate / rate` and,
-/// with `clock.power-of-two-quantum` (the default), rounds that *down* to a
-/// power of two. So a 1024 quantum runs 512 at 44.1 kHz, 1024 at 88.2 kHz,
-/// 2048 at 176.4 kHz and 4096 at 352.8 kHz, never 1881 or 3763. A period
-/// that does not match the quantum costs several back-to-back cycles per
-/// period and the source clients cannot keep up.
-///
-/// The result is also capped at PipeWire's default `clock.quantum-limit`
-/// (8192): at 768 kHz a 1024 quantum would be 16384, but the graph runs 8192.
-pub fn scaled_quantum(q48: u32, rate: u32) -> u32 {
-    const PW_QUANTUM_LIMIT: u64 = 8192;
-    let q48 = q48.max(32);
-    let r = rate.max(8_000) as u64;
-    let raw = ((q48 as u64 * r) / 48_000).clamp(32, PW_QUANTUM_LIMIT) as u32;
-    if q48.is_power_of_two() {
-        (1u32 << (31 - raw.leading_zeros())).max(32)
-    } else {
-        raw
-    }
-}
+pub use audivane_protocol::scaled_quantum;
 
 #[derive(Clone, Copy)]
 struct SendRawStream(NonNull<pw::sys::pw_stream>);
@@ -1235,6 +1268,8 @@ struct SharedEngineState {
     frames_out: AtomicU64,
     dsp_load_bits: AtomicU64,
     dsp_latency_out: AtomicU64,
+    dsp_align_out: AtomicU64,
+    dsp_conv_graph: AtomicU64,
     cycles_completed: AtomicU64,
     last_error: Mutex<Option<String>>,
     metadata_warning: Mutex<Option<String>>,
@@ -1398,6 +1433,8 @@ impl SharedEngineState {
             frames_out: AtomicU64::new(0),
             dsp_load_bits: AtomicU64::new(0.0_f64.to_bits()),
             dsp_latency_out: AtomicU64::new(0),
+            dsp_align_out: AtomicU64::new(0),
+            dsp_conv_graph: AtomicU64::new(0),
             cycles_completed: AtomicU64::new(0),
             last_error: Mutex::new(None),
             metadata_warning: Mutex::new(None),
@@ -2189,6 +2226,8 @@ impl EngineDriverHandle {
             direct_node: (direct_raw != pw::constants::ID_ANY).then_some(direct_raw),
             frames_out: self.shared.frames_out.load(Ordering::Relaxed),
             dsp_latency_out_frames: self.shared.dsp_latency_out.load(Ordering::Relaxed) as usize,
+            dsp_align_out_frames: self.shared.dsp_align_out.load(Ordering::Relaxed) as usize,
+            dsp_conv_graph_frames: self.shared.dsp_conv_graph.load(Ordering::Relaxed) as usize,
             gaps: DriverGapCounters {
                 direct_zero_periods: self.shared.direct_zero_periods.load(Ordering::Relaxed),
                 direct_zero_frames: self.shared.direct_zero_frames.load(Ordering::Relaxed),
@@ -2455,7 +2494,7 @@ impl EngineDriverHandle {
 
     /// `true` once the ALSA thread has ended by itself: the device failed in a
     /// way that restarting the stream cannot fix (usually it was unplugged).
-    /// The driver cannot play again; the owner has to start a new one.
+    /// The driver cannot play again; a new one has to be started.
     pub fn audio_thread_ended(&self) -> bool {
         !self.shared.stop.load(Ordering::Acquire)
             && self
@@ -2527,9 +2566,21 @@ impl StreamSideData {
     }
 }
 
+/// The node name of the daemon's measurement carrier (`measure_play`): a
+/// silent stream that only keeps the DSP sink running. It counts as a
+/// running client but never takes part in rate arbitration.
+pub const MEASURE_CARRIER_NODE: &str = "audivane_measure";
+
+/// Whether a client node (by `node.name`) is left out of rate arbitration.
+fn rate_exempt(node_name: Option<&str>) -> bool {
+    node_name == Some(MEASURE_CARRIER_NODE)
+}
+
 struct ClientNodeEntry {
     running: bool,
     native_rate: Option<u32>,
+    /// Left out of rate arbitration (the measurement carrier).
+    rate_exempt: bool,
     /// `application.name` (or the node's description/name), for logs.
     name: String,
     /// Start order while running (see `RateArbiter::update_since`).
@@ -2800,6 +2851,9 @@ impl RegistryTracker {
                 direct_client_running = true;
             } else {
                 dsp_client_running = true;
+            }
+            if c.rate_exempt {
+                continue;
             }
             let Some(native_rate) = c.native_rate else {
                 continue;
@@ -3209,6 +3263,8 @@ impl PwSession {
                                 .props
                                 .and_then(|p| p.get("node.rate"))
                                 .and_then(parse_node_rate);
+                            let rate_exempt =
+                                rate_exempt(global.props.and_then(|p| p.get("node.name")));
                             let name = global
                                 .props
                                 .and_then(|p| {
@@ -3238,6 +3294,7 @@ impl PwSession {
                                 ClientNodeEntry {
                                     running: false,
                                     native_rate: initial_rate,
+                                    rate_exempt,
                                     name,
                                     since: None,
                                     _node: node,
@@ -4065,6 +4122,7 @@ impl RealDeviceBackend {
             &engine_probe_rates(self.config.max_dsp_ratio),
         ) {
             Ok(c) => {
+                let c = self.config.caps_view(&c);
                 log::info!("Device '{device}' supports {}", c.summary());
                 self.shared.note_probe();
                 Some(c)
@@ -4257,6 +4315,7 @@ impl DeviceBackend for RealDeviceBackend {
             device: device.to_string(),
             rate: desired_ratio.output_rate(graph_rate).unwrap_or(graph_rate),
             channels: self.channels,
+            channel_map: self.config.channel_map(),
             period_frames: desired_ratio.scale_to_output(quantum),
             buffer_periods: self.buffer_periods.max(2),
             preferred_format: self.formats.first().copied(),
@@ -4507,6 +4566,8 @@ fn startup_missing(
             format: config.formats.first().copied().unwrap_or(SampleFormat::S32),
             rate,
             channels: config.channels.max(1),
+            device_channels: config.min_device_channels(),
+            device_channels_max: 0,
             period_frames: quantum,
             buffer_frames: quantum * config.buffer_periods.max(2),
         },
@@ -4554,6 +4615,7 @@ fn startup_open(
     };
     let caps = match open.probe(channels, &engine_probe_rates(config.max_dsp_ratio)) {
         Ok(c) => {
+            let c = config.caps_view(&c);
             log::info!("Device '{}' supports {}", config.device, c.summary());
             shared.note_probe();
             Some(c)
@@ -4797,6 +4859,7 @@ impl crate::lifecycle::BypassOpen for StartupOpen<'_> {
             device: self.config.device.clone(),
             rate: ratio.output_rate(rate).unwrap_or(rate),
             channels: self.channels,
+            channel_map: self.config.channel_map(),
             period_frames: ratio.scale_to_output(quantum),
             buffer_periods: self.config.buffer_periods.max(2),
             preferred_format: self.config.formats.first().copied(),
@@ -5226,6 +5289,10 @@ fn run_control_thread(
                     if config.device != new_cfg.device {
                         bypass_held = crate::lifecycle::BypassHeld::NONE;
                     }
+                    // Another output pair or format list may pick another
+                    // channel count from the probe (it covers them all).
+                    let view_changed = config.output_channels != new_cfg.output_channels
+                        || config.formats != new_cfg.formats;
                     config = *new_cfg;
                     // Only an edit that steers negotiation (or reopens
                     // anyway) starts a new retry generation.
@@ -5238,6 +5305,16 @@ fn run_control_thread(
                     backend.channels = config.channels.max(1);
                     backend.buffer_periods = config.buffer_periods.max(2);
                     backend.config = config.clone();
+                    let same_device =
+                        backend.probed_device.as_deref() == Some(config.device.as_str());
+                    if view_changed
+                        && same_device
+                        && let Some(c) = backend.caps.take()
+                    {
+                        let c = config.caps_view(&c);
+                        shared.set_device_caps(Some(c.clone()));
+                        backend.caps = Some(c);
+                    }
                     // Same device: restrict the new policy with the cached
                     // probe right away. A new device is probed on reopen.
                     let effective = match backend.refresh_effective(desired_dsp) {
@@ -6213,6 +6290,14 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
             processor.latency_out_frames(active_sink) as u64,
             Ordering::Relaxed,
         );
+        shared.dsp_align_out.store(
+            processor.align_out_frames(active_sink) as u64,
+            Ordering::Relaxed,
+        );
+        shared.dsp_conv_graph.store(
+            processor.conv_latency_frames(active_sink) as u64,
+            Ordering::Relaxed,
+        );
 
         if released_idle || suspended || alsa_opt.is_none() {
             // The last reopen failed (e.g. a route to a rate the device
@@ -7041,7 +7126,18 @@ fn run_alsa_thread<P: EngineAudioProcessor>(
         // The clock delay's DAC term, tracked from here to each trigger.
         vs_delay.dac_read(mono_now_ns(), delay, true);
         vs_delay.clear_pending();
-        processor.dac_read(delay, mono_raw_now_ns());
+        // The followers' convention: the status's delay at its timestamp
+        // (the last pointer update), not at the time this code runs: the
+        // wakeup's lateness would make every follower play that much late.
+        // Only a running stream's: stopped (an xrun), the status still has a
+        // timestamp, with a delay of 0 (the end of what was written, not the
+        // DAC's position).
+        match alsa.status_reading() {
+            Ok((ts, d, true)) if ts > 0 => processor.dac_read(d, ts),
+            Ok((_, _, false)) => {}
+            _ if alsa.is_running() => processor.dac_read(delay, mono_raw_now_ns()),
+            _ => {}
+        }
 
         if alsa.needs_restart() || !alsa.is_running() || shared.device_gone.load(Ordering::Relaxed)
         {
@@ -7572,6 +7668,60 @@ impl VsGraph for RtGraph<'_> {
     }
 }
 
+/// The fade that ends the stream-end flush ([`drain_alsa_tail`]): it
+/// starts `lead_in` output frames into the block it is started for, so it
+/// can end exactly where the flush does, and ramps down over `len`.
+#[derive(Clone, Debug)]
+struct TailCut {
+    ramp: FadeRamp,
+    len: usize,
+    lead_in: usize,
+    started: bool,
+}
+
+impl TailCut {
+    fn new(len: usize) -> Self {
+        Self {
+            ramp: FadeRamp::unity(),
+            len,
+            lead_in: 0,
+            started: false,
+        }
+    }
+
+    /// Start the fade `lead_in` frames into the next block (once).
+    fn start(&mut self, lead_in: usize) {
+        if !self.started {
+            self.started = true;
+            self.lead_in = lead_in;
+            self.ramp.start_fade_out(self.len);
+        }
+    }
+
+    fn started(&self) -> bool {
+        self.started
+    }
+
+    /// Fully faded: everything after is silent.
+    fn done(&self) -> bool {
+        self.started && self.lead_in == 0 && self.ramp.is_fade_out_done()
+    }
+
+    /// Started and not finished.
+    fn fading(&self) -> bool {
+        self.started && !self.done()
+    }
+
+    fn apply(&mut self, samples: &mut [i32], channels: usize) {
+        if !self.started || channels == 0 {
+            return;
+        }
+        let skip = (self.lead_in * channels).min(samples.len());
+        self.lead_in -= skip / channels;
+        self.ramp.apply_interleaved(&mut samples[skip..], channels);
+    }
+}
+
 /// The graph for the tail drain: the source has ended, so no cycle is
 /// triggered; only the clock is read.
 struct NoCycles;
@@ -7696,15 +7846,19 @@ fn drain_alsa_tail<P: EngineAudioProcessor>(
     let device_delay = alsa.delay().unwrap_or(0);
     let (tail, speed) = vs_tail.unwrap_or((0, 1.0));
     // The alignment line (multi-device) holds source ahead of the stage or
-    // the chain: zeros push it out too, at the drain speed.
+    // the chain: zeros push it out too, at the drain speed. So does the
+    // chain's own delay (the upsampler, convolution, lookahead), after the
+    // stage at the graph rate: without it a stream's last stretch (up to
+    // the filter's latency) never plays, and stops at full level.
     let align_tail =
         (processor.alignment_max_frames(active_sink) as f64 / speed.max(0.5)).ceil() as usize;
-    let mut align_left = align_tail;
+    let flush_tail = align_tail + processor.chain_tail_frames(active_sink);
+    let mut flush_left = flush_tail;
     let deadline = Instant::now()
         + Duration::from_nanos(vsl::drain_deadline_ns(
             queued,
             speed,
-            tail + align_tail,
+            tail + flush_tail,
             device_delay,
             ratio,
             graph_rate,
@@ -7712,6 +7866,15 @@ fn drain_alsa_tail<P: EngineAudioProcessor>(
         ));
     let mut vs_drain = VsDrain::default();
     let mut no_delay = VsDelay::new(ratio, graph_rate);
+    // The flush (the ring is empty) ends under a short fade: over its last
+    // frames, so a stream stopped mid-music does not step to silence; or at
+    // once when a new stream or a device release arrives, so neither waits
+    // for the tail. The flush plays the chain's whole delay (the stream's
+    // last stretch of music) uncapped; volume and mute still apply during
+    // it (each block syncs the volume), and the deadline bounds it.
+    let fade_graph = (graph_rate as usize * DRAIN_CUT_MS / 1000).max(1);
+    let has_flush = tail + flush_tail > 0;
+    let mut cut = TailCut::new(params.rate as usize * DRAIN_CUT_MS / 1000);
     loop {
         // The drain can write for a while (the device has room) without
         // returning to the RT loop: the overload guard runs here too.
@@ -7737,13 +7900,21 @@ fn drain_alsa_tail<P: EngineAudioProcessor>(
         } else {
             None
         };
-        match vs_tail {
-            Some(tail) if !vs_drain.more(rem / channels.max(1), tail + align_tail) => break,
-            Some(_) => {}
-            None if rem == 0 && align_left == 0 => break,
-            None => {}
-        }
-        if Instant::now() >= deadline || stop.load(Ordering::Acquire) {
+        // Frames still to play before the drain ends (the ring's, then the
+        // flush's), when known: `None` while varispeed still pulls the ring.
+        // A fade under way finishes even past the flush's end (on zeros).
+        let left = match vs_tail {
+            Some(tail) => {
+                let more = vs_drain.more(rem / channels.max(1), tail + flush_tail);
+                if !more && !cut.fading() {
+                    break;
+                }
+                vs_drain.left()
+            }
+            None if rem == 0 && flush_left == 0 && !cut.fading() => break,
+            None => Some(rem / channels.max(1) + flush_left),
+        };
+        if Instant::now() >= deadline || stop.load(Ordering::Acquire) || cut.done() {
             break;
         }
         let Ok(avail) = alsa.avail() else { break };
@@ -7751,6 +7922,26 @@ fn drain_alsa_tail<P: EngineAudioProcessor>(
             break;
         }
         let (chunk_in, chunk_out) = planner.plan(ratio, period_out);
+        let flushing = rem == 0;
+        if !cut.started() {
+            if flushing
+                && ((shared.driving.load(Ordering::Acquire) && shared.pick_sink().is_some())
+                    || shared.release_requested.load(Ordering::Acquire))
+            {
+                cut.start(0);
+            } else if has_flush
+                && let Some(remaining) = left
+                && remaining < chunk_in + fade_graph
+            {
+                // The fade ends where the drain does:
+                // it starts in this period once that is less than a period
+                // and a fade away. With a short chain delay that is still in
+                // the ring's last frames: a stream stopped mid-music never
+                // steps to silence.
+                let lead_in = remaining.saturating_sub(fade_graph);
+                cut.start(lead_in * chunk_out / chunk_in.max(1));
+            }
+        }
         let in_samples_len = chunk_in * channels;
         let out_samples_len = chunk_out * channels;
         if avail < chunk_out as u32 {
@@ -7791,7 +7982,7 @@ fn drain_alsa_tail<P: EngineAudioProcessor>(
         };
         if !vs_ran {
             if rem == 0 {
-                align_left = align_left.saturating_sub(chunk_in);
+                flush_left = flush_left.saturating_sub(chunk_in);
             }
             match active_sink {
                 SinkChoice::Direct => {
@@ -7814,6 +8005,7 @@ fn drain_alsa_tail<P: EngineAudioProcessor>(
         }
         planner.commit(chunk_in, chunk_out, period_out);
         fade_ramp.apply_interleaved(&mut out_buf[..out_samples_len], channels);
+        cut.apply(&mut out_buf[..out_samples_len], channels);
         if alsa
             .write_i32_all_until(&out_buf[..out_samples_len], || stop.load(Ordering::Acquire))
             .is_err()
@@ -7825,6 +8017,10 @@ fn drain_alsa_tail<P: EngineAudioProcessor>(
 
     let mut padded_periods = 0u32;
     let max_wait_periods = (params.buffer_frames / period_out).max(2) + 2;
+    // After a cut, the device is stopped as soon as the fade has played
+    // (everything queued is the silence written after it), not a whole
+    // buffer later: the new stream waits no longer than it must.
+    let mut silence_queued: i64 = 0;
     // accounted below so a mid-stream silence pad is visible in telemetry
     while padded_periods < max_wait_periods
         && Instant::now() < deadline
@@ -7834,12 +8030,13 @@ fn drain_alsa_tail<P: EngineAudioProcessor>(
         let Ok((avail, delay)) = alsa.avail_and_delay() else {
             break;
         };
-        if alsa.needs_restart() || delay <= 0 {
+        if alsa.needs_restart() || delay <= 0 || (cut.done() && delay <= silence_queued) {
             break;
         }
         if avail >= period_out {
             let _ = alsa.write_silence(period_out);
             padded_periods += 1;
+            silence_queued += i64::from(period_out);
         } else {
             let _ = alsa.wait_for_period(40);
         }
@@ -8030,6 +8227,39 @@ fn next_prime_deadline_ns(
 #[cfg(test)]
 mod tests {
 
+    /// The flush's fade leaves its lead-in untouched, ramps down to 0 over
+    /// its length (across blocks), and only counts as done once silent.
+    #[test]
+    fn the_tail_cut_fades_after_its_lead_in() {
+        let mut cut = super::TailCut::new(8);
+        let mut block = vec![1_000_000i32; 2 * 6];
+        cut.apply(&mut block, 2);
+        assert!(
+            block.iter().all(|&s| s == 1_000_000),
+            "not started: untouched"
+        );
+        assert!(!cut.started() && !cut.done());
+
+        cut.start(4);
+        cut.start(0); // once
+        cut.apply(&mut block, 2);
+        assert!(block[..8].iter().all(|&s| s == 1_000_000), "lead-in");
+        assert!(
+            block[8] < 1_000_000 && block[8] == block[9],
+            "fading, both channels"
+        );
+        assert!(cut.fading() && !cut.done());
+
+        let mut next = vec![1_000_000i32; 2 * 8];
+        cut.apply(&mut next, 2);
+        assert!(next.windows(2).all(|w| w[1] <= w[0]), "monotonic down");
+        assert_eq!(&next[next.len() - 2..], &[0, 0]);
+        assert!(cut.done() && !cut.fading());
+        let mut after = vec![1_000_000i32; 4];
+        cut.apply(&mut after, 2);
+        assert_eq!(after, vec![0; 4], "silent after");
+    }
+
     #[test]
     fn turning_dsp_off_reaches_the_arbiter_although_the_published_rates_stay() {
         use crate::lifecycle::{BypassLeg, DesiredDspConfig, RatePairMask};
@@ -8052,6 +8282,7 @@ mod tests {
             rate_min: 48_000,
             rate_max: 48_000,
             formats: vec![SampleFormat::S32],
+            modes: Vec::new(),
         };
         let formats = [SampleFormat::S32];
         let configured = RatePolicy::default();
@@ -8886,6 +9117,13 @@ mod tests {
         assert_eq!(pod_rates(&many), Some(vec![44_100, 44_100, 48_000]));
         let none = build_sink_format_pod(2, &[], 48_000).unwrap();
         assert_eq!(pod_rates(&none), Some(vec![48_000]));
+    }
+
+    #[test]
+    fn only_the_measurement_carrier_is_exempt_from_rate_arbitration() {
+        assert!(rate_exempt(Some(MEASURE_CARRIER_NODE)));
+        assert!(!rate_exempt(Some("firefox")));
+        assert!(!rate_exempt(None));
     }
 
     #[test]

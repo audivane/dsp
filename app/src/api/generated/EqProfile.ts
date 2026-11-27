@@ -2,6 +2,7 @@
 import type { Band } from "./Band";
 import type { ChannelEq } from "./ChannelEq";
 import type { TiltConfig } from "./TiltConfig";
+import type { ToneConfig } from "./ToneConfig";
 
 export type EqProfile = { name: string, 
 /**
@@ -14,4 +15,8 @@ version: number, preamp_db: number, linked_enabled: boolean, bands: Array<Band>,
  * `tilt.end_hz`, pivoted at its start, so the response is exactly 0 dB
  * between them. The two run in cascade. See [`check_tilt_pair`].
  */
-tilt_high?: TiltConfig | null, };
+tilt_high?: TiltConfig | null, 
+/**
+ * Bass and treble knobs (two fixed shelves, every channel).
+ */
+tone?: ToneConfig | null, };

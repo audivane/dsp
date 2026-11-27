@@ -11,10 +11,9 @@ import { FineSlider } from "./FineSlider";
 import { WHEEL_HINT } from "./sliderWheel";
 import { Arrow, Check, Device, Logo, Speaker, ThemeIcon } from "./Icons";
 import { PresetControl } from "./PresetMenu";
+import { deviceLabel } from "../lib/devices";
 
-export function deviceLabel(name: string, id: string) {
-  return `${name} · ${id.replace(/^hw:CARD=([^,]+),DEV=(\d+)$/, "hw:$1,$2")}`;
-}
+export { deviceLabel } from "../lib/devices";
 
 export function DevicePicker({ className = "chip", id = "device" }: { className?: string; id?: string }) {
   const st = store();
@@ -31,7 +30,7 @@ export function DevicePicker({ className = "chip", id = "device" }: { className?
         {!known && device && <option value={device}>{device}</option>}
         {list.map((d) => (
           <option key={d.id} value={d.id}>
-            {devices.length ? deviceLabel(d.name, d.id) : d.name}
+            {devices.length ? deviceLabel(d) : d.name}
             {d.hdmi ? " (HDMI)" : d.loopback ? " (loopback)" : ""}
           </option>
         ))}
@@ -81,7 +80,7 @@ export function useVolumeModel() {
   // A level below the reported range (an engine that reports its card's
   // floor) still shows where it is.
   const volTaper = volumeSliderTaper(vs?.min_db, vs?.max_db, v && vs ? v.volume_db : null, VOLUME_MIN_DB, VOLUME_MAX_DB);
-  const volText = bitPerfect ? "on DAC" : v && vs ? `${fmtDb(v.volume_db, 1, false)} dB` : "—";
+  const volText = bitPerfect ? "on DAC" : v && vs ? `${fmtDb(v.volume_db, 1, false)} dB` : "-";
   return { st, vs, v, epoch, begin, bitPerfect, off, dspBypassed, title, volTaper, volText };
 }
 
@@ -136,7 +135,7 @@ export function VolumeControls() {
   const balOff = off || dspBypassed;
   const BAL_BYPASS_TIP = "Balance is applied on the DSP path only; Direct playback and Bypass stay bit-perfect.";
   const bal = v?.balance_db ?? 0;
-  const balText = !v ? "—" : bal === 0 ? "C" : (bal < 0 ? "L " : "R ") + Math.abs(bal).toFixed(1);
+  const balText = !v ? "-" : bal === 0 ? "C" : (bal < 0 ? "L " : "R ") + Math.abs(bal).toFixed(1);
   const balTaper = balanceTaper(BALANCE_MAX_DB);
   const hint = `Arrow keys: 0.5 dB, Shift+arrows: 0.1 dB, Page Up/Down: 6 dB. Double-click the value to type it. ${WHEEL_HINT}`;
   return (
@@ -261,8 +260,9 @@ export function TopBar() {
           {(["a", "b"] as const).map((side) => (
             <button
               key={side}
-              aria-pressed={abCfg && (ab?.current ?? "a") === side}
-              title={abCfg ? `Listen to side ${side.toUpperCase()} (key ${side.toUpperCase()}; \` flips)` : "Set up side B in A/B compare"}
+              aria-pressed={abCfg && !ab?.blind && (ab?.current ?? "a") === side}
+              disabled={!!ab?.blind}
+              title={ab?.blind ? "A blind test is running: use its buttons in A/B compare" : abCfg ? `Listen to side ${side.toUpperCase()} (key ${side.toUpperCase()}; \` flips)` : "Set up side B in A/B compare"}
               onClick={() => (abCfg ? void st.abSelect(side) : st.setView("ab"))}
             >
               {side.toUpperCase()}

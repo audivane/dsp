@@ -39,6 +39,7 @@ fn dac(rates: &[u32]) -> DeviceCapabilities {
         rate_min: rates.iter().copied().min().unwrap_or(0),
         rate_max: rates.iter().copied().max().unwrap_or(0),
         formats: vec![SampleFormat::S32],
+        modes: Vec::new(),
     }
 }
 

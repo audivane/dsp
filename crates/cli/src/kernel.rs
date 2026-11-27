@@ -1,4 +1,4 @@
-//! `avdsp kernel` — dump an upsampler kernel for reference tests.
+//! `avdsp kernel`: dump an upsampler kernel for reference tests.
 
 use crate::KernelArgs;
 use anyhow::{Context, Result};

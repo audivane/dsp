@@ -6,8 +6,7 @@
 
 use crate::error::Result;
 use crate::reserve::card_index_from_device;
-use alsa::Round;
-use alsa::mixer::{MilliBel, Mixer, Selem, SelemChannelId, SelemId};
+use alsa::mixer::{Mixer, Selem, SelemChannelId, SelemId};
 use audivane_protocol::ipc::{VOLUME_MAX_DB, VOLUME_MIN_DB};
 
 /// Simple mixer element names tried in priority order before falling back to
@@ -93,12 +92,19 @@ fn inspect_selem(selem: &Selem<'_>) -> Option<(SelemId, MixerElementCandidate)> 
     let has_playback_switch = selem.has_playback_switch();
 
     let db_range = if has_playback_volume {
-        let (min_mb, max_mb) = selem.get_playback_db_range();
+        let (_, max_mb) = selem.get_playback_db_range();
         let (vmin, vmax) = selem.get_playback_volume_range();
-        if min_mb.0 < max_mb.0 && vmin < vmax && selem.ask_playback_vol_db(vmin).is_ok() {
-            Some(((min_mb.0 as f64) / 100.0, (max_mb.0 as f64) / 100.0))
-        } else {
-            None
+        // The floor is the quietest audible step: a mute step at the bottom
+        // (a TLV with the mute flag) is not part of the range, so levels below
+        // the lowest real step go to digital attenuation, never to silence.
+        let lowest = audible_vmin(vmin, vmax, |raw| {
+            selem.ask_playback_vol_db(raw).ok().map(|m| m.0)
+        });
+        match lowest.and_then(|v| selem.ask_playback_vol_db(v).ok()) {
+            Some(min_mb) if min_mb.0 < max_mb.0 => {
+                Some(((min_mb.0 as f64) / 100.0, (max_mb.0 as f64) / 100.0))
+            }
+            _ => None,
         }
     } else {
         None
@@ -249,6 +255,45 @@ pub fn playback_channels(device: &str) -> Result<Option<Vec<PlaybackChannel>>> {
     })
 }
 
+/// The loudest step in `vmin..=vmax` whose level (`db_of`, millibels,
+/// non-decreasing in the step) is at or below `target_mb`, or `vmin` when
+/// none is. ALSA's own dB write cannot be asked for this: the alsa crate's
+/// `Round::Floor` is 0, which alsa-lib takes as "nearest", so a write would
+/// land up to half a step above the target. A step whose level cannot be
+/// read counts as above it.
+/// ALSA's level for a mute step (`SND_CTL_TLV_DB_GAIN_MUTE`, millibels).
+const MUTE_MB: i64 = -9_999_999;
+
+/// The lowest step of `vmin..vmax` that is audible: `vmin`, or `vmin + 1`
+/// when `vmin` is a mute step. `None` when the levels can't be read or no
+/// audible step is below `vmax`.
+fn audible_vmin(vmin: i64, vmax: i64, db_of: impl Fn(i64) -> Option<i64>) -> Option<i64> {
+    let lowest = if db_of(vmin)? <= MUTE_MB {
+        vmin + 1
+    } else {
+        vmin
+    };
+    (lowest < vmax && db_of(lowest).is_some()).then_some(lowest)
+}
+
+fn floor_step(target_mb: i64, vmin: i64, vmax: i64, db_of: impl Fn(i64) -> Option<i64>) -> i64 {
+    let at_or_below = |raw| db_of(raw).is_some_and(|mb| mb <= target_mb);
+    if !at_or_below(vmin) {
+        return vmin;
+    }
+    // Invariant: `lo` is at or below the target; everything above `hi` is not.
+    let (mut lo, mut hi) = (vmin, vmax);
+    while lo < hi {
+        let mid = lo + (hi - lo + 1) / 2;
+        if at_or_below(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
 /// The quietest of a control's channel levels, clamped to its range.
 fn quietest_level(levels: &[f64], (min_db, max_db): (f64, f64)) -> Option<f64> {
     levels
@@ -296,8 +341,13 @@ pub fn apply_playback_volume(
     };
 
     let target_db = volume_db.clamp(min_db, max_db);
-    let target_mb = MilliBel((target_db * 100.0).round() as i64);
-    selem.set_playback_db_all(target_mb, Round::Floor)?;
+    let target_mb = (target_db * 100.0).round() as i64;
+    let (vmin, vmax) = selem.get_playback_volume_range();
+    let db_of = |raw| selem.ask_playback_vol_db(raw).ok().map(|mb| mb.0);
+    // Never write a mute step: the range's floor is the lowest audible one.
+    let vmin = audible_vmin(vmin, vmax, db_of).unwrap_or(vmin);
+    let raw = floor_step(target_mb, vmin, vmax, db_of);
+    selem.set_playback_volume_all(raw)?;
 
     let ch = first_playback_channel(&selem);
     let applied_db = selem
@@ -334,6 +384,42 @@ mod tests {
         assert_eq!(quietest_level(&[-45.0, -10.0], (-64.0, 0.0)), Some(-45.0));
         assert_eq!(quietest_level(&[-80.0, -10.0], (-64.0, 0.0)), Some(-64.0));
         assert_eq!(quietest_level(&[], (-64.0, 0.0)), None);
+    }
+
+    /// A `-60..=0` dB control in 0.5 dB steps (raw 0..=120): every target
+    /// lands on the loudest step at or below it, never the nearest one
+    /// above (-0.2 dB stays below 0 dB).
+    #[test]
+    fn a_write_rounds_down_to_a_card_step() {
+        let db_of = |raw: i64| Some(raw * 50 - 6000);
+        for (target_mb, raw) in [
+            (0, 120),
+            (-20, 119),
+            (-30, 119),
+            (-50, 119),
+            (-74, 118),
+            (-2010, 79),
+            (-5960, 0),
+            (-6000, 0),
+            (-9000, 0),
+        ] {
+            assert_eq!(floor_step(target_mb, 0, 120, db_of), raw, "{target_mb}");
+        }
+        // A mute step at the bottom is left out of the range: the floor is
+        // the lowest audible step, and a target under it stays there (the
+        // rest goes digital), never on the mute step.
+        let muting = |raw: i64| Some(if raw == 0 { MUTE_MB } else { raw * 100 - 5100 });
+        assert_eq!(audible_vmin(0, 51, muting), Some(1));
+        assert_eq!(floor_step(-5050, 1, 51, muting), 1);
+        assert_eq!(floor_step(-5000, 1, 51, muting), 1);
+        assert_eq!(floor_step(-4900, 1, 51, muting), 2);
+        assert_eq!(audible_vmin(0, 120, db_of), Some(0));
+        // Unreadable steps count as above the target.
+        assert_eq!(
+            floor_step(-100, 0, 10, |raw| (raw < 5).then_some(raw * 100 - 1000)),
+            4
+        );
+        assert_eq!(floor_step(-100, 0, 10, |_| None), 0);
     }
 
     fn elem(

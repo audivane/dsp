@@ -6,11 +6,11 @@
     <title>Audivane DSP</title>
     <script>
       (function () {
-        var skin = "system";
+        var skin = "graphite";
         try { skin = localStorage.getItem("avdsp-skin") || skin; } catch (e) {}
         var dark = false;
         try { dark = window.matchMedia("(prefers-color-scheme: dark)").matches; } catch (e) {}
-        document.documentElement.setAttribute("data-skin", skin === "system" ? (dark ? "midnight" : "light") : skin);
+        document.documentElement.setAttribute("data-skin", skin === "system" ? (dark ? "graphite" : "light") : skin);
       })();
     </script>
   </head>

@@ -5,8 +5,8 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { KeysState, MainViewMemory, OsdPayload, ShellEvent, ShellView, UiSettings, WindowLabel } from "./shell";
-import { DaemonError, ErrorCode, type IrInfo, type Transport, type TransportHandlers } from "./transport";
-import type { DaemonEvent, ResponseWindowRequest, UpsamplerConfig, UpsamplerResponse } from "./types";
+import { type AppImageSetup, type AppUpdateState, DaemonError, ErrorCode, type IrInfo, type Transport, type TransportHandlers } from "./transport";
+import type { DaemonEvent, EngineConfig, ResponseWindowRequest, UpsamplerConfig, UpsamplerResponse } from "./types";
 
 /** Messages on the `daemon_subscribe` channel (see `Hub` in src-tauri/src/app.rs). */
 type UiMessage =
@@ -28,6 +28,14 @@ export function isTauri(): boolean {
 export class TauriTransport implements Transport {
   readonly kind = "tauri" as const;
   private analysisSeq = 0;
+
+  async afterUpsamplerBuild(): Promise<EngineConfig> {
+    try {
+      return await invoke<EngineConfig>("daemon_call", { request: { method: "get_config", lane: "upsampler" } });
+    } catch (e) {
+      throw toError(e);
+    }
+  }
 
   async call<T>(method: string, params?: unknown): Promise<T> {
     const request: Record<string, unknown> = { method };
@@ -125,9 +133,25 @@ export class TauriTransport implements Transport {
     return invoke<string>("app_version").catch(() => null);
   }
 
+  async appUpdatePending(): Promise<AppUpdateState | null> {
+    return invoke<AppUpdateState | null>("app_update_pending").catch(() => null);
+  }
+
   async restartApp(): Promise<void> {
     try {
       await invoke("restart_app");
+    } catch (e) {
+      throw toError(e);
+    }
+  }
+
+  async appImageSetup(): Promise<AppImageSetup | null> {
+    return invoke<AppImageSetup | null>("appimage_setup").catch(() => null);
+  }
+
+  async installAppImage(loginStart: boolean): Promise<void> {
+    try {
+      await invoke("appimage_install", { loginStart });
     } catch (e) {
       throw toError(e);
     }
@@ -140,6 +164,17 @@ export class TauriTransport implements Transport {
       multiple: false,
       directory: false,
       filters: [{ name: "WAV impulse response", extensions: ["wav", "WAV"] }],
+    });
+    return typeof picked === "string" ? picked : null;
+  }
+
+  async pickCalibrationBundle(): Promise<string | null> {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const picked = await open({
+      title: "Load room calibration",
+      multiple: false,
+      directory: false,
+      filters: [{ name: "Calibration bundle", extensions: ["json", "JSON"] }],
     });
     return typeof picked === "string" ? picked : null;
   }
@@ -220,6 +255,8 @@ export class TauriTransport implements Transport {
     on<KeysState>("keys-state", (keys) => ({ kind: "keys-state", keys }));
     on<null>("popup-shown", () => ({ kind: "popup-shown" }));
     on<null>("main-closing", () => ({ kind: "main-closing" }));
+    on<null>("update-pending", () => ({ kind: "update-pending", state: "failed" }));
+    on<null>("update-ready", () => ({ kind: "update-pending", state: "ready" }));
     on<OsdPayload>("osd", (payload) => ({ kind: "osd", payload }));
     return () => {
       live = false;

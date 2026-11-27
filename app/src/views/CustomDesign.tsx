@@ -4,8 +4,8 @@
 // live `check_design` result shows each field's error next to it and the
 // per-rate plan (taps, memory, CPU) under the controls.
 
-import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
-import type { DesignCheck, FieldError, FilterDesign, FilterPreset, Length, PhaseMethod, RateTarget, Sampling, UpsamplerResponse, Window } from "../api/types";
+import { Fragment, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import type { DesignCheck, FieldError, FilterDesign, FilterPreset, Length, OptimalMethod, PhaseMethod, RateTarget, Sampling, UpsamplerResponse, Window } from "../api/types";
 import { NumField } from "../components/NumField";
 import { Seg } from "../components/Seg";
 import { WHEEL_HINT, WheelAccumulator, attachSliderWheelGate, wheelDirection } from "../components/sliderWheel";
@@ -14,9 +14,17 @@ import { whyFor } from "../components/Why";
 import { PRESETS, presetEntry } from "../lib/filterPresets";
 import { clamp, fmtInt, fmtMs, fmtRate, fmtTaps } from "../lib/format";
 import {
+  bandPassbandEnd,
+  bandPinMisfit,
+  bandRate,
   CASCADE_LABEL,
   DEFAULT_BETA,
   DEFAULT_GAUSSIAN_DB,
+  DEFAULT_NW,
+  NW_RANGE,
+  OPTIMAL_LABEL,
+  OPTIMAL_MAX_DB,
+  OPTIMAL_MAX_TAPS,
   FLATTOP_LABEL,
   INTERP_LABEL,
   KIND_LABEL,
@@ -34,12 +42,15 @@ import {
   lowLatencyDesign,
   musicDesign,
   planLatencyMs,
+  fallbackNote,
   planRows,
   sameDesign,
   setCutoffMode,
   setKind,
   setLengthRule,
   setMix,
+  setOptimalLengthRule,
+  setOptimalMethod,
   setPath,
   setPhaseMethod,
   setPhaseType,
@@ -57,6 +68,8 @@ import {
   type KernelDesign,
   type KindMemory,
   type LengthRule,
+  type OptimalDesign,
+  type OptimalLengthRule,
   type SincDesign,
   type WindowType,
 } from "../lib/filterDesign";
@@ -157,6 +170,15 @@ export function useDesignCheck(design: FilterDesign | null, target: RateTarget, 
   const seq = useRef(0);
   const now = useRef({ design, target });
   now.current = { design, target };
+  // A check that failed (it timed out behind a long build, say) is made
+  // again once the build is done.
+  const builds = useApp((s) => s.upsBuilds);
+  const [retry, setRetry] = useState(0);
+  const failedNow = state.failed !== null;
+  useEffect(() => {
+    if (failedNow) setRetry((n) => n + 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [builds]);
   useEffect(() => {
     if (!key) return;
     const n = ++seq.current;
@@ -169,7 +191,7 @@ export function useDesignCheck(design: FilterDesign | null, target: RateTarget, 
         .catch((e: unknown) => n === seq.current && setState({ key, check: null, failed: errorText(e) }));
     }, 150);
     return () => clearTimeout(timer);
-  }, [key]);
+  }, [key, retry]);
   if (!key) return { check: null, pending: false, failed: null };
   return { check: state.check, pending: state.key !== key, failed: state.key === key ? state.failed : null };
 }
@@ -207,6 +229,7 @@ export function CustomDesignControls(props: CustomProps) {
   return (
     <>
       <StartFrom onEdit={onEdit} off={off} />
+      <DesignAdvice check={props.check} onEdit={onEdit} off={off} />
       {/* The design rows, with the cost table beside them on a wide panel (below on a narrow one). */}
       <div className="ups-design">
         <div className="ups-design-grid">
@@ -220,6 +243,7 @@ export function CustomDesignControls(props: CustomProps) {
                 options={[
                   ["windowed_sinc", KIND_LABEL.windowed_sinc, "A sinc kernel shaped by a window: you set the window, length, cutoff and phase"],
                   ["lanczos", KIND_LABEL.lanczos, "A sinc shaped by a wider sinc over a whole number of lobes: short and soft, set by the lobe count"],
+                  ["optimal", KIND_LABEL.optimal, "A low-pass designed directly for its band, no window: equiripple (the smallest largest error) or least squares. For short filters"],
                   ["cascade", KIND_LABEL.cascade, "Fixed ×2 and ×3 stages in a row. Even integer ratios made of 2 and 3 only (×2, ×4, ×6, ×8…)"],
                   ["interpolator", KIND_LABEL.interpolator, "A short fixed interpolator: very light on CPU, soft top octave. Integer ratios only"],
                   ["block_fft", KIND_LABEL.block_fft, "Spectral zero-padding of overlapping blocks: a brick-wall response. Power-of-two ratios only"],
@@ -227,6 +251,7 @@ export function CustomDesignControls(props: CustomProps) {
               />
             </Row>
             {d.kind === "windowed_sinc" && <SincControls {...props} design={d} lengths={lengths.current} groups={groups} />}
+            {d.kind === "optimal" && <OptimalControls design={d} onEdit={onEdit} off={off} groups={groups} />}
             {d.kind === "lanczos" && (
               <>
                 <RowPair>
@@ -274,6 +299,7 @@ export function CustomDesignControls(props: CustomProps) {
                   disabled={off}
                   onChange={(method) => onEdit({ ...d, method })}
                   options={[
+                    ["nos", INTERP_LABEL.nos, "Zero-order sample hold with no reconstruction filter: half-sample delay, sinc roll-off and full imaging"],
                     ["cosine", INTERP_LABEL.cosine, "Cosine interpolation between samples: the lightest, rolls off the top octave"],
                     ["catmull_rom", INTERP_LABEL.catmull_rom, "A cubic Catmull-Rom spline: light, a little sharper than cosine"],
                     ["table_sinc", INTERP_LABEL.table_sinc, "A table-driven sinc: much sharper, 127 multiply-adds per output sample"],
@@ -288,6 +314,51 @@ export function CustomDesignControls(props: CustomProps) {
       </div>
       <FieldErrors errors={general} labelled />
     </>
+  );
+}
+
+// ------------------------------------------------------------ advice
+
+/**
+ * A design that does not build at some of the rates it plays: applied
+ * where it builds (the others play Recommended), or refused when it builds
+ * nowhere. The plain words, one-click fixes, and the engine's own words per
+ * rate behind "Details".
+ */
+function DesignAdvice({ check, onEdit, off }: { check: CheckState; onEdit: Edit; off: boolean }) {
+  const advice = check.pending ? null : check.check?.advice;
+  if (!advice || off) return null;
+  const note = fallbackNote(check.check);
+  return (
+    <div className={"notice ups-advice" + (advice.applied ? "" : " warn")} role="status">
+      {note && <strong className="ups-advice-head">{note}</strong>}
+      {/* Refused: the message is the marked field's error already. */}
+      {advice.applied && <span>{advice.message}</span>}
+      {advice.fixes.length > 0 && (
+        <span className="ups-advice-fixes">
+          {advice.fixes.map((f) => (
+            <button key={f.label} type="button" className="btn small" title="Make this change: the design then builds at every rate it plays" onClick={() => onEdit(f.design, `${f.label}: done`)}>
+              {f.label}
+            </button>
+          ))}
+        </span>
+      )}
+      {advice.details.length > 0 && (
+        <details className="ups-advice-details">
+          <summary>Details</summary>
+          <ul>
+            {advice.details.map((d) => (
+              <li key={`${d.source_rate}-${d.ratio.up}-${d.ratio.down}`}>
+                <span className="ups-advice-at">
+                  {fmtRate(d.source_rate)} {d.ratio.down === 1 ? `×${d.ratio.up}` : `${d.ratio.up}/${d.ratio.down}`}
+                </span>{" "}
+                {d.message}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </div>
   );
 }
 
@@ -382,9 +453,10 @@ const WINDOW_TIPS: Record<WindowType, string> = {
   nuttall: "Nuttall: a four-term cosine window, about −98 dB sidelobes",
   hann: "Hann: a raised cosine, gentle and short; about −31 dB sidelobes",
   tukey: "Tukey: flat in the middle, tapered at the ends. Linear phase and a manual length and cutoff only",
+  dpss: "DPSS (Slepian): the most energy near DC of any window of its length; close to Kaiser, about 1 to 2 dB deeper at the same length. Set by NW, the time-bandwidth product",
 };
 
-function SincControls({ design: d, onEdit, off, lengths, groups, check, readoutRate, measured }: CustomProps & { design: SincDesign; lengths: Partial<Record<LengthRule, Length>>; groups: Partial<Record<ErrorGroup, FieldError[]>> }) {
+function SincControls({ design: d, onEdit, off, lengths, groups, check, readoutRate, measured, target }: CustomProps & { design: SincDesign; lengths: Partial<Record<LengthRule, Length>>; groups: Partial<Record<ErrorGroup, FieldError[]>> }) {
   const tukey = d.window.type === "tukey";
   const searched = d.length.rule === "band" || d.length.rule === "auto";
   const tukeyWhy = tukey ? "The Tukey window has no calibrated stopband: use a manual length." : null;
@@ -443,7 +515,7 @@ function SincControls({ design: d, onEdit, off, lengths, groups, check, readoutR
         <PhaseRow design={d} onEdit={onEdit} off={off} />
       </RowPair>
       <FieldErrors errors={groups.phase} />
-      {d.cutoff.mode === "band" && <BandRow design={d} onEdit={onEdit} off={off} />}
+      {d.cutoff.mode === "band" && <BandRow design={d} onEdit={onEdit} off={off} readoutRate={readoutRate} bandAt={bandRate(readoutRate, plan?.ratio ?? resolveRateRatio(target, readoutRate))} />}
       {searched && d.cutoff.mode !== "band" && <span className="hint">A band or automatic length needs the Band cutoff.</span>}
       <FieldErrors errors={groups.cutoff} />
     </>
@@ -534,6 +606,25 @@ function WindowParams({ design: d, onEdit, off, measured }: { design: SincDesign
           format={(v) => `−${v.toFixed(1)}`}
           title="The level of every sidelobe below the main lobe, 40 to 220 dB (zero-reflection phase: up to 190). Deeper: a wider main lobe"
           onCommit={(v) => put({ ...w, sidelobe_ratio: sidelobeRatio(clamp(Math.abs(v), 40, 220)) })}
+        />
+      );
+    case "dpss":
+      if (!given) {
+        return (
+          <span className="ups-derived" title={`With the Band cutoff the engine derives NW from ${from}. Pick Fraction or Stop at Nyquist to set NW yourself.`}>
+            NW from {from}
+          </span>
+        );
+      }
+      return (
+        <NumField
+          className="ups-num ups-num-short"
+          label="NW"
+          value={w.nw ?? DEFAULT_NW}
+          disabled={off}
+          format={(v) => String(Number(v.toFixed(3)))}
+          title={`Time-bandwidth product, ${NW_RANGE[0]} to ${NW_RANGE[1]}: the main lobe is about NW bins wide; now about a ${Math.round(kaiserAttenuationDb(Math.PI * (w.nw ?? DEFAULT_NW)) - 12)} dB stopband (Kaiser β ≈ π·NW). Higher: deeper and wider. With the Band cutoff the engine derives it instead`}
+          onCommit={(v) => put({ ...w, nw: clamp(Math.round(v * 1000) / 1000, NW_RANGE[0], NW_RANGE[1]) })}
         />
       );
     case "tukey":
@@ -694,23 +785,84 @@ function CutoffParams({ design: d, onEdit, off, readoutRate }: { design: SincDes
   );
 }
 
-function BandRow({ design: d, onEdit, off }: { design: SincDesign; onEdit: Edit; off: boolean }) {
+/** "20000", "20k", "20 kHz", "20000 Hz" as Hz. */
+function parseHz(text: string): number | null {
+  const m = /^\s*([0-9]*\.?[0-9]+)\s*(k|khz|hz)?\s*$/i.exec(text);
+  if (!m) return null;
+  const v = Number(m[1]) * (m[2] && m[2].toLowerCase().startsWith("k") ? 1000 : 1);
+  return Number.isFinite(v) && v > 0 ? v : null;
+}
+
+/**
+ * `bandAt`: the rate whose Nyquist the band's fractions are of at the
+ * previewed source rate (the output rate when decimating).
+ */
+function BandRow({ design: d, onEdit, off, readoutRate, bandAt }: { design: SincDesign; onEdit: Edit; off: boolean; readoutRate: number; bandAt: number }) {
   const c = d.cutoff;
   if (c.mode !== "band") return null;
   const put = (p: Partial<typeof c>) => onEdit({ ...d, cutoff: { ...c, ...p } });
   const auto = d.length.rule === "auto";
+  // The passband end is a fraction of the Nyquist (it scales with the
+  // source rate) or a frequency (`passband_end_hz`: the same at every rate;
+  // the fraction stays as the fallback where the frequency does not fit).
+  const hz = c.passband_end_hz ?? null;
+  const nyq = bandAt / 2;
+  const misfit = bandPinMisfit(c, bandAt) !== null;
+  const fallback = `${c.passband_end.toFixed(3)} × Nyquist`;
+  const setUnit = (u: "nyq" | "hz") => {
+    if (u === "hz") put({ passband_end_hz: Math.round(c.passband_end * nyq) });
+    else put({ passband_end_hz: undefined, passband_end: clamp(Math.round(bandPassbandEnd(c, bandAt) * 1e4) / 1e4, 0.5, 1) });
+  };
   return (
-    <Row label="Band edges" title="Fractions of the Nyquist (1.0 = 22.05 kHz at 44.1 kHz)">
-      <NumField
-        className="ups-num"
-        label="Pass to"
-        unit="× Nyq"
-        value={c.passband_end}
+    <Row
+      label="Band edges"
+      title={
+        hz === null
+          ? "Fractions of the Nyquist (1.0 = 22.05 kHz at 44.1 kHz)"
+          : `The passband ends at ${fmtInt(hz)} Hz at every source rate; the stopband start is a fraction of the Nyquist. Where ${fmtInt(hz)} Hz does not fit below the stopband (a low source rate), the passband ends at ${fallback} instead`
+      }
+    >
+      {hz === null ? (
+        <NumField
+          className="ups-num"
+          label="Pass to"
+          unit="× Nyq"
+          value={c.passband_end}
+          disabled={off}
+          format={(v) => v.toFixed(3)}
+          title="End of the passband (0.5 to 1): up to here the response stays flat within the accuracy target"
+          onCommit={(v) => put({ passband_end: clamp(v, 0.5, 1) })}
+        />
+      ) : (
+        <NumField
+          className="ups-num"
+          label="Pass to"
+          unit="Hz"
+          value={hz}
+          disabled={off}
+          format={(v) => fmtInt(v)}
+          parse={parseHz}
+          title={`End of the passband in Hz, the same at every source rate (type 20000 or 20k). Where it does not fit below the stopband, ${fallback} stands in`}
+          onCommit={(v) => put({ passband_end_hz: Math.round(clamp(v, 1000, 384000)) })}
+        />
+      )}
+      <Seg<"nyq" | "hz">
+        label="Passband end unit"
+        value={hz === null ? "nyq" : "hz"}
         disabled={off}
-        format={(v) => v.toFixed(3)}
-        title="End of the passband (0.5 to 1): up to here the response stays flat within the accuracy target"
-        onCommit={(v) => put({ passband_end: clamp(v, 0.5, 1) })}
+        onChange={setUnit}
+        options={[
+          ["nyq", "× Nyq", "A fraction of the source Nyquist: the band scales with the source rate"],
+          ["hz", "Hz", "A frequency: the passband ends there at every source rate, so higher rates get a wider transition and a shorter filter"],
+        ]}
       />
+      <span className="hint" title={`At the ${fmtRate(readoutRate)} source rate the page previews`}>
+        {hz === null
+          ? `= ${fmtInt(c.passband_end * nyq)} Hz`
+          : misfit
+            ? `does not fit at ${fmtRate(readoutRate)}: ${fallback} (${fmtInt(c.passband_end * nyq)} Hz)`
+            : `= ${(hz / nyq).toFixed(3)} × Nyq`}
+      </span>
       <NumField
         className="ups-num"
         label="Stop from"
@@ -735,6 +887,73 @@ function BandRow({ design: d, onEdit, off }: { design: SincDesign; onEdit: Edit;
       )}
       {auto && <span className="hint">Depth: the accuracy target</span>}
     </Row>
+  );
+}
+
+// ------------------------------------------------------------ optimal
+
+const OPTIMAL_TIPS: Record<OptimalMethod, string> = {
+  equiripple: `Parks-McClellan: every error ripple at one level, the smallest largest error for the length. Up to ${fmtInt(OPTIMAL_MAX_TAPS.equiripple)} taps on the grid and ${OPTIMAL_MAX_DB.equiripple} dB`,
+  least_squares: `The smallest summed squared error: the error is largest at the band edges and falls away from them. Up to ${fmtInt(OPTIMAL_MAX_TAPS.least_squares)} taps and ${OPTIMAL_MAX_DB.least_squares} dB`,
+};
+
+function OptimalControls({ design: d, onEdit, off, groups }: { design: OptimalDesign; onEdit: Edit; off: boolean; groups: Partial<Record<ErrorGroup, FieldError[]>> }) {
+  const l = d.length;
+  const max = OPTIMAL_MAX_TAPS[d.method];
+  const maxDb = OPTIMAL_MAX_DB[d.method];
+  const put = (length: Length) => onEdit({ ...d, length });
+  return (
+    <>
+      <Row label="Method" title="How the filter is designed for its band">
+        <Seg<OptimalMethod> label="Design method" value={d.method} disabled={off} onChange={(m) => onEdit(setOptimalMethod(d, m))} options={(Object.keys(OPTIMAL_LABEL) as OptimalMethod[]).map((m) => [m, OPTIMAL_LABEL[m], OPTIMAL_TIPS[m]])} />
+      </Row>
+      <Row label="Length" title="How long the kernel is: longer is steeper, costs more CPU and (linear phase) more delay. An even length is designed one tap shorter">
+        <Seg<OptimalLengthRule>
+          label="Length rule"
+          value={l.rule === "fixed" || l.rule === "per_input" || l.rule === "auto" ? l.rule : null}
+          disabled={off}
+          onChange={(rule) => onEdit(setOptimalLengthRule(d, rule))}
+          options={[
+            ["fixed", "Taps", `A number of taps on the grid (output rate at an integer ratio), up to ${fmtInt(max)}`],
+            ["per_input", "Per input sample", "Taps per input sample (× the ratio on the grid): the filter lasts the same time at every ratio"],
+            ["auto", "Automatic", "The engine finds the shortest filter whose passband error and images stay under a level between the band edges"],
+          ]}
+        />
+        {l.rule === "fixed" && (
+          <NumField className="ups-num" label="Taps" value={l.taps} disabled={off} format={(v) => fmtInt(v)} parse={parseTaps} title={`Kernel taps on the grid, 3 to ${fmtInt(max)} (${OPTIMAL_LABEL[d.method]})`} onCommit={(v) => put({ ...l, taps: Math.round(clamp(v, 3, max)) })} />
+        )}
+        {l.rule === "per_input" && typeof l.taps === "number" && (
+          <NumField className="ups-num" label="Taps" unit="per input" value={l.taps} disabled={off} format={(v) => fmtInt(v)} title={`Taps per input sample (the kernel is this times the ratio, at most ${fmtInt(max)} on the grid)`} onCommit={(v) => put({ ...l, taps: Math.round(clamp(v, 1, 65535)) })} />
+        )}
+        {l.rule === "auto" && (
+          <>
+            <Seg<"match" | "db">
+              label="Accuracy target"
+              value={l.budget === "match_output" ? "match" : "db"}
+              disabled={off}
+              onChange={(m) => put({ ...l, budget: m === "match" ? "match_output" : { db: Math.min(120, maxDb) } })}
+              options={[
+                ["match", "Match output", `Aim at the output's own resolution (about 141 dB for 24-bit with dither), at most ${maxDb} dB: as deep as ${OPTIMAL_LABEL[d.method].toLowerCase()} goes`],
+                ["db", "Set level", `How far below full scale the passband error and the images must stay (55 to ${maxDb} dB)`],
+              ]}
+            />
+            {l.budget !== "match_output" && (
+              <NumField className="ups-num" label="Level" unit="dB" value={l.budget.db} disabled={off} format={(v) => v.toFixed(0)} title={`Passband error and image level, dB below full scale (55 to ${maxDb})`} onCommit={(v) => put({ ...l, budget: { db: Math.round(clamp(v, 55, maxDb)) } })} />
+            )}
+          </>
+        )}
+      </Row>
+      <FieldErrors errors={groups.length} />
+      <RowPair>
+        <Row label="Band edges" title="Fractions of the Nyquist (1.0 = 22.05 kHz at 44.1 kHz); the transition between them is not constrained">
+          <NumField className="ups-num" label="Pass to" unit="× Nyq" value={d.passband_end} disabled={off} format={(v) => v.toFixed(3)} title="End of the passband (0.5 to 1)" onCommit={(v) => onEdit({ ...d, passband_end: clamp(v, 0.5, 1) })} />
+          <NumField className="ups-num" label="Stop from" unit="× Nyq" value={d.stopband_start} disabled={off} format={(v) => v.toFixed(3)} title="Start of the stopband (above the passband end, up to 1.5). 1.0 puts it at the Nyquist (no imaging)" onCommit={(v) => onEdit({ ...d, stopband_start: clamp(v, 0.5, 1.5) })} />
+        </Row>
+        <PhaseRow design={d} onEdit={onEdit} off={off} />
+      </RowPair>
+      <FieldErrors errors={groups.cutoff} />
+      <FieldErrors errors={groups.phase} />
+    </>
   );
 }
 
@@ -808,12 +1027,18 @@ function BlockRow({ design: d, onEdit, off, errors }: { design: Extract<FilterDe
 
 function PlanReadout({ design: d, check, readoutRate, measured, target, off }: CustomProps) {
   const supported = useApp((s) => s.caps.designs) !== false;
+  const cpuShare = useApp((s) => s.status?.limits?.cpu_share);
+  const quantum = useApp((s) => s.config?.quantum);
   if (off) return null;
   if (!supported) return <div className="ups-adv-readout">{ENGINE_UPDATE_TIP.replace("this yet", "the design check yet")}</div>;
-  const rows = planRows(check.check?.plans ?? []);
+  const notes = check.check?.notes ?? [];
+  const rows = planRows(check.check?.plans ?? [], cpuShare, notes);
+  // Rates where a passband end in Hz does not fit and the fraction stands in.
+  const pins = notes.filter((n) => !n.plays);
+  const pinAt = (rate: number) => pins.find((n) => n.source_rate === rate);
   const here = check.check?.plans.find((p) => p.source_rate === readoutRate);
   const measuredHere = measured && measured.source_rate === readoutRate ? measured : null;
-  const lat = measuredHere ? (measuredHere.latency_samples / measuredHere.output_rate) * 1000 : here ? planLatencyMs(d, here.plan, readoutRate) : null;
+  const lat = measuredHere ? (measuredHere.latency_samples / measuredHere.output_rate) * 1000 : here ? planLatencyMs(d, here.plan, readoutRate, quantum) : null;
   // The engine plans each rate where it would open this device.
   const ratio = here?.ratio ?? resolveRateRatio(target, readoutRate);
   return (
@@ -825,8 +1050,14 @@ function PlanReadout({ design: d, check, readoutRate, measured, target, off }: C
         {check.pending && <span className="hint">Checking…</span>}
         {check.failed && <span className="hint">The check failed: {check.failed}</span>}
         {ratio.up !== ratio.down && (
-          <span className="hint" title={measuredHere ? "Measured by the engine for this design" : "Half the kernel (linear phase); the measurement gives the other phases"}>
-            Latency at {fmtRate(readoutRate)}: {lat === null ? "measured once applied" : `${measuredHere ? "" : "≈ "}${fmtMs(lat)}`}
+          <span className="hint" title={
+              measuredHere
+                ? "Measured by the engine for this design"
+                : quantum === undefined
+                  ? "Half the kernel only (linear phase), without the engine's processing block; the measurement gives the whole delay and the other phases"
+                  : "Half the kernel (linear phase) plus the engine's processing block, as the live engine counts it; the measurement gives the other phases"
+            }>
+            Latency at {fmtRate(readoutRate)}: {lat === null ? "measured once applied" : `${measuredHere ? "" : "≈ "}${fmtMs(lat)}${!measuredHere && quantum === undefined ? " (kernel only)" : ""}`}
           </span>
         )}
       </div>
@@ -849,18 +1080,33 @@ function PlanReadout({ design: d, check, readoutRate, measured, target, off }: C
           </thead>
           <tbody>
             {rows.map((r) => (
-              <tr key={r.rate} className={r.rate === readoutRate ? "here" : undefined}>
-                <td>{r.rateText}</td>
-                <td>{r.ratioText}</td>
-                <td title={r.tapsTip}>{r.tapsText}</td>
-                <td title={r.memoryTip}>{r.memoryText}</td>
-                <td>{r.cpuText}</td>
-              </tr>
+              <Fragment key={r.rate}>
+                <tr className={[r.rate === readoutRate ? "here" : "", r.over ? "over" : "", r.fallback ? "fallback" : ""].filter(Boolean).join(" ") || undefined}>
+                  <td title={pinAt(r.rate)?.message}>
+                    {r.rateText}
+                    {pinAt(r.rate) && " *"}
+                  </td>
+                  <td>{r.ratioText}</td>
+                  <td title={r.fallback ? `Recommended's: ${r.tapsTip}` : r.tapsTip}>{r.tapsText}</td>
+                  <td title={r.memoryTip}>{r.memoryText}</td>
+                  <td title={r.cpuTip}>{r.cpuText}</td>
+                </tr>
+                {r.fallback && (
+                  <tr className="ups-plan-fallback">
+                    <td colSpan={5}>{r.fallback}</td>
+                  </tr>
+                )}
+              </Fragment>
             ))}
           </tbody>
         </table>
       ) : (
         check.check && check.check.errors.length === 0 && <span className="hint">No allowed source rate is resampled with this rate setting.</span>
+      )}
+      {pins.length > 0 && d.kind === "windowed_sinc" && d.cutoff.mode === "band" && d.cutoff.passband_end_hz != null && (
+        <span className="hint" title={pins.map((n) => n.message).join("\n")}>
+          * {fmtInt(d.cutoff.passband_end_hz)} Hz does not fit the band at {pins.map((n) => fmtRate(n.source_rate)).join(", ")}: the passband ends at {d.cutoff.passband_end.toFixed(3)} × Nyquist there.
+        </span>
       )}
     </div>
   );
@@ -881,10 +1127,12 @@ export function AdvancedDesign({ design: d, onEdit, off, errors, measured }: { d
   const k = d;
   const sinc = k.kind === "windowed_sinc" ? k : null;
   const w = sinc?.window ?? null;
-  const samplings: Sampling[] = w?.type === "gaussian" && "alpha" in w ? ["symmetric", "integer_centre"] : ["periodic", "symmetric"];
+  const samplings: Sampling[] = w?.type === "gaussian" && "alpha" in w ? ["symmetric", "integer_centre"] : w?.type === "dpss" ? ["symmetric"] : ["periodic", "symmetric"];
   const keepWhy =
     k.kind === "lanczos"
       ? "A Lanczos kernel's zeros are off the input grid."
+      : k.kind === "optimal"
+        ? "An optimal low-pass is not a Nyquist filter: its zeros are off the input grid."
       : k.phase.type !== "linear"
         ? "Needs linear phase."
         : sinc && (sinc.cutoff.mode !== "fraction" || sinc.cutoff.value !== 1)

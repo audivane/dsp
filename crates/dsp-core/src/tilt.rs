@@ -147,6 +147,22 @@ impl TiltState {
         self.shelves.fill(ShelfState::default());
         self.corners.fill(BiquadState::default());
     }
+
+    /// Whether [`Self::copy_from`] can take `other` (the same sections).
+    pub(crate) fn same_shape(&self, other: &Self) -> bool {
+        self.shelves.len() == other.shelves.len() && self.corners.len() == other.corners.len()
+    }
+
+    /// Take `other`'s state for an input `k` times as large (the sections
+    /// are linear; [`Self::same_shape`]). Never allocates.
+    pub(crate) fn copy_scaled(&mut self, other: &Self, k: f64) {
+        for (d, s) in self.shelves.iter_mut().zip(&other.shelves) {
+            d.z1 = s.z1 * k;
+        }
+        for (d, s) in self.corners.iter_mut().zip(&other.corners) {
+            *d = s.scaled(k);
+        }
+    }
 }
 
 impl TiltFilter {
@@ -159,6 +175,23 @@ impl TiltFilter {
             sample_rate,
             clamped_end_hz: None,
         }
+    }
+
+    /// The same sections and gain, bit for bit (a state made by one is the
+    /// other's).
+    pub(crate) fn same_filter(&self, other: &Self) -> bool {
+        self.gain == other.gain && self.shelves == other.shelves && self.corners == other.corners
+    }
+
+    /// The slowest section's time constant, frames (see
+    /// [`Coeffs::decay_frames`]).
+    pub(crate) fn decay_frames(&self) -> f64 {
+        let shelves = self
+            .shelves
+            .iter()
+            .map(|c| crate::biquad::pole_decay(c.a1.abs()));
+        let corners = self.corners.iter().map(Coeffs::decay_frames);
+        shelves.chain(corners).fold(0.0, f64::max)
     }
 
     pub fn is_identity(&self) -> bool {

@@ -146,6 +146,7 @@ impl Default for DriverConfig {
                 device: "hw:Loopback,0,0".to_string(),
                 rate: 192_000,
                 channels: 2,
+                channel_map: Vec::new(),
                 period_frames: 1024,
                 buffer_periods: 3,
                 preferred_format: None,

@@ -24,8 +24,13 @@ pub struct AlsaConfig {
     pub device: String,
     /// Target output sample rate in Hz (e.g. `192_000`).
     pub rate: u32,
-    /// Number of interleaved channels (default `2`).
+    /// Number of interleaved channels the caller writes (default `2`).
     pub channels: u32,
+    /// The device channel each written channel plays on, 0-based (empty:
+    /// the first ones, in order). The device opens at the smallest
+    /// channel count it supports that holds them; its other channels get
+    /// exact zeros ([`AlsaOutput::write_i32_interleaved`]).
+    pub channel_map: Vec<u32>,
     /// Desired period size in output frames.
     pub period_frames: u32,
     /// Desired buffer size as a multiple of `period_frames` (e.g. `3` or `4`).
@@ -46,6 +51,7 @@ impl Default for AlsaConfig {
             device: "hw:Loopback,0,0".to_string(),
             rate: 48_000,
             channels: 2,
+            channel_map: Vec::new(),
             period_frames: 1024,
             buffer_periods: 3,
             preferred_format: None,
@@ -55,12 +61,67 @@ impl Default for AlsaConfig {
     }
 }
 
+impl AlsaConfig {
+    /// The fewest device channels the open needs: [`Self::channels`], or
+    /// more for a [`Self::channel_map`] reaching past them.
+    pub fn min_device_channels(&self) -> u32 {
+        min_device_channels(self.channels, &self.channel_map)
+    }
+}
+
+/// The fewest device channels that hold `channels` written channels placed
+/// by `channel_map` (empty: the first ones).
+pub fn min_device_channels(channels: u32, channel_map: &[u32]) -> u32 {
+    channel_map
+        .iter()
+        .map(|&c| c.saturating_add(1))
+        .max()
+        .unwrap_or(0)
+        .max(channels)
+}
+
+/// Why `channel_map` cannot place `channels` written channels: a length
+/// other than `channels`, or a device channel used twice. `None` when it
+/// can (an empty map always can).
+pub fn channel_map_error(channels: u32, channel_map: &[u32]) -> Option<String> {
+    if channel_map.is_empty() {
+        return None;
+    }
+    if channel_map.len() != channels as usize {
+        return Some(format!(
+            "output channels {} name {} channels; the engine plays {channels}",
+            map_text(channel_map),
+            channel_map.len()
+        ));
+    }
+    for (i, c) in channel_map.iter().enumerate() {
+        if channel_map[..i].contains(c) {
+            return Some(format!(
+                "output channels {}: device channel {c} is used twice",
+                map_text(channel_map)
+            ));
+        }
+    }
+    None
+}
+
+fn map_text(channel_map: &[u32]) -> String {
+    let parts: Vec<String> = channel_map.iter().map(u32::to_string).collect();
+    format!("[{}]", parts.join(", "))
+}
+
 /// Hardware/software parameters actually negotiated with the ALSA driver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NegotiatedParams {
     pub format: SampleFormat,
     pub rate: u32,
+    /// Channels the caller writes per frame ([`AlsaConfig::channels`]).
     pub channels: u32,
+    /// Channels the device opened at: [`Self::channels`], or more when it
+    /// has no mode with that few or a channel map reaches past them.
+    pub device_channels: u32,
+    /// The most channels the device takes (0 when unknown).
+    pub device_channels_max: u32,
     pub period_frames: u32,
     pub buffer_frames: u32,
 }
@@ -102,8 +163,13 @@ impl OpenPcm {
         } else {
             formats.to_vec()
         };
-        let params = negotiate_params(&self.pcm, &self.device, config, &candidate_list)?;
-        AlsaOutput::from_pcm(self.pcm, &self.device, params)
+        // The narrowest channel count that holds the pair first; a wider
+        // one only when it cannot play (a stereo device plays as before).
+        let counts = open_counts(&self.pcm, &self.device, config)?;
+        let params = walk_counts(&counts, |c| {
+            negotiate_params(&self.pcm, &self.device, config, &candidate_list, c)
+        })?;
+        AlsaOutput::from_pcm(self.pcm, &self.device, params, &config.channel_map)
     }
 
     /// Configure at `source_rate * ratio` for the first ratio of `ladder`
@@ -162,8 +228,20 @@ impl OpenPcm {
             c
         };
 
-        if let Some(caps) = caps.filter(|c| !c.rates.is_empty()) {
-            let (ratio, format) = plan_open(caps, source_rate, &ladder, &candidate_list)?;
+        // Planned from the probe: the narrowest channel count that holds
+        // the pair and plays the source at some ratio of the ladder with a
+        // configured format, wider ones only when it cannot.
+        let planned = caps.and_then(|c| {
+            plan_modes(
+                c,
+                config.min_device_channels(),
+                source_rate,
+                &ladder,
+                &candidate_list,
+            )
+        });
+        if let Some(plan) = planned {
+            let (view, ratio, format) = plan?;
             let try_cfg = cfg_for(ratio);
             // The planned format first, then the other candidates the device
             // takes at this rate (in case the driver disagrees with the probe).
@@ -172,7 +250,7 @@ impl OpenPcm {
                 candidate_list
                     .iter()
                     .copied()
-                    .filter(|&f| f != format && caps.supports(try_cfg.rate, f)),
+                    .filter(|&f| f != format && view.supports(try_cfg.rate, f)),
             );
             if ratio != desired {
                 log::info!(
@@ -184,24 +262,40 @@ impl OpenPcm {
                     try_cfg.rate
                 );
             }
-            let params = negotiate_params(&self.pcm, &self.device, &try_cfg, &order)?;
-            let out = AlsaOutput::from_pcm(self.pcm, &self.device, params)?;
+            if channel_map_error(config.channels, &config.channel_map).is_some() {
+                // Refused with the reason (`open_counts` names it).
+                open_counts(&self.pcm, &self.device, config)?;
+            }
+            let params =
+                negotiate_params(&self.pcm, &self.device, &try_cfg, &order, view.channels)?;
+            let out = AlsaOutput::from_pcm(self.pcm, &self.device, params, &config.channel_map)?;
             return Ok((out, RatioOpen::at(ratio)));
         }
 
-        let (taken, refused, transient) = walk_ladder(&ladder, source_rate, |ratio| {
-            let try_cfg = cfg_for(ratio);
-            negotiate_params(&self.pcm, &self.device, &try_cfg, &candidate_list).inspect_err(|e| {
-                log::debug!(
-                    "ALSA '{}' rejected {} Hz: {e}; trying a smaller ratio",
-                    self.device,
-                    try_cfg.rate
-                );
-            })
-        });
+        // Blind: the whole ladder at the narrowest channel count first (a
+        // stereo device steps down its ratios as before), a wider count
+        // only when no ratio opens at the narrower one.
+        let counts = open_counts(&self.pcm, &self.device, config)?;
+        let (taken, refused, transient) = walk_counts_ladder(
+            &counts,
+            &ladder,
+            source_rate,
+            |channels, ratio| {
+                let try_cfg = cfg_for(ratio);
+                negotiate_params(&self.pcm, &self.device, &try_cfg, &candidate_list, channels)
+                    .inspect_err(|e| {
+                        log::debug!(
+                            "ALSA '{}' rejected {} Hz at {channels} channels: {e}; trying a smaller ratio",
+                            self.device,
+                            try_cfg.rate
+                        );
+                    })
+            },
+        );
         match taken {
             Ok((ratio, params)) => {
-                let out = AlsaOutput::from_pcm(self.pcm, &self.device, params)?;
+                let out =
+                    AlsaOutput::from_pcm(self.pcm, &self.device, params, &config.channel_map)?;
                 Ok((
                     out,
                     RatioOpen {
@@ -220,6 +314,76 @@ impl OpenPcm {
             })),
         }
     }
+}
+
+/// Plan an open from the probe: the narrowest mode of at least
+/// `min_channels` channels where [`plan_open`] finds a ratio of `ladder`
+/// and one of `formats`, wider ones only when it finds none; `Ok` holds
+/// that mode as a view (`channels`, `rates`). `None` when the probe has no
+/// usable mode for the pair (the open goes blind); `Err` the narrowest
+/// mode's refusal.
+pub fn plan_modes(
+    caps: &DeviceCapabilities,
+    min_channels: u32,
+    source_rate: u32,
+    ladder: &[RateRatio],
+    formats: &[SampleFormat],
+) -> Option<Result<(DeviceCapabilities, RateRatio, SampleFormat)>> {
+    let mut first = None;
+    for m in caps
+        .modes_for(min_channels)
+        .into_iter()
+        .filter(|m| !m.rates.is_empty())
+    {
+        let view = DeviceCapabilities {
+            channels: m.channels,
+            rates: m.rates,
+            ..caps.clone()
+        };
+        match plan_open(&view, source_rate, ladder, formats) {
+            Ok((ratio, format)) => return Some(Ok((view, ratio, format))),
+            Err(e) => {
+                first.get_or_insert(e);
+            }
+        }
+    }
+    first.map(Err)
+}
+
+/// [`walk_ladder`] at each of `counts` in turn: the next (wider) count
+/// only when every ladder entry at the narrower one was refused for good
+/// (no transient failure). The refused and transient entries are the ones
+/// at the count that opened (or the last one tried).
+#[allow(clippy::type_complexity)]
+fn walk_counts_ladder<T>(
+    counts: &[u32],
+    ladder: &[RateRatio],
+    source_rate: u32,
+    mut attempt: impl FnMut(u32, RateRatio) -> Result<T>,
+) -> (
+    std::result::Result<(RateRatio, T), Option<AlsaError>>,
+    Vec<RateRatio>,
+    Vec<RateRatio>,
+) {
+    let mut first_err: Option<AlsaError> = None;
+    let mut last = (Vec::new(), Vec::new());
+    for &c in counts {
+        let (taken, refused, transient) = walk_ladder(ladder, source_rate, |r| attempt(c, r));
+        match taken {
+            Ok(v) => return (Ok(v), refused, transient),
+            Err(e) => {
+                let stop = !transient.is_empty();
+                if first_err.is_none() {
+                    first_err = e;
+                }
+                last = (refused, transient);
+                if stop {
+                    break;
+                }
+            }
+        }
+    }
+    (Err(first_err), last.0, last.1)
 }
 
 /// Try the `ladder` entries in order with `attempt` until one opens. A
@@ -283,6 +447,9 @@ pub struct AlsaOutput {
     pcm: PCM,
     params: NegotiatedParams,
     scratch: Vec<u8>,
+    /// The device channel each written channel lands on; `None` when they
+    /// are the device's channels as they are (the plain pack).
+    map: Option<Vec<usize>>,
     xruns: u64,
     /// Set whenever `recover()` executes (EPIPE/ESTRPIPE) so the driver knows
     /// the PCM dropped back to `State::Prepared` and must prefill + `start()`
@@ -329,19 +496,29 @@ impl AlsaOutput {
         )
     }
 
-    fn from_pcm(pcm: PCM, device: &str, params: NegotiatedParams) -> Result<Self> {
+    fn from_pcm(
+        pcm: PCM,
+        device: &str,
+        params: NegotiatedParams,
+        channel_map: &[u32],
+    ) -> Result<Self> {
         // Pre-allocate packing buffer once so the audio path never allocates.
         let bytes_per_sample = bytes_per_sample(params.format);
         let max_bytes =
-            (params.buffer_frames as usize) * (params.channels as usize) * bytes_per_sample;
+            (params.buffer_frames as usize) * (params.device_channels as usize) * bytes_per_sample;
         let scratch = vec![0u8; max_bytes.max(4096)];
+        let map = output_map(params.channels, params.device_channels, channel_map);
 
         log::info!(
-            "Opened ALSA '{}' format={:?} rate={} ch={} period={} buffer={}",
+            "Opened ALSA '{}' format={:?} rate={} ch={}{} period={} buffer={}",
             device,
             params.format,
             params.rate,
             params.channels,
+            match &map {
+                Some(m) => format!(" (device {}, on {m:?})", params.device_channels),
+                None => String::new(),
+            },
             params.period_frames,
             params.buffer_frames
         );
@@ -350,6 +527,7 @@ impl AlsaOutput {
             pcm,
             params,
             scratch,
+            map,
             xruns: 0,
             needs_restart: false,
             recover_suspend: true,
@@ -469,6 +647,19 @@ impl AlsaOutput {
         }
     }
 
+    /// A DAC reading from one status call (allocation-free): the
+    /// timestamp (`htstamp`, ns), the delay (frames) and whether the stream
+    /// was running then. A stopped stream (after an xrun) can report a
+    /// timestamp with a delay of 0: not a position at the DAC.
+    pub fn status_reading(&self) -> Result<(u64, i64, bool)> {
+        let status = self.pcm.status()?;
+        let ts = status.get_htstamp();
+        let ns = (ts.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec as u64);
+        Ok((ns, status.get_delay(), status.get_state() == State::Running))
+    }
+
     /// Read the PCM status monotonic timestamp in nanoseconds (`htstamp`) and
     /// current delay in frames.
     pub fn status_timestamp_ns(&self) -> Result<(u64, i64)> {
@@ -523,7 +714,7 @@ impl AlsaOutput {
         }
 
         let bps = bytes_per_sample(self.params.format);
-        let frame_bytes = ch * bps;
+        let frame_bytes = self.params.device_channels as usize * bps;
         let max_chunk_frames = self.scratch.len() / frame_bytes;
         let mut written_frames = 0usize;
 
@@ -531,11 +722,17 @@ impl AlsaOutput {
             let chunk_frames = (total_frames - written_frames).min(max_chunk_frames);
             let start_sample = written_frames * ch;
             let end_sample = start_sample + chunk_frames * ch;
-            let n_bytes = pack_left_justified_i32(
-                self.params.format,
-                &samples[start_sample..end_sample],
-                &mut self.scratch,
-            );
+            let chunk = &samples[start_sample..end_sample];
+            let n_bytes = match &self.map {
+                None => pack_left_justified_i32(self.params.format, chunk, &mut self.scratch),
+                Some(map) => pack_mapped_i32(
+                    self.params.format,
+                    chunk,
+                    map,
+                    self.params.device_channels as usize,
+                    &mut self.scratch,
+                ),
+            };
 
             let res = {
                 let io = self.pcm.io_bytes();
@@ -629,9 +826,8 @@ impl AlsaOutput {
     /// Write `frames` of digital silence (zero bytes) to ALSA using the
     /// pre-allocated scratch buffer.
     pub fn write_silence(&mut self, frames: u32) -> Result<usize> {
-        let ch = self.params.channels as usize;
         let bps = bytes_per_sample(self.params.format);
-        let frame_bytes = ch * bps;
+        let frame_bytes = self.params.device_channels as usize * bps;
         let max_chunk_frames = self.scratch.len() / frame_bytes;
         let mut written = 0usize;
         let target = frames as usize;
@@ -702,6 +898,9 @@ trait HwSpace {
     fn begin(&mut self) -> std::result::Result<(), alsa::Error>;
     fn set_access(&mut self) -> std::result::Result<(), alsa::Error>;
     fn set_format(&mut self, format: SampleFormat) -> std::result::Result<(), alsa::Error>;
+    /// The channel counts of at least `min` the device takes with
+    /// interleaved access (any format or rate), ascending.
+    fn channel_counts(&mut self, min: u32) -> std::result::Result<Vec<u32>, alsa::Error>;
     fn set_channels(&mut self, channels: u32) -> std::result::Result<(), alsa::Error>;
     /// Sets the rate (nearest) and returns the rate the space holds.
     fn set_rate(&mut self, rate: u32) -> std::result::Result<u32, alsa::Error>;
@@ -739,6 +938,11 @@ impl HwSpace for PcmSpace<'_> {
     fn set_format(&mut self, format: SampleFormat) -> std::result::Result<(), alsa::Error> {
         self.hwp()?.set_format(to_alsa_format(format))
     }
+    fn channel_counts(&mut self, min: u32) -> std::result::Result<Vec<u32>, alsa::Error> {
+        self.begin()?;
+        self.set_access()?;
+        Ok(channel_counts(self.hwp()?, min))
+    }
     fn set_channels(&mut self, channels: u32) -> std::result::Result<(), alsa::Error> {
         self.hwp()?.set_channels(channels)
     }
@@ -775,16 +979,18 @@ fn rejected(e: alsa::Error) -> Result<bool> {
     }
 }
 
-/// The first of `candidate_formats` the device takes with the rest of
-/// `config`. Only a confirmed capability rejection of every candidate
-/// becomes [`AlsaError::Unsupported`] (naming the parameter); any other
-/// error from a setter or the install step is returned as it is, so a
-/// ladder never records it as a rate the device cannot play.
+/// The first of `candidate_formats` the device takes at `channels`
+/// channels with the rest of `config`. Only a confirmed capability
+/// rejection of every candidate becomes [`AlsaError::Unsupported`] (naming
+/// the parameter); any other error from a setter or the install step is
+/// returned as it is, so a ladder never records it as a rate the device
+/// cannot play.
 fn choose_format(
     space: &mut impl HwSpace,
     device: &str,
     config: &AlsaConfig,
     candidate_formats: &[SampleFormat],
+    channels: u32,
     supported: impl FnOnce() -> String,
 ) -> Result<SampleFormat> {
     // Why each candidate failed, so the error names the parameter.
@@ -806,7 +1012,7 @@ fn choose_format(
             format_rejected.push(fmt);
             continue;
         }
-        if let Err(e) = space.set_channels(config.channels) {
+        if let Err(e) = space.set_channels(channels) {
             rejected(e)?;
             channels_rejected = true;
             continue;
@@ -843,22 +1049,21 @@ fn choose_format(
         "interleaved read/write access".to_string()
     } else if !rate_rejected.is_empty() {
         format!(
-            "rate {} Hz (with {} channels, format {})",
+            "rate {} Hz (with {channels} channels, format {})",
             config.rate,
-            config.channels,
             names(&rate_rejected)
         )
     } else if channels_rejected {
-        format!("{} channels", config.channels)
+        format!("{channels} channels")
     } else if format_rejected.len() == candidate_formats.len() {
         format!("sample format {}", names(&format_rejected))
     } else if let Some(e) = install_err {
         format!(
-            "{} Hz, {} channels with the requested buffer ({e})",
-            config.rate, config.channels
+            "{} Hz, {channels} channels with the requested buffer ({e})",
+            config.rate
         )
     } else {
-        format!("{} Hz, {} channels", config.rate, config.channels)
+        format!("{} Hz, {channels} channels", config.rate)
     };
     Err(AlsaError::Unsupported {
         device: device.to_string(),
@@ -867,23 +1072,81 @@ fn choose_format(
     })
 }
 
+/// The channel counts an open for `config` tries, narrowest first: every
+/// count the device takes that holds the channel map. None (a mono device,
+/// a pair past the device's channels) or an invalid map: refused.
+fn open_counts(pcm: &PCM, device: &str, config: &AlsaConfig) -> Result<Vec<u32>> {
+    if let Some(why) = channel_map_error(config.channels, &config.channel_map) {
+        return Err(AlsaError::Unsupported {
+            device: device.to_string(),
+            rejected: why,
+            supported: describe_pcm(pcm),
+        });
+    }
+    let min = config.min_device_channels();
+    let counts = match (PcmSpace { pcm, hwp: None }).channel_counts(min) {
+        Ok(c) => c,
+        Err(e) if e.errno().abs() == libc::EINVAL => Vec::new(),
+        Err(e) => return Err(AlsaError::Alsa(e)),
+    };
+    if counts.is_empty() {
+        let rejected = if config.channel_map.is_empty() {
+            format!("{min} or more channels")
+        } else {
+            format!(
+                "{min} or more channels (output channels {})",
+                map_text(&config.channel_map)
+            )
+        };
+        return Err(AlsaError::Unsupported {
+            device: device.to_string(),
+            rejected,
+            supported: describe_pcm(pcm),
+        });
+    }
+    Ok(counts)
+}
+
+/// Try `counts` narrowest first: a wider count only once every narrower
+/// one was refused for good ([`AlsaError::is_capability`]); any other
+/// error ends the walk. `Err` is the narrowest count's refusal (or the
+/// error that ended it).
+fn walk_counts<T>(counts: &[u32], mut attempt: impl FnMut(u32) -> Result<T>) -> Result<T> {
+    let mut first: Option<AlsaError> = None;
+    for &c in counts {
+        match attempt(c) {
+            Ok(v) => return Ok(v),
+            Err(e) if e.is_capability() => {
+                first.get_or_insert(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(first.unwrap_or(AlsaError::Interrupted))
+}
+
 fn negotiate_params(
     pcm: &PCM,
     device: &str,
     config: &AlsaConfig,
     candidate_formats: &[SampleFormat],
+    channels: u32,
 ) -> Result<NegotiatedParams> {
+    let device_channels_max = HwParams::any(pcm)
+        .and_then(|h| h.get_channels_max())
+        .unwrap_or(0);
     let format = choose_format(
         &mut PcmSpace { pcm, hwp: None },
         device,
         config,
         candidate_formats,
+        channels,
         || describe_pcm(pcm),
     )?;
 
     let hwp = pcm.hw_params_current()?;
     let rate = hwp.get_rate()?;
-    let channels = hwp.get_channels()?;
+    let device_channels = hwp.get_channels()?;
     let period_frames = hwp.get_period_size()? as u32;
     let buffer_frames = hwp.get_buffer_size()? as u32;
 
@@ -899,7 +1162,9 @@ fn negotiate_params(
     Ok(NegotiatedParams {
         format,
         rate,
-        channels,
+        channels: config.channels,
+        device_channels,
+        device_channels_max,
         period_frames,
         buffer_frames,
     })
@@ -962,6 +1227,80 @@ pub fn pack_left_justified_i32(fmt: SampleFormat, samples: &[i32], dst: &mut [u8
     }
 }
 
+/// The channel counts of at least `min` that `hwp` holds, ascending, up
+/// to [`MAX_DEVICE_CHANNELS`] (an output pair names channels below it).
+pub(crate) fn channel_counts(hwp: &HwParams<'_>, min: u32) -> Vec<u32> {
+    let (Ok(lo), Ok(hi)) = (hwp.get_channels_min(), hwp.get_channels_max()) else {
+        return Vec::new();
+    };
+    (lo.max(min)..=hi.min(MAX_DEVICE_CHANNELS))
+        .filter(|&c| hwp.test_channels(c).is_ok())
+        .collect()
+}
+
+/// The most channels an open considers (`output_channels` name channels
+/// `0..64`).
+pub const MAX_DEVICE_CHANNELS: u32 = audivane_protocol::ipc::MAX_DEVICE_CHANNELS;
+
+/// Where each of `channels` written channels lands among `device_channels`
+/// (`channel_map`, empty: the first ones): `None` when the pack is the
+/// plain one (as many device channels, in order).
+fn output_map(channels: u32, device_channels: u32, channel_map: &[u32]) -> Option<Vec<usize>> {
+    let map: Vec<usize> = if channel_map.is_empty() {
+        (0..channels as usize).collect()
+    } else {
+        channel_map.iter().map(|&c| c as usize).collect()
+    };
+    let identity = device_channels == channels && map.iter().enumerate().all(|(i, &c)| i == c);
+    (!identity).then_some(map)
+}
+
+/// Pack one left-justified sample at the start of `dst` in `fmt` layout.
+#[inline]
+fn pack_one(fmt: SampleFormat, s: i32, dst: &mut [u8]) {
+    match fmt {
+        SampleFormat::S32 => dst[..4].copy_from_slice(&s.to_le_bytes()),
+        SampleFormat::S24 => dst[..4].copy_from_slice(&(s >> 8).to_le_bytes()),
+        SampleFormat::S24_3 => {
+            let b = s.to_le_bytes();
+            dst[..3].copy_from_slice(&b[1..4]);
+        }
+        SampleFormat::S16 => dst[..2].copy_from_slice(&((s >> 16) as i16).to_le_bytes()),
+    }
+}
+
+/// Pack interleaved `samples` (`map.len()` channels per frame) into frames
+/// of `device_channels`, sample `i` of each frame on device channel
+/// `map[i]`, the other channels exact zeros. Returns the bytes written.
+/// Allocation-free (the audio path).
+///
+/// `dst` must hold `frames * device_channels * bytes_per_sample(fmt)`; every
+/// `map` entry is below `device_channels`.
+#[inline]
+pub fn pack_mapped_i32(
+    fmt: SampleFormat,
+    samples: &[i32],
+    map: &[usize],
+    device_channels: usize,
+    dst: &mut [u8],
+) -> usize {
+    let bps = bytes_per_sample(fmt);
+    let ch = map.len().max(1);
+    let frames = samples.len() / ch;
+    let frame_bytes = device_channels * bps;
+    let n_bytes = frames * frame_bytes;
+    dst[..n_bytes].fill(0);
+    for (frame, out) in samples
+        .chunks_exact(ch)
+        .zip(dst[..n_bytes].chunks_exact_mut(frame_bytes))
+    {
+        for (&s, &slot) in frame.iter().zip(map) {
+            pack_one(fmt, s, &mut out[slot * bps..]);
+        }
+    }
+    n_bytes
+}
+
 /// Read-only helper that checks `SwParams` is valid on drop-free path.
 #[allow(dead_code)]
 fn _assert_sw_params_send(_: &SwParams<'_>) {}
@@ -969,6 +1308,7 @@ fn _assert_sw_params_send(_: &SwParams<'_>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use audivane_protocol::ipc::{FormatCapability, RateCapability};
 
     /// A configuration space that fails the scripted steps with an errno.
     #[derive(Default)]
@@ -979,6 +1319,21 @@ mod tests {
         install_errno: Option<i32>,
         buffer_errno: Option<i32>,
         installs: usize,
+        /// (channels, format, rates) the space holds; empty: any channel
+        /// count and format, at `rates`.
+        modes: Vec<(u32, SampleFormat, Vec<u32>)>,
+        /// The format and count set in the attempt that installed last.
+        format: Option<SampleFormat>,
+        set_channels: Option<u32>,
+        opened: Option<(u32, SampleFormat)>,
+    }
+
+    impl Scripted {
+        fn mode(&self) -> Option<&(u32, SampleFormat, Vec<u32>)> {
+            self.modes
+                .iter()
+                .find(|m| Some(m.0) == self.set_channels && Some(m.1) == self.format)
+        }
     }
 
     fn err(errno: i32) -> alsa::Error {
@@ -987,25 +1342,53 @@ mod tests {
 
     impl HwSpace for Scripted {
         fn begin(&mut self) -> std::result::Result<(), alsa::Error> {
+            self.format = None;
+            self.set_channels = None;
             Ok(())
         }
         fn set_access(&mut self) -> std::result::Result<(), alsa::Error> {
             Ok(())
         }
-        fn set_format(&mut self, _: SampleFormat) -> std::result::Result<(), alsa::Error> {
+        fn set_format(&mut self, f: SampleFormat) -> std::result::Result<(), alsa::Error> {
+            if !self.modes.is_empty() && !self.modes.iter().any(|m| m.1 == f) {
+                return Err(err(libc::EINVAL));
+            }
+            self.format = Some(f);
             Ok(())
         }
-        fn set_channels(&mut self, _: u32) -> std::result::Result<(), alsa::Error> {
+        fn channel_counts(&mut self, min: u32) -> std::result::Result<Vec<u32>, alsa::Error> {
+            if self.modes.is_empty() {
+                return Ok(vec![min]);
+            }
+            let mut c: Vec<u32> = self
+                .modes
+                .iter()
+                .map(|m| m.0)
+                .filter(|&c| c >= min)
+                .collect();
+            c.sort_unstable();
+            c.dedup();
+            Ok(c)
+        }
+        fn set_channels(&mut self, channels: u32) -> std::result::Result<(), alsa::Error> {
+            self.set_channels = Some(channels);
+            if !self.modes.is_empty() && self.mode().is_none() {
+                return Err(err(libc::EINVAL));
+            }
             Ok(())
         }
         fn set_rate(&mut self, rate: u32) -> std::result::Result<u32, alsa::Error> {
             if let Some(errno) = self.rate_errno {
                 return Err(err(errno));
             }
-            Ok(if self.rates.contains(&rate) {
+            let rates = match self.mode() {
+                Some(m) => &m.2,
+                None => &self.rates,
+            };
+            Ok(if rates.contains(&rate) {
                 rate
             } else {
-                self.rates[0]
+                rates[0]
             })
         }
         fn set_period_and_buffer(
@@ -1017,7 +1400,9 @@ mod tests {
         }
         fn install(&mut self) -> std::result::Result<(), alsa::Error> {
             self.installs += 1;
-            self.install_errno.map_or(Ok(()), |e| Err(err(e)))
+            self.install_errno.map_or(Ok(()), |e| Err(err(e)))?;
+            self.opened = self.set_channels.zip(self.format);
+            Ok(())
         }
     }
 
@@ -1026,6 +1411,7 @@ mod tests {
             device: "hw:Test".into(),
             rate,
             channels: 2,
+            channel_map: Vec::new(),
             period_frames: 1024,
             buffer_periods: 4,
             preferred_format: None,
@@ -1035,9 +1421,35 @@ mod tests {
     }
 
     fn choose(space: &mut Scripted, rate: u32) -> Result<SampleFormat> {
-        choose_format(space, "hw:Test", &cfg(rate), &FORMAT_PREFERENCE, || {
+        choose_format(space, "hw:Test", &cfg(rate), &FORMAT_PREFERENCE, 2, || {
             "48000 Hz".into()
         })
+    }
+
+    /// A blind open as a follower makes it: every channel count that holds
+    /// `c`'s map, narrowest first, the ladder at each.
+    fn blind(
+        space: &mut Scripted,
+        c: &AlsaConfig,
+        ladder: &[RateRatio],
+        source_rate: u32,
+    ) -> Option<(u32, SampleFormat, RateRatio)> {
+        let counts = space.channel_counts(c.min_device_channels()).unwrap();
+        let (taken, _, _) = walk_counts_ladder(&counts, ladder, source_rate, |ch, r| {
+            let mut try_cfg = c.clone();
+            try_cfg.rate = r.output_rate(source_rate).unwrap();
+            choose_format(
+                space,
+                "hw:Test",
+                &try_cfg,
+                &FORMAT_PREFERENCE,
+                ch,
+                String::new,
+            )
+        });
+        let (ratio, _) = taken.ok()?;
+        let (ch, f) = space.opened?;
+        Some((ch, f, ratio))
     }
 
     #[test]
@@ -1158,6 +1570,177 @@ mod tests {
         assert!(matches!(last, AlsaError::Alsa(_)) && !last.is_capability());
         assert!(refused.is_empty());
         assert_eq!(transient, [x(2), RateRatio::ONE]);
+    }
+
+    #[test]
+    fn a_blind_open_takes_the_narrowest_count_then_the_format() {
+        use SampleFormat::*;
+        let x = RateRatio::integer;
+        // Stereo S16 and 8 channels S32 at the same rate: the default pair
+        // opens as stereo S16, as before (never 8 channels for S32).
+        let mut s = Scripted {
+            modes: vec![(2, S16, vec![48_000]), (8, S32, vec![48_000])],
+            ..Default::default()
+        };
+        assert_eq!(
+            blind(&mut s, &cfg(48_000), &[x(1)], 48_000),
+            Some((2, S16, x(1)))
+        );
+        // Pair 3/4 needs 4 or more: the 8-channel mode, S32.
+        let mut pair = cfg(48_000);
+        pair.channel_map = vec![3, 4];
+        assert_eq!(blind(&mut s, &pair, &[x(1)], 48_000), Some((8, S32, x(1))));
+        // A ratio the stereo mode lacks: it steps down there (x2) before a
+        // wider mode is tried (x4 at 8 channels).
+        let mut s = Scripted {
+            modes: vec![
+                (2, S32, vec![48_000, 96_000]),
+                (8, S32, vec![48_000, 96_000, 192_000]),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            blind(&mut s, &cfg(48_000), &[x(4), x(2), x(1)], 48_000),
+            Some((2, S32, x(2)))
+        );
+        // Only an 8-channel mode (an audio interface): 8.
+        let mut s = Scripted {
+            modes: vec![(8, S32, vec![48_000])],
+            ..Default::default()
+        };
+        assert_eq!(
+            blind(&mut s, &cfg(48_000), &[x(1)], 48_000),
+            Some((8, S32, x(1)))
+        );
+        // A pair past the device: no count holds it.
+        pair.channel_map = vec![8, 9];
+        assert!(
+            s.channel_counts(pair.min_device_channels())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_planned_open_falls_back_across_channel_counts() {
+        use SampleFormat::*;
+        use audivane_protocol::ipc::ChannelMode;
+        let rates = |f: SampleFormat, rs: &[u32]| -> Vec<RateCapability> {
+            rs.iter()
+                .map(|&rate| RateCapability {
+                    rate,
+                    formats: vec![FormatCapability {
+                        format: f,
+                        sbits: None,
+                    }],
+                })
+                .collect()
+        };
+        // 4 channels S16 only, 8 channels S32: pair 3/4 with S32 configured
+        // plans 8 channels, not "no usable rates" at 4.
+        let probe = DeviceCapabilities {
+            device: "hw:Test".into(),
+            channels: 4,
+            channels_min: 4,
+            channels_max: 8,
+            rates: rates(S16, &[48_000]),
+            modes: vec![
+                ChannelMode {
+                    channels: 4,
+                    rates: rates(S16, &[48_000, 96_000]),
+                },
+                ChannelMode {
+                    channels: 8,
+                    rates: rates(S32, &[48_000, 96_000]),
+                },
+            ],
+            ..Default::default()
+        };
+        let x = RateRatio::integer;
+        let view = probe.for_output(4, &[S32]);
+        assert_eq!(view.channels, 8);
+        assert!(view.supports(96_000, S32));
+        let (plan, ratio, format) = plan_modes(&view, 4, 48_000, &[x(2), x(1)], &[S32])
+            .unwrap()
+            .unwrap();
+        assert_eq!((plan.channels, ratio, format), (8, x(2), S32));
+        // With S16 allowed too, the narrower 4-channel mode wins.
+        let (plan, _, format) = plan_modes(&view, 4, 48_000, &[x(2)], &[S32, S16])
+            .unwrap()
+            .unwrap();
+        assert_eq!((plan.channels, format), (4, S16));
+        // Nothing at any count: the narrowest mode's refusal.
+        assert!(
+            plan_modes(&view, 4, 48_000, &[x(2)], &[S24])
+                .unwrap()
+                .is_err()
+        );
+        // The pair past every mode: blind.
+        assert!(plan_modes(&view, 10, 48_000, &[x(2)], &[S32]).is_none());
+    }
+
+    #[test]
+    fn channel_maps_are_checked() {
+        assert_eq!(min_device_channels(2, &[]), 2);
+        assert_eq!(min_device_channels(2, &[0, 1]), 2);
+        assert_eq!(min_device_channels(2, &[6, 3]), 7);
+        assert_eq!(channel_map_error(2, &[]), None);
+        assert_eq!(channel_map_error(2, &[3, 2]), None);
+        assert!(
+            channel_map_error(2, &[3, 3])
+                .unwrap()
+                .contains("used twice")
+        );
+        assert!(
+            channel_map_error(2, &[3])
+                .unwrap()
+                .contains("name 1 channels")
+        );
+    }
+
+    #[test]
+    fn the_plain_pack_stays_for_a_stereo_device_in_order() {
+        assert_eq!(output_map(2, 2, &[]), None);
+        assert_eq!(output_map(2, 2, &[0, 1]), None);
+        assert_eq!(output_map(2, 2, &[1, 0]), Some(vec![1, 0]));
+        assert_eq!(output_map(2, 8, &[]), Some(vec![0, 1]));
+        assert_eq!(output_map(2, 8, &[6, 7]), Some(vec![6, 7]));
+    }
+
+    #[test]
+    fn a_mapped_pack_places_the_pair_and_zeros_the_rest() {
+        // Two frames, L = 0x1111_1100 / 0x3333_3300, R = negative values.
+        let samples = [0x1111_1100_i32, -0x2222_2200, 0x3333_3300, -0x4444_4400];
+        for fmt in FORMAT_PREFERENCE {
+            let bps = bytes_per_sample(fmt);
+            let mut plain = [0u8; 16];
+            let n_plain = pack_left_justified_i32(fmt, &samples, &mut plain);
+            // In order on a stereo frame: the plain pack exactly.
+            let mut same = [0xAAu8; 16];
+            let n = pack_mapped_i32(fmt, &samples, &[0, 1], 2, &mut same);
+            assert_eq!(&same[..n], &plain[..n_plain], "{fmt:?}");
+            // On channels 5 and 2 of 8 (swapped on purpose).
+            let mut wide = [0xAAu8; 2 * 8 * 4];
+            let n = pack_mapped_i32(fmt, &samples, &[5, 2], 8, &mut wide);
+            assert_eq!(n, 2 * 8 * bps, "{fmt:?}");
+            for frame in 0..2 {
+                for ch in 0..8 {
+                    let at = (frame * 8 + ch) * bps;
+                    let got = &wide[at..at + bps];
+                    let src = match ch {
+                        5 => Some(2 * frame),
+                        2 => Some(2 * frame + 1),
+                        _ => None,
+                    };
+                    match src {
+                        Some(i) => assert_eq!(got, &plain[i * bps..(i + 1) * bps], "{fmt:?}"),
+                        None => assert!(got.iter().all(|&b| b == 0), "{fmt:?} ch {ch}"),
+                    }
+                }
+            }
+            // Past the packed frames, `dst` is untouched.
+            assert!(wide[n..].iter().all(|&b| b == 0xAA));
+        }
     }
 
     #[test]

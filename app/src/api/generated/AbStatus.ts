@@ -4,7 +4,16 @@ import type { AbOvers } from "./AbOvers";
 import type { AbSide } from "./AbSide";
 import type { LevelMatch } from "./LevelMatch";
 
-export type AbStatus = { enabled: boolean, current: AbSide, 
+export type AbStatus = { enabled: boolean, 
+/**
+ * The side playing; `None` while a blind test runs (`blind`).
+ */
+current: AbSide | null, 
+/**
+ * A blind test runs (`ab_blind`): `current` is hidden and the overs
+ * read 0.
+ */
+blind: boolean, 
 /**
  * B's level offset `o` (dB): B plus `o` is as loud as A.
  */

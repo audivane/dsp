@@ -7,9 +7,13 @@
  *
  * Each tap runs two Hann FFTs: 8192 points (50% overlap) for every bin and
  * 32768 points (87.5% overlap) for the low band, where a 1/24-octave bin is
- * narrower than four 8192-point bins. Power is averaged over the frames since
- * the previous report. Bin `k` is centred on `f_min_hz * 2^(k /
- * bins_per_octave)` (half a step either side), up to `min(20 kHz, Nyquist)`.
+ * narrower than four 8192-point bins; above 88.2 kHz both run on the signal
+ * decimated to 44.1/48 kHz and a third FFT (bins of at most 48 Hz) reads the
+ * bins above 20 kHz. Power is averaged over the frames since the previous
+ * report. Bin `k` is centred on `f_min_hz * 2^(k / bins_per_octave)` (half a
+ * step either side); each tap's bins run up to its own Nyquist (less two FFT
+ * bins) or 100 kHz, whichever is lower, with no bin straddling that top, so
+ * `pre` (graph rate) and `post` (output rate) can differ in length.
  *
  * Values are band power in dB, channel-mean, rounded to 0.1 dB: 0 dB = a
  * full-scale sine. A bin reads the signal power inside it, or a sine's

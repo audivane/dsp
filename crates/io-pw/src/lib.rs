@@ -21,9 +21,9 @@ pub use driver::{
 };
 pub use engine_driver::{
     BypassNotifier, DriverGapCounters, DriverWaker, DspLanding, EngineAudioProcessor,
-    EngineDriverConfig, EngineDriverHandle, EngineDriverSnapshot, NegotiatedChain, RatioNegotiator,
-    ReleaseHook, ReleaseKind, SinkVolumePort, device_present, predicted_dsp_landing,
-    predicted_dsp_landings, scaled_quantum, waiting_text,
+    EngineDriverConfig, EngineDriverHandle, EngineDriverSnapshot, MEASURE_CARRIER_NODE,
+    NegotiatedChain, RatioNegotiator, ReleaseHook, ReleaseKind, SinkVolumePort, device_present,
+    predicted_dsp_landing, predicted_dsp_landings, scaled_quantum, waiting_text,
 };
 pub use error::{PwError, Result};
 pub use lifecycle::{

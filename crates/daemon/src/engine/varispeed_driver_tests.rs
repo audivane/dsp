@@ -898,6 +898,8 @@ fn dsp_off_fades_the_audible_end_of_a_delayed_chain() {
         enabled: true,
         ir_path: "unused".into(),
         gain_db: 0.0,
+        matrix: None,
+        calibration: false,
     }];
     let mut ir = vec![0.0; 1024];
     ir[800] = 1.0;
@@ -906,7 +908,7 @@ fn dsp_off_fades_the_audible_end_of_a_delayed_chain() {
         sample_rate: 48_000,
         channels: CH,
         max_block: 512,
-        irs: Some(vec![ir]),
+        irs: Some(vec![ir].into()),
     })));
     let mut d = Drv::new(48_000, RateRatio::ONE, chain, 256);
     d.graph.source = Box::new(|_, _| 0.5);
@@ -960,6 +962,8 @@ fn the_drain_flushes_the_chain_after_the_stage() {
         enabled: true,
         ir_path: "unused".into(),
         gain_db: 0.0,
+        matrix: None,
+        calibration: false,
     }];
     let mut ir = vec![0.0; 4096];
     ir[3000] = 1.0;
@@ -968,7 +972,7 @@ fn the_drain_flushes_the_chain_after_the_stage() {
         sample_rate: 48_000,
         channels: CH,
         max_block: 512,
-        irs: Some(vec![ir]),
+        irs: Some(vec![ir].into()),
     })));
     let mut d = Drv::new(48_000, RateRatio::ONE, chain, 256);
     d.graph.source = Box::new(|_, _| 0.25);

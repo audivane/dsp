@@ -7,7 +7,6 @@ import { MockDaemon, MockTransport } from "../api/mock";
 import { DaemonError, ErrorCode } from "../api/transport";
 import { AppStore, clearStash } from "./store";
 import { meterStore } from "./meters";
-import { crossfeedAsRun, crossfeedLevel, defaultCrossfeed, withCrossfeedLevel } from "../lib/effects";
 
 const until = async (pred: () => boolean, ms = 3000) => {
   const t = Date.now();
@@ -35,8 +34,8 @@ class SpyTransport extends MockTransport {
 }
 
 let stores: AppStore[] = [];
-async function setup(opts: { refuse?: string[]; digital?: boolean; legacyCrossfeedLevel?: boolean } = {}) {
-  const daemon = new MockDaemon({ digitalVolume: opts.digital, legacyCrossfeedLevel: opts.legacyCrossfeedLevel });
+async function setup(opts: { refuse?: string[]; digital?: boolean } = {}) {
+  const daemon = new MockDaemon({ digitalVolume: opts.digital });
   const t = new SpyTransport(daemon, { request: 1, reply: 1, event: 1 });
   for (const m of opts.refuse ?? []) t.refuse.add(m);
   const s = new AppStore(t);
@@ -92,14 +91,14 @@ describe("effect stages", () => {
 
   it("shows the daemon's refusal inline and drops the draft", async () => {
     const { s, daemon } = await setup();
-    s.editStage("crossfeed", () => ({ enabled: true, mode: "bs2b_custom", cutoff_hz: 5000, feed_db: 4.5, level: "matched" }));
+    s.editStage("crossfeed", () => ({ enabled: true, mode: "bs2b_custom", cutoff_hz: 5000, feed_db: 4.5, level: "matched", width: 1, width_shape: "flat", width_corner_hz: 700 }));
     expect(s.stage("crossfeed")?.cutoff_hz).toBe(5000);
     await idle(s);
     expect(s.getState().stageErrors.crossfeed).toMatch(/cutoff_hz must be within 300/);
     expect(s.getState().stageDrafts.crossfeed).toBeUndefined();
     expect(daemon.config.chain.crossfeed ?? null).toBeNull();
     // A later accepted edit clears it.
-    s.editStage("crossfeed", () => ({ enabled: true, mode: "bs2b_chu_moy", cutoff_hz: 700, feed_db: 4.5, level: "matched" }));
+    s.editStage("crossfeed", () => ({ enabled: true, mode: "bs2b_chu_moy", cutoff_hz: 700, feed_db: 4.5, level: "matched", width: 1, width_shape: "flat", width_corner_hz: 700 }));
     await idle(s);
     expect(s.getState().stageErrors.crossfeed).toBeUndefined();
     expect(daemon.config.chain.crossfeed?.mode).toBe("bs2b_chu_moy");
@@ -112,7 +111,7 @@ describe("effect stages", () => {
     s.setStageEnabled("limiter", true);
     await idle(s);
     expect(daemon.config.chain.pitch.cents).toBe(-50);
-    expect(daemon.config.chain.harmonics?.character).toBe("triode");
+    expect(daemon.config.chain.harmonics?.layers[0]?.preset).toBe("se_triode_high_mu");
     expect(daemon.config.chain.limiter.mode).toBe("auto_headroom");
     expect(t.count("set_pitch")).toBe(1);
     expect(t.count("set_harmonics")).toBe(1);
@@ -307,47 +306,19 @@ describe("review fixes", () => {
     expect(daemon.config.chain.limiter.mode).toBe("auto_headroom");
   });
 
-  it("an optional harmonic comes back at its last level", async () => {
+  it("a harmonic order turned off comes back at its last level", async () => {
     const { s, daemon } = await setup();
-    s.setStage("harmonics", { enabled: true, character: "custom", h2_db: -40, h3_db: -58, h4_db: -20, h5_db: null, dc_block: true });
-    s.setOptionalHarmonic("h4_db", false);
+    s.setStage("harmonics", { enabled: true, dc_block: true, layers: [{ kind: "chebyshev", enabled: true, levels_db: [-40, -58, -20, null, null, null, null, null], signs: ["+", "-", "+", "+", "+", "+", "+", "+"], drive_db: 0, amount: 1 }] });
+    s.setHarmonicOrder(0, 2, false);
     await idle(s);
-    expect(daemon.config.chain.harmonics?.h4_db ?? null).toBeNull();
-    s.setOptionalHarmonic("h4_db", true);
+    const h4 = () => {
+      const l = daemon.config.chain.harmonics?.layers[0];
+      return l?.kind === "chebyshev" ? l.levels_db[2] : undefined;
+    };
+    expect(h4() ?? null).toBeNull();
+    s.setHarmonicOrder(0, 2, true);
     await idle(s);
-    expect(daemon.config.chain.harmonics?.h4_db).toBe(-20);
-  });
-
-  it("crossfeed level support is known only from the daemon's config", async () => {
-    const { s, t, daemon } = await setup();
-    expect(daemon.config.chain.crossfeed ?? null).toBeNull();
-    expect(s.getState().stageCaps.crossfeedLevel).toBeNull();
-    // Choosing a level with no config sends the default stage, still off.
-    s.editStage("crossfeed", (c) => withCrossfeedLevel(c, "peak_safe"));
-    await idle(s);
-    expect(t.last("set_crossfeed")).toMatchObject({ enabled: false, level: "peak_safe" });
-    expect(daemon.config.chain.crossfeed).toMatchObject({ enabled: false, level: "peak_safe" });
-    await until(() => s.getState().stageCaps.crossfeedLevel === true);
-    // Editing the level of an enabled stage keeps it on.
-    s.setStageEnabled("crossfeed", true);
-    await idle(s);
-    s.editStage("crossfeed", (c) => withCrossfeedLevel(c, "matched"));
-    await idle(s);
-    expect(daemon.config.chain.crossfeed).toMatchObject({ enabled: true, level: "matched" });
-  });
-
-  it("an engine without the crossfeed level: a draft with `level` does not count, the echo does", async () => {
-    const { s, daemon } = await setup({ legacyCrossfeedLevel: true });
-    s.editStage("crossfeed", () => ({ ...defaultCrossfeed(), level: "matched" }));
-    // The draft carries `level`, but nothing is known until the daemon answers.
-    expect(s.getState().stageCaps.crossfeedLevel).toBeNull();
-    await idle(s);
-    await until(() => s.getState().stageCaps.crossfeedLevel === false);
-    const echoed = daemon.config.chain.crossfeed!;
-    expect("level" in echoed).toBe(false);
-    expect(echoed.enabled).toBe(true);
-    // Shown as what the engine runs: peak-safe.
-    expect(crossfeedLevel(crossfeedAsRun(s.stage("crossfeed")!, s.getState().stageCaps.crossfeedLevel))).toBe("peak_safe");
+    expect(h4()).toBe(-20);
   });
 
   it("an older engine (no guard, no limiter) disables those controls instead of crashing", async () => {
@@ -385,7 +356,7 @@ describe("review fixes", () => {
   it("ending a stage wheel drag after Off never replays enabled: true", async () => {
     const { s, t, daemon } = await setup();
     // Simulate a wheel notch on Crossfeed cutoff (switches to Custom, enabled: true).
-    s.editStage("crossfeed", (c) => ({ ...(c ?? { enabled: true, mode: "bs2b_default", cutoff_hz: 700, feed_db: 4.5, level: "matched" }), enabled: true, mode: "bs2b_custom", cutoff_hz: 705 }), "drag");
+    s.editStage("crossfeed", (c) => ({ ...(c ?? { enabled: true, mode: "bs2b_default", cutoff_hz: 700, feed_db: 4.5, level: "matched", width: 1, width_shape: "flat", width_corner_hz: 700 }), enabled: true, mode: "bs2b_custom", cutoff_hz: 705 }), "drag");
     // Turn Crossfeed Off within the wheel window before endStageDrag fires.
     s.setStageEnabled("crossfeed", false);
     await idle(s);
@@ -402,7 +373,7 @@ describe("review fixes", () => {
 
   it("endStageDrag flushes a throttled drag edit and clears the draft", async () => {
     const { s, daemon } = await setup();
-    s.editStage("crossfeed", () => ({ enabled: true, mode: "bs2b_custom", cutoff_hz: 705, feed_db: 4.5, level: "matched" }), "drag");
+    s.editStage("crossfeed", () => ({ enabled: true, mode: "bs2b_custom", cutoff_hz: 705, feed_db: 4.5, level: "matched", width: 1, width_shape: "flat", width_corner_hz: 700 }), "drag");
     // Second notch within the throttle interval stays pending until endStageDrag.
     s.editStage("crossfeed", (c) => ({ ...c!, cutoff_hz: 710 }), "drag");
     s.endStageDrag("crossfeed");

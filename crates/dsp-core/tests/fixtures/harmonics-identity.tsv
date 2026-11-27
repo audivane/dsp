@@ -1,0 +1,397 @@
+# case	output hash	peak gain bits	small-signal bits
+triode | dc on | 44100 | joint	662025cc69fa8988	3fc4a2b6f4db5e71	3fa0c3ac6086e5a6
+triode | dc on | 44100 | split	662025cc69fa8988	3fc4a2b6f4db5e71	3fa0c3ac6086e5a6
+triode | dc on | 96000 | joint	fa16616c01d218ec	3fc4a3ca449bda37	3fa0c3ac6086e5a6
+triode | dc on | 96000 | split	fa16616c01d218ec	3fc4a3ca449bda37	3fa0c3ac6086e5a6
+triode | dc on | 768000 | joint	52ca0daa97d747ac	3fc4a49707847b74	3fa0c3ac6086e5a6
+triode | dc on | 768000 | split	52ca0daa97d747ac	3fc4a49707847b74	3fa0c3ac6086e5a6
+triode | dc off | 44100 | joint	80356a9c9a1a6ea1	3fc4a4b4285aa6bd	3fa0c3ac6086e5a6
+triode | dc off | 44100 | split	80356a9c9a1a6ea1	3fc4a4b4285aa6bd	3fa0c3ac6086e5a6
+triode | dc off | 96000 | joint	21dafa99d9186348	3fc4a4b4285aa6bd	3fa0c3ac6086e5a6
+triode | dc off | 96000 | split	21dafa99d9186348	3fc4a4b4285aa6bd	3fa0c3ac6086e5a6
+triode | dc off | 768000 | joint	af003f7557ebc64f	3fc4a4b4285aa6bd	3fa0c3ac6086e5a6
+triode | dc off | 768000 | split	af003f7557ebc64f	3fc4a4b4285aa6bd	3fa0c3ac6086e5a6
+pentode | dc on | 44100 | joint	694b566e39bb53c5	bfa30b9ee62d54c9	3fcce6aae8f36dc7
+pentode | dc on | 44100 | split	694b566e39bb53c5	bfa30b9ee62d54c9	3fcce6aae8f36dc7
+pentode | dc on | 96000 | joint	55d625cf99481ff6	bfa30aec548c2eec	3fcce6aae8f36dc7
+pentode | dc on | 96000 | split	55d625cf99481ff6	bfa30aec548c2eec	3fcce6aae8f36dc7
+pentode | dc on | 768000 | joint	ee993a47cccc1607	bfa30a678534a542	3fcce6aae8f36dc7
+pentode | dc on | 768000 | split	ee993a47cccc1607	bfa30a678534a542	3fcce6aae8f36dc7
+pentode | dc off | 44100 | joint	5176a774d44526bb	bfa30a5499853cf1	3fcce6aae8f36dc7
+pentode | dc off | 44100 | split	5176a774d44526bb	bfa30a5499853cf1	3fcce6aae8f36dc7
+pentode | dc off | 96000 | joint	31101e8da3e1f0e6	bfa30a5499853cf1	3fcce6aae8f36dc7
+pentode | dc off | 96000 | split	31101e8da3e1f0e6	bfa30a5499853cf1	3fcce6aae8f36dc7
+pentode | dc off | 768000 | joint	d25599a410d75e67	bfa30a5499853cf1	3fcce6aae8f36dc7
+pentode | dc off | 768000 | split	d25599a410d75e67	bfa30a5499853cf1	3fcce6aae8f36dc7
+se_triode_high_mu | dc on | 44100 | joint	1db10c036219184e	3feb03d9c32cbf02	3fc12474edcc8fa1
+se_triode_high_mu | dc on | 44100 | split	1db10c036219184e	3feb03d9c32cbf02	3fc12474edcc8fa1
+se_triode_high_mu | dc on | 96000 | joint	135478ab352cdf58	3feb052f6c125514	3fc12474edcc8fa1
+se_triode_high_mu | dc on | 96000 | split	135478ab352cdf58	3feb052f6c125514	3fc12474edcc8fa1
+se_triode_high_mu | dc on | 768000 | joint	4116789c255bce4c	3feb062d86bbfed6	3fc12474edcc8fa1
+se_triode_high_mu | dc on | 768000 | split	4116789c255bce4c	3feb062d86bbfed6	3fc12474edcc8fa1
+se_triode_high_mu | dc off | 44100 | joint	778fe3deace18907	3feb0651b88a0aa8	3fc12474edcc8fa1
+se_triode_high_mu | dc off | 44100 | split	778fe3deace18907	3feb0651b88a0aa8	3fc12474edcc8fa1
+se_triode_high_mu | dc off | 96000 | joint	37756f0714b34be8	3feb0651b88a0aa8	3fc12474edcc8fa1
+se_triode_high_mu | dc off | 96000 | split	37756f0714b34be8	3feb0651b88a0aa8	3fc12474edcc8fa1
+se_triode_high_mu | dc off | 768000 | joint	2ddf890e0d5d1476	3feb0651b88a0aa8	3fc12474edcc8fa1
+se_triode_high_mu | dc off | 768000 | split	2ddf890e0d5d1476	3feb0651b88a0aa8	3fc12474edcc8fa1
+se_triode_low_mu | dc on | 44100 | joint	c4ea67967e796ff0	3fcb4645e11265ea	3fbeabd6acd99932
+se_triode_low_mu | dc on | 44100 | split	c4ea67967e796ff0	3fcb4645e11265ea	3fbeabd6acd99932
+se_triode_low_mu | dc on | 96000 | joint	149198417938645b	3fcb47de572cbefc	3fbeabd6acd99932
+se_triode_low_mu | dc on | 96000 | split	149198417938645b	3fcb47de572cbefc	3fbeabd6acd99932
+se_triode_low_mu | dc on | 768000 | joint	a7779af8413562fb	3fcb490e217c87f4	3fbeabd6acd99932
+se_triode_low_mu | dc on | 768000 | split	a7779af8413562fb	3fcb490e217c87f4	3fbeabd6acd99932
+se_triode_low_mu | dc off | 44100 | joint	a30cab87ddab00e0	3fcb493948f3a38d	3fbeabd6acd99932
+se_triode_low_mu | dc off | 44100 | split	a30cab87ddab00e0	3fcb493948f3a38d	3fbeabd6acd99932
+se_triode_low_mu | dc off | 96000 | joint	55f0a06949ad2f93	3fcb493948f3a38d	3fbeabd6acd99932
+se_triode_low_mu | dc off | 96000 | split	55f0a06949ad2f93	3fcb493948f3a38d	3fbeabd6acd99932
+se_triode_low_mu | dc off | 768000 | joint	e9a4f8b1147fed50	3fcb493948f3a38d	3fbeabd6acd99932
+se_triode_low_mu | dc off | 768000 | split	e9a4f8b1147fed50	3fcb493948f3a38d	3fbeabd6acd99932
+se_pentode | dc on | 44100 | joint	af8d4aa354bc4b18	3fe2bf7474f8e602	3fd262de0f1416ff
+se_pentode | dc on | 44100 | split	af8d4aa354bc4b18	3fe2bf7474f8e602	3fd262de0f1416ff
+se_pentode | dc on | 96000 | joint	f5021cf03fb3c286	3fe2c07f5c498f60	3fd262de0f1416ff
+se_pentode | dc on | 96000 | split	f5021cf03fb3c286	3fe2c07f5c498f60	3fd262de0f1416ff
+se_pentode | dc on | 768000 | joint	185b0127af42998c	3fe2c145ddda10d2	3fd262de0f1416ff
+se_pentode | dc on | 768000 | split	185b0127af42998c	3fe2c145ddda10d2	3fd262de0f1416ff
+se_pentode | dc off | 44100 | joint	93e2d90dff535ecd	3fe2c1620aa2d625	3fd262de0f1416ff
+se_pentode | dc off | 44100 | split	93e2d90dff535ecd	3fe2c1620aa2d625	3fd262de0f1416ff
+se_pentode | dc off | 96000 | joint	6b2d7060db07e563	3fe2c1620aa2d625	3fd262de0f1416ff
+se_pentode | dc off | 96000 | split	6b2d7060db07e563	3fe2c1620aa2d625	3fd262de0f1416ff
+se_pentode | dc off | 768000 | joint	cabc81b5a2a7c31f	3fe2c1620aa2d625	3fd262de0f1416ff
+se_pentode | dc off | 768000 | split	cabc81b5a2a7c31f	3fe2c1620aa2d625	3fd262de0f1416ff
+pp_triode | dc on | 44100 | joint	94a359f0cc2e821d	bfa35a5e4e64f3ab	3fb6aca9608c48e2
+pp_triode | dc on | 44100 | split	94a359f0cc2e821d	bfa35a5e4e64f3ab	3fb6aca9608c48e2
+pp_triode | dc on | 96000 | joint	32aa2ba5613f167a	bfa35a5e4e64f3ab	3fb6aca9608c48e2
+pp_triode | dc on | 96000 | split	32aa2ba5613f167a	bfa35a5e4e64f3ab	3fb6aca9608c48e2
+pp_triode | dc on | 768000 | joint	bcb28fef6ffb7c02	bfa35a5e4e64f3ab	3fb6aca9608c48e2
+pp_triode | dc on | 768000 | split	bcb28fef6ffb7c02	bfa35a5e4e64f3ab	3fb6aca9608c48e2
+pp_triode | dc off | 44100 | joint	94a359f0cc2e821d	bfa35a5e4e64f3ab	3fb6aca9608c48e2
+pp_triode | dc off | 44100 | split	94a359f0cc2e821d	bfa35a5e4e64f3ab	3fb6aca9608c48e2
+pp_triode | dc off | 96000 | joint	32aa2ba5613f167a	bfa35a5e4e64f3ab	3fb6aca9608c48e2
+pp_triode | dc off | 96000 | split	32aa2ba5613f167a	bfa35a5e4e64f3ab	3fb6aca9608c48e2
+pp_triode | dc off | 768000 | joint	bcb28fef6ffb7c02	bfa35a5e4e64f3ab	3fb6aca9608c48e2
+pp_triode | dc off | 768000 | split	bcb28fef6ffb7c02	bfa35a5e4e64f3ab	3fb6aca9608c48e2
+pp_triode_imbalanced | dc on | 44100 | joint	9af17eb2eee18db5	3fb1f523f8759a98	3fb6aca9608c48e2
+pp_triode_imbalanced | dc on | 44100 | split	9af17eb2eee18db5	3fb1f523f8759a98	3fb6aca9608c48e2
+pp_triode_imbalanced | dc on | 96000 | joint	3553ef0ece72f45b	3fb1f67e7ef154e2	3fb6aca9608c48e2
+pp_triode_imbalanced | dc on | 96000 | split	3553ef0ece72f45b	3fb1f67e7ef154e2	3fb6aca9608c48e2
+pp_triode_imbalanced | dc on | 768000 | joint	28c80bba9246c936	3fb1f78038eeeb62	3fb6aca9608c48e2
+pp_triode_imbalanced | dc on | 768000 | split	28c80bba9246c936	3fb1f78038eeeb62	3fb6aca9608c48e2
+pp_triode_imbalanced | dc off | 44100 | joint	4a892121b2d7fe55	3fb1f7a4e29ce3dc	3fb6aca9608c48e2
+pp_triode_imbalanced | dc off | 44100 | split	4a892121b2d7fe55	3fb1f7a4e29ce3dc	3fb6aca9608c48e2
+pp_triode_imbalanced | dc off | 96000 | joint	214d50290eae13d7	3fb1f7a4e29ce3dc	3fb6aca9608c48e2
+pp_triode_imbalanced | dc off | 96000 | split	214d50290eae13d7	3fb1f7a4e29ce3dc	3fb6aca9608c48e2
+pp_triode_imbalanced | dc off | 768000 | joint	48424c141f4e2616	3fb1f7a4e29ce3dc	3fb6aca9608c48e2
+pp_triode_imbalanced | dc off | 768000 | split	48424c141f4e2616	3fb1f7a4e29ce3dc	3fb6aca9608c48e2
+diff_pair | dc on | 44100 | joint	bcc57932fdaf1e1d	bfe1b42c3712d5f3	3ffcfded3296c91a
+diff_pair | dc on | 44100 | split	bcc57932fdaf1e1d	bfe1b42c3712d5f3	3ffcfded3296c91a
+diff_pair | dc on | 96000 | joint	d041a49a2727ceb6	bfe1b42c3712d5f3	3ffcfded3296c91a
+diff_pair | dc on | 96000 | split	d041a49a2727ceb6	bfe1b42c3712d5f3	3ffcfded3296c91a
+diff_pair | dc on | 768000 | joint	70831820d7519e83	bfe1b42c3712d5f3	3ffcfded3296c91a
+diff_pair | dc on | 768000 | split	70831820d7519e83	bfe1b42c3712d5f3	3ffcfded3296c91a
+diff_pair | dc off | 44100 | joint	bcc57932fdaf1e1d	bfe1b42c3712d5f3	3ffcfded3296c91a
+diff_pair | dc off | 44100 | split	bcc57932fdaf1e1d	bfe1b42c3712d5f3	3ffcfded3296c91a
+diff_pair | dc off | 96000 | joint	d041a49a2727ceb6	bfe1b42c3712d5f3	3ffcfded3296c91a
+diff_pair | dc off | 96000 | split	d041a49a2727ceb6	bfe1b42c3712d5f3	3ffcfded3296c91a
+diff_pair | dc off | 768000 | joint	70831820d7519e83	bfe1b42c3712d5f3	3ffcfded3296c91a
+diff_pair | dc off | 768000 | split	70831820d7519e83	bfe1b42c3712d5f3	3ffcfded3296c91a
+solid_state_feedback | dc on | 44100 | joint	6cf2e9dd1adefdb4	3fc27e883253ec69	3f9608662de35634
+solid_state_feedback | dc on | 44100 | split	6cf2e9dd1adefdb4	3fc27e883253ec69	3f9608662de35634
+solid_state_feedback | dc on | 96000 | joint	f0cc03f99980121a	3fb6cf5a80b5d62f	3f9608662de35634
+solid_state_feedback | dc on | 96000 | split	f0cc03f99980121a	3fb6cf5a80b5d62f	3f9608662de35634
+solid_state_feedback | dc on | 768000 | joint	4b349218bf8b21c2	3f68adaa911b616e	3f9608662de35634
+solid_state_feedback | dc on | 768000 | split	4b349218bf8b21c2	3f68adaa911b616e	3f9608662de35634
+solid_state_feedback | dc off | 44100 | joint	dc0a1e92dd71abf0	3fc2806031c6a324	3f9608662de35634
+solid_state_feedback | dc off | 44100 | split	1bd8fd14863a7982	3fc2806031c6a324	3f9608662de35634
+solid_state_feedback | dc off | 96000 | joint	6d329f79243ab2ab	3fb6cb0b2e494674	3f9608662de35634
+solid_state_feedback | dc off | 96000 | split	6d329f79243ab2ab	3fb6cb0b2e494674	3f9608662de35634
+solid_state_feedback | dc off | 768000 | joint	2794c1cd94c78c7b	3f67f6a3d351557d	3f9608662de35634
+solid_state_feedback | dc off | 768000 | split	2794c1cd94c78c7b	3f67f6a3d351557d	3f9608662de35634
+pp_pentode_feedback | dc on | 44100 | joint	38e3e68dc9c011fd	3fedfd76528f3f6b	3fce16b52dbc9dab
+pp_pentode_feedback | dc on | 44100 | split	38e3e68dc9c011fd	3fedfd76528f3f6b	3fce16b52dbc9dab
+pp_pentode_feedback | dc on | 96000 | joint	edcf6d1dd3d3aa56	3febe89e6ddeef16	3fce16b52dbc9dab
+pp_pentode_feedback | dc on | 96000 | split	edcf6d1dd3d3aa56	3febe89e6ddeef16	3fce16b52dbc9dab
+pp_pentode_feedback | dc on | 768000 | joint	5513b225caafa92a	3fea3085d5c602b0	3fce16b52dbc9dab
+pp_pentode_feedback | dc on | 768000 | split	5513b225caafa92a	3fea3085d5c602b0	3fce16b52dbc9dab
+pp_pentode_feedback | dc off | 44100 | joint	ae499aaa982016ea	3fee4136e05f0974	3fce16b52dbc9dab
+pp_pentode_feedback | dc off | 44100 | split	ae499aaa982016ea	3fee4136e05f0974	3fce16b52dbc9dab
+pp_pentode_feedback | dc off | 96000 | joint	ea8980ad156cad1b	3fec16705a26370a	3fce16b52dbc9dab
+pp_pentode_feedback | dc off | 96000 | split	ea8980ad156cad1b	3fec16705a26370a	3fce16b52dbc9dab
+pp_pentode_feedback | dc off | 768000 | joint	3773c9459219e940	3fea5df2921393a7	3fce16b52dbc9dab
+pp_pentode_feedback | dc off | 768000 | split	3773c9459219e940	3fea5df2921393a7	3fce16b52dbc9dab
+output_transformer | dc on | 44100 | joint	131f34f26788c1ec	4002d8ff1f686f99	0000000000000000
+output_transformer | dc on | 44100 | split	131f34f26788c1ec	4002d8ff1f686f99	0000000000000000
+output_transformer | dc on | 96000 | joint	1902f4f29f9e6554	4002e6e1934d0905	0000000000000000
+output_transformer | dc on | 96000 | split	1902f4f29f9e6554	4002e6e1934d0905	0000000000000000
+output_transformer | dc on | 768000 | joint	34b70eb52dbaa0d2	4002f142bf16fb69	0000000000000000
+output_transformer | dc on | 768000 | split	34b70eb52dbaa0d2	4002f142bf16fb69	0000000000000000
+output_transformer | dc off | 44100 | joint	131f34f26788c1ec	4002d8ff1f686f99	0000000000000000
+output_transformer | dc off | 44100 | split	131f34f26788c1ec	4002d8ff1f686f99	0000000000000000
+output_transformer | dc off | 96000 | joint	1902f4f29f9e6554	4002e6e1934d0905	0000000000000000
+output_transformer | dc off | 96000 | split	1902f4f29f9e6554	4002e6e1934d0905	0000000000000000
+output_transformer | dc off | 768000 | joint	34b70eb52dbaa0d2	4002f142bf16fb69	0000000000000000
+output_transformer | dc off | 768000 | split	34b70eb52dbaa0d2	4002f142bf16fb69	0000000000000000
+tape | dc on | 44100 | joint	344f0a673fbd27c4	3ff932cc040e3121	0000000000000000
+tape | dc on | 44100 | split	344f0a673fbd27c4	3ff932cc040e3121	0000000000000000
+tape | dc on | 96000 | joint	194b87acbf052b91	3ff9496aa57f0db4	0000000000000000
+tape | dc on | 96000 | split	194b87acbf052b91	3ff9496aa57f0db4	0000000000000000
+tape | dc on | 768000 | joint	08ee8578ba48c7b9	3ff96c98d4d50ba0	0000000000000000
+tape | dc on | 768000 | split	08ee8578ba48c7b9	3ff96c98d4d50ba0	0000000000000000
+tape | dc off | 44100 | joint	344f0a673fbd27c4	3ff932cc040e3121	0000000000000000
+tape | dc off | 44100 | split	344f0a673fbd27c4	3ff932cc040e3121	0000000000000000
+tape | dc off | 96000 | joint	194b87acbf052b91	3ff9496aa57f0db4	0000000000000000
+tape | dc off | 96000 | split	194b87acbf052b91	3ff9496aa57f0db4	0000000000000000
+tape | dc off | 768000 | joint	08ee8578ba48c7b9	3ff96c98d4d50ba0	0000000000000000
+tape | dc off | 768000 | split	08ee8578ba48c7b9	3ff96c98d4d50ba0	0000000000000000
+tape_master | dc on | 44100 | joint	6fbda7da242821c5	3ff00e64feca2151	0000000000000000
+tape_master | dc on | 44100 | split	6fbda7da242821c5	3ff00e64feca2151	0000000000000000
+tape_master | dc on | 96000 | joint	3f09bf18ffcf9081	3ff0122a684aa918	0000000000000000
+tape_master | dc on | 96000 | split	3f09bf18ffcf9081	3ff0122a684aa918	0000000000000000
+tape_master | dc on | 768000 | joint	1646ec0e27bd5b44	3ff0122a684aa918	0000000000000000
+tape_master | dc on | 768000 | split	1646ec0e27bd5b44	3ff0122a684aa918	0000000000000000
+tape_master | dc off | 44100 | joint	6fbda7da242821c5	3ff00e64feca2151	0000000000000000
+tape_master | dc off | 44100 | split	6fbda7da242821c5	3ff00e64feca2151	0000000000000000
+tape_master | dc off | 96000 | joint	3f09bf18ffcf9081	3ff0122a684aa918	0000000000000000
+tape_master | dc off | 96000 | split	3f09bf18ffcf9081	3ff0122a684aa918	0000000000000000
+tape_master | dc off | 768000 | joint	1646ec0e27bd5b44	3ff0122a684aa918	0000000000000000
+tape_master | dc off | 768000 | split	1646ec0e27bd5b44	3ff0122a684aa918	0000000000000000
+tape_studio | dc on | 44100 | joint	76b178b6eaaa5d37	3ff6a6168c6b7c76	0000000000000000
+tape_studio | dc on | 44100 | split	76b178b6eaaa5d37	3ff6a6168c6b7c76	0000000000000000
+tape_studio | dc on | 96000 | joint	72bc5bb01b25f144	3ff6a79a95c2929c	0000000000000000
+tape_studio | dc on | 96000 | split	72bc5bb01b25f144	3ff6a79a95c2929c	0000000000000000
+tape_studio | dc on | 768000 | joint	e85788ff883f4eea	3ff6a79a95c2929c	0000000000000000
+tape_studio | dc on | 768000 | split	e85788ff883f4eea	3ff6a79a95c2929c	0000000000000000
+tape_studio | dc off | 44100 | joint	76b178b6eaaa5d37	3ff6a6168c6b7c76	0000000000000000
+tape_studio | dc off | 44100 | split	76b178b6eaaa5d37	3ff6a6168c6b7c76	0000000000000000
+tape_studio | dc off | 96000 | joint	72bc5bb01b25f144	3ff6a79a95c2929c	0000000000000000
+tape_studio | dc off | 96000 | split	72bc5bb01b25f144	3ff6a79a95c2929c	0000000000000000
+tape_studio | dc off | 768000 | joint	e85788ff883f4eea	3ff6a79a95c2929c	0000000000000000
+tape_studio | dc off | 768000 | split	e85788ff883f4eea	3ff6a79a95c2929c	0000000000000000
+tape_vintage | dc on | 44100 | joint	db312d6893328e12	4001e849c1cab031	0000000000000000
+tape_vintage | dc on | 44100 | split	db312d6893328e12	4001e849c1cab031	0000000000000000
+tape_vintage | dc on | 96000 | joint	356dae21d8775ca0	4001e9609508bbec	0000000000000000
+tape_vintage | dc on | 96000 | split	356dae21d8775ca0	4001e9609508bbec	0000000000000000
+tape_vintage | dc on | 768000 | joint	6a9a5e3127bae55c	4001e9609508bbec	0000000000000000
+tape_vintage | dc on | 768000 | split	6a9a5e3127bae55c	4001e9609508bbec	0000000000000000
+tape_vintage | dc off | 44100 | joint	db312d6893328e12	4001e849c1cab031	0000000000000000
+tape_vintage | dc off | 44100 | split	db312d6893328e12	4001e849c1cab031	0000000000000000
+tape_vintage | dc off | 96000 | joint	356dae21d8775ca0	4001e9609508bbec	0000000000000000
+tape_vintage | dc off | 96000 | split	356dae21d8775ca0	4001e9609508bbec	0000000000000000
+tape_vintage | dc off | 768000 | joint	6a9a5e3127bae55c	4001e9609508bbec	0000000000000000
+tape_vintage | dc off | 768000 | split	6a9a5e3127bae55c	4001e9609508bbec	0000000000000000
+no layers | dc on | 44100 | joint	1149d50a9bf57784	0000000000000000	0000000000000000
+no layers | dc on | 44100 | split	1149d50a9bf57784	0000000000000000	0000000000000000
+no layers | dc on | 96000 | joint	3dea74f79eeb0779	0000000000000000	0000000000000000
+no layers | dc on | 96000 | split	3dea74f79eeb0779	0000000000000000	0000000000000000
+no layers | dc on | 768000 | joint	2968811b5990362c	0000000000000000	0000000000000000
+no layers | dc on | 768000 | split	2968811b5990362c	0000000000000000	0000000000000000
+no layers | dc off | 44100 | joint	1149d50a9bf57784	0000000000000000	0000000000000000
+no layers | dc off | 44100 | split	1149d50a9bf57784	0000000000000000	0000000000000000
+no layers | dc off | 96000 | joint	3dea74f79eeb0779	0000000000000000	0000000000000000
+no layers | dc off | 96000 | split	3dea74f79eeb0779	0000000000000000	0000000000000000
+no layers | dc off | 768000 | joint	2968811b5990362c	0000000000000000	0000000000000000
+no layers | dc off | 768000 | split	2968811b5990362c	0000000000000000	0000000000000000
+H2-H9 mixed signs, trimmed | dc on | 44100 | joint	c883670f1612a6f0	3ff052a181be4641	c0210f16f3fdaafb
+H2-H9 mixed signs, trimmed | dc on | 44100 | split	c883670f1612a6f0	3ff052a181be4641	c0210f16f3fdaafb
+H2-H9 mixed signs, trimmed | dc on | 96000 | joint	d6e1a2a682de673a	3ff05358a3274d1e	c0210f16f3fdaafb
+H2-H9 mixed signs, trimmed | dc on | 96000 | split	d6e1a2a682de673a	3ff05358a3274d1e	c0210f16f3fdaafb
+H2-H9 mixed signs, trimmed | dc on | 768000 | joint	47eded3bcb8b0726	3ff053e0d66f78c1	c0210f16f3fdaafb
+H2-H9 mixed signs, trimmed | dc on | 768000 | split	47eded3bcb8b0726	3ff053e0d66f78c1	c0210f16f3fdaafb
+H2-H9 mixed signs, trimmed | dc off | 44100 | joint	ccffa4ac8d57d0d1	3fe5df3146704172	c0210f16f3fdaafb
+H2-H9 mixed signs, trimmed | dc off | 44100 | split	ccffa4ac8d57d0d1	3fe5df3146704172	c0210f16f3fdaafb
+H2-H9 mixed signs, trimmed | dc off | 96000 | joint	5d9d76fee2a52967	3fe5df3146704172	c0210f16f3fdaafb
+H2-H9 mixed signs, trimmed | dc off | 96000 | split	5d9d76fee2a52967	3fe5df3146704172	c0210f16f3fdaafb
+H2-H9 mixed signs, trimmed | dc off | 768000 | joint	daa062a053bd2ce3	3fe5df3146704172	c0210f16f3fdaafb
+H2-H9 mixed signs, trimmed | dc off | 768000 | split	daa062a053bd2ce3	3fe5df3146704172	c0210f16f3fdaafb
+H2-H9 tilted, low all | dc on | 44100 | joint	1f40a267a0f2ec06	3fe9222d6f1edb07	3fa3aaf24cabb5b0
+H2-H9 tilted, low all | dc on | 44100 | split	1f40a267a0f2ec06	3fe9222d6f1edb07	3fa3aaf24cabb5b0
+H2-H9 tilted, low all | dc on | 96000 | joint	25b0822ebf93b56c	3fe8956ef318e2a5	3fa3aaf24cabb5b0
+H2-H9 tilted, low all | dc on | 96000 | split	25b0822ebf93b56c	3fe8956ef318e2a5	3fa3aaf24cabb5b0
+H2-H9 tilted, low all | dc on | 768000 | joint	330c1deebd56bffa	3fe9beb4e8d9fe15	3fa3aaf24cabb5b0
+H2-H9 tilted, low all | dc on | 768000 | split	330c1deebd56bffa	3fe9beb4e8d9fe15	3fa3aaf24cabb5b0
+H2-H9 tilted, low all | dc off | 44100 | joint	0c5fb4873f47a3f0	3fecfa8fe280896a	3fa3aaf24cabb5b0
+H2-H9 tilted, low all | dc off | 44100 | split	0c5fb4873f47a3f0	3fecfa8fe280896a	3fa3aaf24cabb5b0
+H2-H9 tilted, low all | dc off | 96000 | joint	974a3bcbf5188b0c	3fec6143521d02b4	3fa3aaf24cabb5b0
+H2-H9 tilted, low all | dc off | 96000 | split	974a3bcbf5188b0c	3fec6143521d02b4	3fa3aaf24cabb5b0
+H2-H9 tilted, low all | dc off | 768000 | joint	af3ad218734b8449	3fed84a8a4c3c19a	3fa3aaf24cabb5b0
+H2-H9 tilted, low all | dc off | 768000 | split	af3ad218734b8449	3fed84a8a4c3c19a	3fa3aaf24cabb5b0
+H2-H9 tilted, overrides | dc on | 44100 | joint	254b63500896bc64	4030ec4a464f1bab	c0210f16f3fdaafb
+H2-H9 tilted, overrides | dc on | 44100 | split	254b63500896bc64	4030ec4a464f1bab	c0210f16f3fdaafb
+H2-H9 tilted, overrides | dc on | 96000 | joint	967d75833f279ba3	40308638a94ea9c8	c0210f16f3fdaafb
+H2-H9 tilted, overrides | dc on | 96000 | split	967d75833f279ba3	40308638a94ea9c8	c0210f16f3fdaafb
+H2-H9 tilted, overrides | dc on | 768000 | joint	c5a0f70ab7266ced	4031fa7a8f2e23e2	c0210f16f3fdaafb
+H2-H9 tilted, overrides | dc on | 768000 | split	c5a0f70ab7266ced	4031fa7a8f2e23e2	c0210f16f3fdaafb
+H2-H9 tilted, overrides | dc off | 44100 | joint	5ed988c0115c7f59	4030d375ca35293c	c0210f16f3fdaafb
+H2-H9 tilted, overrides | dc off | 44100 | split	5ed988c0115c7f59	4030d375ca35293c	c0210f16f3fdaafb
+H2-H9 tilted, overrides | dc off | 96000 | joint	68326f1d94d6deef	403037b774898283	c0210f16f3fdaafb
+H2-H9 tilted, overrides | dc off | 96000 | split	68326f1d94d6deef	403037b774898283	c0210f16f3fdaafb
+H2-H9 tilted, overrides | dc off | 768000 | joint	d26729413d3972f8	4031afb7d6f5cae6	c0210f16f3fdaafb
+H2-H9 tilted, overrides | dc off | 768000 | split	d26729413d3972f8	4031afb7d6f5cae6	c0210f16f3fdaafb
+cheb + flux | dc on | 44100 | joint	6e0a1344ca29b6b3	40080e2cf69b1d86	3fc12474edcc8fa1
+cheb + flux | dc on | 44100 | split	6e0a1344ca29b6b3	40080e2cf69b1d86	3fc12474edcc8fa1
+cheb + flux | dc on | 96000 | joint	45a7864d56407419	40081b5165bc3c6c	3fc12474edcc8fa1
+cheb + flux | dc on | 96000 | split	45a7864d56407419	40081b5165bc3c6c	3fc12474edcc8fa1
+cheb + flux | dc on | 768000 | joint	c662d22b149b4098	40082524526dacf5	3fc12474edcc8fa1
+cheb + flux | dc on | 768000 | split	c662d22b149b4098	40082524526dacf5	3fc12474edcc8fa1
+cheb + flux | dc off | 44100 | joint	4ff54c94a94568cb	40080ea8216999ce	3fc12474edcc8fa1
+cheb + flux | dc off | 44100 | split	4ff54c94a94568cb	40080ea8216999ce	3fc12474edcc8fa1
+cheb + flux | dc off | 96000 | joint	775c062a6835334e	40081b89ef6264d1	3fc12474edcc8fa1
+cheb + flux | dc off | 96000 | split	775c062a6835334e	40081b89ef6264d1	3fc12474edcc8fa1
+cheb + flux | dc off | 768000 | joint	d285bd68ed301d76	4008252b5e08d12a	3fc12474edcc8fa1
+cheb + flux | dc off | 768000 | split	d285bd68ed301d76	4008252b5e08d12a	3fc12474edcc8fa1
+cheb + hyst | dc on | 44100 | joint	ecaaa3d2307e8e04	4001ad027b0edeb7	3fc12474edcc8fa1
+cheb + hyst | dc on | 44100 | split	ecaaa3d2307e8e04	4001ad027b0edeb7	3fc12474edcc8fa1
+cheb + hyst | dc on | 96000 | joint	2692a7d910576be9	4001adfc8a447051	3fc12474edcc8fa1
+cheb + hyst | dc on | 96000 | split	2692a7d910576be9	4001adfc8a447051	3fc12474edcc8fa1
+cheb + hyst | dc on | 768000 | joint	04940be06b248472	4001ae32d30af52e	3fc12474edcc8fa1
+cheb + hyst | dc on | 768000 | split	04940be06b248472	4001ae32d30af52e	3fc12474edcc8fa1
+cheb + hyst | dc off | 44100 | joint	4837709c0b4340bb	4001ad897db7f626	3fc12474edcc8fa1
+cheb + hyst | dc off | 44100 | split	4837709c0b4340bb	4001ad897db7f626	3fc12474edcc8fa1
+cheb + hyst | dc off | 96000 | joint	1a4a8aa15650bba4	4001ae3a8e7fd430	3fc12474edcc8fa1
+cheb + hyst | dc off | 96000 | split	1a4a8aa15650bba4	4001ae3a8e7fd430	3fc12474edcc8fa1
+cheb + hyst | dc off | 768000 | joint	ab1c15a78a2cd9f4	4001ae3a8e7fd430	3fc12474edcc8fa1
+cheb + hyst | dc off | 768000 | split	ab1c15a78a2cd9f4	4001ae3a8e7fd430	3fc12474edcc8fa1
+two flux | dc on | 44100 | joint	f193c91a14d494ea	400ca76c92ca1d1a	0000000000000000
+two flux | dc on | 44100 | split	f193c91a14d494ea	400ca76c92ca1d1a	0000000000000000
+two flux | dc on | 96000 | joint	4da664fdcff809f0	400cbc73f6740670	0000000000000000
+two flux | dc on | 96000 | split	4da664fdcff809f0	400cbc73f6740670	0000000000000000
+two flux | dc on | 768000 | joint	6d9ee7f78a91c4e3	400cd36947c6dc3a	0000000000000000
+two flux | dc on | 768000 | split	6d9ee7f78a91c4e3	400cd36947c6dc3a	0000000000000000
+two flux | dc off | 44100 | joint	f193c91a14d494ea	400ca76c92ca1d1a	0000000000000000
+two flux | dc off | 44100 | split	f193c91a14d494ea	400ca76c92ca1d1a	0000000000000000
+two flux | dc off | 96000 | joint	4da664fdcff809f0	400cbc73f6740670	0000000000000000
+two flux | dc off | 96000 | split	4da664fdcff809f0	400cbc73f6740670	0000000000000000
+two flux | dc off | 768000 | joint	6d9ee7f78a91c4e3	400cd36947c6dc3a	0000000000000000
+two flux | dc off | 768000 | split	6d9ee7f78a91c4e3	400cd36947c6dc3a	0000000000000000
+three hyst | dc on | 44100 | joint	5ee4268110c4a4bd	402098461aab8349	0000000000000000
+three hyst | dc on | 44100 | split	5ee4268110c4a4bd	402098461aab8349	0000000000000000
+three hyst | dc on | 96000 | joint	0b2bc249321f7ed0	402098d512b78631	0000000000000000
+three hyst | dc on | 96000 | split	0b2bc249321f7ed0	402098d512b78631	0000000000000000
+three hyst | dc on | 768000 | joint	5d57189213113a92	402098d512b78631	0000000000000000
+three hyst | dc on | 768000 | split	5d57189213113a92	402098d512b78631	0000000000000000
+three hyst | dc off | 44100 | joint	5ee4268110c4a4bd	402098461aab8349	0000000000000000
+three hyst | dc off | 44100 | split	5ee4268110c4a4bd	402098461aab8349	0000000000000000
+three hyst | dc off | 96000 | joint	0b2bc249321f7ed0	402098d512b78631	0000000000000000
+three hyst | dc off | 96000 | split	0b2bc249321f7ed0	402098d512b78631	0000000000000000
+three hyst | dc off | 768000 | joint	5d57189213113a92	402098d512b78631	0000000000000000
+three hyst | dc off | 768000 | split	5d57189213113a92	402098d512b78631	0000000000000000
+tilt + hyst | dc on | 44100 | joint	3ca85159462161e9	4002b004d9e25d34	3fce16b52dbc9dab
+tilt + hyst | dc on | 44100 | split	3ca85159462161e9	4002b004d9e25d34	3fce16b52dbc9dab
+tilt + hyst | dc on | 96000 | joint	f16de9e36f165d72	4003267ca685f897	3fce16b52dbc9dab
+tilt + hyst | dc on | 96000 | split	f16de9e36f165d72	4003267ca685f897	3fce16b52dbc9dab
+tilt + hyst | dc on | 768000 | joint	4ae6bbcc4b2e6bf0	40045cd542bc6a72	3fce16b52dbc9dab
+tilt + hyst | dc on | 768000 | split	4ae6bbcc4b2e6bf0	40045cd542bc6a72	3fce16b52dbc9dab
+tilt + hyst | dc off | 44100 | joint	c0dd9570b81cda47	4002be704c02e54d	3fce16b52dbc9dab
+tilt + hyst | dc off | 44100 | split	c0dd9570b81cda47	4002be704c02e54d	3fce16b52dbc9dab
+tilt + hyst | dc off | 96000 | joint	98db2715d64e0ebe	4003301a038e8b6d	3fce16b52dbc9dab
+tilt + hyst | dc off | 96000 | split	98db2715d64e0ebe	4003301a038e8b6d	3fce16b52dbc9dab
+tilt + hyst | dc off | 768000 | joint	20ca113e14d6a924	400466246aedfa0c	3fce16b52dbc9dab
+tilt + hyst | dc off | 768000 | split	20ca113e14d6a924	400466246aedfa0c	3fce16b52dbc9dab
+tilt + two hyst | dc on | 44100 | joint	93f874ab311d9792	40151f8f11a2f27d	3f9608662de35634
+tilt + two hyst | dc on | 44100 | split	93f874ab311d9792	40151f8f11a2f27d	3f9608662de35634
+tilt + two hyst | dc on | 96000 | joint	8827c363d4b706b8	40151e0c0bc117e7	3f9608662de35634
+tilt + two hyst | dc on | 96000 | split	8827c363d4b706b8	40151e0c0bc117e7	3f9608662de35634
+tilt + two hyst | dc on | 768000 | joint	a52221ac1698fb4c	4015526daefb0096	3f9608662de35634
+tilt + two hyst | dc on | 768000 | split	a52221ac1698fb4c	4015526daefb0096	3f9608662de35634
+tilt + two hyst | dc off | 44100 | joint	bff620ef81908e9d	40151f973bf6e6ba	3f9608662de35634
+tilt + two hyst | dc off | 44100 | split	bff620ef81908e9d	40151f973bf6e6ba	3f9608662de35634
+tilt + two hyst | dc off | 96000 | joint	575b8780c34d443e	40151e028fbf5fc1	3f9608662de35634
+tilt + two hyst | dc off | 96000 | split	575b8780c34d443e	40151e028fbf5fc1	3f9608662de35634
+tilt + two hyst | dc off | 768000 | joint	460dd6eaba0a868b	401552614b4dfe99	3f9608662de35634
+tilt + two hyst | dc off | 768000 | split	460dd6eaba0a868b	401552614b4dfe99	3f9608662de35634
+tilt + flux + hyst | dc on | 44100 | joint	cabd9740c4a0613a	4020044b4e8139a0	3fd0627a4656cd66
+tilt + flux + hyst | dc on | 44100 | split	cabd9740c4a0613a	4020044b4e8139a0	3fd0627a4656cd66
+tilt + flux + hyst | dc on | 96000 | joint	581b85d803c03efd	402018e24294559b	3fd0627a4656cd66
+tilt + flux + hyst | dc on | 96000 | split	581b85d803c03efd	402018e24294559b	3fd0627a4656cd66
+tilt + flux + hyst | dc on | 768000 | joint	976fb47a442f0547	402058cb5c90f148	3fd0627a4656cd66
+tilt + flux + hyst | dc on | 768000 | split	976fb47a442f0547	402058cb5c90f148	3fd0627a4656cd66
+tilt + flux + hyst | dc off | 44100 | joint	1df5b69d3c2b31d4	4020066b844e3af6	3fd0627a4656cd66
+tilt + flux + hyst | dc off | 44100 | split	1df5b69d3c2b31d4	4020066b844e3af6	3fd0627a4656cd66
+tilt + flux + hyst | dc off | 96000 | joint	cf4122b7d8685530	40201a4b6780b0b2	3fd0627a4656cd66
+tilt + flux + hyst | dc off | 96000 | split	cf4122b7d8685530	40201a4b6780b0b2	3fd0627a4656cd66
+tilt + flux + hyst | dc off | 768000 | joint	cb1b388417ba312b	40205a2b34b1ff5e	3fd0627a4656cd66
+tilt + flux + hyst | dc off | 768000 | split	cb1b388417ba312b	40205a2b34b1ff5e	3fd0627a4656cd66
+shared tilt filters | dc on | 44100 | joint	27460cd36027356c	3fdbe659f56a9636	3fb357fad583340f
+shared tilt filters | dc on | 44100 | split	27460cd36027356c	3fdbe659f56a9636	3fb357fad583340f
+shared tilt filters | dc on | 96000 | joint	eaa14ba8d7d2a6c4	3fd55b1d080aa98c	3fb357fad583340f
+shared tilt filters | dc on | 96000 | split	eaa14ba8d7d2a6c4	3fd55b1d080aa98c	3fb357fad583340f
+shared tilt filters | dc on | 768000 | joint	1a0d6c9f13ad5153	3fc54def8081e797	3fb357fad583340f
+shared tilt filters | dc on | 768000 | split	1a0d6c9f13ad5153	3fc54def8081e797	3fb357fad583340f
+shared tilt filters | dc off | 44100 | joint	1f18d54c177c0e3d	3fdc4d62c6acab9b	3fb357fad583340f
+shared tilt filters | dc off | 44100 | split	ef3964751fb3e588	3fdc4d62c6acab9b	3fb357fad583340f
+shared tilt filters | dc off | 96000 | joint	ac4beda246e3deb5	3fd56a8a9f6e1b99	3fb357fad583340f
+shared tilt filters | dc off | 96000 | split	ac4beda246e3deb5	3fd56a8a9f6e1b99	3fb357fad583340f
+shared tilt filters | dc off | 768000 | joint	82005f2e1d289870	3fc54d26c26c9c69	3fb357fad583340f
+shared tilt filters | dc off | 768000 | split	82005f2e1d289870	3fc54d26c26c9c69	3fb357fad583340f
+hyst, flux, cheb | dc on | 44100 | joint	f0dbb98d1e271ae7	4011175abba96aa4	3fa0c3ac6086e5a6
+hyst, flux, cheb | dc on | 44100 | split	f0dbb98d1e271ae7	4011175abba96aa4	3fa0c3ac6086e5a6
+hyst, flux, cheb | dc on | 96000 | joint	1386114b339453b6	4011174a803fa957	3fa0c3ac6086e5a6
+hyst, flux, cheb | dc on | 96000 | split	1386114b339453b6	4011174a803fa957	3fa0c3ac6086e5a6
+hyst, flux, cheb | dc on | 768000 | joint	f118b86fa0829b28	40111c7d134ed453	3fa0c3ac6086e5a6
+hyst, flux, cheb | dc on | 768000 | split	f118b86fa0829b28	40111c7d134ed453	3fa0c3ac6086e5a6
+hyst, flux, cheb | dc off | 44100 | joint	c0481e5ef76bb899	40111764a5219358	3fa0c3ac6086e5a6
+hyst, flux, cheb | dc off | 44100 | split	c0481e5ef76bb899	40111764a5219358	3fa0c3ac6086e5a6
+hyst, flux, cheb | dc off | 96000 | joint	739c4deaf353a593	4011174f0dc9a6b3	3fa0c3ac6086e5a6
+hyst, flux, cheb | dc off | 96000 | split	739c4deaf353a593	4011174f0dc9a6b3	3fa0c3ac6086e5a6
+hyst, flux, cheb | dc off | 768000 | joint	c4925f992741c904	40111c7da460c223	3fa0c3ac6086e5a6
+hyst, flux, cheb | dc off | 768000 | split	c4925f992741c904	40111c7da460c223	3fa0c3ac6086e5a6
+off and zero layers | dc on | 44100 | joint	694b566e39bb53c5	bfa30b9ee62d54c9	3fcce6aae8f36dc7
+off and zero layers | dc on | 44100 | split	694b566e39bb53c5	bfa30b9ee62d54c9	3fcce6aae8f36dc7
+off and zero layers | dc on | 96000 | joint	55d625cf99481ff6	bfa30aec548c2eec	3fcce6aae8f36dc7
+off and zero layers | dc on | 96000 | split	55d625cf99481ff6	bfa30aec548c2eec	3fcce6aae8f36dc7
+off and zero layers | dc on | 768000 | joint	ee993a47cccc1607	bfa30a678534a542	3fcce6aae8f36dc7
+off and zero layers | dc on | 768000 | split	ee993a47cccc1607	bfa30a678534a542	3fcce6aae8f36dc7
+off and zero layers | dc off | 44100 | joint	5176a774d44526bb	bfa30a5499853cf1	3fcce6aae8f36dc7
+off and zero layers | dc off | 44100 | split	5176a774d44526bb	bfa30a5499853cf1	3fcce6aae8f36dc7
+off and zero layers | dc off | 96000 | joint	31101e8da3e1f0e6	bfa30a5499853cf1	3fcce6aae8f36dc7
+off and zero layers | dc off | 96000 | split	31101e8da3e1f0e6	bfa30a5499853cf1	3fcce6aae8f36dc7
+off and zero layers | dc off | 768000 | joint	d25599a410d75e67	bfa30a5499853cf1	3fcce6aae8f36dc7
+off and zero layers | dc off | 768000 | split	d25599a410d75e67	bfa30a5499853cf1	3fcce6aae8f36dc7
+drive, amount, invert_even | dc on | 44100 | joint	19b977863f8011d9	3fb52278c1a8ddd8	3f92d2876e770063
+drive, amount, invert_even | dc on | 44100 | split	19b977863f8011d9	3fb52278c1a8ddd8	3f92d2876e770063
+drive, amount, invert_even | dc on | 96000 | joint	a9514f1a05fe3cec	3fb52395ffc1ca9b	3f92d2876e770063
+drive, amount, invert_even | dc on | 96000 | split	a9514f1a05fe3cec	3fb52395ffc1ca9b	3f92d2876e770063
+drive, amount, invert_even | dc on | 768000 | joint	020efb6049ebf891	3fb5246a259b5127	3f92d2876e770063
+drive, amount, invert_even | dc on | 768000 | split	020efb6049ebf891	3fb5246a259b5127	3f92d2876e770063
+drive, amount, invert_even | dc off | 44100 | joint	534dd7d5c16e3a6a	3fb524885cd6a537	3f92d2876e770063
+drive, amount, invert_even | dc off | 44100 | split	534dd7d5c16e3a6a	3fb524885cd6a537	3f92d2876e770063
+drive, amount, invert_even | dc off | 96000 | joint	d07ff9b6ced7aabb	3fb524885cd6a537	3f92d2876e770063
+drive, amount, invert_even | dc off | 96000 | split	d07ff9b6ced7aabb	3fb524885cd6a537	3f92d2876e770063
+drive, amount, invert_even | dc off | 768000 | joint	4466f76525263dfc	3fb524885cd6a537	3f92d2876e770063
+drive, amount, invert_even | dc off | 768000 | split	4466f76525263dfc	3fb524885cd6a537	3f92d2876e770063
+eight layers | dc on | 44100 | joint	adb71518e694cfa5	40262fcde77e3936	3fd8b573817d4696
+eight layers | dc on | 44100 | split	adb71518e694cfa5	40262fcde77e3936	3fd8b573817d4696
+eight layers | dc on | 96000 | joint	42591636e116c5c3	402641b7d8a88828	3fd8b573817d4696
+eight layers | dc on | 96000 | split	42591636e116c5c3	402641b7d8a88828	3fd8b573817d4696
+eight layers | dc on | 768000 | joint	811a89774b650160	40266e8625fd3aba	3fd8b573817d4696
+eight layers | dc on | 768000 | split	811a89774b650160	40266e8625fd3aba	3fd8b573817d4696
+eight layers | dc off | 44100 | joint	5107b3e87693acb7	40264f616df5fa1a	3fd8b573817d4696
+eight layers | dc off | 44100 | split	5107b3e87693acb7	40264f616df5fa1a	3fd8b573817d4696
+eight layers | dc off | 96000 | joint	8a07c46cbba8b1b5	40265d1655243074	3fd8b573817d4696
+eight layers | dc off | 96000 | split	8a07c46cbba8b1b5	40265d1655243074	3fd8b573817d4696
+eight layers | dc off | 768000 | joint	d866fdcf6bc19852	4026899ef5902fe6	3fd8b573817d4696
+eight layers | dc off | 768000 | split	d866fdcf6bc19852	4026899ef5902fe6	3fd8b573817d4696
+hyst at half amount + flux | dc on | 44100 | joint	ad513cf90a22d554	4006bfe0cfd7dd01	0000000000000000
+hyst at half amount + flux | dc on | 44100 | split	ad513cf90a22d554	4006bfe0cfd7dd01	0000000000000000
+hyst at half amount + flux | dc on | 96000 | joint	eb2099abf6b1d349	4006cdbfb824c000	0000000000000000
+hyst at half amount + flux | dc on | 96000 | split	eb2099abf6b1d349	4006cdbfb824c000	0000000000000000
+hyst at half amount + flux | dc on | 768000 | joint	79521634a9bd1573	4006d78fe08950a6	0000000000000000
+hyst at half amount + flux | dc on | 768000 | split	79521634a9bd1573	4006d78fe08950a6	0000000000000000
+hyst at half amount + flux | dc off | 44100 | joint	ad513cf90a22d554	4006bfe0cfd7dd01	0000000000000000
+hyst at half amount + flux | dc off | 44100 | split	ad513cf90a22d554	4006bfe0cfd7dd01	0000000000000000
+hyst at half amount + flux | dc off | 96000 | joint	eb2099abf6b1d349	4006cdbfb824c000	0000000000000000
+hyst at half amount + flux | dc off | 96000 | split	eb2099abf6b1d349	4006cdbfb824c000	0000000000000000
+hyst at half amount + flux | dc off | 768000 | joint	79521634a9bd1573	4006d78fe08950a6	0000000000000000
+hyst at half amount + flux | dc off | 768000 | split	79521634a9bd1573	4006d78fe08950a6	0000000000000000
+stage off | dc on | 44100 | joint	09727b73d0b9cbcc	0000000000000000	0000000000000000
+stage off | dc on | 44100 | split	09727b73d0b9cbcc	0000000000000000	0000000000000000
+stage off | dc on | 96000 | joint	d7b117c695fabe21	0000000000000000	0000000000000000
+stage off | dc on | 96000 | split	d7b117c695fabe21	0000000000000000	0000000000000000
+stage off | dc on | 768000 | joint	ca939ce4c65cdd74	0000000000000000	0000000000000000
+stage off | dc on | 768000 | split	ca939ce4c65cdd74	0000000000000000	0000000000000000
+stage off | dc off | 44100 | joint	09727b73d0b9cbcc	0000000000000000	0000000000000000
+stage off | dc off | 44100 | split	09727b73d0b9cbcc	0000000000000000	0000000000000000
+stage off | dc off | 96000 | joint	d7b117c695fabe21	0000000000000000	0000000000000000
+stage off | dc off | 96000 | split	d7b117c695fabe21	0000000000000000	0000000000000000
+stage off | dc off | 768000 | joint	ca939ce4c65cdd74	0000000000000000	0000000000000000
+stage off | dc off | 768000 | split	ca939ce4c65cdd74	0000000000000000	0000000000000000

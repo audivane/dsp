@@ -41,7 +41,9 @@ pub struct RationalResampler {
     kernel_len: usize,
     /// `L` branches of `taps` coefficients, each reversed so the newest input
     /// meets the last coefficient: `coeffs[b T + t] = h[b + (T - 1 - t) L]`.
-    coeffs: Vec<f64>,
+    /// Shared by the per-channel resamplers of
+    /// [`RationalResampler::split_channels`].
+    coeffs: std::sync::Arc<Vec<f64>>,
     /// The kernel's own delay in intermediate-grid samples.
     kernel_delay: f64,
     channels: usize,
@@ -101,7 +103,7 @@ impl RationalResampler {
             m,
             taps,
             kernel_len: kernel.len(),
-            coeffs,
+            coeffs: std::sync::Arc::new(coeffs),
             kernel_delay,
             channels,
             max_block_in,
@@ -183,9 +185,40 @@ impl RationalResampler {
 
     /// Scale every output by `gain` (folded into the coefficients).
     pub fn scale_output(&mut self, gain: f64) {
-        for c in &mut self.coeffs {
+        // Unique until the resampler is split, so this never copies.
+        for c in std::sync::Arc::make_mut(&mut self.coeffs) {
             *c *= gain;
         }
+    }
+
+    /// One single-channel resampler per channel, each running its channel
+    /// exactly as this one does, bit for bit (the two-channel dot product
+    /// sums each channel in the one-channel order, `crate::dot`), from
+    /// this one's state. The coefficients are shared. Off the real-time
+    /// thread (it allocates); `self` is left without channels.
+    pub fn split_channels(&mut self) -> Vec<RationalResampler> {
+        let hist = std::mem::take(&mut self.hist);
+        self.channels = 0;
+        hist.into_iter()
+            .map(|h| RationalResampler {
+                ratio: self.ratio,
+                l: self.l,
+                m: self.m,
+                taps: self.taps,
+                kernel_len: self.kernel_len,
+                coeffs: std::sync::Arc::clone(&self.coeffs),
+                kernel_delay: self.kernel_delay,
+                channels: 1,
+                max_block_in: self.max_block_in,
+                hist: vec![h],
+                phase: self.phase,
+                lead: self.lead,
+                pos: self.pos,
+                step_int: self.step_int,
+                step_frac: self.step_frac,
+                kernels: self.kernels,
+            })
+            .collect()
     }
 
     /// `output[c].len()` must be [`Self::output_frames`]`(input[c].len())`.

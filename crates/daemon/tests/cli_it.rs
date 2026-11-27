@@ -468,7 +468,7 @@ fn ab_commands() {
     let stdout = ctl_ok(&harness.socket, &["ab", "b", "--fade", "25"]);
     assert!(stdout.contains("side B"), "{stdout}");
     let flags = &harness.engine.snapshot().ab;
-    assert_eq!(flags.as_ref().map(|a| a.current), Some(AbSide::B));
+    assert_eq!(flags.as_ref().and_then(|a| a.current), Some(AbSide::B));
 
     let stdout = ctl_ok(&harness.socket, &["ab", "a"]);
     assert!(stdout.contains("side A"), "{stdout}");
@@ -841,8 +841,17 @@ fn preset_commands() {
     );
     assert!(stdout.contains("imported preset"), "{stdout}");
     let list = ctl_json(&harness.socket, &["preset", "list"]);
-    assert_eq!(list.as_array().unwrap().len(), 2);
-    let imported = ctl_json(&harness.socket, &["preset", "show", "AutoEQ"]);
+    assert_eq!(
+        list.as_array().unwrap().len(),
+        1,
+        "an EQ preset is not global"
+    );
+    let list = ctl_json(&harness.socket, &["preset", "--part", "eq", "list"]);
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    let imported = ctl_json(
+        &harness.socket,
+        &["preset", "show", "AutoEQ", "--part", "eq"],
+    );
     assert_eq!(
         imported["chain"]["eq"]["bands"].as_array().unwrap().len(),
         2
@@ -863,11 +872,11 @@ fn preset_commands() {
         ],
     );
     assert_eq!(
-        ctl_json(&harness.socket, &["preset", "list"])
+        ctl_json(&harness.socket, &["preset", "list", "--part", "eq"])
             .as_array()
             .unwrap()
             .len(),
-        3
+        2
     );
 
     // Deleting the active preset clears it.
@@ -886,6 +895,16 @@ fn preset_commands() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+
+    // A global preset of some parts only.
+    let stdout = ctl_ok(
+        &harness.socket,
+        &["preset", "save", "Partial", "--parts", "eq,upsampling"],
+    );
+    assert!(stdout.contains("eq+upsampling"), "{stdout}");
+    let stdout = ctl_ok(&harness.socket, &["preset", "list"]);
+    assert!(stdout.contains("Partial"), "{stdout}");
+    assert!(stdout.contains("(active)"), "{stdout}");
 }
 
 #[test]

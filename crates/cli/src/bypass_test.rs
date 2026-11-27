@@ -1,4 +1,4 @@
-//! `avdsp bypass-test` — prove the passthrough path is bit-exact.
+//! `avdsp bypass-test`: prove the passthrough path is bit-exact.
 
 use crate::BypassTestArgs;
 use crate::wavio;

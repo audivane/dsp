@@ -124,6 +124,14 @@ fn run(args: Args) -> anyhow::Result<()> {
         }
     }
 
+    // Identical DACs may have come up under each other's names: each
+    // output follows its own USB device (an old config records them now).
+    if audivane_dsp_daemon::control::device_identity::reconcile_at_start(&mut config)
+        && let Err(err) = store.save(&config)
+    {
+        log::warn!("cannot save {}: {err}", store.path().display());
+    }
+
     // A device that is not there (unplugged), or there but failing to open,
     // does not stop the engine: its sinks come up on the engine's own clock
     // and it opens the device when it can. Any other start failure still

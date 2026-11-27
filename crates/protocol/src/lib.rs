@@ -14,6 +14,38 @@ pub mod ratio;
 pub use design::{FilterDesign, RECOMMENDED_PRESET, StoredDesign};
 pub use ratio::{MAX_RATIO_TERM, RateRatio};
 
+/// Scale a 48 kHz base quantum to `rate` the way PipeWire does, so the ALSA
+/// period the engine opens with is the quantum the graph actually runs.
+///
+/// PipeWire turns `node.latency = q/rate` into `q * graph_rate / rate` and,
+/// with `clock.power-of-two-quantum` (the default), rounds that *down* to a
+/// power of two. So a 1024 quantum runs 512 at 44.1 kHz, 1024 at 88.2 kHz,
+/// 2048 at 176.4 kHz and 4096 at 352.8 kHz, never 1881 or 3763. A period
+/// that does not match the quantum costs several back-to-back cycles per
+/// period and the source clients cannot keep up.
+///
+/// The result is also capped at PipeWire's default `clock.quantum-limit`
+/// (8192): at 768 kHz a 1024 quantum would be 16384, but the graph runs 8192.
+pub fn scaled_quantum(q48: u32, rate: u32) -> u32 {
+    const PW_QUANTUM_LIMIT: u64 = 8192;
+    let q48 = q48.max(32);
+    let r = rate.max(8_000) as u64;
+    let raw = ((q48 as u64 * r) / 48_000).clamp(32, PW_QUANTUM_LIMIT) as u32;
+    if q48.is_power_of_two() {
+        (1u32 << (31 - raw.leading_zeros())).max(32)
+    } else {
+        raw
+    }
+}
+
+/// The largest block the engine builds its chain with at `rate`:
+/// [`scaled_quantum`] clamped to 512..=8192 frames. The upsampler's
+/// partitioned convolution runs this rounded up to a power of two, capped
+/// at 1024, so its delay (and `status.filter_latency_ms`) follows it.
+pub fn chain_max_block(quantum: u32, rate: u32) -> usize {
+    scaled_quantum(quantum, rate).clamp(512, 8192) as usize
+}
+
 /// Graph (source) rates the engine can run at. `rate.allowed_rates` must be
 /// a subset of this list.
 pub const ALLOWED_RATES: &[u32] = &[
@@ -246,6 +278,61 @@ pub fn check_tilt_pair(low: &TiltConfig, high: &TiltConfig) -> Result<(), String
     Ok(())
 }
 
+/// Bass tone control: an RBJ low shelf at this corner and Q (a gentle,
+/// first-order-like shelf, as on some hardware tone controls).
+pub const TONE_BASS_HZ: f64 = 140.0;
+pub const TONE_BASS_Q: f64 = 0.48;
+/// Treble tone control: an RBJ high shelf at this corner and Q.
+pub const TONE_TREBLE_HZ: f64 = 4_900.0;
+pub const TONE_TREBLE_Q: f64 = 0.49;
+/// Largest tone boost or cut, dB (either way). The UI steps by 0.5 dB.
+pub const TONE_MAX_DB: f64 = 6.0;
+
+/// Bass and treble knobs: two fixed shelves on every channel, run after the
+/// bands of the EQ stage. Not part of the band list. A knob at 0 dB adds no
+/// filter, so 0/0 is the same as no `tone` at all.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct ToneConfig {
+    /// Low shelf gain at [`TONE_BASS_HZ`], dB (±[`TONE_MAX_DB`]).
+    #[serde(default)]
+    pub bass_db: f64,
+    /// High shelf gain at [`TONE_TREBLE_HZ`], dB (±[`TONE_MAX_DB`]).
+    #[serde(default)]
+    pub treble_db: f64,
+}
+
+impl ToneConfig {
+    /// The shelves this tone adds, as bands: none for a knob at 0 dB.
+    pub fn bands(&self) -> Vec<Band> {
+        let mut out = Vec::new();
+        if self.bass_db != 0.0 {
+            out.push(Band {
+                kind: FilterType::LowShelf,
+                freq_hz: TONE_BASS_HZ,
+                gain_db: self.bass_db,
+                q: TONE_BASS_Q,
+                enabled: true,
+            });
+        }
+        if self.treble_db != 0.0 {
+            out.push(Band {
+                kind: FilterType::HighShelf,
+                freq_hz: TONE_TREBLE_HZ,
+                gain_db: self.treble_db,
+                q: TONE_TREBLE_Q,
+                enabled: true,
+            });
+        }
+        out
+    }
+
+    /// True if either knob is off 0 dB.
+    pub fn is_active(&self) -> bool {
+        self.bass_db != 0.0 || self.treble_db != 0.0
+    }
+}
+
 #[derive(Deserialize)]
 struct RawEqProfile {
     #[serde(default)]
@@ -266,6 +353,8 @@ struct RawEqProfile {
     tilt: Option<TiltConfig>,
     #[serde(default)]
     tilt_high: Option<TiltConfig>,
+    #[serde(default)]
+    tone: Option<ToneConfig>,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -294,6 +383,9 @@ pub struct EqProfile {
     /// between them. The two run in cascade. See [`check_tilt_pair`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tilt_high: Option<TiltConfig>,
+    /// Bass and treble knobs (two fixed shelves, every channel).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tone: Option<ToneConfig>,
 }
 
 impl Default for EqProfile {
@@ -308,6 +400,7 @@ impl Default for EqProfile {
             right: None,
             tilt: None,
             tilt_high: None,
+            tone: None,
         }
     }
 }
@@ -326,6 +419,7 @@ impl From<RawEqProfile> for EqProfile {
                     right: None,
                     tilt: raw.tilt,
                     tilt_high: raw.tilt_high,
+                    tone: raw.tone,
                 },
                 Some(right) => EqProfile {
                     name: raw.name,
@@ -341,6 +435,7 @@ impl From<RawEqProfile> for EqProfile {
                     right: Some(right),
                     tilt: raw.tilt,
                     tilt_high: raw.tilt_high,
+                    tone: raw.tone,
                 },
             }
         } else {
@@ -354,6 +449,7 @@ impl From<RawEqProfile> for EqProfile {
                 right: raw.right,
                 tilt: raw.tilt,
                 tilt_high: raw.tilt_high,
+                tone: raw.tone,
             }
         }
     }
@@ -376,6 +472,8 @@ impl Serialize for EqProfile {
             tilt: Option<&'a TiltConfig>,
             #[serde(skip_serializing_if = "Option::is_none")]
             tilt_high: Option<&'a TiltConfig>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tone: Option<&'a ToneConfig>,
         }
         Out {
             name: &self.name,
@@ -387,6 +485,7 @@ impl Serialize for EqProfile {
             right: self.right.as_ref(),
             tilt: self.tilt.as_ref(),
             tilt_high: self.tilt_high.as_ref(),
+            tone: self.tone.as_ref(),
         }
         .serialize(serializer)
     }
@@ -400,6 +499,15 @@ impl EqProfile {
             || self.right.as_ref().is_some_and(ChannelEq::is_active)
             || self.tilt.as_ref().is_some_and(TiltConfig::is_active)
             || self.tilt_high.as_ref().is_some_and(TiltConfig::is_active)
+            || self.tone.as_ref().is_some_and(ToneConfig::is_active)
+    }
+
+    /// The tone knobs' shelves (empty when there is no tone or it is 0/0).
+    pub fn tone_bands(&self) -> Vec<Band> {
+        self.tone
+            .as_ref()
+            .map(ToneConfig::bands)
+            .unwrap_or_default()
     }
 }
 
@@ -413,8 +521,40 @@ pub struct ConvolutionConfig {
     #[serde(default = "yes")]
     pub enabled: bool,
     /// WAV impulse response: mono (applied to every channel) or one channel
-    /// per output channel. Resampled offline when its rate differs.
+    /// per output channel. Resampled offline when its rate differs. Empty
+    /// (and may be left out) for a `matrix` item.
+    #[serde(default)]
     pub ir_path: PathBuf,
+    #[serde(default)]
+    pub gain_db: f64,
+    /// A FIR matrix in place of `ir_path`: `out_j = Σ_i F_ji * in_i` over
+    /// the chain's channels, one entry per non-zero filter (an output with
+    /// no entry is silent). `gain_db` above scales every entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matrix: Option<Vec<MatrixEntry>>,
+    /// The item the loaded room calibration installed (`bundle_load`; left
+    /// out when `false`). The daemon keeps it in place across convolution
+    /// edits and preset loads, and only `bundle_unload` removes it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub calibration: bool,
+}
+
+/// One filter of a convolution matrix: `ir_path` from input channel `in`
+/// to output channel `out`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct MatrixEntry {
+    #[serde(rename = "in")]
+    pub input: usize,
+    #[serde(rename = "out")]
+    pub output: usize,
+    /// WAV impulse response, resampled offline when its rate differs.
+    pub ir_path: PathBuf,
+    /// Which channel of the WAV to use (0-based); left out, the file must
+    /// be mono.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<usize>,
     #[serde(default)]
     pub gain_db: f64,
 }
@@ -538,9 +678,24 @@ pub fn filter_error_budget_db(output: &OutputConfig) -> f64 {
 pub struct BandSpec {
     /// End of the passband, as a fraction of the source Nyquist. Up to here
     /// the response stays within the stopband's relative error of 0 dB
-    /// (a Kaiser design ripples by the same amount in both bands).
+    /// (a Kaiser design ripples by the same amount in both bands). When
+    /// [`Self::passband_end_hz`] is set, this is the fallback at a source
+    /// rate where that frequency does not fit the band.
     #[serde(default = "default_passband_end")]
     pub passband_end: f64,
+    /// End of the passband as an absolute frequency, Hz: converted to a
+    /// fraction of the source Nyquist when the design is built, so the band
+    /// does not scale with the source rate (Recommended and `craven_apod`
+    /// pin 20 kHz this way; the Custom editor's "Hz" unit sets it). Like
+    /// the fractions it is of the lower Nyquist, so decimating converts it
+    /// at the output rate. Where
+    /// the frequency does not fit the band at a source rate (it must end
+    /// below the stopband start, at most at the Nyquist, and leave a
+    /// transition no wider than the Nyquist), the design uses
+    /// [`Self::passband_end`] there instead and the design check notes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub passband_end_hz: Option<f64>,
     /// Start of the stopband, as a fraction of the source Nyquist. 1.0 puts
     /// it at the source Nyquist (no imaging); above 1.0 lets images of the
     /// top of the band through, for a wider transition and shorter ringing.
@@ -557,6 +712,7 @@ impl Default for BandSpec {
     fn default() -> Self {
         Self {
             passband_end: default_passband_end(),
+            passband_end_hz: None,
             stopband_start: default_stopband_start(),
             attenuation_db: default_attenuation_db(),
         }
@@ -676,6 +832,10 @@ pub enum FilterPreset {
     HalfbandSmall,
     HalfbandTiny,
     HannNyquist,
+    // Peter Craven's apodizing filter (JAES 52(3), 2004): fully down by the
+    // source Nyquist, passband to 20 kHz at every source rate, minimum
+    // phase.
+    CravenApod,
     // Lanczos kernels, named by their lobe count `a`.
     Lanczos23,
     Lanczos23Mp,
@@ -696,6 +856,7 @@ pub enum FilterPreset {
     CascadeFirMp,
     CascadeFft,
     // Short interpolators.
+    Nos,
     Cosine,
     CatmullRom,
     TableSinc,
@@ -753,6 +914,7 @@ impl FilterPreset {
         Self::HalfbandSmall,
         Self::HalfbandTiny,
         Self::HannNyquist,
+        Self::CravenApod,
         Self::Lanczos23,
         Self::Lanczos23Mp,
         Self::Lanczos511,
@@ -768,6 +930,7 @@ impl FilterPreset {
         Self::CascadeFirAsym,
         Self::CascadeFirMp,
         Self::CascadeFft,
+        Self::Nos,
         Self::Cosine,
         Self::CatmullRom,
         Self::TableSinc,
@@ -837,6 +1000,7 @@ const NAMES: &[&str] = &[
     "halfband_small",
     "halfband_tiny",
     "hann_nyquist",
+    "craven_apod",
     "lanczos23",
     "lanczos23_mp",
     "lanczos511",
@@ -852,6 +1016,7 @@ const NAMES: &[&str] = &[
     "cascade_fir_asym",
     "cascade_fir_mp",
     "cascade_fft",
+    "nos",
     "cosine",
     "catmull_rom",
     "table_sinc",
@@ -1138,6 +1303,12 @@ pub const CROSSFEED_CUTOFF_MIN_HZ: f64 = 300.0;
 pub const CROSSFEED_CUTOFF_MAX_HZ: f64 = 2000.0;
 pub const CROSSFEED_FEED_MIN_DB: f64 = 1.0;
 pub const CROSSFEED_FEED_MAX_DB: f64 = 15.0;
+/// Range of the stage's stereo width (side gain `k`; 1 = unchanged).
+pub const STEREO_WIDTH_MIN: f64 = 0.0;
+pub const STEREO_WIDTH_MAX: f64 = 2.0;
+/// Range of the `above_bass` width shape's corner.
+pub const STEREO_WIDTH_CORNER_MIN_HZ: f64 = 200.0;
+pub const STEREO_WIDTH_CORNER_MAX_HZ: f64 = 2000.0;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
@@ -1149,23 +1320,21 @@ pub enum CrossfeedMode {
     Bs2bJanMeier,
     Bs2bCustom,
     Linkwitz,
+    /// No crossfeed: the stage runs for its stereo width alone.
+    None,
 }
 
-/// How the crossfeed stage sets its output level.
+/// How the stereo width's side gain depends on frequency.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case")]
-pub enum CrossfeedLevel {
-    /// Same A-weighted loudness with crossfeed on and off, for stereo pink
-    /// noise with inter-channel correlation 0.5. Rare worst-case peaks can
-    /// exceed the input's peak by up to 5.6 dB and then clip at the output
-    /// unless the limiter is on or enough digital attenuation precedes the
-    /// quantizer (hardware volume gives no headroom).
+pub enum StereoWidthShape {
+    /// The same side gain at every frequency (an M/S side level control).
     #[default]
-    Matched,
-    /// Scale by the exact worst-case peak gain: the output can never exceed
-    /// the input's peak, at the cost of 1.4 to 5.6 dB of level.
-    PeakSafe,
+    Flat,
+    /// Side gain 1 in the bass, `width` above `width_corner_hz` (a
+    /// first-order high-pass on the side's change).
+    AboveBass,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -1181,9 +1350,16 @@ pub struct CrossfeedConfig {
     /// Low-frequency crossfeed attenuation in dB for `bs2b_custom` (1..=15).
     #[serde(default = "default_crossfeed_feed_db")]
     pub feed_db: f64,
-    /// Level policy of the stage (default `matched`).
+    /// Stereo width: the side (L − R) gain `k`, 0..=2; 0 is mono, 1 leaves
+    /// the image as it is. The centre (L + R) is never changed by it.
+    #[serde(default = "default_stereo_width")]
+    pub width: f64,
+    /// Where the width acts (default `flat`).
     #[serde(default)]
-    pub level: CrossfeedLevel,
+    pub width_shape: StereoWidthShape,
+    /// Corner of the `above_bass` shape in Hz (200..=2000).
+    #[serde(default = "default_stereo_width_corner_hz")]
+    pub width_corner_hz: f64,
 }
 
 impl Default for CrossfeedConfig {
@@ -1193,7 +1369,9 @@ impl Default for CrossfeedConfig {
             mode: CrossfeedMode::default(),
             cutoff_hz: default_crossfeed_cutoff_hz(),
             feed_db: default_crossfeed_feed_db(),
-            level: CrossfeedLevel::default(),
+            width: default_stereo_width(),
+            width_shape: StereoWidthShape::default(),
+            width_corner_hz: default_stereo_width_corner_hz(),
         }
     }
 }
@@ -1220,8 +1398,20 @@ impl PitchConfig {
 }
 
 impl CrossfeedConfig {
+    /// True when the stage changes the signal: on, with a crossfeed mode or
+    /// a width other than 1.
     pub fn is_active(&self) -> bool {
-        self.enabled
+        self.enabled && (self.crossfeed_active() || self.width_active())
+    }
+
+    /// True when a crossfeed mode (not `none`) is selected.
+    pub fn crossfeed_active(&self) -> bool {
+        self.mode != CrossfeedMode::None
+    }
+
+    /// True when the width changes the image (`width != 1`).
+    pub fn width_active(&self) -> bool {
+        self.width != 1.0
     }
 
     /// Effective `(cutoff_hz, feed_db)` for the selected mode.
@@ -1230,7 +1420,7 @@ impl CrossfeedConfig {
             CrossfeedMode::Bs2bDefault => (700.0, 4.5),
             CrossfeedMode::Bs2bChuMoy => (700.0, 6.0),
             CrossfeedMode::Bs2bJanMeier => (650.0, 9.5),
-            CrossfeedMode::Bs2bCustom => (self.cutoff_hz, self.feed_db),
+            CrossfeedMode::Bs2bCustom | CrossfeedMode::None => (self.cutoff_hz, self.feed_db),
             // Corner chosen for a 0.3 ms low-frequency interaural delay:
             // f_c = (1 + R) / (2π · 0.3 ms · R), R = 10^(6/20).
             CrossfeedMode::Linkwitz => (796.4, 6.0),
@@ -1246,59 +1436,185 @@ fn default_crossfeed_feed_db() -> f64 {
     4.5
 }
 
+fn default_stereo_width() -> f64 {
+    1.0
+}
+
+fn default_stereo_width_corner_hz() -> f64 {
+    700.0
+}
+
 // ---------------------------------------------------------------- Harmonics
 
 pub const HARMONICS_MIN_DB: f64 = -120.0;
 pub const HARMONICS_MAX_DB: f64 = -20.0;
+/// Highest harmonic order of the stage (orders run 2..=9).
+pub const HARMONICS_MAX_ORDER: usize = 9;
+/// Number of harmonic orders, H2..=H9 (index 0 is H2).
+pub const HARMONICS_ORDERS: usize = HARMONICS_MAX_ORDER - 1;
+/// Highest order the readouts report: series cross terms and tape layers
+/// reach past [`HARMONICS_MAX_ORDER`].
+pub const HARMONICS_READOUT_MAX_ORDER: usize = 15;
+/// Number of orders in a readout, H2..=H15 (index 0 is H2).
+pub const HARMONICS_READOUT_ORDERS: usize = HARMONICS_READOUT_MAX_ORDER - 1;
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+/// Most layers in one harmonics stage.
+pub const HARMONICS_MAX_LAYERS: usize = 8;
+/// Lowest Chebyshev layer drive, dB (the operating point moved down the
+/// curve; 0 dB is the preset's reference point).
+pub const HARMONICS_MIN_DRIVE_DB: f64 = -40.0;
+/// Highest Chebyshev layer drive, dB: drive never goes past the reference.
+pub const HARMONICS_MAX_DRIVE_DB: f64 = 0.0;
+
+/// Tilt of a Chebyshev layer: low-shelf corner range, Hz (fundamental
+/// frequency; the rise starts below it).
+pub const TILT_LOW_MIN_HZ: f64 = 20.0;
+pub const TILT_LOW_MAX_HZ: f64 = 2_000.0;
+/// Tilt: high-shelf corner range, Hz (fundamental frequency; the rise starts
+/// above it).
+pub const TILT_HIGH_MIN_HZ: f64 = 200.0;
+pub const TILT_HIGH_MAX_HZ: f64 = 20_000.0;
+/// Tilt: largest rise or cut of either shelf, dB.
+pub const TILT_MAX_DB: f64 = 24.0;
+/// Tilt: the shelf slopes on offer, dB/oct (shelf order 1..=4).
+pub const TILT_SLOPES: [u8; 4] = [6, 12, 18, 24];
+/// Tilt: a low shelf's slope when `slope` is omitted, dB/oct.
+pub const TILT_LOW_DEFAULT_SLOPE: u8 = 12;
+/// Tilt: a high shelf's slope when `slope` is omitted, dB/oct.
+pub const TILT_HIGH_DEFAULT_SLOPE: u8 = 6;
+
+/// Sag of a Chebyshev layer: largest drop of the drive at a full envelope,
+/// dB.
+pub const HARMONICS_SAG_MAX_DB: f64 = 6.0;
+/// Bias shift of a Chebyshev layer: largest operating point, fraction of
+/// full scale (either sign).
+pub const HARMONICS_BIAS_MAX_DEPTH: f64 = 0.25;
+/// Sag and bias envelopes: time constant range, ms.
+pub const HARMONICS_ENVELOPE_MIN_MS: f64 = 0.1;
+pub const HARMONICS_ENVELOPE_MAX_MS: f64 = 10_000.0;
+
+/// Flux layer: low-shelf corner range, Hz (boost below the corner).
+pub const FLUX_MIN_CORNER_HZ: f64 = 1.0;
+pub const FLUX_MAX_CORNER_HZ: f64 = 5_000.0;
+/// Flux layer: largest low-frequency boost, dB.
+pub const FLUX_MAX_BOOST_DB: f64 = 40.0;
+/// Flux layer: H3 calibration target range, dBc.
+pub const FLUX_MIN_H3_DB: f64 = -120.0;
+pub const FLUX_MAX_H3_DB: f64 = -12.0;
+/// Flux layer: calibration frequency range, Hz.
+pub const FLUX_MIN_CALIBRATION_HZ: f64 = 5.0;
+pub const FLUX_MAX_CALIBRATION_HZ: f64 = 1_000.0;
+
+/// Hysteresis layer: H3 calibration target range, dBc.
+pub const HYSTERESIS_MIN_H3_DB: f64 = -120.0;
+pub const HYSTERESIS_MAX_H3_DB: f64 = -12.0;
+/// Hysteresis layer: calibration frequency range, Hz.
+pub const HYSTERESIS_MIN_CALIBRATION_HZ: f64 = 20.0;
+pub const HYSTERESIS_MAX_CALIBRATION_HZ: f64 = 5_000.0;
+/// Lowest output rate at which a hysteresis layer stays cleanly below heavy
+/// aliasing (4× of 44.1 kHz). Below this, readouts warn.
+pub const HYSTERESIS_MIN_CLEAN_RATE_HZ: f64 = 176_400.0;
+/// Hysteresis layer: bass EQ pair corner range, Hz.
+pub const HYSTERESIS_MIN_EQ_HZ: f64 = 20.0;
+pub const HYSTERESIS_MAX_EQ_HZ: f64 = 500.0;
+/// Hysteresis layer: largest bass EQ boost into the core, dB.
+pub const HYSTERESIS_MAX_EQ_DB: f64 = 12.0;
+/// Hysteresis layer: largest field offset (asymmetry), in the magnetic
+/// core's knee units.
+pub const HYSTERESIS_MAX_ASYMMETRY: f64 = 1.0;
+
+/// Sign of one harmonic's Chebyshev term. For odd orders the effect
+/// alternates: at low and moderate levels a negative H3 or H7 compresses
+/// (soft saturation), a negative H5 or H9 expands. Flipping an even term's
+/// sign flips which half-wave is flattened.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
-#[serde(rename_all = "snake_case")]
-pub enum HarmonicsCharacter {
-    /// Warm triode-like profile: dominant 2nd harmonic (-40 dB), subtle 3rd (-58 dB) and 4th (-72 dB).
-    #[default]
-    Triode,
-    /// Pentode-like profile: dominant 3rd harmonic (-42 dB), subtle 2nd (-56 dB) and 5th (-66 dB).
-    Pentode,
-    /// Custom per-harmonic levels.
-    Custom,
+pub enum HarmonicSign {
+    #[serde(rename = "+")]
+    Positive,
+    #[serde(rename = "-")]
+    Negative,
 }
 
+impl HarmonicSign {
+    /// `1.0` or `-1.0`.
+    pub fn factor(self) -> f64 {
+        match self {
+            Self::Positive => 1.0,
+            Self::Negative => -1.0,
+        }
+    }
+}
+
+/// Default signs for H2..=H9: H3 negative (compressive), the others
+/// positive.
+pub const HARMONICS_DEFAULT_SIGNS: [HarmonicSign; HARMONICS_ORDERS] = {
+    let mut s = [HarmonicSign::Positive; HARMONICS_ORDERS];
+    s[1] = HarmonicSign::Negative;
+    s
+};
+
+/// The harmonics stage: a list of layers, added together (parallel sum,
+/// at its natural gain) or run one after the other
+/// ([`HarmonicsRouting::Series`]).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct HarmonicsConfig {
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// The layers, in order. Disabled layers are kept but not applied.
     #[serde(default)]
-    pub character: HarmonicsCharacter,
-    /// 2nd harmonic level relative to fundamental at 0 dBFS (dB, -120..=-20).
-    #[serde(default = "default_h2_db")]
-    pub h2_db: f64,
-    /// 3rd harmonic level relative to fundamental at 0 dBFS (dB, -120..=-20).
-    #[serde(default = "default_h3_db")]
-    pub h3_db: f64,
-    /// Optional 4th harmonic level at 0 dBFS (dB, -120..=-20); `None` = off.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub h4_db: Option<f64>,
-    /// Optional 5th harmonic level at 0 dBFS (dB, -120..=-20); `None` = off.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub h5_db: Option<f64>,
+    pub layers: Vec<HarmonicsLayer>,
     /// Remove DC offset introduced by even-order harmonics.
     #[serde(default = "yes")]
     pub dc_block: bool,
+    /// How the layers combine (absent: parallel).
+    #[serde(default, skip_serializing_if = "HarmonicsRouting::is_parallel")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<HarmonicsRouting>", optional))]
+    pub routing: HarmonicsRouting,
+    /// The system preset ([`HarmonicsSystem::id`]) the stage was started
+    /// from, for the editor to compare against (absent: built by hand). The
+    /// engine ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub system: Option<String>,
+}
+
+/// How the harmonics stage combines its layers.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+#[serde(rename_all = "snake_case")]
+pub enum HarmonicsRouting {
+    /// Every layer sees the input; their distortions are added (one shared
+    /// sag/bias supply).
+    #[default]
+    Parallel,
+    /// The active layers one after the other, in list order: each layer is
+    /// its own device (its own calibration, supply and DC blocker) and feeds
+    /// the next at the level it puts out. The cross terms of heavy settings
+    /// count. Where an earlier layer's output goes past full scale, a later
+    /// layer shapes the part within it and passes the excess unshaped.
+    /// The old `series_makeup` (series with the output trims on the last
+    /// layer) reads as this.
+    #[serde(alias = "series_makeup")]
+    Series,
+}
+
+impl HarmonicsRouting {
+    pub fn is_parallel(&self) -> bool {
+        *self == Self::Parallel
+    }
+
+    pub fn is_series(&self) -> bool {
+        *self == Self::Series
+    }
 }
 
 impl Default for HarmonicsConfig {
+    /// One layer from the `se_triode_high_mu` preset (audible at programme
+    /// levels; the hand-picked `triode` is near inaudible there).
     fn default() -> Self {
-        Self {
-            enabled: true,
-            character: HarmonicsCharacter::default(),
-            h2_db: default_h2_db(),
-            h3_db: default_h3_db(),
-            h4_db: None,
-            h5_db: None,
-            dc_block: true,
-        }
+        Self::from_preset("se_triode_high_mu").expect("the se_triode_high_mu preset exists")
     }
 }
 
@@ -1307,22 +1623,722 @@ impl HarmonicsConfig {
         self.enabled
     }
 
-    /// Effective `(h2_db, h3_db, h4_db, h5_db)` for the selected character.
-    pub fn effective_levels_db(&self) -> (f64, f64, Option<f64>, Option<f64>) {
-        match self.character {
-            HarmonicsCharacter::Triode => (-40.0, -58.0, Some(-72.0), None),
-            HarmonicsCharacter::Pentode => (-56.0, -42.0, None, Some(-66.0)),
-            HarmonicsCharacter::Custom => (self.h2_db, self.h3_db, self.h4_db, self.h5_db),
+    /// A one-layer config from the preset `id`.
+    pub fn from_preset(id: &str) -> Option<Self> {
+        Some(Self {
+            system: None,
+            enabled: true,
+            layers: vec![harmonics_preset(id)?.to_layer()],
+            dc_block: true,
+            routing: HarmonicsRouting::Parallel,
+        })
+    }
+
+    /// The layers that are applied.
+    pub fn active_layers(&self) -> impl Iterator<Item = &HarmonicsLayer> {
+        self.layers.iter().filter(|l| l.enabled())
+    }
+}
+
+/// One layer of the harmonics stage. Every parameter is editable; `preset`
+/// names the preset it started from (compare with that preset's layer to
+/// mark it modified, copy it back to reset).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HarmonicsLayer {
+    /// Signed Chebyshev terms H2..=H9 (a static curve).
+    Chebyshev(ChebyshevLayer),
+    /// Core saturation (transformer, tape): low-shelf boost, odd saturator,
+    /// exact inverse shelf. H3 rises toward low frequencies and with level.
+    Flux(FluxLayer),
+    /// Tape magnetic hysteresis (Jiles-Atherton ODE): level-dependent loop
+    /// saturation with pinning and remanence.
+    Hysteresis(HysteresisLayer),
+}
+
+impl HarmonicsLayer {
+    pub fn enabled(&self) -> bool {
+        match self {
+            Self::Chebyshev(l) => l.enabled,
+            Self::Flux(l) => l.enabled,
+            Self::Hysteresis(l) => l.enabled,
+        }
+    }
+
+    /// How much of the layer is applied, 0..=1 (flux layers have no amount:
+    /// 1).
+    pub fn amount(&self) -> f64 {
+        match self {
+            Self::Chebyshev(l) => l.amount,
+            Self::Flux(_) => 1.0,
+            Self::Hysteresis(l) => l.amount,
+        }
+    }
+
+    /// The layer's amount, for the kinds that have one.
+    pub fn amount_mut(&mut self) -> Option<&mut f64> {
+        match self {
+            Self::Chebyshev(l) => Some(&mut l.amount),
+            Self::Flux(_) => None,
+            Self::Hysteresis(l) => Some(&mut l.amount),
+        }
+    }
+
+    /// The preset this layer started from.
+    pub fn preset(&self) -> Option<&str> {
+        match self {
+            Self::Chebyshev(l) => l.preset.as_deref(),
+            Self::Flux(l) => l.preset.as_deref(),
+            Self::Hysteresis(l) => l.preset.as_deref(),
+        }
+    }
+
+    /// The same layer with `enabled` and `preset` cleared (and a flat tilt,
+    /// sag or bias at depth 0 dropped): its sound.
+    pub fn params(&self) -> Self {
+        let mut l = self.clone();
+        match &mut l {
+            Self::Chebyshev(c) => {
+                c.enabled = true;
+                c.preset = None;
+                // A flat tilt sounds as no tilt.
+                if c.tilt.as_ref().is_some_and(|t| t.is_flat()) {
+                    c.tilt = None;
+                }
+                if let Some(t) = c.tilt.as_deref_mut() {
+                    t.omit_silent_slopes();
+                }
+                // So do sag and bias at depth 0.
+                if c.sag.is_some_and(|s| !s.is_on()) {
+                    c.sag = None;
+                }
+                if c.bias.is_some_and(|b| !b.is_on()) {
+                    c.bias = None;
+                }
+            }
+            Self::Flux(f) => {
+                f.enabled = true;
+                f.preset = None;
+            }
+            Self::Hysteresis(h) => {
+                h.enabled = true;
+                h.preset = None;
+                // An EQ that is off and a zero offset sound as none.
+                if h.bass_eq.is_some_and(|e| !e.is_on()) {
+                    h.bass_eq = None;
+                }
+                if h.asymmetry == Some(0.0) {
+                    h.asymmetry = None;
+                }
+            }
+        }
+        l
+    }
+
+    /// Whether the layer differs from the preset it names (`None`: no
+    /// preset, or one this build does not know).
+    pub fn is_modified(&self) -> Option<bool> {
+        let preset = harmonics_preset(self.preset()?)?;
+        Some(preset.layer.params() != self.params())
+    }
+}
+
+/// A Chebyshev layer: the static curve `x + Σ a_k (T_k(x) − T_k(0))` with
+/// `|a_k|` the levels and the signs, read at the drive's operating point
+/// (renormalised so a full-scale sine keeps a unit fundamental), its terms
+/// scaled by `amount`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct ChebyshevLayer {
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Preset this layer started from (`null`: built by hand).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub preset: Option<String>,
+    /// Levels of H2..=H9 relative to the fundamental for a sine at the
+    /// reference point (drive 0 dB, amount 1: a 0 dBFS sine), dB
+    /// (-120..=-20); `null` = that order off.
+    pub levels_db: [Option<f64>; HARMONICS_ORDERS],
+    /// Sign of each order's term, H2..=H9.
+    #[serde(default = "default_harmonic_signs")]
+    pub signs: [HarmonicSign; HARMONICS_ORDERS],
+    /// Flip every even order's sign (which half-wave is flattened).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub invert_even: bool,
+    /// Where a 0 dBFS sine sits on the curve, dB below the reference
+    /// (-40..=0): lower drive moves down the curve, H_k falling by about
+    /// (k − 1) dB per dB.
+    #[serde(default)]
+    pub drive_db: f64,
+    /// Scale of the layer's distortion terms (0..=1).
+    #[serde(default = "one")]
+    pub amount: f64,
+    /// Harmonic levels that change with frequency (`null`: flat, the
+    /// levels hold at every frequency).
+    // Boxed: the per-order overrides make it large.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub tilt: Option<Box<HarmonicsTilt>>,
+    /// Supply sag: loud passages lower the drive in front of the curve
+    /// (`null` or depth 0: off; applied at `depth_db × amount`). The stage's
+    /// sag layers share one supply: the dry signal is turned down once, by
+    /// the deepest sag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub sag: Option<HarmonicsSag>,
+    /// Bias shift: sustained loud passages move the operating point on the
+    /// curve, shifting the even/odd balance (`null` or depth 0: off;
+    /// applied at `depth × amount`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub bias: Option<HarmonicsBias>,
+}
+
+/// Supply sag of a Chebyshev layer: an envelope of `|x|` (attack, release)
+/// lowers the drive by up to `depth_db` as it rises to full scale. Not
+/// renormalised: loud passages are gently compressed and lean toward the
+/// low orders.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct HarmonicsSag {
+    /// Drive drop at a full envelope, dB (0..=6; 0 = off).
+    pub depth_db: f64,
+    /// Envelope attack and release time constants, ms (0.1..=10000).
+    pub attack_ms: f64,
+    pub release_ms: f64,
+}
+
+impl Default for HarmonicsSag {
+    fn default() -> Self {
+        Self {
+            depth_db: 1.0,
+            attack_ms: 20.0,
+            release_ms: 200.0,
         }
     }
 }
 
-fn default_h2_db() -> f64 {
-    -40.0
+/// Bias shift of a Chebyshev layer: a slower envelope of `|x|` moves the
+/// operating point to `depth × envelope`; the curve is read around it
+/// (its value and slope there removed), so only the even/odd balance
+/// changes, never the level. The reach can be cut short where strong
+/// high-order curves would raise the peak gain too much (`bias_limited` in the
+/// readout).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct HarmonicsBias {
+    /// Operating point at a full envelope, fraction of full scale
+    /// (-0.25..=0.25; 0 = off; the sign picks the side).
+    pub depth: f64,
+    /// Envelope attack and release time constants, ms (0.1..=10000).
+    pub attack_ms: f64,
+    pub release_ms: f64,
 }
 
-fn default_h3_db() -> f64 {
-    -58.0
+impl Default for HarmonicsBias {
+    fn default() -> Self {
+        Self {
+            depth: 0.1,
+            attack_ms: 300.0,
+            release_ms: 2_000.0,
+        }
+    }
+}
+
+/// Check one envelope's time constants; `Err` names the field.
+fn check_envelope(name: &str, attack_ms: f64, release_ms: f64) -> Result<(), String> {
+    for (field, ms) in [("attack_ms", attack_ms), ("release_ms", release_ms)] {
+        if !ms.is_finite() || !(HARMONICS_ENVELOPE_MIN_MS..=HARMONICS_ENVELOPE_MAX_MS).contains(&ms)
+        {
+            return Err(format!(
+                "{name}.{field} must be between {HARMONICS_ENVELOPE_MIN_MS} and {HARMONICS_ENVELOPE_MAX_MS} ms (got {ms})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl HarmonicsSag {
+    /// Whether it changes the sound (depth above 0).
+    pub fn is_on(&self) -> bool {
+        self.depth_db > 0.0
+    }
+
+    /// Check its ranges; `Err` names the field.
+    pub fn validate(&self) -> Result<(), String> {
+        let d = self.depth_db;
+        if !d.is_finite() || !(0.0..=HARMONICS_SAG_MAX_DB).contains(&d) {
+            return Err(format!(
+                "sag.depth_db must be between 0 and {HARMONICS_SAG_MAX_DB} dB (got {d})"
+            ));
+        }
+        check_envelope("sag", self.attack_ms, self.release_ms)
+    }
+}
+
+impl HarmonicsBias {
+    /// Whether it changes the sound (depth not 0).
+    pub fn is_on(&self) -> bool {
+        self.depth != 0.0
+    }
+
+    /// Check its ranges; `Err` names the field.
+    pub fn validate(&self) -> Result<(), String> {
+        let d = self.depth;
+        if !d.is_finite() || d.abs() > HARMONICS_BIAS_MAX_DEPTH {
+            return Err(format!(
+                "bias.depth must be between -{HARMONICS_BIAS_MAX_DEPTH} and {HARMONICS_BIAS_MAX_DEPTH} (got {d})"
+            ));
+        }
+        check_envelope("bias", self.attack_ms, self.release_ms)
+    }
+}
+
+impl ChebyshevLayer {
+    /// Whether sag or bias is set (a depth other than 0), whatever the
+    /// amount.
+    pub fn has_sag_or_bias(&self) -> bool {
+        self.sag.is_some_and(|s| s.is_on()) || self.bias.is_some_and(|b| b.is_on())
+    }
+
+    /// Whether sag or bias is set and the amount is above 0 (both depths
+    /// scale with it): the layer's operating point moves, so it runs on its
+    /// own instead of merging into the stage's static table.
+    pub fn is_dynamic(&self) -> bool {
+        self.amount > 0.0 && self.has_sag_or_bias()
+    }
+
+    /// The signs with `invert_even` applied.
+    pub fn effective_signs(&self) -> [HarmonicSign; HARMONICS_ORDERS] {
+        let mut s = self.signs;
+        if self.invert_even {
+            for sign in s.iter_mut().step_by(2) {
+                *sign = match *sign {
+                    HarmonicSign::Positive => HarmonicSign::Negative,
+                    HarmonicSign::Negative => HarmonicSign::Positive,
+                };
+            }
+        }
+        s
+    }
+}
+
+/// One shelf of a [`HarmonicsTilt`]: a corner and how far the harmonics
+/// rise (or, negative, fall) beyond it.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct TiltShelf {
+    /// Corner, Hz, as a fundamental frequency: harmonic `k`'s filter has
+    /// its corner at `k × hz`.
+    pub hz: f64,
+    /// Rise beyond the corner, dB (-24..=24; 0 = no shelf).
+    pub db: f64,
+    /// Slope, dB/oct: 6, 12, 18 or 24, the shelf's order times 6 (omitted:
+    /// 12 for a low shelf, 6 for a high one). It is the asymptote: a shelf
+    /// of order `n` is the first-order curve squeezed `n` times closer to
+    /// its corner, so its steepest slope is `slope × (R − 1)/(R + 1)`,
+    /// `R = 10^{|db|/20}`: a small rise only rises over fewer octaves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub slope: Option<u8>,
+}
+
+impl TiltShelf {
+    /// A shelf at the default slope.
+    pub fn new(hz: f64, db: f64) -> Self {
+        Self {
+            hz,
+            db,
+            slope: None,
+        }
+    }
+
+    /// The shelf's order (1..=4): its slope (`default` when omitted) over 6
+    /// dB/oct, clamped (validation rejects any other slope).
+    pub fn order(&self, default: u8) -> usize {
+        usize::from(self.slope.unwrap_or(default) / 6).clamp(1, 4)
+    }
+}
+
+/// A per-order override of a [`HarmonicsTilt`]: both shelves for one order
+/// (the low one applies whatever the order's parity).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct OrderTilt {
+    pub low: TiltShelf,
+    pub high: TiltShelf,
+}
+
+/// How a Chebyshev layer's harmonic levels change with frequency. Each
+/// order's distortion term goes through its own filter `G_k`: a low shelf
+/// and a high shelf (12 and 6 dB/oct unless their `slope` says otherwise),
+/// unity at `k × 1 kHz`, so harmonic
+/// `k` of a 0 dBFS sine at `f` is `h_k + 20 log10 |G_k(k f)|` dBc (relative
+/// to the input level). The layer's levels hold at 1 kHz. The terms carry no
+/// linear part, so small signals keep a flat response.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct HarmonicsTilt {
+    /// Rise toward low frequencies (`hz` 20..=2000): `slope` (default 12)
+    /// dB/oct below the corner until it reaches `db`. Odd orders only,
+    /// unless `low_even`.
+    pub low: TiltShelf,
+    /// Rise toward high frequencies (`hz` 200..=20000): `slope` (default 6)
+    /// dB/oct above the corner until it reaches `db`. Every order.
+    pub high: TiltShelf,
+    /// The low shelf applies to the even orders too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub low_even: bool,
+    /// Per-order overrides, H2..=H9 (`null`: the layer's shelves).
+    #[serde(default, skip_serializing_if = "HarmonicsTilt::no_overrides")]
+    #[cfg_attr(
+        feature = "ts",
+        ts(as = "Option<[Option<OrderTilt>; HARMONICS_ORDERS]>", optional)
+    )]
+    pub orders: [Option<OrderTilt>; HARMONICS_ORDERS],
+}
+
+impl Default for HarmonicsTilt {
+    /// Flat: both shelves at 0 dB (low corner 100 Hz, high corner 2 kHz).
+    fn default() -> Self {
+        Self {
+            low: TiltShelf::new(100.0, 0.0),
+            high: TiltShelf::new(2_000.0, 0.0),
+            low_even: false,
+            orders: [None; HARMONICS_ORDERS],
+        }
+    }
+}
+
+impl HarmonicsTilt {
+    fn no_overrides(orders: &[Option<OrderTilt>; HARMONICS_ORDERS]) -> bool {
+        orders.iter().all(Option::is_none)
+    }
+
+    /// The shelves of order `k` (2..=9): its override, else the layer's
+    /// (the low shelf only on odd orders unless `low_even`).
+    pub fn order_shelves(&self, k: usize) -> OrderTilt {
+        if let Some(o) = self.orders.get(k.wrapping_sub(2)).copied().flatten() {
+            return o;
+        }
+        let low_db = if k % 2 == 1 || self.low_even {
+            self.low.db
+        } else {
+            0.0
+        };
+        OrderTilt {
+            low: TiltShelf {
+                db: low_db,
+                ..self.low
+            },
+            high: self.high,
+        }
+    }
+
+    /// Drop every `slope` that changes nothing (at its shelf's default, or
+    /// on a shelf at 0 dB).
+    pub fn omit_silent_slopes(&mut self) {
+        let omit = |s: &mut TiltShelf, default: u8| {
+            if s.db == 0.0 || s.slope == Some(default) {
+                s.slope = None;
+            }
+        };
+        omit(&mut self.low, TILT_LOW_DEFAULT_SLOPE);
+        omit(&mut self.high, TILT_HIGH_DEFAULT_SLOPE);
+        for o in self.orders.iter_mut().flatten() {
+            omit(&mut o.low, TILT_LOW_DEFAULT_SLOPE);
+            omit(&mut o.high, TILT_HIGH_DEFAULT_SLOPE);
+        }
+    }
+
+    /// Whether every order's filter is unity (both shelves at 0 dB).
+    pub fn is_flat(&self) -> bool {
+        (2..=HARMONICS_MAX_ORDER).all(|k| {
+            let o = self.order_shelves(k);
+            o.low.db == 0.0 && o.high.db == 0.0
+        })
+    }
+
+    /// Check every shelf's range; `Err` names the field.
+    pub fn validate(&self) -> Result<(), String> {
+        let check = |name: &str, s: &TiltShelf, lo: f64, hi: f64| {
+            if !s.hz.is_finite() || !(lo..=hi).contains(&s.hz) {
+                return Err(format!(
+                    "{name}.hz must be between {lo} and {hi} Hz (got {})",
+                    s.hz
+                ));
+            }
+            if !s.db.is_finite() || s.db.abs() > TILT_MAX_DB {
+                return Err(format!(
+                    "{name}.db must be between -{TILT_MAX_DB} and {TILT_MAX_DB} dB (got {})",
+                    s.db
+                ));
+            }
+            if let Some(v) = s.slope
+                && !TILT_SLOPES.contains(&v)
+            {
+                return Err(format!(
+                    "{name}.slope must be 6, 12, 18 or 24 dB/oct (got {v})"
+                ));
+            }
+            Ok(())
+        };
+        check("tilt.low", &self.low, TILT_LOW_MIN_HZ, TILT_LOW_MAX_HZ)?;
+        check("tilt.high", &self.high, TILT_HIGH_MIN_HZ, TILT_HIGH_MAX_HZ)?;
+        for (i, o) in self.orders.iter().enumerate() {
+            if let Some(o) = o {
+                let name = format!("tilt.orders[{i}] (H{})", i + 2);
+                check(
+                    &format!("{name}.low"),
+                    &o.low,
+                    TILT_LOW_MIN_HZ,
+                    TILT_LOW_MAX_HZ,
+                )?;
+                check(
+                    &format!("{name}.high"),
+                    &o.high,
+                    TILT_HIGH_MIN_HZ,
+                    TILT_HIGH_MAX_HZ,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A flux (core saturation) layer, calibrated from one number: H3 in dBc
+/// for a 0 dBFS sine at `calibration_hz`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct FluxLayer {
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Preset this layer started from (`null`: built by hand).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub preset: Option<String>,
+    /// Low-shelf corner, Hz (1..=5000): the boost starts below it.
+    pub corner_hz: f64,
+    /// Low-frequency boost of the shelf, dB (0..=40); the boost flattens
+    /// out below `corner_hz / 10^(boost/20)`.
+    pub max_boost_db: f64,
+    /// H3 for a 0 dBFS sine at `calibration_hz`, dBc (-120..=-12).
+    pub target_h3_db: f64,
+    /// Calibration frequency, Hz (5..=1000).
+    pub calibration_hz: f64,
+}
+
+/// A tape magnetic hysteresis layer (Jiles-Atherton model), calibrated from
+/// H3 in dBc for a 0 dBFS sine at `calibration_hz` (at `amount = 1`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct HysteresisLayer {
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Preset this layer started from (`null`: built by hand).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub preset: Option<String>,
+    /// Saturation character (0..=1): lower emphasizes Rayleigh pinning across
+    /// levels; higher pushes deeper into the soft Langevin knee near 0 dBFS.
+    pub saturation: f64,
+    /// Hysteresis loop width (0..=1): 0 is anhysteretic Langevin saturation;
+    /// 1 gives a wide magnetic loop.
+    pub width: f64,
+    /// Scale of the layer's distortion residual (0..=1).
+    #[serde(default = "one")]
+    pub amount: f64,
+    /// H3 for a 0 dBFS sine at `calibration_hz` (at `amount = 1`), dBc
+    /// (-120..=-12).
+    pub target_h3_db: f64,
+    /// Calibration frequency, Hz (20..=5000).
+    pub calibration_hz: f64,
+    /// Record/playback EQ pair around the core: a low-shelf boost into the
+    /// magnetic core and its exact inverse after it, so the music's
+    /// response stays flat and only the distortion rises toward the bass
+    /// (`null`, disabled or 0 dB: off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub bass_eq: Option<HysteresisBassEq>,
+    /// DC offset of the core's field, in units of its saturation knee
+    /// (-1..=1, whatever the drive; `null` or 0: symmetric, no even orders).
+    /// Adds H2 (and the other even orders) with a phase that holds across
+    /// levels; the sign flips its polarity. The drive is calibrated without
+    /// it, so the H3 target holds for the symmetric core (the offset moves
+    /// H3 a little at large values); an offset that makes the layer expand
+    /// is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub asymmetry: Option<f64>,
+}
+
+/// The bass EQ pair of a hysteresis layer: a 12 dB/oct low shelf (unity at
+/// 1 kHz) in front of the core and its exact inverse after it. Harmonic
+/// `k` of a tone at `f` rises by about `(k-th order's level slope + 1) ×`
+/// the boost at `f`, minus the boost at `k f`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct HysteresisBassEq {
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Shelf corner, Hz (20..=500): the boost starts below it.
+    pub hz: f64,
+    /// Boost into the core below the corner, dB (0..=12; 0 = off).
+    pub db: f64,
+}
+
+impl Default for HysteresisBassEq {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hz: 120.0,
+            db: 3.0,
+        }
+    }
+}
+
+impl HysteresisBassEq {
+    /// Whether it changes the sound.
+    pub fn is_on(&self) -> bool {
+        self.enabled && self.db != 0.0
+    }
+
+    /// Check its ranges; `Err` names the field.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.hz.is_finite() || !(HYSTERESIS_MIN_EQ_HZ..=HYSTERESIS_MAX_EQ_HZ).contains(&self.hz)
+        {
+            return Err(format!(
+                "bass_eq.hz must be between {HYSTERESIS_MIN_EQ_HZ} and {HYSTERESIS_MAX_EQ_HZ} Hz (got {})",
+                self.hz
+            ));
+        }
+        if !self.db.is_finite() || !(0.0..=HYSTERESIS_MAX_EQ_DB).contains(&self.db) {
+            return Err(format!(
+                "bass_eq.db must be between 0 and {HYSTERESIS_MAX_EQ_DB} dB (got {})",
+                self.db
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl HysteresisLayer {
+    /// The bass EQ pair when it is on.
+    pub fn active_bass_eq(&self) -> Option<HysteresisBassEq> {
+        self.bass_eq.filter(HysteresisBassEq::is_on)
+    }
+
+    /// The field offset (0 when unset).
+    pub fn asymmetry(&self) -> f64 {
+        self.asymmetry.unwrap_or(0.0)
+    }
+}
+
+/// A preset: one layer's full parameters, plus where they come from.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct HarmonicsPreset {
+    /// Stable id, stored in a layer's `preset`.
+    pub id: String,
+    /// Display name (a generic archetype, never a product).
+    pub name: String,
+    /// `hand_picked`, `computed` (from device equations) or `archetype`.
+    pub origin: String,
+    /// What 0 dBFS and drive 0 dB stand for on the device.
+    pub reference: String,
+    /// Where the numbers come from.
+    pub source: String,
+    /// The layer (its `preset` field is left out here).
+    pub layer: HarmonicsLayer,
+}
+
+impl HarmonicsPreset {
+    /// The preset's layer, tagged with this preset's id.
+    pub fn to_layer(&self) -> HarmonicsLayer {
+        let mut l = self.layer.params();
+        match &mut l {
+            HarmonicsLayer::Chebyshev(c) => c.preset = Some(self.id.clone()),
+            HarmonicsLayer::Flux(f) => f.preset = Some(self.id.clone()),
+            HarmonicsLayer::Hysteresis(h) => h.preset = Some(self.id.clone()),
+        }
+        l
+    }
+}
+
+/// The built-in presets (`harmonics_presets.json`).
+pub fn harmonics_presets() -> &'static [HarmonicsPreset] {
+    static PRESETS: std::sync::OnceLock<Vec<HarmonicsPreset>> = std::sync::OnceLock::new();
+    PRESETS.get_or_init(|| {
+        serde_json::from_str(include_str!("harmonics_presets.json"))
+            .expect("harmonics_presets.json parses")
+    })
+}
+
+/// The built-in preset `id`.
+pub fn harmonics_preset(id: &str) -> Option<&'static HarmonicsPreset> {
+    harmonics_presets().iter().find(|p| p.id == id)
+}
+
+/// A system preset: a whole harmonics stage standing for a typical piece of
+/// gear (an archetype, never a product). Each layer is an ordinary layer
+/// tagged with the layer preset it started from, some with settings
+/// changed, so the editor marks those modified and can reset them.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct HarmonicsSystem {
+    /// Stable id.
+    pub id: String,
+    /// Display name (a generic archetype, never a product).
+    pub name: String,
+    /// What the gear is: the chain the layers stand for.
+    pub gear: String,
+    /// What it sounds like.
+    pub sound: String,
+    /// How the layers combine (absent: parallel).
+    #[serde(default, skip_serializing_if = "HarmonicsRouting::is_parallel")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<HarmonicsRouting>", optional))]
+    pub routing: HarmonicsRouting,
+    /// The layers, in order.
+    pub layers: Vec<HarmonicsLayer>,
+}
+
+impl HarmonicsSystem {
+    /// The whole stage this preset stands for (on, DC blocker on).
+    pub fn to_config(&self) -> HarmonicsConfig {
+        HarmonicsConfig {
+            enabled: true,
+            layers: self.layers.clone(),
+            dc_block: true,
+            routing: self.routing,
+            system: Some(self.id.clone()),
+        }
+    }
+}
+
+/// The built-in system presets (`harmonics_systems.json`).
+pub fn harmonics_systems() -> &'static [HarmonicsSystem] {
+    static SYSTEMS: std::sync::OnceLock<Vec<HarmonicsSystem>> = std::sync::OnceLock::new();
+    SYSTEMS.get_or_init(|| {
+        serde_json::from_str(include_str!("harmonics_systems.json"))
+            .expect("harmonics_systems.json parses")
+    })
+}
+
+/// The built-in system preset `id`.
+pub fn harmonics_system(id: &str) -> Option<&'static HarmonicsSystem> {
+    harmonics_systems().iter().find(|s| s.id == id)
+}
+
+fn default_harmonic_signs() -> [HarmonicSign; HARMONICS_ORDERS] {
+    HARMONICS_DEFAULT_SIGNS
+}
+
+fn one() -> f64 {
+    1.0
 }
 
 // ---------------------------------------------------------------- DC block
@@ -1526,15 +2542,73 @@ mod tests {
     use super::*;
 
     #[test]
-    fn crossfeed_level_defaults_to_matched() {
-        let cf: CrossfeedConfig = serde_json::from_str(r#"{"mode":"bs2b_chu_moy"}"#).unwrap();
-        assert_eq!(cf.level, CrossfeedLevel::Matched);
-        assert_eq!(CrossfeedConfig::default().level, CrossfeedLevel::Matched);
+    fn convolution_items_round_trip_and_matrix_items_parse() {
+        // An item from before matrices: unchanged on the way back out.
+        let old = serde_json::json!({"name": "room", "enabled": true, "ir_path": "/x.wav", "gain_db": -1.5});
+        let item: ConvolutionConfig = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(item.matrix, None);
+        assert_eq!(serde_json::to_value(&item).unwrap(), old);
+
+        let m: ConvolutionConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "matrix": [
+                {"in": 0, "out": 0, "ir_path": "/sub.wav", "channel": 0},
+                {"in": 1, "out": 0, "ir_path": "/sub.wav", "channel": 1, "gain_db": -0.5}
+            ]
+        }))
+        .unwrap();
+        assert!(m.ir_path.as_os_str().is_empty());
+        let entries = m.matrix.as_ref().unwrap();
+        assert_eq!((entries[1].input, entries[1].output), (1, 0));
+        assert_eq!((entries[1].channel, entries[1].gain_db), (Some(1), -0.5));
+        assert_eq!(entries[0].gain_db, 0.0);
+        let back: ConvolutionConfig =
+            serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+    }
+
+    #[test]
+    fn crossfeed_width_defaults_and_activity() {
+        let cf: CrossfeedConfig = serde_json::from_str(r#"{"mode":"linkwitz"}"#).unwrap();
+        assert_eq!(cf.width, 1.0);
+        assert_eq!(cf.width_shape, StereoWidthShape::Flat);
+        assert_eq!(cf.width_corner_hz, 700.0);
+        assert!(cf.is_active());
+        let none: CrossfeedConfig = serde_json::from_str(r#"{"mode":"none"}"#).unwrap();
+        assert!(!none.is_active(), "no crossfeed and width 1 is no stage");
+        let wide: CrossfeedConfig =
+            serde_json::from_str(r#"{"mode":"none","width":1.5,"width_shape":"above_bass"}"#)
+                .unwrap();
+        assert!(wide.is_active());
+        assert_eq!(wide.width_shape, StereoWidthShape::AboveBass);
+        assert!(
+            !CrossfeedConfig {
+                enabled: false,
+                ..wide
+            }
+            .is_active()
+        );
+    }
+
+    #[test]
+    fn crossfeed_reads_a_config_with_the_old_level_policy() {
+        // `level` is gone (the stage always plays at its matched loudness);
+        // a file that still carries it reads, and writes back without it.
         let cf: CrossfeedConfig = serde_json::from_str(r#"{"level":"peak_safe"}"#).unwrap();
-        assert_eq!(cf.level, CrossfeedLevel::PeakSafe);
+        assert_eq!(cf, CrossfeedConfig::default());
         let json = serde_json::to_value(&cf).unwrap();
-        assert_eq!(json["level"], "peak_safe");
-        assert!(serde_json::from_str::<CrossfeedConfig>(r#"{"level":"loud"}"#).is_err());
+        assert!(json.get("level").is_none());
+    }
+
+    #[test]
+    fn harmonics_reads_the_old_series_makeup_routing_as_series() {
+        // Every reader (the CLI's config restore and offline render too, not
+        // only the daemon's migration) takes the old form.
+        let h: HarmonicsConfig =
+            serde_json::from_str(r#"{"layers":[],"routing":"series_makeup"}"#).unwrap();
+        assert_eq!(h.routing, HarmonicsRouting::Series);
+        let json = serde_json::to_value(&h).unwrap();
+        assert_eq!(json["routing"], "series");
     }
 
     #[test]
@@ -1867,6 +2941,7 @@ mod tests {
             }),
             tilt: None,
             tilt_high: None,
+            tone: None,
         };
         assert!(layered.is_active());
         let json = serde_json::to_string(&layered).unwrap();
@@ -1899,6 +2974,7 @@ mod tests {
             }),
             tilt: None,
             tilt_high: None,
+            tone: None,
         };
         assert!(!disabled_sections.is_active());
 
@@ -1942,6 +3018,8 @@ mod tests {
                 enabled: false,
                 ir_path: PathBuf::from("/tmp/x.wav"),
                 gain_db: 0.0,
+                matrix: None,
+                calibration: false,
             }],
             ..ChainConfig::neutral()
         };
@@ -1983,6 +3061,69 @@ mod tests {
         };
         assert_eq!(zero_hz.effective_cents(), 0.0);
         assert!(!zero_hz.is_active());
+    }
+
+    #[test]
+    fn chebyshev_sag_and_bias_serde_and_sound() {
+        let mut layer = harmonics_preset("se_triode_high_mu").unwrap().to_layer();
+        let plain = serde_json::to_value(&layer).unwrap();
+        assert!(plain.get("sag").is_none() && plain.get("bias").is_none());
+        let HarmonicsLayer::Chebyshev(c) = &mut layer else {
+            unreachable!()
+        };
+        assert!(!c.is_dynamic());
+        // Depth 0: not dynamic, and the sound of the preset.
+        c.sag = Some(HarmonicsSag {
+            depth_db: 0.0,
+            ..HarmonicsSag::default()
+        });
+        c.bias = Some(HarmonicsBias {
+            depth: 0.0,
+            ..HarmonicsBias::default()
+        });
+        assert!(!c.is_dynamic());
+        assert_eq!(layer.is_modified(), Some(false));
+        let HarmonicsLayer::Chebyshev(c) = &mut layer else {
+            unreachable!()
+        };
+        c.bias = Some(HarmonicsBias {
+            depth: -0.1,
+            ..HarmonicsBias::default()
+        });
+        assert!(c.is_dynamic());
+        assert_eq!(layer.is_modified(), Some(true));
+        let json = serde_json::to_string(&layer).unwrap();
+        assert!(
+            json.contains(r#""bias":{"depth":-0.1,"attack_ms":300.0,"release_ms":2000.0}"#),
+            "{json}"
+        );
+        let back: HarmonicsLayer = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, layer);
+        // Ranges.
+        assert!(
+            HarmonicsSag {
+                depth_db: 6.5,
+                ..HarmonicsSag::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            HarmonicsBias {
+                depth: 0.25,
+                ..HarmonicsBias::default()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            HarmonicsBias {
+                attack_ms: 0.05,
+                ..HarmonicsBias::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
@@ -2083,6 +3224,66 @@ mod tests {
                 .unwrap()
                 .contains("tilt_high")
         );
+    }
+
+    #[test]
+    fn harmonics_tilt_slopes_serde_validate_and_compare() {
+        // Omitted slope: the defaults, and nothing serialized.
+        let t: HarmonicsTilt =
+            serde_json::from_str(r#"{"low":{"hz":60,"db":12},"high":{"hz":6000,"db":6}}"#).unwrap();
+        assert_eq!((t.low.slope, t.high.slope), (None, None));
+        assert_eq!(
+            (
+                t.low.order(TILT_LOW_DEFAULT_SLOPE),
+                t.high.order(TILT_HIGH_DEFAULT_SLOPE)
+            ),
+            (2, 1)
+        );
+        assert!(!serde_json::to_string(&t).unwrap().contains("slope"));
+        let mut s = t.clone();
+        s.high.slope = Some(24);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""slope":24"#), "{json}");
+        let back: HarmonicsTilt = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(back.high.order(TILT_HIGH_DEFAULT_SLOPE), 4);
+        assert!(s.validate().is_ok());
+        // Overrides keep their slope; the layer's low slope reaches every
+        // order it applies to.
+        s.low.slope = Some(18);
+        assert_eq!(s.order_shelves(3).low.slope, Some(18));
+        assert_eq!(s.order_shelves(3).high.slope, Some(24));
+        let mut bad = s.clone();
+        bad.low.slope = Some(20);
+        assert!(bad.validate().unwrap_err().contains("tilt.low.slope"));
+        bad.low.slope = Some(0);
+        assert!(bad.validate().is_err());
+        let mut bad = s.clone();
+        bad.orders[3] = Some(OrderTilt {
+            low: TiltShelf::new(60.0, 6.0),
+            high: TiltShelf {
+                slope: Some(30),
+                ..TiltShelf::new(6_000.0, 6.0)
+            },
+        });
+        assert!(
+            bad.validate()
+                .unwrap_err()
+                .contains("tilt.orders[3] (H5).high.slope")
+        );
+        // A slope at its default, or on a 0 dB shelf, changes nothing.
+        let mut d = t.clone();
+        d.low.slope = Some(12);
+        d.high.slope = Some(6);
+        d.omit_silent_slopes();
+        assert_eq!(d, t);
+        let mut z = t.clone();
+        z.low = TiltShelf {
+            slope: Some(24),
+            ..TiltShelf::new(60.0, 0.0)
+        };
+        z.omit_silent_slopes();
+        assert_eq!(z.low.slope, None);
     }
 
     #[test]

@@ -3,4 +3,4 @@
 /**
  * The short interpolators.
  */
-export type InterpMethod = "cosine" | "catmull_rom" | "table_sinc";
+export type InterpMethod = "nos" | "cosine" | "catmull_rom" | "table_sinc";

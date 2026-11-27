@@ -17,8 +17,12 @@ import type {
   FlattopSet,
   InterpMethod,
   Length,
+  OptimalMethod,
   Phase,
   PhaseMethod,
+  DesignCheck,
+  RateAdmission,
+  RateNote,
   RatePlan,
   RateTarget,
   Sampling,
@@ -26,12 +30,13 @@ import type {
   UpsamplerConfig,
   Window,
 } from "../api/types";
-import { fmtInt, fmtRate, fmtTaps } from "./format";
+import { fmtInt, fmtRate, fmtRateShort, fmtTaps } from "./format";
 
 export type DesignKind = FilterDesign["kind"];
 export type SincDesign = Extract<FilterDesign, { kind: "windowed_sinc" }>;
 export type LanczosDesign = Extract<FilterDesign, { kind: "lanczos" }>;
-export type KernelDesign = SincDesign | LanczosDesign;
+export type OptimalDesign = Extract<FilterDesign, { kind: "optimal" }>;
+export type KernelDesign = SincDesign | LanczosDesign | OptimalDesign;
 export type WindowType = Window["type"];
 export type LengthRule = Length["rule"];
 export type CutoffMode = Cutoff["mode"];
@@ -45,6 +50,7 @@ export const RECOMMENDED_PRESET = "recommended";
 export const KIND_LABEL: Record<DesignKind, string> = {
   windowed_sinc: "Windowed sinc",
   lanczos: "Lanczos",
+  optimal: "Optimal",
   cascade: "Cascade",
   interpolator: "Interpolator",
   block_fft: "Block FFT",
@@ -58,6 +64,12 @@ export const WINDOW_LABEL: Record<WindowType, string> = {
   nuttall: "Nuttall",
   hann: "Hann",
   tukey: "Tukey",
+  dpss: "DPSS",
+};
+
+export const OPTIMAL_LABEL: Record<OptimalMethod, string> = {
+  equiripple: "Equiripple",
+  least_squares: "Least squares",
 };
 
 export const CASCADE_LABEL: Record<CascadeStage, string> = {
@@ -70,6 +82,7 @@ export const CASCADE_LABEL: Record<CascadeStage, string> = {
 };
 
 export const INTERP_LABEL: Record<InterpMethod, string> = {
+  nos: "NOS (sample hold)",
   cosine: "Cosine",
   catmull_rom: "Catmull-Rom",
   table_sinc: "Table sinc",
@@ -91,6 +104,41 @@ export const FLATTOP_LABEL: Record<FlattopSet, string> = { hft196d: "HFT196D", h
 
 const STANDARD_NUMERICS = { path: "standard", grid_cutoff: "design_ratio" } as const;
 const FIR_NUMERICS = { path: "fir", grid_cutoff: "scaled" } as const;
+/**
+ * `design::band_rate`: the rate whose Nyquist a band's fractions are of,
+ * from `rate` at `ratio`: the lower of the input and output rates (the
+ * output rate when decimating), on every path.
+ */
+export function bandRate(rate: number, ratio: { up: number; down: number }): number {
+  return Math.min(rate, (rate * ratio.up) / ratio.down);
+}
+
+export type PinnedBand = { passband_end: number; passband_end_hz?: number | null; stopband_start: number };
+
+/**
+ * `design::band_pin_misfit`: the pinned passband end (`passband_end_hz`) as a
+ * fraction of the Nyquist at `rate` when it does not fit the band there (it
+ * must end below the stopband start, at most at the Nyquist, with a transition
+ * no wider than the Nyquist); `null` when it fits or there is no pin.
+ */
+export function bandPinMisfit(b: PinnedBand, rate: number): number | null {
+  if (b.passband_end_hz == null) return null;
+  const f = b.passband_end_hz / (rate / 2);
+  const se = b.stopband_start;
+  const fits = Number.isFinite(f) && f > 0 && f <= 1 && f < se && se - f <= 1;
+  return fits ? null : f;
+}
+
+/**
+ * `design::band_passband_end`: a band's passband end as a fraction of the
+ * Nyquist at `rate` (`passband_end_hz` pins an absolute frequency; where it
+ * does not fit, the fraction stands in).
+ */
+export function bandPassbandEnd(b: PinnedBand, rate: number): number {
+  if (b.passband_end_hz == null || bandPinMisfit(b, rate) !== null) return b.passband_end;
+  return b.passband_end_hz / (rate / 2);
+}
+
 export const DEFAULT_BAND = { passband_end: 0.9, stopband_start: 1.0, attenuation_db: 150 } as const;
 export const DEFAULT_BETA = 14;
 export const DEFAULT_GAUSSIAN_DB = 150;
@@ -103,6 +151,16 @@ export const REFLECT_MAX_SIDELOBE_DB = 190;
 export const DEFAULT_FIXED_TAPS = 65536;
 export const DEFAULT_PER_INPUT_TAPS = 511;
 export const DEFAULT_LOBES = 23;
+/** The DPSS time-bandwidth product a new window starts at (about a 116 dB stopband). */
+export const DEFAULT_NW = 4;
+/** The engine's NW range (`window_model::DPSS_NW_RANGE`). */
+export const NW_RANGE: [number, number] = [1, 10];
+/** The optimal designs' tap limits on the grid (`paths::optimal`). */
+export const OPTIMAL_MAX_TAPS: Record<OptimalMethod, number> = { equiripple: 4095, least_squares: 65535 };
+/** The optimal designs' deepest automatic budget, dB (`check::optimal_max_db`). */
+export const OPTIMAL_MAX_DB: Record<OptimalMethod, number> = { equiripple: 150, least_squares: 135 };
+/** A new optimal design's length: 160 taps per input sample (about 118 dB at ×8 over 0.9 to 1.0). */
+export const DEFAULT_OPTIMAL_TAPS = 160;
 
 /** The basis of Music and Low latency: Kaiser, full band, linear phase, 64k taps. */
 function baseDesign(): SincDesign {
@@ -141,7 +199,7 @@ export function lowLatencyDesign(): SincDesign {
 
 // ------------------------------------------------------------ queries
 
-export const isKernel = (d: FilterDesign): d is FilterDesign & KernelDesign => d.kind === "windowed_sinc" || d.kind === "lanczos";
+export const isKernel = (d: FilterDesign): d is FilterDesign & KernelDesign => d.kind === "windowed_sinc" || d.kind === "lanczos" || d.kind === "optimal";
 export const isStandard = (d: KernelDesign) => d.numerics.path === "standard";
 /** The phase is made by checked zero reflection. */
 export const isReflected = (p: Phase) => p.type !== "linear" && p.method === "reflect";
@@ -150,8 +208,8 @@ const searchedLength = (l: Length) => l.rule === "band" || l.rule === "auto";
 /** The windows each arithmetic path builds as the presets have them; used to pick a path when a window needs another. */
 const PATH_WINDOWS: Record<ArithmeticPath, readonly WindowType[]> = {
   standard: ["kaiser", "gaussian", "tukey"],
-  fir: ["kaiser", "gaussian", "flattop", "chebyshev", "nuttall", "hann"],
-  fir_after: ["kaiser", "gaussian", "flattop", "chebyshev", "nuttall", "hann"],
+  fir: ["kaiser", "gaussian", "flattop", "chebyshev", "nuttall", "hann", "dpss"],
+  fir_after: ["kaiser", "gaussian", "flattop", "chebyshev", "nuttall", "hann", "dpss"],
   exact_pi_inverse_after: ["kaiser", "chebyshev", "nuttall"],
   exact_over_ratio_before: ["kaiser", "chebyshev", "nuttall"],
   exact_pi_inverse_pairwise: ["kaiser", "chebyshev", "nuttall"],
@@ -217,6 +275,8 @@ export function defaultWindow(type: WindowType, d: KernelDesign): Window {
       return { type, sampling: legacy };
     case "tukey":
       return { type, taper: 0.25, sampling: "symmetric" };
+    case "dpss":
+      return { type, nw: searched ? null : DEFAULT_NW, sampling: "symmetric" };
   }
 }
 
@@ -228,6 +288,7 @@ function manualLength(d: KernelDesign): Length {
 /** A window that a band or automatic length derives (β from the attenuation). */
 function derivedWindow(w: Window): Window {
   if (w.type === "kaiser") return { ...w, beta: null };
+  if (w.type === "dpss") return { ...w, nw: null };
   if (w.type === "gaussian" && "stopband_db" in w) return { ...w, stopband_db: null };
   return w;
 }
@@ -235,6 +296,7 @@ function derivedWindow(w: Window): Window {
 /** A window with its own value again, for a manual length. */
 function explicitWindow(w: Window): Window {
   if (w.type === "kaiser" && w.beta === null) return { ...w, beta: DEFAULT_BETA };
+  if (w.type === "dpss" && w.nw === null) return { ...w, nw: DEFAULT_NW };
   if (w.type === "gaussian" && "stopband_db" in w && w.stopband_db === null) return { ...w, stopband_db: DEFAULT_GAUSSIAN_DB };
   return w;
 }
@@ -286,6 +348,8 @@ export function setPath<D extends KernelDesign>(d: D, path: ArithmeticPath): D {
   };
   // The standard path counts frames: it keeps the length when decimating.
   if (toStandard) next = { ...next, decimation: { length: "keep" } };
+  // An optimal design has no window and is built on the fir paths only (the
+  // engine says so for the others).
   if (toStandard && d.phase.type !== "linear" && d.phase.method === "cepstral") next = { ...next, phase: { ...d.phase, method: "reflect" } };
   if (next.kind === "windowed_sinc") {
     const w = next.window;
@@ -337,6 +401,30 @@ export function setLengthRule(d: SincDesign, rule: LengthRule, prev?: Partial<Re
   return applyBetaRule(next);
 }
 
+/** The length rules an optimal design takes. */
+export type OptimalLengthRule = "fixed" | "per_input" | "auto";
+
+export function setOptimalLengthRule(d: OptimalDesign, rule: OptimalLengthRule): OptimalDesign {
+  if (d.length.rule === rule) return d;
+  const max = OPTIMAL_MAX_DB[d.method];
+  const length: Length =
+    rule === "fixed"
+      ? { rule, taps: DEFAULT_OPTIMAL_TAPS * 8 - 1 }
+      : rule === "per_input"
+        ? { rule, taps: DEFAULT_OPTIMAL_TAPS }
+        : { rule, budget: { db: Math.min(120, max) } };
+  return { ...d, length };
+}
+
+/** The method changes; an automatic budget past the new method's depth comes down to it. */
+export function setOptimalMethod(d: OptimalDesign, method: OptimalMethod): OptimalDesign {
+  if (d.method === method) return d;
+  let next: OptimalDesign = { ...d, method };
+  const l = next.length;
+  if (l.rule === "auto" && l.budget !== "match_output" && l.budget.db > OPTIMAL_MAX_DB[method]) next = { ...next, length: { rule: "auto", budget: { db: OPTIMAL_MAX_DB[method] } } };
+  return next;
+}
+
 export function setCutoffMode(d: SincDesign, mode: CutoffMode): SincDesign {
   if (d.cutoff.mode === mode) return d;
   if (mode === "band") {
@@ -352,7 +440,9 @@ export function setPhaseType<D extends KernelDesign>(d: D, type: PhaseType): D {
   const cur = d.phase;
   if (cur.type === type) return d;
   if (type === "linear") return { ...d, phase: { type } };
-  const method: PhaseMethod = cur.type !== "linear" ? cur.method : isStandard(d) ? "reflect" : "cepstral";
+  // An optimal design defaults to the reflected phase (exact magnitude: the
+  // cepstral transform's passband floor would cost its accuracy).
+  const method: PhaseMethod = cur.type !== "linear" ? cur.method : isStandard(d) || d.kind === "optimal" ? "reflect" : "cepstral";
   const phase: Phase = type === "minimum" ? { type, method } : { type, method, mix: cur.type === "intermediate" ? cur.mix : DEFAULT_MIX };
   return { ...d, phase, preserve_samples: false };
 }
@@ -389,8 +479,26 @@ export function setKind(d: FilterDesign, kind: DesignKind, memory: KindMemory = 
       }
       return { ...defaultDesign(), ...based };
     }
+    case "optimal": {
+      const src: KernelDesign = isKernel(d) ? d : defaultDesign();
+      let next: OptimalDesign = {
+        ...based,
+        kind: "optimal",
+        method: "equiripple",
+        length: { rule: "per_input", taps: DEFAULT_OPTIMAL_TAPS },
+        passband_end: DEFAULT_BAND.passband_end,
+        stopband_start: DEFAULT_BAND.stopband_start,
+        decimation: { length: "scale", odd: "down", base_taps: null },
+        phase: src.phase,
+        preserve_samples: false,
+        rates: { accept: "any", fallback_window: null },
+        numerics: { ...FIR_NUMERICS },
+      };
+      if (src.numerics.path === "fir_after") next = { ...next, numerics: { ...src.numerics } };
+      return next;
+    }
     case "lanczos": {
-      const src: KernelDesign = d.kind === "windowed_sinc" ? d : defaultDesign();
+      const src: KernelDesign = d.kind === "windowed_sinc" || d.kind === "lanczos" ? d : defaultDesign();
       let next: LanczosDesign = {
         ...based,
         kind: "lanczos",
@@ -470,7 +578,11 @@ export function errorGroup(path: string): ErrorGroup {
   const seg = p.startsWith("design.") ? p.slice("design.".length).split(/[.[]/)[0] : null;
   switch (seg) {
     case "kind":
+    case "method":
       return "kind";
+    case "passband_end":
+    case "stopband_start":
+      return "cutoff";
     case "window":
       return "window";
     case "length":
@@ -519,6 +631,7 @@ export function fieldLabel(path: string): string {
     alpha: "α",
     stopband_db: "Stopband",
     sidelobe_ratio: "Sidelobes",
+    nw: "NW",
     taper: "Taper",
     sampling: "Window sampling",
     type: "Window",
@@ -533,7 +646,7 @@ export function fieldLabel(path: string): string {
     stopband_start: "Band edges",
     attenuation_db: "Depth",
     mix: "Blend",
-    method: "Phase method",
+    method: p === "method" ? "Design method" : "Phase method",
     preserve_samples: "Original samples",
     base_taps: "Decimation base",
     length: p.startsWith("decimation") ? "Decimation" : "Length",
@@ -559,7 +672,7 @@ export function fmtBytes(n: number): string {
 }
 
 export function fmtCpu(load: number | undefined): string {
-  if (load === undefined) return "—";
+  if (load === undefined) return "-";
   const pct = load * 100;
   return `${pct < 1 ? pct.toFixed(2) : pct < 10 ? pct.toFixed(1) : Math.round(pct)}%`;
 }
@@ -575,13 +688,26 @@ export interface PlanRow {
   memoryText: string;
   memoryTip: string;
   cpuText: string;
+  /** Over the CPU share (`status.limits.cpu_share`): this rate falls back to a lighter filter. */
+  over: boolean;
+  cpuTip: string;
+  /** The design does not build here: the rate plays this instead ("plays Recommended: too short here …"). */
+  fallback: string | null;
 }
 
-/** One readout row per planned source rate. */
-export function planRows(plans: readonly RatePlan[]): PlanRow[] {
+/**
+ * One readout row per planned source rate. With the engine's CPU share,
+ * a row over it is marked: the engine admits a design that fits the rate
+ * playing and falls back per rate where it does not.
+ */
+export function planRows(plans: readonly RatePlan[], cpuShare?: number, notes: readonly RateNote[] = []): PlanRow[] {
   return [...plans]
     .sort((a, b) => a.source_rate - b.source_rate)
-    .map(({ source_rate, ratio, plan }) => ({
+    .map(({ source_rate, ratio, plan }) => {
+      const over = cpuShare !== undefined && plan.cpu_load !== undefined && plan.cpu_load > cpuShare;
+      const note = notes.find((n) => n.source_rate === source_rate && n.plays);
+      return {
+      fallback: note ? `plays ${playsLabel(note.plays!)}: ${note.message}` : null,
       rate: source_rate,
       rateText: fmtRate(source_rate),
       ratioText: ratioLabel(ratio),
@@ -592,20 +718,121 @@ export function planRows(plans: readonly RatePlan[]): PlanRow[] {
           : `${fmtInt(plan.grid_taps)} taps on the ${plan.grid_up}× grid${plan.grid_taps_exact ? "" : " (an upper bound: the engine sizes it when it designs the kernel)"}`,
       memoryText: fmtBytes(plan.resident_bytes),
       memoryTip: `${fmtBytes(plan.resident_bytes)} while it runs (both channels), up to ${fmtBytes(plan.workspace_bytes)} while it is built`,
-      cpuText: fmtCpu(plan.cpu_load),
-    }));
+      cpuText: fmtCpu(plan.cpu_load) + (over ? " · falls back" : ""),
+      over,
+      cpuTip: over
+        ? `Over the CPU budget (${fmtCpu(cpuShare)} of a core): a ${fmtRate(source_rate)} source falls back to a lighter filter at the same output rate (the last setting that ran, else the engine's light filter). The rates within it run this design.`
+        : "Share of one CPU core one pipeline takes, as the engine prices it",
+    };
+    });
+}
+
+/** "Recommended", "a lighter Recommended", or the design's name. */
+export function playsLabel(plays: string): string {
+  if (plays === RECOMMENDED_PRESET) return "Recommended";
+  if (plays === `${RECOMMENDED_PRESET}_light`) return "a lighter Recommended";
+  return plays;
+}
+
+const joinAnd = (xs: string[]) => (xs.length < 2 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`);
+
+/** "44.1k ×8". */
+const rateAt = (rate: number, ratio?: { up: number; down: number }) => (ratio ? `${fmtRateShort(rate)} ${ratioLabel(ratio)}` : fmtRateShort(rate));
+
+/**
+ * The Custom editor's note for a design applied with fallbacks: "Applied at
+ * 44.1k ×8 and 48k ×8. 176.4k ×4 and 192k ×4 play Recommended." Null when it
+ * builds at every rate it plays (or is refused).
+ */
+export function fallbackNote(check: DesignCheck | null | undefined): string | null {
+  if (!check?.advice?.applied) return null;
+  const falls = check.notes.filter((n) => n.plays);
+  if (falls.length === 0) return null;
+  const ratioOf = (rate: number) => check.plans.find((p) => p.source_rate === rate)?.ratio;
+  const fallRates = new Set(falls.map((n) => n.source_rate));
+  const applied = check.plans.filter((p) => !fallRates.has(p.source_rate)).map((p) => rateAt(p.source_rate, p.ratio));
+  const plays = [...new Set(falls.map((n) => n.plays!))].map(playsLabel).join(" or ");
+  const fallText = joinAnd(falls.map((n) => rateAt(n.source_rate, ratioOf(n.source_rate))));
+  return `${applied.length ? `Applied at ${joinAnd(applied)}. ` : ""}${fallText} ${falls.length === 1 ? "plays" : "play"} ${plays}.`;
+}
+
+/** What a fallback row plays and why, in a few words ("Recommended: too short here …"). */
+function fallbackText(r: RateAdmission): string {
+  const f = r.fallback!;
+  const what = f.action === "reverted" ? "the last setting that ran" : f.action === "recommended" ? "Recommended" : "the engine's light filter";
+  const why = f.cause === "overload" ? "it overloaded there" : f.cause === "design" ? (f.reason ? `this design is ${f.reason}` : "this design does not build there") : `over the CPU budget at ${fmtCpu(r.load)}`;
+  return `${what}; ${why}`;
 }
 
 /**
- * The delay a design adds at a source rate, ms, from its plan: half the
- * kernel for a linear-phase kernel of known length. Null when only the
- * designed kernel can tell (minimum or intermediate phase, an estimated
- * length, the runtime kinds): the measured response gives it then.
+ * The applied setting per source rate (`status.upsampler_rates`), in a
+ * line: null when it runs at every rate (or nothing is reported).
  */
-export function planLatencyMs(d: FilterDesign, plan: DesignPlan, sourceRate: number): number | null {
+export function perRateNote(rows: readonly RateAdmission[] | undefined): string | null {
+  if (!rows?.some((r) => r.fallback)) return null;
+  const runs = rows.filter((r) => !r.fallback).map((r) => fmtRate(r.source_rate));
+  const falls = rows.filter((r) => r.fallback).map((r) => `${fmtRate(r.source_rate)} (${fallbackText(r)})`);
+  const head = runs.length ? `Runs this filter at ${runs.join(", ")}. ` : "";
+  return `${head}Falls back at ${falls.join(", ")}, at the same output rate.`;
+}
+
+/**
+ * The rate playing now plays a fallback (`status.upsampler_fallback_now`):
+ * "Playing Recommended at 176.4 kHz: this design is too long for an
+ * equiripple design here." Null otherwise.
+ */
+export function fallbackNowNote(row: RateAdmission | null | undefined): string | null {
+  if (!row?.fallback) return null;
+  const f = row.fallback;
+  const what = f.action === "reverted" ? "the last setting that ran" : f.action === "recommended" ? "Recommended" : "the engine's light filter";
+  const why =
+    f.cause === "design"
+      ? f.reason
+        ? `your design is ${f.reason}`
+        : "your design does not build at this rate"
+      : f.cause === "overload"
+        ? "your filter overloaded at this rate"
+        : `your filter is over the CPU budget at this rate (${fmtCpu(row.load)})`;
+  return `Playing ${what} at ${fmtRate(row.source_rate)}: ${why}.`;
+}
+
+/**
+ * The engine's graph block at `rate` (`scaled_quantum` in io-pw): the
+ * 48 kHz quantum scaled to the rate, 32 ..= 8192 frames, floored to a
+ * power of two when the quantum is one.
+ */
+export function scaledQuantum(quantum: number, rate: number): number {
+  const q = Math.max(32, quantum);
+  const raw = Math.min(8192, Math.max(32, Math.floor((q * Math.max(8000, rate)) / 48000)));
+  return Number.isInteger(Math.log2(q)) ? Math.max(32, 2 ** Math.floor(Math.log2(raw))) : raw;
+}
+
+/**
+ * The input block the upsampler's partitioned convolution runs at `rate`
+ * (`engine_block` in dsp-core): the chain block, `scaledQuantum` clamped
+ * to 512 ..= 8192, rounded up to a power of two and capped at 1024.
+ */
+export function upsamplerEngineBlock(quantum: number, rate: number): number {
+  const chain = Math.min(8192, Math.max(512, scaledQuantum(quantum, rate)));
+  return Math.min(1024, 2 ** Math.ceil(Math.log2(chain)));
+}
+
+/**
+ * The delay a design adds at a source rate, ms, from its plan: half the kernel
+ * for a linear-phase kernel of known length, plus (at an integer ratio) the
+ * partitioned convolution's block × the ratio, as `status.filter_latency_ms`
+ * counts it. The block needs the engine's `quantum`; without it the figure is
+ * the kernel's alone. Null when only the designed kernel can tell (minimum or
+ * intermediate phase, an estimated length, the runtime kinds): the measured
+ * response gives it then.
+ */
+export function planLatencyMs(d: FilterDesign, plan: DesignPlan, sourceRate: number, quantum?: number): number | null {
   if (!isKernel(d) || d.phase.type !== "linear" || !plan.grid_taps_exact || plan.grid_taps <= 0) return null;
   const gridRate = sourceRate * plan.grid_up;
-  return ((plan.grid_taps - 1) / 2 / gridRate) * 1000;
+  const kernelMs = ((plan.grid_taps - 1) / 2 / gridRate) * 1000;
+  // A rational ratio runs a direct polyphase filter: no block delay.
+  if (plan.grid_down !== 1 || plan.grid_up <= 1 || quantum === undefined) return kernelMs;
+  return kernelMs + (upsamplerEngineBlock(quantum, sourceRate) / sourceRate) * 1000;
 }
 
 // ------------------------------------------------------------ summaries
@@ -632,6 +859,8 @@ export function designSummary(d: FilterDesign): string {
       return `${WINDOW_LABEL[d.window.type]} ${lengthShort(d.length)} · ${d.phase.type}`;
     case "lanczos":
       return `Lanczos ${d.lobes} · ${d.phase.type}`;
+    case "optimal":
+      return `${OPTIMAL_LABEL[d.method]} ${lengthShort(d.length)} · ${d.phase.type}`;
     case "cascade":
       return `Cascade ${CASCADE_LABEL[d.stage]}`;
     case "interpolator":

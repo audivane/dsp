@@ -1,4 +1,4 @@
-//! `avdsp eq` — import, export and evaluate EQ profiles.
+//! `avdsp eq`: import, export and evaluate EQ profiles.
 
 use crate::{ChannelArg, EqCommand};
 use anyhow::{Context, Result, bail};

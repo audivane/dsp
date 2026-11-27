@@ -1,4 +1,4 @@
-//! Short interpolators (`cosine`, `catmull_rom`, `table_sinc`).
+//! Short interpolators (`nos`, `cosine`, `catmull_rom`, `table_sinc`).
 
 use audivane_protocol::RateRatio;
 use std::f64::consts::PI;
@@ -22,6 +22,7 @@ pub fn build(
 ) -> Result<Box<dyn UpsamplerRuntime>, PresetError> {
     check_ratio(p, ratio)?;
     match p {
+        FilterPreset::Nos => Ok(Box::new(Nos::new(ratio, channels))),
         FilterPreset::Cosine => Ok(Box::new(PolyInterp::new(PolyMode::Cosine, ratio, channels))),
         FilterPreset::CatmullRom => Ok(Box::new(PolyInterp::new(
             PolyMode::CatmullRom,
@@ -30,6 +31,89 @@ pub fn build(
         ))),
         FilterPreset::TableSinc => Ok(Box::new(TableSinc::new(ratio, channels))),
         _ => Err(PresetError::NotImplemented(p)),
+    }
+}
+
+/// Zero-order hold (non-oversampling sample hold): repeats each input sample
+/// `ratio` times with no reconstruction filter.
+///
+/// The causal boxcar impulse `[1; ratio]` is symmetric (linear phase) with
+/// exact group delay `(ratio - 1) / 2` output frames (approaching half an
+/// input sample as `ratio` grows).
+#[derive(Clone)]
+struct Nos {
+    ratio: usize,
+    channels: usize,
+    gain: f64,
+}
+
+impl Nos {
+    fn new(ratio: usize, channels: usize) -> Self {
+        crate::test_support::record("nos", || crate::test_support::words(&[ratio as u64], &[]));
+        Self {
+            ratio,
+            channels,
+            gain: 1.0,
+        }
+    }
+}
+
+impl UpsamplerRuntime for Nos {
+    fn ratio(&self) -> RateRatio {
+        RateRatio::integer(self.ratio as u32)
+    }
+
+    fn process(&mut self, input: &[&[f64]], output: &mut [&mut [f64]]) {
+        assert_eq!(input.len(), self.channels, "input channel mismatch");
+        assert_eq!(output.len(), self.channels, "output channel mismatch");
+        let r = self.ratio;
+        let gain = self.gain;
+
+        for (&inp, out) in input.iter().zip(output.iter_mut()) {
+            assert_eq!(out.len(), inp.len() * r, "output length mismatch");
+            if gain == 1.0 {
+                for (i, &x) in inp.iter().enumerate() {
+                    out[i * r..(i + 1) * r].fill(x);
+                }
+            } else {
+                for (i, &x) in inp.iter().enumerate() {
+                    out[i * r..(i + 1) * r].fill(x * gain);
+                }
+            }
+        }
+    }
+
+    fn reset(&mut self) {}
+
+    fn latency_out_frames(&self) -> usize {
+        self.ratio / 2
+    }
+
+    fn latency_out_exact(&self) -> f64 {
+        (self.ratio - 1) as f64 * 0.5
+    }
+
+    fn scale_output(&mut self, gain: f64) {
+        self.gain *= gain;
+    }
+
+    fn split_channels(&mut self) -> Option<Vec<Box<dyn UpsamplerRuntime>>> {
+        let channels = std::mem::take(&mut self.channels);
+        Some(
+            (0..channels)
+                .map(|_| {
+                    Box::new(Nos {
+                        ratio: self.ratio,
+                        channels: 1,
+                        gain: self.gain,
+                    }) as Box<dyn UpsamplerRuntime>
+                })
+                .collect(),
+        )
+    }
+
+    fn impulse_span_out_frames(&self) -> usize {
+        self.ratio
     }
 }
 
@@ -45,6 +129,7 @@ enum PolyMode {
 /// phases `mu = k / ratio` (`k = 1..=ratio`), rather than accumulating `1 / ratio`
 /// in `f64` (which can drift and emit an extra sample at non-power-of-two
 /// ratios). Identical at power-of-two ratios.
+#[derive(Clone)]
 struct PolyInterp {
     mode: PolyMode,
     ratio: usize,
@@ -149,6 +234,21 @@ impl UpsamplerRuntime for PolyInterp {
         self.gain *= gain;
     }
 
+    fn split_channels(&mut self) -> Option<Vec<Box<dyn UpsamplerRuntime>>> {
+        let history = std::mem::take(&mut self.history);
+        Some(
+            history
+                .into_iter()
+                .map(|h| {
+                    Box::new(PolyInterp {
+                        history: vec![h],
+                        ..self.clone()
+                    }) as Box<dyn UpsamplerRuntime>
+                })
+                .collect(),
+        )
+    }
+
     fn impulse_span_out_frames(&self) -> usize {
         match self.mode {
             PolyMode::Cosine => 3 * self.ratio - 1,
@@ -164,6 +264,7 @@ impl UpsamplerRuntime for PolyInterp {
 /// Design choice: emits exactly `ratio` outputs per input sample at exact
 /// phases `p = k / ratio` (`k = 0..ratio`), rather than accumulating `1 / ratio`
 /// in `f64`. Identical at power-of-two ratios.
+#[derive(Clone)]
 struct TableSinc {
     ratio: usize,
     /// Precomputed per-phase 127-tap coefficients, shared across all channels.
@@ -302,6 +403,24 @@ impl UpsamplerRuntime for TableSinc {
         63 * self.ratio
     }
 
+    fn split_channels(&mut self) -> Option<Vec<Box<dyn UpsamplerRuntime>>> {
+        let history = std::mem::take(&mut self.history);
+        let pos = std::mem::take(&mut self.pos);
+        Some(
+            history
+                .into_iter()
+                .zip(pos)
+                .map(|(h, p)| {
+                    Box::new(TableSinc {
+                        history: vec![h],
+                        pos: vec![p],
+                        ..self.clone()
+                    }) as Box<dyn UpsamplerRuntime>
+                })
+                .collect(),
+        )
+    }
+
     fn scale_output(&mut self, gain: f64) {
         for phase in &mut self.phases {
             for v in phase.iter_mut() {
@@ -319,7 +438,8 @@ impl UpsamplerRuntime for TableSinc {
 mod tests {
     use super::*;
 
-    const INTERP_PRESETS: [FilterPreset; 3] = [
+    const INTERP_PRESETS: [FilterPreset; 4] = [
+        FilterPreset::Nos,
         FilterPreset::Cosine,
         FilterPreset::CatmullRom,
         FilterPreset::TableSinc,
@@ -336,24 +456,33 @@ mod tests {
                 let mut out = vec![0.0; total_in * ratio];
                 rt.process(&[&inp], &mut [&mut out]);
 
-                let peak_idx = out
-                    .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
-                    .unwrap()
-                    .0;
-                assert_eq!(
-                    peak_idx,
-                    rt.latency_out_frames(),
-                    "{} x{ratio} peak mismatch",
-                    preset.name()
-                );
-                assert!(
-                    (out[peak_idx] - 1.0).abs() < 1e-12,
-                    "{} x{ratio} peak value {}",
-                    preset.name(),
-                    out[peak_idx]
-                );
+                if preset == FilterPreset::Nos {
+                    assert!(
+                        out[..ratio].iter().all(|&v| v == 1.0),
+                        "nos x{ratio} impulse {out:?}"
+                    );
+                    assert_eq!(rt.latency_out_frames(), ratio / 2);
+                    assert_eq!(rt.latency_out_exact(), (ratio - 1) as f64 * 0.5);
+                } else {
+                    let peak_idx = out
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+                        .unwrap()
+                        .0;
+                    assert_eq!(
+                        peak_idx,
+                        rt.latency_out_frames(),
+                        "{} x{ratio} peak mismatch",
+                        preset.name()
+                    );
+                    assert!(
+                        (out[peak_idx] - 1.0).abs() < 1e-12,
+                        "{} x{ratio} peak value {}",
+                        preset.name(),
+                        out[peak_idx]
+                    );
+                }
 
                 let span = rt.impulse_span_out_frames();
                 assert!(
@@ -477,5 +606,109 @@ mod tests {
         for (a, b) in cr_out.iter().zip(expected.iter()) {
             assert!((a - b).abs() < 1e-15, "got {cr_out:?}");
         }
+    }
+
+    #[test]
+    fn nos_repeats_samples_bit_for_bit() {
+        let samples = [
+            0.0_f64,
+            -0.0_f64,
+            1.0,
+            -1.0,
+            0.123_456_789_012_345_67,
+            -0.987_654_321_098_765_4,
+            f64::MIN_POSITIVE,
+            -1e-320,
+        ];
+        for &ratio in &[2usize, 3, 4, 8, 64] {
+            let mut rt = super::build(FilterPreset::Nos, 44_100, ratio, 2, 64).unwrap();
+            let ch1: Vec<f64> = samples.iter().rev().copied().collect();
+            let mut out0 = vec![f64::NAN; samples.len() * ratio];
+            let mut out1 = vec![f64::NAN; samples.len() * ratio];
+            rt.process(&[&samples, &ch1], &mut [&mut out0, &mut out1]);
+
+            for (i, &x) in samples.iter().enumerate() {
+                for k in 0..ratio {
+                    assert_eq!(
+                        out0[i * ratio + k].to_bits(),
+                        x.to_bits(),
+                        "x{ratio} ch0 sample {i} copy {k}"
+                    );
+                }
+            }
+            for (i, &x) in ch1.iter().enumerate() {
+                for k in 0..ratio {
+                    assert_eq!(
+                        out1[i * ratio + k].to_bits(),
+                        x.to_bits(),
+                        "x{ratio} ch1 sample {i} copy {k}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nos_sinc_droop_and_images() {
+        use audivane_protocol::{RateTarget, UpsamplerConfig};
+
+        let cfg_x4 = UpsamplerConfig {
+            target: RateTarget::Ratio(4),
+            preset: Some("nos".into()),
+            design: None,
+        };
+        let discrete_zoh_db = |f: f64, fs: f64, r: usize| -> f64 {
+            let num = (PI * f / fs).sin().abs();
+            let den = r as f64 * (PI * f / (r as f64 * fs)).sin().abs();
+            20.0 * (num / den).log10()
+        };
+
+        // 44.1 kHz x4: impulse is [1, 1, 1, 1], droop at 20 kHz matches discrete ZOH sinc,
+        // and imaging lobes remain above source Nyquist.
+        let m44 = crate::resample::measure_upsampler(&cfg_x4, 44_100).unwrap();
+        assert_eq!(m44.response.impulse, vec![1.0; 4]);
+        assert_eq!(m44.response.taps, 4);
+        let [mag_20k_44, img_34k, null_44k] =
+            m44.magnitude_db_at(&[20_000.0, 34_100.0, 44_100.0])[..]
+        else {
+            unreachable!()
+        };
+        let want_20k_44 = discrete_zoh_db(20_000.0, 44_100.0, 4);
+        assert!(
+            (mag_20k_44 - want_20k_44).abs() < 0.05,
+            "44.1k x4 at 20 kHz: got {mag_20k_44:.4} dB, want {want_20k_44:.4} dB"
+        );
+        // First image of 10 kHz sits at 44.1 - 10 = 34.1 kHz and must not be filtered out.
+        let want_34k = discrete_zoh_db(34_100.0, 44_100.0, 4);
+        assert!(
+            (img_34k - want_34k).abs() < 0.05 && img_34k > -15.0,
+            "44.1k x4 image at 34.1 kHz: got {img_34k:.4} dB, want {want_34k:.4} dB"
+        );
+        // Null at fs = 44.1 kHz.
+        assert!(null_44k < -100.0);
+
+        // 96 kHz x4: droop at 20 kHz is about -0.6 dB.
+        let m96 = crate::resample::measure_upsampler(&cfg_x4, 96_000).unwrap();
+        let mag_20k_96 = m96.magnitude_db_at(&[20_000.0])[0];
+        let want_20k_96 = discrete_zoh_db(20_000.0, 96_000.0, 4);
+        assert!(
+            (mag_20k_96 - want_20k_96).abs() < 0.05,
+            "96k x4 at 20 kHz: got {mag_20k_96:.4} dB, want {want_20k_96:.4} dB"
+        );
+
+        // At high ratio (x16), discrete ZOH converges to continuous sinc(f / fs).
+        let cfg_x16 = UpsamplerConfig {
+            target: RateTarget::Ratio(16),
+            preset: Some("nos".into()),
+            design: None,
+        };
+        let m44_x16 = crate::resample::measure_upsampler(&cfg_x16, 44_100).unwrap();
+        let x = PI * 20_000.0 / 44_100.0;
+        let cont_sinc_db = 20.0 * (x.sin() / x).abs().log10();
+        let mag_20k_x16 = m44_x16.magnitude_db_at(&[20_000.0])[0];
+        assert!(
+            (mag_20k_x16 - cont_sinc_db).abs() < 0.05,
+            "44.1k x16 at 20 kHz: got {mag_20k_x16:.4} dB, continuous sinc {cont_sinc_db:.4} dB"
+        );
     }
 }

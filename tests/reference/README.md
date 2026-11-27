@@ -2,9 +2,9 @@
 
 `run.py` validates the Rust DSP against independent Python implementations:
 the real `avdsp` binary processes generated WAV files, and the results are
-compared sample for sample with numpy/scipy. Nothing here re-implements the
-Rust code: the Python side uses textbook RBJ coefficients, `scipy.signal`
-and the kernel dumped by `avdsp kernel`.
+compared sample for sample with numpy/scipy. The Python side does not
+re-implement the Rust: it uses textbook RBJ coefficients, `scipy.signal` and
+the kernel dumped by `avdsp kernel`.
 
 ## Requirements
 
@@ -32,6 +32,7 @@ python3 tests/reference/run.py --avdsp target/fastrel/avdsp
 | --- | --- | --- |
 | `eq_response` | `avdsp eq response` vs `scipy.signal.sosfreqz` of independently computed RBJ coefficients, 10-band profile at 44.1 kHz and 192 kHz | 1e-6 dB (and 1e-6 rad phase) |
 | `convolution` | `avdsp process --conv` with `--trim-latency`, `--dither none`, float output vs `scipy.signal.fftconvolve` (mono and stereo, odd block size 333) | 1e-6 |
+| `matrix` | `avdsp process --conv IN:OUT[:CH]=PATH` entries: a 2 → 1 sum from one stereo WAV (the other output silent), and a full 2 × 2 with cross terms followed by a stereo IR in series, vs sums of `scipy.signal.fftconvolve` | 1e-6 |
 | `upsampling` | `avdsp process --upsample 4` vs `scipy.signal.upfirdn` using the kernel written by `avdsp kernel` (which has DC gain `ratio`, for zero-stuffing) | 1e-6 |
 | `bypass` | 16/24-bit random PCM through `avdsp process` with no stages and a matching `--format` | byte-identical `data` chunk |
 | `levelmatch` | analytic A-weighted offset of a `+6 dB` profile against a flat profile | −6.0 dB ± 0.05 |
@@ -42,7 +43,7 @@ Notes:
   Python coefficients at exactly those frequencies, so no interpolation is
   involved.
 - The upsampling check reads the chain latency from the `process` output
-  (`latency N out frames`), because `--trim-latency` removes exactly that
+  (`latency: N out frames`), because `--trim-latency` removes exactly that
   delay. It allows a ±1 sample alignment offset in case an implementation
   rounds the linear-phase group delay, and reports the offset it used.
 - The bypass check compares the raw PCM payload, not the WAV headers, so

@@ -10,6 +10,8 @@
 //!   pre-allocated scratch buffer (no gaps or clicks).
 //! - Per-channel peak and RMS meters are accumulated into lock-free atomics.
 
+use crate::engine::harmonics_live::HarmonicsLiveRt;
+use crate::engine::measure::{BlockCtx, MasterMeasure, MeasureSlot};
 use crate::engine::spectrum::SpectrumRt;
 use crate::engine::tee::{StageView, TeeRt};
 use crate::engine::varispeed::{StopKind, VarispeedApplied, VarispeedRt, VarispeedRtCmd};
@@ -36,6 +38,33 @@ const SWAP_CROSSFADE_MS: usize = 10;
 const SWAP_FADE_HALF_MS: usize = 5;
 const WARMUP_SETTLE_MARGIN_FRAMES: usize = 1024;
 const RECYCLE_STASH_CAP: usize = 4;
+/// The most of a new convolution's ring a swap warms up for, ms: past it
+/// a room or reverb tail is far down, and the edit has waited long enough.
+pub(crate) const WARMUP_RING_CAP_MS: u64 = 1_000;
+
+/// The share of a period a swap's state handover may take on the audio
+/// thread ([`ActiveChain::inherit_filter_state`]: a copy before that
+/// callback's DSP, both chains then run), at [`HANDOVER_BYTES_PER_S`].
+const HANDOVER_SHARE: f64 = 0.25;
+/// A conservative copy rate for large, cold buffers, bytes/s (a fast machine
+/// copies 7 to 8 GB/s; a laptop under load, less).
+const HANDOVER_BYTES_PER_S: f64 = 2e9;
+
+/// The most convolution state a swap copies in one callback of `frames`
+/// at `rate` ([`HANDOVER_SHARE`] of it): a larger state is not handed
+/// over, its chain warms up for its ring instead. 0 without a period.
+pub(crate) fn handover_budget(frames: usize, rate: u32) -> usize {
+    if rate == 0 {
+        return 0;
+    }
+    (frames as f64 / f64::from(rate) * HANDOVER_SHARE * HANDOVER_BYTES_PER_S) as usize
+}
+
+/// [`WARMUP_RING_CAP_MS`] in output frames at `rate` x `ratio`.
+pub(crate) fn warm_ring_cap(rate: u32, ratio: RateRatio) -> usize {
+    (u64::from(rate) * WARMUP_RING_CAP_MS / 1_000) as usize * ratio.up as usize
+        / (ratio.down as usize).max(1)
+}
 
 /// Target volume/balance/mute parameters published lock-free from control/engine
 /// threads to the RT processor.
@@ -65,6 +94,7 @@ impl Default for VolumeTarget {
 /// The RT reader never allocates, blocks, or spins unboundedly: if a concurrent
 /// write is observed in progress, it skips reading and picks up the update on
 /// the next cycle.
+#[derive(Debug)]
 pub struct SharedVolume {
     seq: AtomicU64,
     volume_bits: AtomicU64,
@@ -219,15 +249,30 @@ impl ActiveChain {
     /// position `pos` onto it (clearing its state). A no-op for integer
     /// ratios and for a chain already there, so a running chain is never
     /// disturbed.
-    pub fn align_to(&mut self, pos: u64) {
+    /// Returns whether it cleared the state (the chain was off the grid).
+    pub fn align_to(&mut self, pos: u64) -> bool {
         let ratio = self.ratio();
         if ratio.is_integer() || self.input_pos() == pos % u64::from(ratio.down) {
-            return;
+            return false;
         }
         match self {
             Self::Bypass => {}
             Self::Single(c) | Self::Resample(c) => c.reset_to(pos),
             Self::Ab(ab) => ab.reset_to(pos),
+        }
+        true
+    }
+
+    /// The warm-up a chain that starts from cleared state needs, output
+    /// frames: its latency, a convolution's ring (capped) and the margin
+    /// `margin` (0 for a chain with neither latency nor convolution).
+    pub(crate) fn cold_warm_frames(&self, ring_cap: usize, margin: usize) -> usize {
+        let lat = self.latency_out_frames();
+        let ring = self.conv_ring_frames().min(ring_cap);
+        if lat == 0 && ring == 0 {
+            0
+        } else {
+            lat + ring + margin
         }
     }
 
@@ -236,6 +281,26 @@ impl ActiveChain {
             Self::Bypass => 0,
             Self::Single(c) | Self::Resample(c) => c.latency_out_frames(),
             Self::Ab(ab) => ab.latency_out_frames(),
+        }
+    }
+
+    /// The convolution's own delay, graph-rate frames
+    /// (the chain's; the playing side's in A/B).
+    pub fn conv_latency_frames(&self) -> usize {
+        match self {
+            Self::Bypass => 0,
+            Self::Single(c) | Self::Resample(c) => c.conv_latency_frames(),
+            Self::Ab(ab) => ab.conv_latency_frames(),
+        }
+    }
+
+    /// Output frames the chain plays after its last input frame: its
+    /// latency plus a convolution IR's ring ([`Chain::tail_out_frames`]).
+    pub fn tail_out_frames(&self) -> usize {
+        match self {
+            Self::Bypass => 0,
+            Self::Single(c) | Self::Resample(c) => c.tail_out_frames(),
+            Self::Ab(ab) => ab.tail_out_frames(),
         }
     }
 
@@ -302,6 +367,86 @@ impl ActiveChain {
         }
     }
 
+    /// Carry the playing chain's filter state over to this one, which
+    /// warms up next to it for a swap ([`Chain::inherit_filter_state`]): an
+    /// edit that keeps the convolution and its input (nothing before it
+    /// changed) plays the convolver on rather than starting it from
+    /// silence. Returns whether the convolution was handed over (true
+    /// without one); one that was not needs [`Self::conv_ring_frames`] of
+    /// warm-up to play its whole response. Real-time safe.
+    ///
+    /// Call it once the chain is on the stream's frame grid
+    /// ([`Self::align_to`] clears state): an align that clears it later
+    /// undoes the handover. `max_copy_bytes` bounds the convolution state
+    /// copied ([`handover_budget`]); a larger one is not handed over.
+    pub(crate) fn inherit_filter_state(
+        &mut self,
+        from: &mut ActiveChain,
+        max_copy_bytes: usize,
+    ) -> bool {
+        match (self, from) {
+            (Self::Single(dst), Self::Single(src)) => dst.inherit_filter_state(src, max_copy_bytes),
+            (Self::Ab(dst), Self::Ab(src)) => dst.inherit_filter_state(src, max_copy_bytes),
+            (Self::Ab(dst), Self::Single(src)) => {
+                dst.inherit_filter_state_from_single(src, max_copy_bytes)
+            }
+            (Self::Single(dst), Self::Ab(src)) => {
+                dst.inherit_filter_state_from_ab(src, max_copy_bytes)
+            }
+            (dst, _) => dst.conv_ring_frames() == 0,
+        }
+    }
+
+    /// Take the playing chain over in place for an edit before an
+    /// unchanged convolution ([`Chain::take_over_upstream`]: its
+    /// convolution and later stages move here, the edit fades in at the
+    /// convolution's input): this chain then replaces it at once. Single
+    /// chains only (an A/B pair warms up). Real-time safe.
+    pub(crate) fn take_over_upstream(&mut self, from: &mut ActiveChain) -> bool {
+        match (self, from) {
+            (Self::Single(dst), Self::Single(src)) => dst.take_over_upstream(src),
+            _ => false,
+        }
+    }
+
+    /// An upstream edit's fade is running in this chain
+    /// ([`Chain::upstream_fading`]): the next swap waits for its end.
+    /// How long the fresh stages before a convolution take to settle,
+    /// output frames, capped at the takeover's longest hold
+    /// ([`Chain::settle_out_frames`]; 0 without a convolution, or an A/B
+    /// pair).
+    pub(crate) fn settle_out_frames(&self, out_rate: u32) -> usize {
+        let cap = f64::from(out_rate) * audivane_dsp_core::chain::UPSTREAM_SETTLE_MAX_MS / 1000.0;
+        match self {
+            Self::Single(c) | Self::Resample(c) => {
+                let s = c.settle_out_frames();
+                if s.is_finite() {
+                    s.min(cap) as usize
+                } else {
+                    cap as usize
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn upstream_fading(&self) -> bool {
+        match self {
+            Self::Single(c) | Self::Resample(c) => c.upstream_fading(),
+            _ => false,
+        }
+    }
+
+    /// Output frames a convolution rings past the chain's latency
+    /// ([`Chain::conv_ring_frames`]; 0 without one).
+    pub(crate) fn conv_ring_frames(&self) -> usize {
+        match self {
+            Self::Bypass => 0,
+            Self::Single(c) | Self::Resample(c) => c.conv_ring_frames(),
+            Self::Ab(ab) => ab.conv_ring_frames(),
+        }
+    }
+
     fn limiter_mut(&mut self) -> Option<&mut Limiter> {
         match self {
             Self::Bypass => None,
@@ -316,6 +461,25 @@ impl ActiveChain {
     pub(crate) fn set_limiter_audible(&mut self, audible: bool) {
         if let Some(limiter) = self.limiter_mut() {
             limiter.set_learning(audible);
+        }
+    }
+
+    /// The word the chain quantizes to, bits (32: none, the bypass).
+    pub(crate) fn output_bits(&self) -> u32 {
+        match self {
+            Self::Bypass => 32,
+            Self::Single(c) | Self::Resample(c) => c.output_bits(),
+            Self::Ab(ab) => ab.output_bits(),
+        }
+    }
+
+    /// Blocks of this chain a late channel worker made silent (its own:
+    /// a chain warming up beside it does not count; 0 without workers).
+    pub(crate) fn worker_late_blocks(&self) -> u64 {
+        match self {
+            Self::Bypass => 0,
+            Self::Single(c) | Self::Resample(c) => c.worker_late_blocks(),
+            Self::Ab(ab) => ab.worker_late_blocks(),
         }
     }
 
@@ -406,9 +570,40 @@ impl ActiveChain {
         channels: usize,
         max_chunk: usize,
         gain: &mut StereoGainRamp,
+        tap: Option<&mut [f32]>,
+    ) -> ClipStats {
+        self.process_in_with_gain_live(input, out, channels, max_chunk, gain, tap, None)
+    }
+
+    /// Copy the harmonics stage's input and output (the side playing) from the next
+    /// block on ([`Chain::set_harmonics_tap`]); a flag, real-time safe.
+    pub(crate) fn set_harmonics_tap(&mut self, on: bool) {
+        match self {
+            Self::Single(c) => c.set_harmonics_tap(on),
+            Self::Ab(ab) => ab.set_harmonics_tap(on),
+            Self::Bypass | Self::Resample(_) => {}
+        }
+    }
+
+    /// [`Self::process_in_with_gain`], each chain call's harmonics tap
+    /// queued to `live` at its output rate.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn process_in_with_gain_live(
+        &mut self,
+        input: DspIn<'_>,
+        out: &mut [i32],
+        channels: usize,
+        max_chunk: usize,
+        gain: &mut StereoGainRamp,
         mut tap: Option<&mut [f32]>,
+        mut live: Option<(&mut HarmonicsLiveRt, u32)>,
     ) -> ClipStats {
         let in_frames = input.frames(channels);
+        if let Some((l, rate)) = live.as_mut()
+            && matches!(self, Self::Bypass | Self::Resample(_))
+        {
+            l.push(None, false, *rate);
+        }
         match self {
             Self::Bypass => {
                 match input {
@@ -465,6 +660,9 @@ impl ActiveChain {
                             transparent,
                         ),
                     };
+                    if let Some((l, rate)) = live.as_mut() {
+                        l.push(c.harmonics_tap(), c.has_harmonics(), *rate);
+                    }
                     if in_frames <= limit {
                         return stats;
                     }
@@ -498,6 +696,9 @@ impl ActiveChain {
                             transparent,
                         ),
                     };
+                    if let Some((l, rate)) = live.as_mut() {
+                        l.push(ab.harmonics_tap(), ab.has_harmonics(), *rate);
+                    }
                     if in_frames <= limit {
                         return stats;
                     }
@@ -527,6 +728,19 @@ pub(crate) enum DspIn<'a> {
 }
 
 impl<'a> DspIn<'a> {
+    /// As [`Self::planar`], `transparent` when the samples are `f32` values
+    /// a client could have sent (a measurement's file).
+    pub(crate) fn planar_with(bufs: &'a [Vec<f64>], frames: usize, transparent: bool) -> Self {
+        match Self::planar(bufs, frames) {
+            Self::Planar { chans, frames, .. } => Self::Planar {
+                chans,
+                frames,
+                transparent,
+            },
+            other => other,
+        }
+    }
+
     /// The first `frames` frames of `bufs` (at most [`MAX_METER_CHANNELS`]).
     pub(crate) fn planar(bufs: &'a [Vec<f64>], frames: usize) -> Self {
         let mut chans: [&[f64]; MAX_METER_CHANNELS] = [&[]; MAX_METER_CHANNELS];
@@ -1115,6 +1329,8 @@ pub struct DaemonProcessor {
     /// never see a promoted generation before `in_flight` flips on.
     swap_state: Arc<AtomicU64>,
     active_swap_seq: u64,
+    /// Chains installed so far (a measurement faults on a swap).
+    chain_installs: u64,
     swap_drain_paused: Arc<AtomicBool>,
     swap_phase: SwapPhase,
     dsp_enabled: bool,
@@ -1154,6 +1370,8 @@ pub struct DaemonProcessor {
     post_scratch: Vec<f32>,
     selftest_scratch: Vec<i32>,
     spectrum: Option<SpectrumRt>,
+    /// The harmonics live view's rings ([`HarmonicsLiveRt`]).
+    harmonics_live: Option<HarmonicsLiveRt>,
     /// The varispeed stage's slot (before every chain).
     vs: VarispeedRt,
     /// The toggle and fade in flight ([`Transition`]): on top of whatever
@@ -1163,10 +1381,16 @@ pub struct DaemonProcessor {
     /// begun: it waits while the swap phase is busy or a transition holds
     /// it for its switch.
     held_swap: Option<PendingSwap>,
+    /// Graph frames of the last block: the period a swap's handover is
+    /// budgeted against ([`handover_budget`]).
+    period_frames: usize,
     /// Multi-device: the followers' tee, the master's position at the DAC,
     /// the command log and the alignment delay (`tee`). Inert until a
     /// follower is attached.
     tee: TeeRt,
+    /// Measurement playback (`measure_play`): the mute of other streams
+    /// and the file on the routed channels. Inert until a job is posted.
+    measure: MasterMeasure,
     /// Tests: run without the multi-device hooks, as the processor did
     /// before them (the cost comparison).
     #[cfg(test)]
@@ -1197,6 +1421,7 @@ impl DaemonProcessor {
             active_generation_atomic: Arc::new(AtomicU64::new(0)),
             swap_state: Arc::new(AtomicU64::new(0)),
             active_swap_seq: 0,
+            chain_installs: 0,
             swap_drain_paused: Arc::new(AtomicBool::new(false)),
             swap_phase: SwapPhase::Idle,
             dsp_enabled,
@@ -1222,10 +1447,13 @@ impl DaemonProcessor {
             post_scratch: vec![0.0f32; scratch_len],
             selftest_scratch: vec![0i32; 4096 * channels.max(1)],
             spectrum: None,
+            harmonics_live: None,
             vs: VarispeedRt::inert(),
             transition: Transition::Idle,
             held_swap: None,
+            period_frames: 0,
             tee: TeeRt::inert(),
+            measure: MasterMeasure::inert(channels),
             #[cfg(test)]
             base_path: false,
         }
@@ -1249,6 +1477,12 @@ impl DaemonProcessor {
     #[cfg(test)]
     pub(crate) fn set_base_path(&mut self, on: bool) {
         self.base_path = on;
+    }
+
+    /// Attach the slot measurement jobs arrive by (`measure_play`).
+    pub fn with_measure(mut self, slot: Arc<MeasureSlot>, channels: usize) -> Self {
+        self.measure = MasterMeasure::new(slot, channels);
+        self
     }
 
     /// Attach the multi-device tee slot (built off-RT with its host,
@@ -1365,6 +1599,13 @@ impl DaemonProcessor {
     #[cfg(test)]
     pub(crate) fn varispeed_stash_len(&self) -> usize {
         self.vs.stash_len()
+    }
+
+    /// Attach the harmonics live view's rings (constructed off-RT, before
+    /// the audio thread starts).
+    pub fn with_harmonics_live(mut self, live: HarmonicsLiveRt) -> Self {
+        self.harmonics_live = Some(live);
+        self
     }
 
     /// Attach the live-spectrum rings (constructed off-RT, before the audio
@@ -1905,14 +2146,54 @@ impl DaemonProcessor {
             return;
         }
 
+        // An edit before an unchanged convolution: the new chain takes the
+        // playing one over in place (its convolution and later stages, with
+        // their state) and fades the edit in at the convolution's input,
+        // so its first outputs are the playing chain's next: it replaces it
+        // now, no warm-up, no crossfade after. Not when the IR's fade bound
+        // refuses the edit (it warms up below).
+        if new_chain.take_over_upstream(&mut self.active_chain) {
+            if new_chain.is_resample() != self.dsp_enabled {
+                self.hold_outgoing = false;
+            }
+            // A chain installed (a measurement faults on it), its fade
+            // heard as a swap ([`Self::chain_swapping`]).
+            self.chain_installs = self.chain_installs.wrapping_add(1);
+            let old = std::mem::replace(&mut self.active_chain, new_chain);
+            self.set_active_swap(generation, swap_seq);
+            self.push_recycle(old);
+            self.swap_phase = SwapPhase::Idle;
+            return;
+        }
+
         let new_lat = new_chain.latency_out_frames();
+        // A convolution the edit keeps, with its input, plays on from the
+        // outgoing chain's state (on the grid already: `prepare_incoming`);
+        // one it does not (an EQ edit, a new IR, a state over the copy
+        // budget) warms up for its ring too (capped), so it never takes
+        // over before its IR's peak, with its tail missing, or with an
+        // edited stage's start transient still ringing through it.
+        let budget = handover_budget(self.period_frames, self.active_rate);
+        let ring = if new_chain.inherit_filter_state(&mut self.active_chain, budget) {
+            0
+        } else {
+            new_chain
+                .conv_ring_frames()
+                .min(warm_ring_cap(self.active_rate, actual_ratio))
+        };
+        // With a convolution, the fresh EQ sections settle too before the
+        // new chain is heard (beside the ring: both from now), capped.
+        let out_rate = actual_ratio
+            .output_rate(self.active_rate)
+            .unwrap_or(self.active_rate);
+        let ring = ring.max(new_chain.settle_out_frames(out_rate));
         // A chain of the other kind always warms up: a chain that reports no
         // latency (a short rational minimum-phase kernel whose peak rounds
         // to frame 0) still needs its filter length to settle.
-        let target_frames = if new_lat == 0 && same_kind {
+        let target_frames = if new_lat == 0 && ring == 0 && same_kind {
             0
         } else {
-            new_lat + WARMUP_SETTLE_MARGIN_FRAMES
+            new_lat + ring + WARMUP_SETTLE_MARGIN_FRAMES
         };
 
         if target_frames == 0 {
@@ -1934,7 +2215,9 @@ impl DaemonProcessor {
     /// side, the outgoing chain's limiter and DC-block state.
     fn prepare_incoming(&self, new_chain: &mut ActiveChain) {
         // A rational chain joins the stream on its frame grid, so it writes
-        // the same output counts as the chain it runs next to.
+        // the same output counts as the chain it runs next to. It has not
+        // run yet: its convolution is clean and the reset clears nothing
+        // of it (no clear to budget).
         new_chain.align_to(self.next_pos);
         // Re-apply the latest A/B selection to the chain being installed. A
         // chain built before an `AbSelect` arrived (and still sitting in the
@@ -1948,6 +2231,17 @@ impl DaemonProcessor {
         new_chain.inherit_dc_block_state(&self.active_chain);
     }
 
+    /// A swap is audible now: its crossfade, its fade through silence, or
+    /// an upstream edit's fade at the convolution's input.
+    fn chain_swapping(&self) -> bool {
+        matches!(
+            self.swap_phase,
+            SwapPhase::Crossfading { .. }
+                | SwapPhase::FadeOutOld { .. }
+                | SwapPhase::FadeInNew { .. }
+        ) || self.active_chain.upstream_fading()
+    }
+
     /// Make `incoming` the audible chain and return the outgoing one. The
     /// held headroom is inherited again here, with both chains at hand: steps
     /// the outgoing chain took while the incoming one warmed up are kept,
@@ -1959,6 +2253,7 @@ impl DaemonProcessor {
         incoming.inherit_limiter_headroom(&self.active_chain);
         incoming.inherit_dc_block_state(&self.active_chain);
         incoming.set_limiter_audible(true);
+        self.chain_installs = self.chain_installs.wrapping_add(1);
         std::mem::replace(&mut self.active_chain, incoming)
     }
 
@@ -2186,13 +2481,26 @@ impl DaemonProcessor {
         self.active_chain.align_to(in_pos);
         self.active_chain
             .set_ab_measure_epoch(self.meters.ab_measure_epoch.load(Ordering::Acquire));
-        let stats = self.active_chain.process_in_with_gain(
+        // The harmonics live view: one flag read; copies only while watched.
+        let live_on = self
+            .harmonics_live
+            .as_ref()
+            .is_some_and(HarmonicsLiveRt::is_enabled);
+        self.active_chain.set_harmonics_tap(live_on);
+        let live_rate = out_rate(graph_rate, ratio);
+        let live = self
+            .harmonics_live
+            .as_mut()
+            .filter(|_| live_on)
+            .map(|l| (l, live_rate));
+        let stats = self.active_chain.process_in_with_gain_live(
             dsp_in,
             out,
             channels,
             self.max_block,
             &mut self.dsp_gain,
             post_tap,
+            live,
         );
         self.active_chain.drain_ab_hops(&self.meters);
 
@@ -2210,7 +2518,19 @@ impl DaemonProcessor {
                 if new_chain.ratio() != ratio {
                     self.push_recycle(new_chain);
                 } else {
-                    new_chain.align_to(in_pos);
+                    let mut target_frames = target_frames;
+                    if new_chain.align_to(in_pos) {
+                        // Off the grid after all (not reached: it joined on
+                        // it): its state, a handed-over convolution's too,
+                        // is gone; it warms up from here as a cold chain.
+                        target_frames = target_frames.max(
+                            warmed_frames
+                                + new_chain.cold_warm_frames(
+                                    warm_ring_cap(self.active_rate, ratio),
+                                    WARMUP_SETTLE_MARGIN_FRAMES,
+                                ),
+                        );
+                    }
                     let mut warm_gain = gain_before;
                     warmed_frames += Self::warm_chain_block(
                         &mut new_chain,
@@ -2448,6 +2768,7 @@ impl DaemonProcessor {
         active_sink: SinkChoice,
         planned: Option<(usize, usize)>,
         full: bool,
+        inject: bool,
         dsp_in: &[f32],
         direct_in: &[f32],
         out: &mut [i32],
@@ -2471,15 +2792,18 @@ impl DaemonProcessor {
         if hooks && self.tee.has_delay() {
             // The alignment cap is in playback time: at the slowest speed
             // the stage plays until it settles.
-            let (slowest, ramping) = match (planned, full) {
+            let (slowest, fastest, ramping) = match (planned, full) {
                 (Some(_), true) => self
                     .vs
                     .tee_view()
-                    .map_or((1.0, false), |v| (v.slowest, v.ramping)),
-                _ => (1.0, false),
+                    .map_or((1.0, 1.0, false), |v| (v.slowest, v.fastest, v.ramping)),
+                _ => (1.0, 1.0, false),
             };
             self.tee.bound_speed(slowest, ramping, src_frames);
+            self.tee.note_fastest(fastest);
         }
+        // (Read before the line is taken out: the tee reads 0 without it.)
+        let delay_frames = self.tee.delay_frames();
         let mut delay = if hooks { self.tee.take_delay() } else { None };
         let dsp_in = match delay.as_deref_mut() {
             Some(d) => d.process(dsp_in, channels, full),
@@ -2529,9 +2853,23 @@ impl DaemonProcessor {
                 } else {
                     dsp_in
                 };
+                // `active`: the file at the chain's input, by the source
+                // index the delayed block carries.
+                let mut planar = Vec::new();
+                let first = index.saturating_sub(delay_frames as u64);
+                let injected = if inject {
+                    planar = std::mem::take(&mut self.measure.planar);
+                    self.measure.active_input(tap, first, &mut planar)
+                } else {
+                    None
+                };
+                let input = match injected {
+                    Some(exact) => DspIn::planar_with(&planar, tap.len() / ch, exact),
+                    None => DspIn::F32(tap),
+                };
                 self.process_block_in(
                     active_sink,
-                    DspIn::F32(tap),
+                    input,
                     tap,
                     out,
                     channels,
@@ -2539,6 +2877,23 @@ impl DaemonProcessor {
                     graph_rate,
                     in_pos,
                 );
+                if !planar.is_empty() {
+                    self.measure.planar = planar;
+                }
+                if inject {
+                    // `bypass`: the file after the chain, with the
+                    // master's digital volume; `active` without a
+                    // limiter: the whole output at the ceiling.
+                    let unity = self.dsp_gain.is_unity_settled();
+                    let gains = self.dsp_gain.current();
+                    let bits = self.dac_bits.load(Ordering::Relaxed);
+                    self.measure.bypass_output(out, gains, unity, bits);
+                    // `active`: the keepalive after the chain, on the word
+                    // the chain wrote.
+                    let word = bits.min(self.active_chain.output_bits());
+                    self.measure.post_keepalive(out, word);
+                    self.measure.clamp_output(out);
+                }
             }
         }
         self.vs.put_buffers(bufs);
@@ -2655,6 +3010,39 @@ impl DaemonProcessor {
         }
         stopped
     }
+
+    /// The output path's DSP delay, output frames: the chain and the stage,
+    /// and the multi-device alignment ahead of them (`0, 0` on Direct or
+    /// bypass).
+    fn latency_parts(&self, active_sink: SinkChoice) -> (usize, usize) {
+        if !self.chain_runs(active_sink, self.running_ratio) {
+            (0, 0)
+        } else {
+            // The stage's delay (nominal frames) counts at the output rate.
+            let stage = if self.mode(active_sink, self.running_ratio) == PlayMode::Full {
+                self.vs
+                    .latency_frames(self.active_rate, self.vs_channels())
+                    .map_or(0, |l| (l * self.running_ratio.as_f64()).round() as usize)
+            } else {
+                0
+            };
+            // The alignment delay (multi-device), source frames ahead of
+            // the stage: at its speed, at the output rate.
+            let align = self.tee.delay_frames();
+            let align = if align > 0 && self.mode(active_sink, self.running_ratio) == PlayMode::Full
+            {
+                let s = if stage > 0 {
+                    self.vs.tee_view().map_or(1.0, |v| v.speed)
+                } else {
+                    1.0
+                };
+                (align as f64 / s * self.running_ratio.as_f64()).round() as usize
+            } else {
+                0
+            };
+            (self.active_chain.latency_out_frames() + stage, align)
+        }
+    }
 }
 
 impl EngineAudioProcessor for DaemonProcessor {
@@ -2739,6 +3127,7 @@ impl EngineAudioProcessor for DaemonProcessor {
             }
         }
 
+        self.measure.poll();
         // Varispeed stages (install, retire) before the chains.
         let full = self.mode(active_sink, actual_ratio) == PlayMode::Full;
         self.vs.poll_cmds(is_streaming, full);
@@ -2791,6 +3180,7 @@ impl EngineAudioProcessor for DaemonProcessor {
         if !self.swap_drain_paused.load(Ordering::Acquire)
             && !matches!(self.transition, Transition::FadingOut { .. })
             && self.can_accept_swap()
+            && !(is_streaming && self.active_chain.upstream_fading())
             && let Some(swap) = self.held_swap.take()
         {
             self.begin_swap(
@@ -2820,6 +3210,7 @@ impl EngineAudioProcessor for DaemonProcessor {
         // Varispeed: a planned block holds the stage's source frames; the
         // stage runs first, once, and every chain gets its planar output.
         // The taps read what the chains hear.
+        self.period_frames = dsp_in.len() / channels.max(1);
         let planned = self.vs.take_planned();
         let full = self.mode(active_sink, ratio) == PlayMode::Full;
         // Multi-device: the block's source frames go to the followers'
@@ -2831,6 +3222,44 @@ impl EngineAudioProcessor for DaemonProcessor {
             None => dsp_in,
         };
         let hooks = self.multi_device_hooks();
+        // A measurement: arm or check it, and mute the other streams
+        // before the tee (the followers hear the mute too), on either
+        // branch (Keep pitch faults it here).
+        let measuring = hooks && !self.measure.idle();
+        if hooks {
+            self.tee.set_measuring(measuring);
+        }
+        let mut inject = false;
+        let mut mute_buf = Vec::new();
+        if measuring {
+            inject = self.measure.begin_block(BlockCtx {
+                full,
+                sink: active_sink,
+                staged: planned.is_some() || self.vs.is_stretch(),
+                ratio,
+                graph_rate,
+                index: self.tee.next_index(),
+                frames: dsp_in.len() / ch,
+                delay: self.tee.delay_frames(),
+                delay_fading: self.tee.delay_fading(),
+                chain_latency: self.active_chain.latency_out_frames(),
+                chain_tail: self.active_chain.tail_out_frames(),
+                chain_installs: self.chain_installs,
+                chain_swapping: self.chain_swapping(),
+                late_blocks: self.active_chain.worker_late_blocks(),
+            });
+            mute_buf = std::mem::take(&mut self.measure.mute_buf);
+        }
+        let muted_len = if measuring && self.measure.mute_source(dsp_in, &mut mute_buf) {
+            dsp_in.len()
+        } else {
+            0
+        };
+        let dsp_in: &[f32] = if muted_len > 0 {
+            &mute_buf[..muted_len]
+        } else {
+            dsp_in
+        };
         let stopped = match planned {
             // Keep pitch: the stretch runs first, and the tee takes its
             // output.
@@ -2848,6 +3277,7 @@ impl EngineAudioProcessor for DaemonProcessor {
                 active_sink,
                 planned,
                 full,
+                inject,
                 dsp_in,
                 direct_in,
                 out,
@@ -2857,6 +3287,10 @@ impl EngineAudioProcessor for DaemonProcessor {
                 in_pos,
             ),
         };
+        self.measure.end_block(out.len() / ch);
+        if measuring {
+            self.measure.mute_buf = mute_buf;
+        }
         if hooks && self.vs.take_switched() {
             // The stage kind changed (Keep pitch): the tee's frames are
             // source frames or stretched ones, so its map, its epoch and
@@ -2896,37 +3330,25 @@ impl EngineAudioProcessor for DaemonProcessor {
     }
 
     fn latency_out_frames(&self, active_sink: SinkChoice) -> usize {
-        if !self.chain_runs(active_sink, self.running_ratio) {
-            0
+        let (filters, align) = self.latency_parts(active_sink);
+        filters + align
+    }
+
+    fn align_out_frames(&self, active_sink: SinkChoice) -> usize {
+        self.latency_parts(active_sink).1
+    }
+
+    fn conv_latency_frames(&self, active_sink: SinkChoice) -> usize {
+        if self.chain_runs(active_sink, self.running_ratio) {
+            self.active_chain.conv_latency_frames()
         } else {
-            // The stage's delay (nominal frames) counts at the output rate.
-            let stage = if self.mode(active_sink, self.running_ratio) == PlayMode::Full {
-                self.vs
-                    .latency_frames(self.active_rate, self.vs_channels())
-                    .map_or(0, |l| (l * self.running_ratio.as_f64()).round() as usize)
-            } else {
-                0
-            };
-            // The alignment delay (multi-device), source frames ahead of
-            // the stage: at its speed, at the output rate.
-            let align = self.tee.delay_frames();
-            let align = if align > 0 && self.mode(active_sink, self.running_ratio) == PlayMode::Full
-            {
-                let s = if stage > 0 {
-                    self.vs.tee_view().map_or(1.0, |v| v.speed)
-                } else {
-                    1.0
-                };
-                (align as f64 / s * self.running_ratio.as_f64()).round() as usize
-            } else {
-                0
-            };
-            self.active_chain.latency_out_frames() + stage + align
+            0
         }
     }
 
     fn dac_read(&mut self, delay: i64, time_ns: u64) {
         self.tee.dac_read(delay, time_ns);
+        self.measure.dac_read(delay, time_ns);
     }
 
     fn alignment_frames(&self, active_sink: SinkChoice) -> usize {
@@ -2945,8 +3367,19 @@ impl EngineAudioProcessor for DaemonProcessor {
         }
     }
 
+    fn chain_tail_frames(&self, active_sink: SinkChoice) -> usize {
+        if !self.chain_runs(active_sink, self.running_ratio) {
+            return 0;
+        }
+        // Output frames back to graph frames, rounded up: the flush feeds
+        // whole periods anyway.
+        let out = self.active_chain.tail_out_frames();
+        (out as f64 / self.running_ratio.as_f64().max(f64::MIN_POSITIVE)).ceil() as usize
+    }
+
     fn stream_prepared(&mut self) {
         self.tee.new_stream();
+        self.measure.interrupted();
     }
 
     fn reset_dsp_state(&mut self) {
@@ -2961,6 +3394,7 @@ impl EngineAudioProcessor for DaemonProcessor {
         self.active_chain.reset();
         self.vs.reset_all();
         self.tee.reset();
+        self.measure.interrupted();
         self.next_pos = 0;
         self.meters.set_bypass_muted(false);
         self.publish_swap_state();
@@ -3117,6 +3551,27 @@ mod tests {
         };
         assert_eq!(target_frames, 6 + WARMUP_SETTLE_MARGIN_FRAMES);
         assert_eq!(proc.latency_out_frames(SinkChoice::Dsp), 6);
+    }
+
+    /// The stream-end flush covers the chain's whole latency, in graph
+    /// frames rounded up (on a rational grid too).
+    #[test]
+    fn the_chain_tail_covers_its_latency_in_graph_frames() {
+        let min = FilterPhase::Minimum;
+        let x4 = RateRatio::integer(4);
+        let active = custom_chain(48_000, RateTarget::Ratio(4), 4096, min);
+        let next = custom_chain(48_000, RateTarget::Ratio(4), 4096, min);
+        let proc = start_swap(48_000, x4, active, next);
+        // 2067 output frames at x4.
+        assert_eq!(proc.chain_tail_frames(SinkChoice::Dsp), 517);
+
+        // 6 output frames at 160/147: 5.5 graph frames, so 6.
+        let r = RateRatio::from_rates(44_100, 48_000);
+        let target = RateTarget::Rate(48_000);
+        let active = custom_chain(44_100, target, 4096, min);
+        let next = custom_chain(44_100, target, 4096, min);
+        let proc = start_swap(44_100, r, active, next);
+        assert_eq!(proc.chain_tail_frames(SinkChoice::Dsp), 6);
     }
 
     /// The audio thread meters a running A/B pair for the epoch the
@@ -3809,13 +4264,15 @@ mod tests {
                     enabled: true,
                     ir_path: "unused".into(),
                     gain_db: 0.0,
+                    matrix: None,
+                    calibration: false,
                 }],
                 ..ChainConfig::neutral()
             },
             sample_rate: 48_000,
             channels: 2,
             max_block: 512,
-            irs: Some(vec![vec![1.0; 2048]]),
+            irs: Some(vec![vec![1.0; 2048]].into()),
         })));
         assert_ne!(
             chain_no_lat.latency_out_frames(),
@@ -5645,3 +6102,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "conv_swap_tests.rs"]
+mod conv_swap_tests;

@@ -553,7 +553,7 @@ pub fn check_kernel(
         Ok(g.measured(branches, hash))
     })?;
     m.verdict(Policy {
-        dc_tol_db: if kd.phase == Phase::Linear { 0.01 } else { 0.1 },
+        dc_tol_db: dc_tol_db(kd.phase),
         delay_ok: delay_ok(kd, k, cx.ratio.is_integer()),
         custom,
         design: Some(d),
@@ -651,6 +651,21 @@ fn impulse_response(rt: &mut dyn UpsamplerRuntime, max_block: usize) -> Vec<f64>
     }
     out.truncate(span);
     out
+}
+
+/// The DC tolerance of a novel design's branches, dB: 0.01 at linear
+/// phase, 0.1 transformed.
+pub(crate) fn dc_tol_db(phase: Phase) -> f64 {
+    if phase == Phase::Linear { 0.01 } else { 0.1 }
+}
+
+/// The largest DC deviation from unity of the `branches` polyphase
+/// branches of `h`, dB (what the gate's DC check measures).
+pub(crate) fn branch_dc_dev_db(h: &[f64], branches: usize) -> f64 {
+    let branches = branches.max(1);
+    (0..branches)
+        .map(|b| db(h.iter().skip(b).step_by(branches).sum::<f64>()).abs())
+        .fold(0.0, f64::max)
 }
 
 #[cfg(test)]

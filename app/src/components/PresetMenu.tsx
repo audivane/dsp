@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react";
+import type { PresetInfo, PresetPart } from "../api/types";
+import { PART_HOLDS, PART_NAME, PRESET_PARTS, presetCovers } from "../lib/presetParts";
 import { store, useApp } from "../store/store";
 import { ImportApoButton } from "../views/EqView";
 import { Check, ChevronDown } from "./Icons";
@@ -9,22 +11,51 @@ function bandsText(n: number) {
   return n === 1 ? "1 band" : `${n} bands`;
 }
 
-export function PresetControl() {
+/** What a menu entry holds, in a few words. */
+function presetSub(p: PresetInfo, part?: PresetPart): string {
+  if (part === "eq") return bandsText(p.bands);
+  if (part === "convolution") return p.convolution === 1 ? "1 IR" : `${p.convolution} IRs`;
+  if (part) return "";
+  const parts = presetCovers(p);
+  if (parts.length < PRESET_PARTS.length) return parts.length <= 2 ? parts.map((x) => SHORT_PART[x]).join(" + ") : `${parts.length} parts`;
+  return bandsText(p.bands) + (p.convolution > 0 ? ` · ${p.convolution} IR` : "");
+}
+
+const SHORT_PART: Record<PresetPart, string> = {
+  eq: "EQ",
+  convolution: "Convolution",
+  stereo: "Stereo",
+  harmonics: "Harmonics",
+  upsampling: "Upsampling",
+  output: "Output side",
+};
+
+/**
+ * A preset picker. Without `part`: the global presets in the top bar, which
+ * can hold any set of parts (ticked when saving). With `part`: the page's
+ * own saved settings, in its header; loading one changes that part only.
+ * The output part spans four pages (DC block, pitch, limiter, output): the
+ * same picker shows on each, labelled "Output saved".
+ */
+export function PresetControl({ part }: { part?: PresetPart }) {
   const st = store();
-  const presets = useApp((s) => s.presets);
+  const all = useApp((s) => s.presets);
+  const presets = all.filter((p) => (p.part ?? undefined) === part);
   const caps = useApp((s) => s.caps.presets);
-  const statusPreset = useApp((s) => s.status?.preset);
-  const cfgPreset = useApp((s) => s.config?.active_preset);
+  const statusPreset = useApp((s) => (part ? s.status?.part_presets?.find((x) => x.part === part) : s.status?.preset));
+  const cfgPreset = useApp((s) => (part ? s.config?.active_part_presets?.[part] : s.config?.active_preset));
   const active = statusPreset?.name ?? cfgPreset ?? null;
   const dirty = !!statusPreset?.modified;
   const [open, setOpen] = useState(false);
   const [pane, setPane] = useState<Pane>({ kind: "main" });
   const [saveName, setSaveName] = useState("");
   const [renameTo, setRenameTo] = useState("");
+  const [ticked, setTicked] = useState<PresetPart[]>(PRESET_PARTS);
+  // A page's menu opens toward the side with room (the header wraps).
+  const [alignRight, setAlignRight] = useState(false);
   const root = useRef<HTMLDivElement>(null);
   const menu = useRef<HTMLDivElement>(null);
   const btn = useRef<HTMLButtonElement>(null);
-
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => {
@@ -49,18 +80,26 @@ export function PresetControl() {
     setOpen(false);
     setPane({ kind: "main" });
   };
-  const label = caps === false ? "Presets unavailable" : active ?? "No preset";
+  // A page's picker is hidden on an engine without presets (the top bar says so).
+  if (part && caps === false) return null;
+  const what = part ? `Saved ${PART_NAME[part]} settings` : "Presets";
+  const shared = part === "output";
+  const label = caps === false ? "Presets unavailable" : active ? (shared ? `Output: ${active}` : active) : part ? (shared ? "Output saved" : "Saved") : "No preset";
+  const allTicked = ticked.length === PRESET_PARTS.length;
 
   return (
-    <div className="preset" ref={root}>
+    <div className={"preset" + (part ? " page" : "")} ref={root}>
       <button
         ref={btn}
-        className="btn preset-btn"
+        className={"btn preset-btn" + (part ? " small" : "")}
         aria-haspopup="menu"
         aria-expanded={open}
-        aria-label={`Preset: ${label}${dirty ? ", unsaved changes" : ""}`}
+        title={part ? `${what}: ${PART_HOLDS[part]}. Loading one changes ${shared ? "these four pages" : "this page"} only.` : undefined}
+        aria-label={`${part ? what : "Preset"}: ${label}${dirty ? ", unsaved changes" : ""}`}
         onClick={() => {
           setPane({ kind: "main" });
+          const r = btn.current?.getBoundingClientRect();
+          setAlignRight(!!r && r.left + 280 > window.innerWidth);
           setOpen(!open);
         }}
       >
@@ -68,19 +107,22 @@ export function PresetControl() {
         {dirty && <span className="dirty" title="Unsaved changes" />}
         <ChevronDown />
       </button>
-      <button className="btn primary" disabled={!dirty || !active} onClick={() => void st.savePreset()} title={active ? `Save changes to “${active}”` : "Save as a new preset from the menu"}>
-        Save
-      </button>
+      {(!part || (dirty && active)) && (
+        <button className={"btn primary" + (part ? " small" : "")} disabled={!dirty || !active} onClick={() => void st.savePreset(part)} title={active ? `Save changes to “${active}”` : "Save as a new preset from the menu"}>
+          Save
+        </button>
+      )}
       {open && (
-        <div className="menu" role="menu" ref={menu} aria-label="Presets">
+        <div className={"menu" + (part ? " page-presets" + (alignRight ? " right" : "") : "")} role="menu" ref={menu} aria-label={what}>
           {pane.kind === "main" && (
             <>
               {caps === false ? (
                 <p className="note">This engine version does not store presets yet. Import and copy still work on the current EQ.</p>
               ) : (
                 <>
-                  <div className="label">Presets</div>
-                  {presets.length === 0 && <p className="note">No presets yet.</p>}
+                  <div className="label">{what}</div>
+                  {shared && <p className="note">DC block, pitch, limiter and output, saved together.</p>}
+                  {presets.length === 0 && <p className="note">{part ? "Nothing saved for this page yet." : "No presets yet."}</p>}
                   {presets.map((p) => (
                     <button
                       key={p.name}
@@ -89,17 +131,28 @@ export function PresetControl() {
                       aria-checked={p.name === active}
                       onClick={() => {
                         close();
-                        void st.loadPreset(p.name);
+                        void st.loadPreset(p.name, part);
                       }}
                     >
                       <span className="check">{p.name === active && <Check />}</span>
                       {p.name}
-                      <span className="sub">
-                        {bandsText(p.bands)}
-                        {p.convolution > 0 ? ` · ${p.convolution} IR` : ""}
-                      </span>
+                      <span className="sub">{presetSub(p, part)}</span>
                     </button>
                   ))}
+                  {part && (
+                    <button
+                      className="item"
+                      role="menuitem"
+                      title={`${shared ? "These four pages" : "This page"} back to the defaults, with no preset active. Your saved ones stay.`}
+                      onClick={() => {
+                        close();
+                        void st.blankPreset(part);
+                      }}
+                    >
+                      <span className="check" />
+                      New (blank)
+                    </button>
+                  )}
                   <hr />
                   <div className="label">Save current as</div>
                   <form
@@ -108,7 +161,8 @@ export function PresetControl() {
                       e.preventDefault();
                       const n = saveName.trim();
                       if (!n) return;
-                      void st.savePresetAs(n).then((ok) => {
+                      if (!part && ticked.length === 0) return;
+                      void st.savePresetAs(n, part, part ? undefined : ticked).then((ok) => {
                         if (ok) {
                           setSaveName("");
                           close();
@@ -116,35 +170,55 @@ export function PresetControl() {
                       });
                     }}
                   >
-                    <input className="text-input" value={saveName} maxLength={64} placeholder="Preset name" aria-label="New preset name" onChange={(e) => setSaveName(e.target.value)} />
-                    <button className="btn primary small" type="submit" disabled={!saveName.trim()}>
+                    <input className="text-input" value={saveName} maxLength={64} placeholder={part ? "Name" : "Preset name"} aria-label="New preset name" onChange={(e) => setSaveName(e.target.value)} />
+                    <button className="btn primary small" type="submit" disabled={!saveName.trim() || (!part && ticked.length === 0)}>
                       Save
                     </button>
                   </form>
+                  {!part && (
+                    <fieldset className="preset-parts">
+                      <legend>
+                        Holds{" "}
+                        <button type="button" className="link-btn" onClick={() => setTicked(allTicked ? [] : PRESET_PARTS)}>
+                          {allTicked ? "none" : "all"}
+                        </button>
+                      </legend>
+                      {PRESET_PARTS.map((x) => (
+                        <label key={x} title={`Loading the preset sets ${PART_HOLDS[x]}`}>
+                          <input type="checkbox" checked={ticked.includes(x)} onChange={(e) => setTicked(e.target.checked ? PRESET_PARTS.filter((y) => y === x || ticked.includes(y)) : ticked.filter((y) => y !== x))} />
+                          {SHORT_PART[x]}
+                        </label>
+                      ))}
+                    </fieldset>
+                  )}
                   <hr />
                   <button className="item" role="menuitem" disabled={!active} onClick={() => { setRenameTo(active ?? ""); setPane({ kind: "rename" }); }}>
                     Rename…
                   </button>
-                  <button className="item" role="menuitem" disabled={!active || !dirty} onClick={() => { close(); void st.revertPreset(); }}>
+                  <button className="item" role="menuitem" disabled={!active || !dirty} onClick={() => { close(); void st.revertPreset(part); }}>
                     Revert unsaved changes
                   </button>
                   <button className="item danger" role="menuitem" disabled={!active} onClick={() => setPane({ kind: "delete" })}>
                     Delete…
                   </button>
-                  <hr />
+                  {(!part || part === "eq") && <hr />}
                 </>
               )}
-              <ImportApoButton
-                className="item"
-                label="Import ParametricEQ.txt…"
-                onText={(t, n) => {
-                  close();
-                  void st.importApoPreset(t, n);
-                }}
-              />
-              <button className="item" role="menuitem" onClick={() => { close(); void st.copyApo(); }}>
-                Copy as ParametricEQ.txt
-              </button>
+              {(!part || part === "eq") && (
+                <>
+                  <ImportApoButton
+                    className="item"
+                    label="Import ParametricEQ.txt…"
+                    onText={(t, n) => {
+                      close();
+                      void st.importApoPreset(t, n);
+                    }}
+                  />
+                  <button className="item" role="menuitem" onClick={() => { close(); void st.copyApo(); }}>
+                    Copy as ParametricEQ.txt
+                  </button>
+                </>
+              )}
             </>
           )}
           {pane.kind === "rename" && active && (
@@ -152,7 +226,7 @@ export function PresetControl() {
               className="confirm"
               onSubmit={(e) => {
                 e.preventDefault();
-                void st.renamePreset(active, renameTo).then((ok) => ok && close());
+                void st.renamePreset(active, renameTo, part).then((ok) => ok && close());
               }}
             >
               <div className="label" style={{ padding: 0 }}>Rename “{active}”</div>
@@ -171,7 +245,7 @@ export function PresetControl() {
             <div className="confirm">
               <span>Delete “{active}”? The current sound stays as it is.</span>
               <div className="row">
-                <button className="btn small danger" onClick={() => { close(); void st.deletePreset(active); }}>
+                <button className="btn small danger" onClick={() => { close(); void st.deletePreset(active, part); }}>
                   Delete
                 </button>
                 <button className="btn small" onClick={() => setPane({ kind: "main" })}>

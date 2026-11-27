@@ -22,6 +22,7 @@ export type FamilyId =
   | "nuttall"
   | "hann"
   | "leaky"
+  | "craven"
   | "cascade"
   | "interp"
   | "block";
@@ -29,7 +30,7 @@ export type FamilyId =
 export type LengthId = "tiny" | "small" | "short" | "compact" | "medium" | "long" | "xlong" | "huge" | "mega" | `a${number}`;
 
 /** Where a kernel's -6 dB point sits (README "Cutoffs"), as a fraction of the source Nyquist. */
-export type CutoffId = "nyquist" | "wide" | "steep" | "std" | "steep_short" | "apod" | "compact" | "leaky" | "early" | "lanczos" | "none";
+export type CutoffId = "nyquist" | "wide" | "steep" | "std" | "steep_short" | "apod" | "craven" | "compact" | "leaky" | "early" | "lanczos" | "none";
 
 export type Dim = "length" | "shape" | "phase";
 
@@ -73,6 +74,7 @@ const CUTOFF: Record<CutoffId, { fraction: number | null; text: string }> = {
   std: { fraction: 21025 / 22050, text: "standard roll-off: −6 dB at 21.03 kHz for a 44.1 kHz source" },
   steep_short: { fraction: 125 / 133, text: "−6 dB at 20.72 kHz for a 44.1 kHz source" },
   apod: { fraction: 20512.5 / 22050, text: "apodizing: −6 dB at 20.51 kHz for a 44.1 kHz source, fully down before Nyquist, replaces the recording's own pre-ringing" },
+  craven: { fraction: (20000 / 22050 + 1) / 2, text: "apodizing after Craven: flat to 20 kHz at every source rate and fully down (−150 dB) by the source Nyquist, so the recording's own brick-wall ringing at Nyquist is removed" },
   compact: { fraction: null, text: "cutoff set by the source rate: 0.88 of Nyquist below 50 kHz (19.4 kHz at 44.1 kHz), 0.725 below 100 kHz, 0.6 above" },
   leaky: { fraction: 380 / 441, text: "early, leaky roll-off: −6 dB at 19 kHz for a 44.1 kHz source, only 66 dB down at Nyquist" },
   early: { fraction: 27 / 32, text: "early roll-off: −0.1 dB at 0.80 of Nyquist, −100 dB by about 0.92 (−6 dB at 18.60 kHz for a 44.1 kHz source)" },
@@ -85,7 +87,7 @@ const ROLL_OFF = (keys: CutoffId[]) =>
     keys.map((k) => [
       k,
       {
-        label: { nyquist: "Nyquist", wide: "Wide", steep: "Steep", std: "Standard", steep_short: "Steep", apod: "Apodizing", compact: "By rate", leaky: "Leaky", early: "Early", lanczos: "Lanczos", none: "" }[k],
+        label: { nyquist: "Nyquist", wide: "Wide", steep: "Steep", std: "Standard", steep_short: "Steep", apod: "Apodizing", craven: "Craven", compact: "By rate", leaky: "Leaky", early: "Early", lanczos: "Lanczos", none: "" }[k],
         tip: CUTOFF[k].text.charAt(0).toUpperCase() + CUTOFF[k].text.slice(1) + ".",
       },
     ]),
@@ -157,6 +159,12 @@ export const FAMILIES: readonly FamilyInfo[] = [
     default: "short_leaky",
   },
   {
+    id: "craven",
+    label: "Apodizing (Craven)",
+    blurb: "Peter Craven's apodizing filter: fully down by Nyquist, so the recording's own pre-ringing goes, a gentle transition from 20 kHz at every source rate, and minimum phase, so nothing rings before a transient.",
+    default: "craven_apod",
+  },
+  {
     id: "cascade",
     label: "Cascade",
     blurb: "Built from ×2 and ×3 stages; even ratios made of 2 and 3 only (×2, ×4, ×6, ×8, ×12, ×16…).",
@@ -172,9 +180,10 @@ export const FAMILIES: readonly FamilyInfo[] = [
   {
     id: "interp",
     label: "Simple interpolators",
-    blurb: "Almost no latency or CPU, but weak image rejection: cosine, Catmull-Rom or a table sinc.",
+    blurb: "Almost no latency or CPU, but weak image rejection: NOS (sample hold), cosine, Catmull-Rom or a table sinc.",
     shapeLabel: "Method",
     shapes: {
+      nos: { label: "NOS (sample hold)", tip: "Zero-order sample hold with no reconstruction filter: half-sample delay, sinc roll-off and full imaging." },
       cosine: { label: "Cosine", tip: "Raised-cosine blend of the two nearest samples: the shortest possible, the most imaging." },
       catmull_rom: { label: "Catmull-Rom", tip: "4-point cubic through the nearest samples." },
       table_sinc: { label: "Table sinc", tip: "127-tap windowed sinc read from a table: much better image rejection, still short." },
@@ -184,12 +193,12 @@ export const FAMILIES: readonly FamilyInfo[] = [
   {
     id: "block",
     label: "Block FFT",
-    blurb: "Brick wall at Nyquist inside each block, but not time-invariant (about 70 dB image rejection) and slow to respond.",
+    blurb: "Brick wall at Nyquist inside each block, but not time-invariant (the response at one block position has images 60 to 80 dB down; a steady tone's are far lower) and slow to respond.",
     shapeLabel: "Variant",
     shapes: {
       standard: { label: "Standard", tip: "16,384-sample blocks, averaged: about 0.37 s of latency." },
       fast: { label: "Fast", tip: "Keeps the middle half of each block: less work, about 0.46 s of latency." },
-      large: { label: "Large", tip: "2^20 / ratio samples per block: about 89 dB image rejection, 0.37 s (×64) to 11.9 s (×2) of latency." },
+      large: { label: "Large", tip: "2^20 / ratio samples per block: changes less across a block (images about 90 dB down at one block position), 0.37 s (×64) to 11.9 s (×2) of latency." },
     },
     default: "block_fft",
   },
@@ -284,6 +293,7 @@ const TABLE: Record<FilterPreset, Omit<PresetEntry, "name">> = {
   hann_nyquist: e("hann", null, null, L, 16383, "nyquist", "Hann Nyquist"),
   short_leaky: e("leaky", null, null, L, 47, "leaky", "Short leaky"),
   short_leaky_mp: e("leaky", null, null, MP, 47, "leaky", "Short leaky"),
+  craven_apod: e("craven", null, null, MP, "the shortest that keeps 150 dB from Nyquist: about 239 taps per input sample at 44.1 kHz, shorter as the rate rises (its 20 kHz passband stays put)", "craven", "Craven apodizing"),
 
   cascade_fir: e("cascade", null, "fir", L, 255, "none", "Cascade FIR"),
   cascade_fir_asym: e("cascade", null, "fir", IP, "289 taps per ×2 stage, 292 per ×3 stage (cut where the tail falls below 2^-32)", "none", "Cascade FIR asym"),
@@ -292,6 +302,7 @@ const TABLE: Record<FilterPreset, Omit<PresetEntry, "name">> = {
   cascade_elliptic: e("cascade", null, "elliptic", MP, "order 16 (×2) or 17 (×3) recursive stages", "none", "Cascade elliptic"),
   cascade_inverse_chebyshev: e("cascade", null, "inverse_chebyshev", MP, "order 30 (×2) or 24 (×3) recursive stages", "none", "Cascade inverse Chebyshev"),
 
+  nos: e("interp", null, "nos", L, 1, "none", "NOS (sample hold)"),
   cosine: e("interp", null, "cosine", L, 2, "none", "Cosine"),
   catmull_rom: e("interp", null, "catmull_rom", L, 4, "none", "Catmull-Rom"),
   table_sinc: e("interp", null, "table_sinc", L, 127, "none", "Table sinc"),
@@ -538,7 +549,7 @@ export function presetDetail(p: PresetEntry): string {
   const len =
     p.taps !== null
       ? p.family === "interp" && p.taps <= 4
-        ? `${p.taps} input samples of support`
+        ? `${p.taps} input sample${p.taps === 1 ? "" : "s"} of support`
         : `${p.taps.toLocaleString("en-US")} taps per input sample (${fmtMsShort((p.taps / 44100) * 1000)} at 44.1 kHz)`
       : (p.lengthNote ?? "");
   const cut = CUTOFF[p.cutoff].text;
@@ -610,6 +621,9 @@ export function presetCutoffFraction(name: FilterPreset, sourceRate: number): nu
   const p = presetEntry(name);
   if (!p) return 1;
   if (p.cutoff === "compact") return sourceRate < 50000 ? 0.88 : sourceRate < 100000 ? 0.725 : 0.6;
+  // The apodizing band is flat to 20 kHz at every rate: the -6 dB point sits
+  // midway between it and the Nyquist.
+  if (p.cutoff === "craven") return (20000 / (sourceRate / 2) + 1) / 2;
   return CUTOFF[p.cutoff].fraction ?? 1;
 }
 

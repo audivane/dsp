@@ -247,6 +247,8 @@ pub fn design(p: FilterPreset) -> FilterDesign {
         HalfbandTiny => accept(fixed(cheb(CHEB_16), 35, FC_NYQUIST), Accept::Upsampling),
         HannNyquist => accept(fixed(hann, 16_383, FC_NYQUIST), Accept::Upsampling),
 
+        CravenApod => craven(),
+
         Lanczos23 => lanczos23,
         Lanczos23Mp => phase(lanczos23, minimum, FirAfter),
         Lanczos511 => lanczos(511),
@@ -265,6 +267,7 @@ pub fn design(p: FilterPreset) -> FilterDesign {
         CascadeFft => return FilterDesign::Cascade(CascadeStage::FrequencySampled),
         CascadeElliptic => return FilterDesign::Cascade(CascadeStage::Elliptic),
         CascadeInverseChebyshev => return FilterDesign::Cascade(CascadeStage::InverseChebyshev),
+        Nos => return FilterDesign::Interpolator(InterpMethod::Nos),
         Cosine => return FilterDesign::Interpolator(InterpMethod::Cosine),
         CatmullRom => return FilterDesign::Interpolator(InterpMethod::CatmullRom),
         TableSinc => return FilterDesign::Interpolator(InterpMethod::TableSinc),
@@ -290,6 +293,63 @@ pub fn design(p: FilterPreset) -> FilterDesign {
     FilterDesign::Kernel(kernel)
 }
 
+/// Passband end of `craven`, Hz: the same at every source rate.
+pub const CRAVEN_PASSBAND_HZ: f64 = 20_000.0;
+
+/// [`CRAVEN_PASSBAND_HZ`] as a fraction of the Nyquist at 44.1 kHz (the
+/// fraction a custom design shows at that rate; `craven` pins the Hz
+/// value at every source rate).
+pub const CRAVEN_PASSBAND_END: f64 = CRAVEN_PASSBAND_HZ / 22_050.0;
+
+/// Stopband depth of `craven`, dB (the paper sets no figure; the
+/// editor's default band depth).
+pub const CRAVEN_ATTENUATION_DB: f64 = 150.0;
+
+/// Peter Craven's apodizing reconstruction filter ("Antialias filters and
+/// system transient response at high sample rates", JAES 52(3), 2004): a
+/// filter that is fully down by the source Nyquist removes the source's
+/// own brick-wall ringing (which sits at that frequency) and replaces it
+/// with its own, gentler transition, here across the whole gap from 20 kHz
+/// to the Nyquist; minimum phase, so none of it rings before a transient.
+/// A Kaiser band design (the shortest length that keeps
+/// [`CRAVEN_ATTENUATION_DB`] from the Nyquist, its beta from the depth) with
+/// the reflected (exact-magnitude) minimum phase, on the `fir` path. The
+/// passband end is pinned at [`CRAVEN_PASSBAND_HZ`] at every source rate
+/// (the paper's point is the 20 kHz audio band, not a fraction of Nyquist),
+/// so the transition, and with it the kernel, shortens as the source rate
+/// rises; only the stopband edge scales, at 1.0 of the source Nyquist.
+fn craven() -> KernelDesign {
+    KernelDesign {
+        shape: Shape::WindowedSinc {
+            window: Window::Kaiser {
+                beta: None,
+                sampling: Sampling::Symmetric,
+            },
+            length: Length::Band,
+            cutoff: Cutoff::Band(BandSpec {
+                passband_end: CRAVEN_PASSBAND_END,
+                passband_end_hz: Some(CRAVEN_PASSBAND_HZ),
+                stopband_start: 1.0,
+                attenuation_db: CRAVEN_ATTENUATION_DB,
+            }),
+        },
+        decimation: Decimation::Scale {
+            odd: OddRule::Down,
+            base_taps: None,
+        },
+        phase: Phase::Minimum(PhaseMethod::Reflect),
+        preserve_samples: false,
+        rates: Rates {
+            accept: Accept::Any,
+            fallback_window: None,
+        },
+        numerics: Numerics {
+            path: ArithmeticPath::Fir,
+            grid_cutoff: GridCutoff::Scaled,
+        },
+    }
+}
+
 /// The catalogue name of the Recommended design.
 pub const RECOMMENDED: &str = "recommended";
 
@@ -298,13 +358,22 @@ pub const RECOMMENDED: &str = "recommended";
 /// to 768 kHz, so never a fractional ratio.
 pub const RECOMMENDED_TARGET: RateTarget = RateTarget::MaxRate(768_000);
 
+/// Passband end of [`recommended`], Hz: the same at every source rate.
+pub const RECOMMENDED_PASSBAND_HZ: f64 = 20_000.0;
+
+/// The fraction of the source Nyquist [`recommended`] falls back to where
+/// [`RECOMMENDED_PASSBAND_HZ`] does not fit the band (below 44.1 kHz).
+pub const RECOMMENDED_PASSBAND_END: f64 = 0.908;
+
 /// The app's Recommended design (`app/src/lib/upsamplerRecommended.ts`):
-/// a Kaiser windowed sinc, flat to 0.908 (20 kHz at 44.1 kHz) and stopped
-/// from 1.00 times the lower Nyquist, its length the shortest measured one
-/// that matches the output's resolution (the 150 dB band depth is the editor's default;
-/// the automatic search sets its own from the budget), linear phase, on the
-/// `standard` path. No preserved samples;
-/// headroom and the target are not part of a design.
+/// a Kaiser windowed sinc, flat to 20 kHz at every source rate (0.907 of
+/// the Nyquist at 44.1 kHz; 0.908 where 20 kHz does not fit) and stopped
+/// from 1.00 times the lower Nyquist, so the transition widens and the
+/// kernel shortens as the source rate rises; its length the shortest
+/// measured one that matches the output's resolution (the 150 dB band
+/// depth is the editor's default; the automatic search sets its own from
+/// the budget), linear phase, on the `standard` path. No preserved
+/// samples; headroom and the target are not part of a design.
 pub fn recommended() -> FilterDesign {
     FilterDesign::Kernel(KernelDesign {
         shape: Shape::WindowedSinc {
@@ -314,8 +383,9 @@ pub fn recommended() -> FilterDesign {
             },
             length: Length::Auto(FilterErrorBudget::MatchOutput),
             cutoff: Cutoff::Band(BandSpec {
-                passband_end: 0.908,
+                passband_end: RECOMMENDED_PASSBAND_END,
                 stopband_start: 1.0,
+                passband_end_hz: Some(RECOMMENDED_PASSBAND_HZ),
                 attenuation_db: 150.0,
             }),
         },
@@ -354,6 +424,7 @@ pub fn varispeed(passband_end: f64) -> FilterDesign {
             cutoff: Cutoff::Band(BandSpec {
                 passband_end,
                 stopband_start: 1.0,
+                passband_end_hz: None,
                 attenuation_db: 150.0,
             }),
         },
@@ -395,6 +466,7 @@ pub(crate) fn runtime_preset(d: &FilterDesign) -> Option<FilterPreset> {
             CascadeStage::InverseChebyshev => CascadeInverseChebyshev,
         },
         FilterDesign::Interpolator(method) => match method {
+            InterpMethod::Nos => Nos,
             InterpMethod::Cosine => Cosine,
             InterpMethod::CatmullRom => CatmullRom,
             InterpMethod::TableSinc => TableSinc,

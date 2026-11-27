@@ -224,6 +224,7 @@ fn main() -> Result<()> {
             device: args.device.clone(),
             rate: out_rate,
             channels: 2,
+            channel_map: Vec::new(),
             period_frames: args.period,
             buffer_periods: args.buffer_periods,
             preferred_format: Some(args.format.into()),

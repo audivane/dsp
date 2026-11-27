@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 #
-# Local release build: the .deb, .rpm and Arch packages plus SHA256SUMS in
+# Local release build: the .deb, .rpm and Arch packages, the AppImage and
+# SHA256SUMS in
 # dist/release/<version>/, built from the committed tree on the Ubuntu 24.04
 # baseline (see baseline.sh), then smoke-tested.
 #
 # Usage: packaging/release/release.sh [--worktree] [--clean] [--skip-smoke]
 #   --worktree    build the working tree, uncommitted changes included
 #   --clean       drop the cached cargo target dir first (a cold build)
-#   --skip-smoke  skip the install tests (Arch root and Ubuntu root)
+#   --skip-smoke  skip the install tests (Arch root, Ubuntu root, AppImage)
 set -euo pipefail
 
 repo=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
@@ -64,6 +65,10 @@ step "package .deb .rpm .pkg.tar.zst"
 "$here/package.sh" "$work/stage" "$out" "$version"
 done_step
 
+step "AppImage"
+"$here/appimage.sh" "$work/stage" "$out" "$version"
+done_step
+
 if [ $smoke = 1 ]; then
   # Installed twice: the second install runs the upgrade scriptlet (on a
   # reinstall too), which must not fail without systemd.
@@ -74,6 +79,13 @@ if [ $smoke = 1 ]; then
   step "smoke: .deb in a copy of the Ubuntu 24.04 root (install, then upgrade)"
   deb=$(ls "$out"/*.deb)
   "$here/baseline.sh" deb-smoke "$deb" "$deb"
+  done_step
+  # Its binaries are the .deb's (same libraries): here only that it runs,
+  # without FUSE, and reports its version.
+  step "smoke: AppImage (runs, bundled CLI, setup status)"
+  app=$(ls "$out"/*.AppImage)
+  APPIMAGE_EXTRACT_AND_RUN=1 "$app" avdsp --version
+  APPIMAGE_EXTRACT_AND_RUN=1 "$app" --status | sed -n '1p'
   done_step
 fi
 

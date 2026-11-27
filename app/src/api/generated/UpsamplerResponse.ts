@@ -87,7 +87,14 @@ stopband_start_hz: number,
  * Worst level from [`Self::stopband_start_hz`] to the output Nyquist,
  * as a positive attenuation in dB (at least the target attenuation).
  */
-stopband_atten_db: number, latency_samples: number, 
+stopband_atten_db: number, 
+/**
+ * The delay the live engine adds for this design, output frames: the
+ * filter's own (kernel centre or impulse peak) plus the engine's
+ * partition block at this source rate, as `status.filter_latency_ms`
+ * counts it for a chain with no other delayed stage.
+ */
+latency_samples: number, 
 /**
  * Precise threshold crossings ([`RESPONSE_CROSSING_LEVELS_DB`]): for
  * each level, the first frequency from 0 Hz where the response falls to

@@ -47,6 +47,7 @@ serde.workspace = true
 serde_json.workspace = true
 hound.workspace = true
 log.workspace = true
+env_logger.workspace = true
 libc = "0.2"
 zbus = "6"
 tempfile = "3"

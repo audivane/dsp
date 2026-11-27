@@ -99,6 +99,45 @@ describe("store", () => {
     expect(daemon.config.chain.eq?.preamp_db).toBeLessThan(0);
   });
 
+  it("sets one convolution guard and keeps the other", async () => {
+    const { s, t, daemon } = await setup();
+    s.setConvolutionSafety({ subsonic_hz: 30 });
+    await until(() => t.count("set_convolution_safety") === 1 && s.getState().config?.convolution_safety?.subsonic_hz === 30);
+    expect(daemon.config.convolution_safety).toEqual({ max_boost_db: 12, subsonic_hz: 30 });
+  });
+
+  it("loads a room calibration, keeps it out of the IR list, and unloads it", async () => {
+    const { s, t, daemon } = await setup();
+    await s.loadCalibration();
+    await until(() => s.getState().status?.calibration?.label === "desk");
+    expect(t.count("bundle_load")).toBe(1);
+    expect(daemon.config.chain.convolution.some((c) => c.calibration)).toBe(true);
+    expect(s.convolution().some((c) => c.calibration)).toBe(false);
+    // Adding an IR sends the user's list; the calibration stays.
+    await s.addImpulseResponse();
+    await until(() => t.count("set_convolution") === 1);
+    const sent = t.calls.find((c) => c.method === "set_convolution")?.params as { calibration?: boolean }[];
+    expect(sent.some((c) => c.calibration)).toBe(false);
+    expect(daemon.config.chain.convolution.filter((c) => c.calibration)).toHaveLength(1);
+    await s.unloadCalibration();
+    await until(() => !s.getState().status?.calibration);
+    expect(daemon.config.chain.convolution.some((c) => c.calibration)).toBe(false);
+  });
+
+  it("sets the room calibration's main level and resets it to the bundle's", async () => {
+    const { s, t, daemon } = await setup();
+    await s.loadCalibration();
+    await until(() => !!s.getState().config?.calibration);
+    await s.setCalibrationGain(null, -3);
+    expect(t.calls.find((c) => c.method === "bundle_gain")?.params).toEqual({ gain_db: -3 });
+    expect(daemon.config.chain.convolution.find((c) => c.calibration)?.gain_db).toBe(-3);
+    expect(s.getState().config?.calibration?.master?.gain_db).toBe(-3);
+    expect(s.getState().config?.calibration?.master_manifest_gain_db).toBe(0);
+    await s.setCalibrationGain(null, null);
+    expect(s.getState().config?.calibration?.master?.gain_db).toBe(0);
+    expect(s.getState().config?.calibration?.master_manifest_gain_db).toBeUndefined();
+  });
+
   it("throttles drags to ~25 Hz and always sends the final value", async () => {
     const { s, t, daemon } = await setup();
     const before = t.count("set_eq");
@@ -266,7 +305,7 @@ describe("store", () => {
     expect(daemon.config.ab?.chain_b?.upsampler).toEqual(baseChain.upsampler);
 
     // Shared fields and bad values are refused; B is left as it was.
-    for (const patch of [{ output: { bits: 16 } }, { limiter: {} }, { upsampler: { target: { ratio: 2 } } }, [1]]) {
+    for (const patch of [{ output: { headroom_db: 1 } }, { limiter: {} }, { upsampler: { target: { ratio: 2 } } }, [1]]) {
       await expect(t.call("set_ab", { b: { patch } })).rejects.toMatchObject({ code: ErrorCode.INVALID_PARAMS });
     }
     for (const bad of [17, [true, 25], { enabled: "false" }, { cutoff_hz: 25 }]) {
@@ -314,17 +353,93 @@ describe("store", () => {
     await until(() => !s.getState().presets.some((p) => p.name === "Ours"));
   });
 
-  it("imports a ParametricEQ.txt as a preset and loads it", async () => {
+  it("imports a ParametricEQ.txt as an EQ preset and loads it, touching nothing else", async () => {
     const { s, t } = await setup();
+    const before = structuredClone(s.getState().config!.chain);
     await s.importApoPreset("Preamp: -4 dB\nFilter 1: ON PK Fc 1000 Hz Gain 3 dB Q 1\n", "My HP ParametricEQ.txt");
     expect(t.calls.some((c) => c.method === "import_apo" && (c.params as { name: string }).name === "My HP")).toBe(true);
-    await until(() => s.activePreset() === "My HP");
-    expect(s.getState().config?.chain.eq?.bands).toHaveLength(1);
-    // An imported preset is EQ only: loading it turns convolution and upsampling off, and says so.
-    expect(s.getState().config?.chain.convolution).toEqual([]);
-    expect(s.getState().config?.chain.upsampler.target).toBe("off");
-    expect(s.getState().toast?.text).toMatch(/EQ only: convolution and upsampling off/);
-    expect(s.getState().presets.find((p) => p.name === "My HP")).toMatchObject({ bands: 1, convolution: 0 });
+    await until(() => s.activePreset("eq") === "My HP");
+    const after = s.getState().config!.chain;
+    expect(after.eq?.bands).toHaveLength(1);
+    // Only the EQ changed: convolution, upsampling and output stay.
+    expect({ ...after, eq: null }).toEqual({ ...before, eq: null });
+    expect(s.getState().toast?.text).toBe("Imported “My HP”");
+    expect(s.getState().presets.find((p) => p.name === "My HP")).toMatchObject({ part: "eq", bands: 1, convolution: 0 });
+    // Not a global preset.
+    expect(s.presetsOf().some((p) => p.name === "My HP")).toBe(false);
+  });
+
+  it("switches EQ presets while the upsampler and harmonics stay put", async () => {
+    const { s } = await setup();
+    void s.setStageEnabled("harmonics", true);
+    await until(() => !!s.getState().config?.chain.harmonics?.enabled);
+    const before = structuredClone(s.getState().config!.chain);
+    expect(s.presetsOf("eq").map((p) => p.name)).toEqual(["HD650 AutoEQ", "Room + bass shelf"]);
+    await s.loadPreset("Room + bass shelf", "eq");
+    await until(() => s.activePreset("eq") === "Room + bass shelf");
+    const after = s.getState().config!.chain;
+    expect(after.eq?.name).toBe("Room + bass shelf");
+    expect(after.upsampler).toEqual(before.upsampler);
+    expect(after.harmonics ?? null).toEqual(before.harmonics ?? null);
+    expect({ ...after, eq: null }).toEqual({ ...before, eq: null });
+    // The global preset's marker now shows the EQ differs; the EQ's does not.
+    await until(() => s.presetModified());
+    expect(s.presetModified("eq")).toBe(false);
+    // An upsampling change leaves the EQ preset unmodified.
+    await s.loadPreset("Desk ×4", "upsampling");
+    await until(() => s.activePreset("upsampling") === "Desk ×4");
+    expect(s.presetModified("eq")).toBe(false);
+    expect(s.getState().config!.chain.eq?.name).toBe("Room + bass shelf");
+  });
+
+  it("starts a blank page preset: that part at its defaults, unnamed, the saved ones kept", async () => {
+    const { s } = await setup();
+    await s.loadPreset("Room + bass shelf", "eq");
+    await until(() => s.activePreset("eq") === "Room + bass shelf");
+    s.updateBand(0, { q: 3 });
+    await until(() => s.presetModified("eq"));
+    const before = structuredClone(s.getState().config!.chain);
+    await s.blankPreset("eq");
+    await until(() => s.activePreset("eq") === null);
+    const after = s.getState().config!.chain;
+    // An empty EQ that is on (no EQ would read as switched off).
+    expect(after.eq).toMatchObject({ bands: [], preamp_db: 0, linked_enabled: true });
+    expect(after.eq?.left ?? null).toBeNull();
+    expect(after.eq?.tone ?? null).toBeNull();
+    expect(after.eq?.tilt ?? null).toBeNull();
+    expect({ ...after, eq: null }).toEqual({ ...before, eq: null });
+    expect(s.presetModified("eq")).toBe(false);
+    // Like a load, it replaces the EQ's undo history.
+    expect(s.getState().canUndo).toBe(false);
+    expect(s.presetsOf("eq").map((p) => p.name)).toContain("Room + bass shelf");
+    // "Save as" names it.
+    expect(await s.savePresetAs("Just tone", "eq")).toBe(true);
+    await until(() => s.activePreset("eq") === "Just tone");
+  });
+
+  it("saves a global preset of some parts and loads only those", async () => {
+    const { s, t } = await setup();
+    expect(await s.savePresetAs("Just EQ", undefined, ["eq"])).toBe(true);
+    const save = t.calls.find((c) => c.method === "save_preset" && (c.params as { name: string }).name === "Just EQ");
+    expect(save?.params).toMatchObject({ parts: ["eq"] });
+    await until(() => s.activePreset() === "Just EQ");
+    const eq = structuredClone(s.getState().config!.chain.eq);
+    // Change the EQ and the upsampler; loading brings back only the EQ.
+    await s.loadPreset("Room + bass shelf", "eq");
+    await s.loadPreset("Desk ×4", "upsampling");
+    await until(() => s.presetModified());
+    const ups = structuredClone(s.getState().config!.chain.upsampler);
+    await s.loadPreset("Just EQ");
+    await until(() => !s.presetModified());
+    expect(s.getState().config!.chain.eq).toEqual(eq);
+    expect(s.getState().config!.chain.upsampler).toEqual(ups);
+    // Loading it cleared the EQ page's name; the upsampling page keeps its own.
+    expect(s.activePreset("eq")).toBeNull();
+    expect(s.activePreset("upsampling")).toBe("Desk ×4");
+    // Every part ticked sends no list (today's whole-chain preset).
+    expect(await s.savePresetAs("All", undefined, ["stereo", "eq", "convolution", "upsampling", "harmonics", "output"])).toBe(true);
+    const all = t.calls.find((c) => c.method === "save_preset" && (c.params as { name: string }).name === "All");
+    expect(all?.params).not.toHaveProperty("parts");
   });
 
   it("does not store a file without filters as a preset", async () => {
@@ -806,7 +921,7 @@ describe("store", () => {
 
   it("follows the device list the daemon pushes, and sets what an unplug does", async () => {
     const { s, daemon } = await setup();
-    const plugged = { id: "hw:CARD=USB,DEV=0", card: "USB", name: "USB DAC", hdmi: false, loopback: false, active: false };
+    const plugged = { id: "hw:CARD=USB,DEV=0", card: "USB", name: "USB DAC", hdmi: false, loopback: false, active: false, channels: [] };
     const push = (daemon as unknown as { emit(e: DaemonEvent): void }).emit.bind(daemon);
     push({ event: "devices", data: [...s.getState().devices, plugged] });
     await until(() => s.getState().devices.some((d) => d.id === plugged.id));
@@ -886,7 +1001,7 @@ describe("store", () => {
     const { s, daemon } = await setup();
     // 65,536 output-rate taps do not fit 44.1 → 48 kHz (160/147).
     expect(await s.setUpsampler({ target: { rate: 48000 } })).toBe(false);
-    expect(s.getState().upsamplerError).toContain("design.length: at 44100 Hz (160/147)");
+    expect(s.getState().upsamplerError).toMatch(/design\.length: 65,536 taps is .* at 44\.1k ×160\/147.*or change the rate target\.$/);
     expect(refusalField(s.getState().upsamplerError!)?.path).toBe("design.length");
     expect(s.getState().toast).toBeNull();
     expect(daemon.config.chain.upsampler.target).toEqual({ ratio: 4 });
@@ -1011,6 +1126,104 @@ describe("store", () => {
     s.discardUpsDraft();
     expect(s.getState().upsDraft).toBeNull();
     expect(daemon.config.chain.upsampler.design).toMatchObject({ length: { taps: 32768 } });
+  });
+
+  it("shows a long build as building and folds the edits made meanwhile into one", async () => {
+    const { s, t, daemon } = await setup({ latency: { build: 150 } });
+    const before = t.count("set_upsampler");
+    const first = s.setUpsampler({ target: { ratio: 2 } });
+    await until(() => s.getState().upsBuilding !== null);
+    expect(s.getState().upsBuilding?.waiting).toBe(false);
+    // Three edits while the first builds: one more build, the last edit's.
+    const later = [s.setUpsampler({ target: { ratio: 4 } }), s.setUpsampler({ target: { ratio: 8 } }), s.setUpsampler({ target: { ratio: 16 } })];
+    expect(await first).toBe(true);
+    expect(await Promise.all(later)).toEqual([true, true, true]);
+    expect(t.count("set_upsampler") - before).toBe(2);
+    expect(daemon.config.chain.upsampler.target).toEqual({ ratio: 16 });
+    expect(s.getState().upsBuilding).toBeNull();
+    expect(s.getState().upsBuilds).toBeGreaterThanOrEqual(2);
+  });
+
+  it("waits out a build the app stopped waiting for without sending it again", async () => {
+    // The engine takes 200 ms; the app gives up after 80 and asks how it went.
+    const { s, t, daemon } = await setup({ latency: { build: 200, buildTimeout: 80 } });
+    const before = t.count("set_upsampler");
+    const done = s.setUpsampler({ target: { ratio: 8 } });
+    await until(() => s.getState().upsBuilding?.waiting === true);
+    expect(s.getState().upsamplerError).toBeNull();
+    expect(await done).toBe(true);
+    expect(daemon.config.chain.upsampler.target).toEqual({ ratio: 8 });
+    expect(s.getState().upsamplerError).toBeNull();
+    expect(s.getState().upsBuilding).toBeNull();
+    expect(t.count("set_upsampler") - before).toBe(1);
+  });
+
+  it("never undoes a newer change by another client after a timeout", async () => {
+    const { s, t, daemon } = await setup({ latency: { build: 150, buildTimeout: 50 } });
+    const before = t.count("set_upsampler");
+    const done = s.setUpsampler({ target: { ratio: 8 } });
+    // Another client sets x16 once x8 has landed.
+    await until(() => daemon.config.chain.upsampler.target !== "off" && JSON.stringify(daemon.config.chain.upsampler.target) === JSON.stringify({ ratio: 8 }));
+    await daemon.handle("set_upsampler", { ...daemon.config.chain.upsampler, target: { ratio: 16 } });
+    await done;
+    await sleep(300);
+    expect(daemon.config.chain.upsampler.target).toEqual({ ratio: 16 });
+    expect(t.count("set_upsampler") - before).toBe(1);
+    expect(s.getState().upsamplerError).toBeNull();
+  });
+
+  it("clears its timeout once the filter it stopped waiting for lands", async () => {
+    // Every wait (the call, then three reads behind it) gives up before the build is done.
+    const { s, t, daemon } = await setup({ latency: { build: 400, buildTimeout: 40 } });
+    const before = t.count("set_upsampler");
+    expect(await s.setUpsampler({ target: { ratio: 8 } })).toBe(false);
+    expect(s.getState().upsamplerError).toContain("has not finished");
+    await until(() => JSON.stringify(daemon.config.chain.upsampler.target) === JSON.stringify({ ratio: 8 }));
+    await until(() => s.getState().upsamplerError === null);
+    expect(t.count("set_upsampler") - before).toBe(1);
+  });
+
+  it("learns that a build it stopped waiting for was refused, without sending it again", async () => {
+    const { s, t } = await setup({ latency: { build: 150, buildTimeout: 50 } });
+    const before = t.count("set_upsampler");
+    expect(await s.setUpsampler({ target: { rate: 48000 }, preset: "cascade_fir" })).toBe(false);
+    expect(s.getState().upsamplerError).toContain("did not apply the filter");
+    expect(t.count("set_upsampler") - before).toBe(1);
+  });
+
+  it("plays the preset picked while a custom design builds", async () => {
+    const { s, daemon } = await setup({ latency: { build: 150 } });
+    await s.setUpsamplerMode("preset", "gaussian_long");
+    expect(daemon.config.chain.upsampler.preset).toBe("gaussian_long");
+    const custom = s.editCustomDesign({ ...defaultDesign(), length: { rule: "fixed", taps: 32768 } });
+    await until(() => s.getState().upsBuilding !== null);
+    // The preset still plays: the pick must not stop at that.
+    expect(await s.setUpsamplerMode("preset", "gaussian_long")).toBe(true);
+    await custom;
+    await s.whenIdle();
+    expect(daemon.config.chain.upsampler).toMatchObject({ preset: "gaussian_long", design: null });
+    expect(s.getState().upsDraft).toBeNull();
+  });
+
+  it("keeps a newer draft when an older design's build lands", async () => {
+    const { s, t, daemon } = await setup({ latency: { build: 150 } });
+    const design = defaultDesign();
+    const before = t.count("set_upsampler");
+    const first = s.editCustomDesign({ ...design, length: { rule: "fixed", taps: 32768 } });
+    await until(() => t.count("set_upsampler") === before + 1);
+    const bad = { ...design, window: { type: "kaiser" as const, beta: 41, sampling: "symmetric" as const } };
+    expect(await s.editCustomDesign(bad)).toBe(false);
+    await first;
+    await until(() => daemon.config.chain.upsampler.design !== null && (daemon.config.chain.upsampler.design as { length?: { taps?: number } }).length?.taps === 32768);
+    await sleep(50);
+    expect(s.getState().upsDraft?.design).toEqual(bad);
+  });
+
+  it("says why when a long build is refused", async () => {
+    const { s } = await setup({ latency: { build: 120 } });
+    expect(await s.setUpsampler({ target: { rate: 48000 }, preset: "cascade_fir" })).toBe(false);
+    expect(s.getState().upsamplerError).toContain("does not run at 160/147");
+    expect(s.getState().upsBuilding).toBeNull();
   });
 
   it("drops the draft when the user goes back to the preset", async () => {
@@ -1198,7 +1411,8 @@ describe("store", () => {
     expect(s.getState().spectrum.enabled).toBe(true);
     await until(() => spectrumStore.latest !== null);
     expect(spectrumStore.latest?.spectrum.pre.length).toBeGreaterThan(200);
-    expect(spectrumStore.latest?.spectrum.post.length).toBe(spectrumStore.latest?.spectrum.pre.length);
+    // Each tap runs to its own Nyquist (or 100 kHz): the upsampled post one is longer.
+    expect(spectrumStore.latest?.spectrum.post.length).toBeGreaterThan(spectrumStore.latest?.spectrum.pre.length ?? 0);
     expect(Object.keys(s.getState())).not.toContain("spectrumData");
 
     s.setView("ups");

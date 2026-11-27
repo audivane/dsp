@@ -1,4 +1,4 @@
-//! `avdsp` — offline WAV processing, filter design, null tests and
+//! `avdsp`: offline WAV processing, filter design, null tests and
 //! benchmarks for Audivane DSP.
 //!
 //! Exit codes: 0 success, 1 a check failed (e.g. `bypass-test` mismatch),
@@ -7,6 +7,7 @@
 
 mod bench;
 mod bypass_test;
+mod conv_args;
 mod ctl;
 mod eqcmd;
 mod gen_signal;
@@ -91,6 +92,8 @@ pub struct ProcessArgs {
     #[arg(long)]
     pub auto_preamp: bool,
     /// Impulse response WAV for convolution (repeatable; combined in series).
+    /// `IN:OUT[:CH]=PATH` gives a filter-matrix entry (channel `CH` of the
+    /// WAV, else a mono file); a run of entries is one matrix item.
     #[arg(long)]
     pub conv: Vec<PathBuf>,
     /// Integer upsampling ratio (e.g. 4).
@@ -124,9 +127,16 @@ pub struct ProcessArgs {
     /// Output WAV container.
     #[arg(long, value_enum)]
     pub format: Option<ContainerArg>,
-    /// Frames per process call.
+    /// Frames per process call (at most the engine's chain block, see
+    /// --quantum).
     #[arg(long, default_value_t = 1024)]
     pub block: usize,
+    /// The engine's graph quantum at 48 kHz (its `quantum` setting). The
+    /// chain is built with the block the live engine uses at the file's
+    /// rate, so the reported latency is what `status.filter_latency_ms`
+    /// shows for this chain.
+    #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u32).range(i64::from(audivane_protocol::ipc::MIN_QUANTUM)..=i64::from(audivane_protocol::ipc::MAX_QUANTUM)))]
+    pub quantum: u32,
     /// Remove the reported chain latency from the output.
     #[arg(long)]
     pub trim_latency: bool,

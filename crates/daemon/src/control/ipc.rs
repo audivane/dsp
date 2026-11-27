@@ -539,6 +539,12 @@ fn serve_connection(
     stream: UnixStream,
     tx: SyncSender<Vec<u8>>,
 ) {
+    let replier = Replier {
+        tx: tx.clone(),
+        stream: stream.try_clone().ok().map(Arc::new),
+    };
+    // Dropped (and its workers joined) on every way out of this function.
+    let mut slow = SlowCalls::new(Arc::clone(inner), id, replier);
     let mut reader = LineReader::new(BufReader::new(stream));
     loop {
         let bytes = match reader.read_line() {
@@ -554,9 +560,20 @@ fn serve_connection(
                 break;
             }
         };
-        let Some((response, after)) = handle_request(inner, id, &bytes) else {
-            break;
+        let (request_id, call) = match parse_request(&bytes) {
+            Ok(request) => request,
+            Err(error) => {
+                if tx.try_send(error).is_err() {
+                    break;
+                }
+                continue;
+            }
         };
+        if let Some(kind) = SlowKind::of(&call) {
+            slow.submit(kind, request_id, call);
+            continue;
+        }
+        let (response, after) = handle_call(inner, id, request_id, call);
         if tx.try_send(response).is_err() {
             break;
         }
@@ -582,80 +599,258 @@ enum After {
     Shutdown,
 }
 
-/// Handle one request line. Returns the serialized reply plus the follow-up
-/// action. `None` means the connection must be closed.
-fn handle_request(inner: &Arc<ServerInner>, conn_id: u64, line: &[u8]) -> Option<(Vec<u8>, After)> {
+/// Parse one request line into its id and call, or the serialized error
+/// reply for a line that is not a valid request.
+fn parse_request(line: &[u8]) -> Result<(u64, Call), Vec<u8>> {
     let Ok(text) = std::str::from_utf8(line) else {
-        return Some((
-            error_response(0, RpcError::PARSE, "request is not valid UTF-8"),
-            After::None,
+        return Err(error_response(
+            0,
+            RpcError::PARSE,
+            "request is not valid UTF-8",
         ));
     };
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Some((
-            error_response(0, RpcError::PARSE, "empty request line"),
-            After::None,
-        ));
+        return Err(error_response(0, RpcError::PARSE, "empty request line"));
     }
-    let value: Value = match serde_json::from_str(trimmed) {
-        Ok(value) => value,
-        Err(err) => {
-            return Some((
-                error_response(0, RpcError::PARSE, format!("malformed JSON: {err}")),
-                After::None,
-            ));
-        }
-    };
-    let id = value.get("id").and_then(Value::as_u64);
-    let Some(id) = id else {
-        return Some((
-            error_response(0, RpcError::INVALID_REQUEST, "missing or invalid `id`"),
-            After::None,
+    let value: Value = serde_json::from_str(trimmed)
+        .map_err(|err| error_response(0, RpcError::PARSE, format!("malformed JSON: {err}")))?;
+    let Some(id) = value.get("id").and_then(Value::as_u64) else {
+        return Err(error_response(
+            0,
+            RpcError::INVALID_REQUEST,
+            "missing or invalid `id`",
         ));
     };
-    let method = value
+    let Some(method) = value
         .get("method")
         .and_then(Value::as_str)
-        .map(str::to_string);
-    let Some(method) = method else {
-        return Some((
-            error_response(id, RpcError::INVALID_REQUEST, "missing `method`"),
-            After::None,
+        .map(str::to_string)
+    else {
+        return Err(error_response(
+            id,
+            RpcError::INVALID_REQUEST,
+            "missing `method`",
         ));
     };
     if !is_known_method(&method) {
-        return Some((
-            error_response(
-                id,
-                RpcError::INVALID_REQUEST,
-                format!("unknown method {method:?}"),
-            ),
-            After::None,
+        return Err(error_response(
+            id,
+            RpcError::INVALID_REQUEST,
+            format!("unknown method {method:?}"),
         ));
     }
-    let call: Call = match serde_json::from_value(value) {
-        Ok(call) => call,
-        Err(err) => {
-            return Some((
-                error_response(
-                    id,
-                    RpcError::INVALID_PARAMS,
-                    format!("bad params for {method:?}: {err}"),
-                ),
-                After::None,
-            ));
-        }
-    };
+    let call: Call = serde_json::from_value(value).map_err(|err| {
+        error_response(
+            id,
+            RpcError::INVALID_PARAMS,
+            format!("bad params for {method:?}: {err}"),
+        )
+    })?;
+    Ok((id, call))
+}
 
+/// Dispatch one parsed call. Returns the serialized reply plus the
+/// follow-up action.
+fn handle_call(inner: &Arc<ServerInner>, conn_id: u64, id: u64, call: Call) -> (Vec<u8>, After) {
     match inner.service.dispatch(call) {
-        Ok(Dispatch::Value(value)) => Some((ok_response(id, value), After::None)),
+        Ok(Dispatch::Value(value)) => (ok_response(id, value), After::None),
         Ok(Dispatch::Subscribe(topics)) => {
             inner.subscribe(conn_id, topics.clone());
-            Some((ok_response(id, Value::Null), After::Subscribe(topics)))
+            (ok_response(id, Value::Null), After::Subscribe(topics))
         }
-        Ok(Dispatch::Shutdown) => Some((ok_response(id, Value::Null), After::Shutdown)),
-        Err(err) => Some((error_response(id, err.code, err.message), After::None)),
+        Ok(Dispatch::Shutdown) => (ok_response(id, Value::Null), After::Shutdown),
+        Err(err) => (error_response(id, err.code, err.message), After::None),
+    }
+}
+
+// ---------------------------------------------------------------- slow calls
+
+/// Read-only calls that can take tens of milliseconds to seconds. They run
+/// on a worker per connection and kind, off the reader thread, so quick
+/// calls on the same connection (volume, mute, edits) are not held up, and
+/// their replies may arrive out of order.
+///
+/// Per connection and kind, at most one call runs and one waits; a newer
+/// call replaces the waiting one, which is answered `SUPERSEDED` at once.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SlowKind {
+    /// Simulates the harmonics stage (~10–60 ms, more with a sweep).
+    HarmonicsReadout,
+    /// Simulates a tone through the harmonics stage (milliseconds; up to
+    /// ~0.4 s with tape layers at 768 kHz).
+    HarmonicsSpectrum,
+    /// Designs and measures a kernel when the design is not cached
+    /// (0.1–1.5 s on an uncached preset; ~0.3 ms cached).
+    UpsamplerResponse,
+    /// Loads and transforms a chain's convolution filters when not cached
+    /// (tens of milliseconds to a second for long filters at high rates).
+    ConvResponse,
+}
+
+impl SlowKind {
+    const COUNT: usize = 4;
+
+    fn of(call: &Call) -> Option<Self> {
+        match call {
+            Call::HarmonicsReadout { .. } => Some(Self::HarmonicsReadout),
+            Call::HarmonicsSpectrum { .. } => Some(Self::HarmonicsSpectrum),
+            Call::UpsamplerResponse { .. } => Some(Self::UpsamplerResponse),
+            Call::ConvResponse { .. } => Some(Self::ConvResponse),
+            _ => None,
+        }
+    }
+
+    fn method(self) -> &'static str {
+        match self {
+            Self::HarmonicsReadout => "harmonics_readout",
+            Self::HarmonicsSpectrum => "harmonics_spectrum",
+            Self::UpsamplerResponse => "upsampler_response",
+            Self::ConvResponse => "conv_response",
+        }
+    }
+}
+
+/// Sends a worker's reply on its connection. A full or closed queue closes
+/// the connection, as on the reader thread.
+#[derive(Clone)]
+struct Replier {
+    tx: SyncSender<Vec<u8>>,
+    stream: Option<Arc<UnixStream>>,
+}
+
+impl Replier {
+    /// False when the reply could not be queued (the connection is gone).
+    fn send(&self, bytes: Vec<u8>) -> bool {
+        if self.tx.try_send(bytes).is_ok() {
+            return true;
+        }
+        if let Some(stream) = &self.stream {
+            stream.shutdown(std::net::Shutdown::Both).ok();
+        }
+        false
+    }
+}
+
+#[derive(Default)]
+struct Lane {
+    /// A worker thread is running this lane.
+    running: bool,
+    /// The call waiting for it (request id and call).
+    queued: Option<(u64, Call)>,
+}
+
+struct SlowCalls {
+    inner: Arc<ServerInner>,
+    conn_id: u64,
+    replier: Replier,
+    lanes: [Arc<Mutex<Lane>>; SlowKind::COUNT],
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl SlowCalls {
+    fn new(inner: Arc<ServerInner>, conn_id: u64, replier: Replier) -> Self {
+        Self {
+            inner,
+            conn_id,
+            replier,
+            lanes: Default::default(),
+            workers: Vec::new(),
+        }
+    }
+
+    fn submit(&mut self, kind: SlowKind, id: u64, call: Call) {
+        self.join_finished();
+        let lane = Arc::clone(&self.lanes[kind as usize]);
+        let (start, superseded) = {
+            let mut state = lane.lock().unwrap_or_else(|e| e.into_inner());
+            let superseded = state.queued.replace((id, call)).map(|(old, _)| old);
+            let start = !state.running;
+            state.running = true;
+            (start, superseded)
+        };
+        if let Some(old) = superseded {
+            self.replier.send(error_response(
+                old,
+                RpcError::SUPERSEDED,
+                format!("superseded by a newer {} request", kind.method()),
+            ));
+        }
+        if !start {
+            return;
+        }
+        let worker_lane = Arc::clone(&lane);
+        let inner = Arc::clone(&self.inner);
+        let replier = self.replier.clone();
+        let conn_id = self.conn_id;
+        let spawned = thread::Builder::new()
+            .name(format!("avdsp-ipc-s{conn_id}-{}", kind as usize))
+            .spawn(move || run_lane(&inner, conn_id, &worker_lane, &replier));
+        match spawned {
+            Ok(handle) => self.workers.push(handle),
+            Err(err) => {
+                // No thread: answer it here, as before.
+                log::warn!("cannot start an IPC worker: {err}");
+                let job = {
+                    let mut state = lane.lock().unwrap_or_else(|e| e.into_inner());
+                    state.running = false;
+                    state.queued.take()
+                };
+                if let Some((id, call)) = job {
+                    let (reply, _) = handle_call(&self.inner, conn_id, id, call);
+                    self.replier.send(reply);
+                }
+            }
+        }
+    }
+
+    fn join_finished(&mut self) {
+        let mut index = 0;
+        while index < self.workers.len() {
+            if self.workers[index].is_finished() {
+                let _ = self.workers.swap_remove(index).join();
+            } else {
+                index += 1;
+            }
+        }
+    }
+}
+
+impl Drop for SlowCalls {
+    /// The reader is done: let the workers answer what they have (a client
+    /// that half-closes its end still gets its replies) and join them, so
+    /// the reader thread, which shutdown waits on, outlives every dispatch.
+    fn drop(&mut self) {
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn run_lane(inner: &Arc<ServerInner>, conn_id: u64, lane: &Mutex<Lane>, replier: &Replier) {
+    loop {
+        let job = {
+            let mut state = lane.lock().unwrap_or_else(|e| e.into_inner());
+            match state.queued.take() {
+                Some(job) => job,
+                None => {
+                    state.running = false;
+                    return;
+                }
+            }
+        };
+        let (id, call) = job;
+        let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle_call(inner, conn_id, id, call).0
+        }))
+        .unwrap_or_else(|_| error_response(id, RpcError::INTERNAL, "the call panicked"));
+        if !replier.send(reply) {
+            // The connection is gone: drop what waits instead of computing it.
+            let mut state = lane.lock().unwrap_or_else(|e| e.into_inner());
+            state.queued = None;
+            state.running = false;
+            return;
+        }
     }
 }
 
@@ -954,7 +1149,7 @@ mod tests {
         ) -> Result<audivane_protocol::ipc::AbStatus, crate::api::EngineError> {
             Ok(audivane_protocol::ipc::AbStatus {
                 enabled: true,
-                current: side,
+                current: Some(side),
                 offset_db: 0.0,
                 error: None,
                 ..Default::default()
@@ -972,6 +1167,7 @@ mod tests {
                 quantum: 1024,
                 latency_ms: 0.0,
                 filter_latency_ms: 0.0,
+                conv_latency_ms: 0.0,
                 xruns: 0,
                 dsp_load: 0.0,
                 dsp_active: false,
@@ -1083,6 +1279,107 @@ mod tests {
         inner.broadcast(Topic::Status, b"status\n".to_vec());
         assert_eq!(rx.try_recv().unwrap(), b"meters\n");
         assert!(rx.try_recv().is_err(), "only subscribed topics are queued");
+    }
+
+    /// A client end on a connection served by `inner`, with a reader that
+    /// collects reply lines by id.
+    fn connect(inner: &Arc<ServerInner>) -> (UnixStream, BufReader<UnixStream>) {
+        let (server, client) = UnixStream::pair().unwrap();
+        spawn_connection(inner, server).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let reader = BufReader::new(client.try_clone().unwrap());
+        (client, reader)
+    }
+
+    fn next_reply(reader: &mut BufReader<UnixStream>) -> Response {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str(line.trim()).unwrap_or_else(|e| panic!("{line:?}: {e}"))
+    }
+
+    /// A readout that simulates the stage with the level sweep: the slowest
+    /// readout there is (tens of milliseconds in release, more in debug).
+    fn slow_readout(id: u64) -> String {
+        let config = serde_json::to_value(audivane_protocol::HarmonicsConfig::default()).unwrap();
+        let request = serde_json::json!({
+            "id": id,
+            "method": "harmonics_readout",
+            "params": { "config": config, "sweep": true },
+        });
+        format!("{request}\n")
+    }
+
+    #[test]
+    fn quick_calls_overtake_a_running_readout_and_queued_readouts_are_superseded() {
+        let inner = test_inner();
+        let (mut client, mut reader) = connect(&inner);
+        // 1 starts (or still waits when 2 arrives), 2 waits or replaces 1,
+        // 3 replaces whichever waits (answered SUPERSEDED at once), then a
+        // volume change that must not wait for the readout still running.
+        let mut batch = slow_readout(1) + &slow_readout(2) + &slow_readout(3);
+        batch.push_str(
+            r#"{"id":4,"method":"set_volume","params":{"volume_db":-20.0,"balance_db":0.0,"muted":false}}"#,
+        );
+        batch.push('\n');
+        client.write_all(batch.as_bytes()).unwrap();
+
+        let replies: Vec<Response> = (0..4).map(|_| next_reply(&mut reader)).collect();
+        let order: Vec<u64> = replies.iter().map(|r| r.id).collect();
+        let superseded: Vec<u64> = replies
+            .iter()
+            .filter(|r| matches!(&r.result, Outcome::Error(e) if e.code == RpcError::SUPERSEDED))
+            .map(|r| r.id)
+            .collect();
+        for reply in &replies {
+            assert!(
+                matches!(reply.result, Outcome::Ok(_)) || superseded.contains(&reply.id),
+                "{reply:?}"
+            );
+        }
+        // At most one runs and one waits: of three, 1 or 2 (or both, when
+        // the worker had not picked up 1 yet) are dropped unrun.
+        assert!(
+            !superseded.is_empty() && superseded.iter().all(|id| [1, 2].contains(id)),
+            "a queued readout is superseded: {order:?}"
+        );
+        assert_eq!(
+            order.last(),
+            Some(&3),
+            "the newest readout is computed last: {order:?}"
+        );
+        let at = |id: u64| order.iter().position(|&x| x == id).unwrap();
+        assert!(
+            at(4) < at(3),
+            "set_volume waited for the readout: {order:?}"
+        );
+
+        // Dropping the client ends the reader and its worker.
+        client.write_all(slow_readout(5).as_bytes()).unwrap();
+        drop(reader);
+        drop(client);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            inner.prune_finished_threads();
+            if inner.conn_threads.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "connection threads did not exit");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(inner.conns.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_half_closed_client_still_gets_its_readout() {
+        let inner = test_inner();
+        let (mut client, mut reader) = connect(&inner);
+        client.write_all(slow_readout(7).as_bytes()).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let reply = next_reply(&mut reader);
+        assert_eq!(reply.id, 7);
+        assert!(matches!(reply.result, Outcome::Ok(_)), "{reply:?}");
     }
 
     #[test]

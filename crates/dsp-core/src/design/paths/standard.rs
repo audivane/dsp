@@ -38,7 +38,9 @@ use crate::design::{
     GridCutoff, Kernel, KernelDesign, Length, Numerics, Phase, PhaseMethod, Plan, Rates, Sampling,
     Shape, Stepped, Window,
 };
-use crate::resample::{BandError, band_design_for, kaiser_attenuation_db, nyquist_stop_cutoff_for};
+use crate::resample::{
+    BandError, band_length_design_for, kaiser_attenuation_db, nyquist_stop_cutoff_for,
+};
 use crate::window::{gaussian, kaiser, tukey};
 use audivane_protocol::{
     BandSpec, CutoffMode, FilterErrorBudget, FilterPhase, FilterPreset, OutputConfig, RateRatio,
@@ -187,7 +189,7 @@ impl UpsamplerDesign {
                 )
             }
             CutoffMode::Band => {
-                let b = band_design_for(cfg.window, &cfg.band, ratio)?;
+                let b = band_length_design_for(cfg.window, &cfg.band, ratio)?;
                 (b.taps, b.kaiser_beta, b.cutoff)
             }
         };
@@ -241,7 +243,7 @@ impl UpsamplerDesign {
                 )
             }
             CutoffMode::Band => {
-                let b = band_design_for(cfg.window, &cfg.band, r)?;
+                let b = band_length_design_for(cfg.window, &cfg.band, r)?;
                 (b.taps, b.kaiser_beta, b.cutoff)
             }
         };
@@ -506,9 +508,32 @@ pub fn design_of(cfg: &ManualConfig) -> Result<KernelDesign, DesignError> {
 }
 
 /// The Custom config whose manual fields are `k` at `source_rate` (the
-/// stepped values evaluated): what the Custom builder reads. The other
-/// fields are the defaults, which the builder does not read.
+/// stepped values evaluated, a band's absolute passband end converted to a
+/// fraction there, as when upsampling): what the Custom builder reads. The
+/// other fields are the defaults, which the builder does not read.
 pub fn legacy_config(k: &KernelDesign, source_rate: u32) -> Result<ManualConfig, DesignError> {
+    config_at(k, source_rate, source_rate)
+}
+
+/// [`legacy_config`] for a build from `source_rate` at `ratio`: the band's
+/// fractions are of the lower of the two Nyquists ([`design_ratio`]), so an
+/// absolute passband end is converted at the lower rate (the output rate
+/// when decimating).
+pub fn legacy_config_for(
+    k: &KernelDesign,
+    source_rate: u32,
+    ratio: RateRatio,
+) -> Result<ManualConfig, DesignError> {
+    config_at(k, source_rate, crate::design::band_rate(source_rate, ratio))
+}
+
+/// [`legacy_config`] with the stepped values at `source_rate` and an
+/// absolute passband end converted at `band_rate`.
+fn config_at(
+    k: &KernelDesign,
+    source_rate: u32,
+    band_rate: u32,
+) -> Result<ManualConfig, DesignError> {
     if k.numerics
         != (Numerics {
             path: ArithmeticPath::Standard,
@@ -604,15 +629,27 @@ pub fn legacy_config(k: &KernelDesign, source_rate: u32) -> Result<ManualConfig,
             cfg.cutoff_mode = CutoffMode::NyquistStop;
         }
         (Length::Band, Cutoff::Band(band), _) => {
-            (cfg.cutoff_mode, cfg.band) = (CutoffMode::Band, *band);
+            (cfg.cutoff_mode, cfg.band) = (CutoffMode::Band, resolved_band(band, band_rate));
         }
         (Length::Auto(budget), Cutoff::Band(band), _) => {
-            (cfg.cutoff_mode, cfg.band) = (CutoffMode::Band, *band);
+            (cfg.cutoff_mode, cfg.band) = (CutoffMode::Band, resolved_band(band, band_rate));
             cfg.auto_taps = Some(*budget);
         }
         _ => return unsupported("this length rule with this cutoff"),
     }
     Ok(cfg)
+}
+
+/// `band` at `source_rate` as the Custom builder takes it: an absolute
+/// passband end converted to a fraction of the Nyquist there (or the
+/// band's own fraction where it does not fit,
+/// [`crate::design::band_passband_end`]).
+fn resolved_band(band: &BandSpec, source_rate: u32) -> BandSpec {
+    BandSpec {
+        passband_end: crate::design::band_passband_end(band, source_rate),
+        passband_end_hz: None,
+        ..*band
+    }
 }
 
 /// The resolved design of `k` from `source_rate` at `ratio` (the length
@@ -622,7 +659,7 @@ pub(crate) fn recipe(
     source_rate: u32,
     ratio: RateRatio,
 ) -> Result<UpsamplerDesign, DesignError> {
-    let cfg = legacy_config(k, source_rate)?;
+    let cfg = legacy_config_for(k, source_rate, ratio)?;
     UpsamplerDesign::try_for_ratio(&cfg, ratio).map_err(|e| match &e {
         // A search candidate over the workspace limit.
         BandError::Automatic(m) => match budget::candidate_refusal(m) {
@@ -733,7 +770,7 @@ pub(crate) fn feasibility(
     k: &KernelDesign,
     cx: &BuildContext,
 ) -> Result<Plan, DesignError> {
-    let cfg = legacy_config(k, cx.source_rate)?;
+    let cfg = legacy_config_for(k, cx.source_rate, cx.ratio)?;
     let check_ratio = || crate::design::rates::check(d, cx.ratio);
     if cfg.auto_taps.is_some() {
         // The checks the search starts with (`automatic_design` and
@@ -789,7 +826,7 @@ pub(crate) fn searched(
     crate::design::rates::check(d, cx.ratio)?;
     check_budget(k, r.taps, cx)?;
     let mut plan = plan(k, r.taps, budget::standard_priced_taps(k, &r), cx);
-    let cfg = legacy_config(k, cx.source_rate)?;
+    let cfg = legacy_config_for(k, cx.source_rate, cx.ratio)?;
     plan.workspace_bytes = plan
         .workspace_bytes
         .max(crate::design::auto::search_workspace(&cfg, cx.ratio));
@@ -817,6 +854,7 @@ mod tests {
         let band = BandSpec {
             passband_end: 0.9,
             stopband_start: 1.0,
+            passband_end_hz: None,
             attenuation_db: 100.0,
         };
         vec![
@@ -1042,6 +1080,7 @@ mod tests {
         let bad_band = ManualConfig {
             cutoff_mode: CutoffMode::Band,
             band: BandSpec {
+                passband_end_hz: None,
                 attenuation_db: 300.0,
                 ..BandSpec::default()
             },

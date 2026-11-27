@@ -10,6 +10,8 @@ import { Refresh } from "../components/Icons";
 import { VolumeSettings } from "./VolumeSettings";
 import { TraySettings } from "./TraySettings";
 import { FollowersPanel } from "./FollowersPanel";
+import { nameOf } from "../lib/devices";
+import { OutputPairPicker } from "./OutputPairPicker";
 
 /** "Use as default" for one chip; Escape, a click elsewhere or Tab closes it. */
 function RateMenu({ chip, x, y, onClose }: { chip: RateChip; x: number; y: number; onClose: () => void }) {
@@ -120,7 +122,7 @@ export function DeviceView() {
   if (!cfg) return null;
   const dev = devices.length ? st.currentDevice() : undefined;
   const released = status?.state === "idle";
-  const hw = status?.volume ? (status.volume.hardware ? "Yes" : "No (digital)") : "—";
+  const hw = status?.volume ? (status.volume.hardware ? "Yes" : "No (digital)") : "-";
   const effectiveRates = status?.effective_rates ?? [];
   const rateNote = rateSupportNote(cfg.rate.allowed_rates, effectiveRates);
   // An engine without the setting sends no field (older than this option).
@@ -129,7 +131,7 @@ export function DeviceView() {
   const defaultRate = status?.effective_default_rate ?? cfg.rate.default_rate;
   const bits = usedBits(status?.device_caps, status?.output_rate, status?.format);
   const probed = (status?.device_caps?.rates ?? []).filter((c) => c.formats.length > 0).map((c) => c.rate);
-  const dacPlays = probed.length ? probed.map((r) => fmtRateShort(r)).join(", ") : "—";
+  const dacPlays = probed.length ? probed.map((r) => fmtRateShort(r)).join(", ") : "-";
   const bitsTitle =
     bits !== null && status?.format
       ? `The DAC takes ${fmtSampleFormat(status.format)} samples and converts ${bits} bits of each` +
@@ -154,10 +156,20 @@ export function DeviceView() {
             <Refresh />
           </button>
         </div>
+        {status?.device_caps && status.device_caps.device === cfg.device && (
+          <OutputPairPicker
+            id="device-pair"
+            label="Output channels of the main device"
+            opened={status.device_caps.channels}
+            channels={status.device_caps.channels_max}
+            pair={cfg.output_channels}
+            onChange={(p) => void st.setOutputChannels(p)}
+          />
+        )}
         {conflict && (
           <div className="device-conflict" role="alert">
             <span>
-              {devices.find((d) => d.id === conflict)?.name ?? conflict} already plays under "Also play on". A device plays one role at a time: remove it there to make it the main device.
+              {nameOf(devices, conflict)} already plays under "Also play on". A device plays one role at a time: remove it there to make it the main device.
             </span>
             <button className="btn small" onClick={() => void st.moveDeviceToFollower(conflict)}>
               Remove it and switch
@@ -199,7 +211,7 @@ export function DeviceView() {
           </div>
           <div className="fact">
             <div className="k">Rate now</div>
-            <div className="v">{status?.output_rate ? fmtRate(status.output_rate) : "—"}</div>
+            <div className="v">{status?.output_rate ? fmtRate(status.output_rate) : "-"}</div>
           </div>
           <div className="fact">
             <div className="k">Hardware volume</div>
@@ -211,7 +223,7 @@ export function DeviceView() {
           </div>
           <div className="fact">
             <div className="k">Engine</div>
-            <div className="v">{status?.version ?? "—"}</div>
+            <div className="v">{status?.version ?? "-"}</div>
           </div>
         </div>
         <div className="row">

@@ -5,6 +5,7 @@ import { measureErrorText, measurePhase, runningText } from "./abMeasure";
 const status = (over: Partial<AbStatus> = {}): AbStatus => ({
   enabled: true,
   current: "a",
+  blind: false,
   offset_db: 0,
   gain_a_db: 0,
   gain_b_db: 0,

@@ -17,7 +17,7 @@ export function DcBlockView() {
   const cutoff = cfg?.cutoff_hz ?? DC_CUTOFF.def;
   return (
     <section className="view" aria-labelledby="dc-title">
-      <StageHead id="dc-title" title="DC block" on={on} onPower={missing ? undefined : () => st.setStageEnabled("dc_block", !on)}>
+      <StageHead id="dc-title" title="DC block" part={missing ? undefined : "output"} on={on} onPower={missing ? undefined : () => st.setStageEnabled("dc_block", !on)}>
         {!missing && <CompareButton stage="dc" />}
       </StageHead>
       {missing && <MissingNotice id="dc_block" />}

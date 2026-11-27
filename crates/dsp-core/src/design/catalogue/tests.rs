@@ -489,6 +489,7 @@ fn ratio_classes() {
         Lanczos65535,
         CascadeFir,
         BlockFft,
+        Nos,
         Cosine,
     ] {
         assert!(check(p, frac).is_err(), "{p:?}");
@@ -690,8 +691,9 @@ fn recommended_card(
         window: WindowKind::Kaiser,
         cutoff_mode: CutoffMode::Band,
         band: BandSpec {
-            passband_end: 0.908,
+            passband_end: RECOMMENDED_PASSBAND_END,
             stopband_start: 1.0,
+            passband_end_hz: Some(RECOMMENDED_PASSBAND_HZ),
             attenuation_db: 150.0,
         },
         auto_taps: Some(FilterErrorBudget::MatchOutput),
@@ -793,8 +795,16 @@ fn recommended_builds_the_cards_kernel() {
         headroom_db: 0.0,
     };
     let card = recommended_card(ManualConfig::default()).with_output(&out);
-    for ratio in [RateRatio::integer(2), r(44_100, 48_000)] {
-        let k = crate::design::kernel(&recommended().with_output(&out), 44_100, ratio).unwrap();
+    for (rate, ratio) in [
+        (44_100, RateRatio::integer(2)),
+        (44_100, r(44_100, 48_000)),
+        (96_000, RateRatio::integer(2)),
+    ] {
+        let k = crate::design::kernel(&recommended().with_output(&out), rate, ratio).unwrap();
+        // The builder takes the 20 kHz pin as a fraction of the Nyquist.
+        let mut card = card.clone();
+        card.band.passband_end = RECOMMENDED_PASSBAND_HZ / (f64::from(rate) / 2.0);
+        card.band.passband_end_hz = None;
         let d = UpsamplerDesign::try_for_ratio(&card, ratio).unwrap();
         let want = try_design_kernel_for(&d, ratio).unwrap();
         assert_eq!(
@@ -805,4 +815,122 @@ fn recommended_builds_the_cards_kernel() {
         // Linear phase: the delay is the kernel's centre.
         assert_eq!(k.delay_exact, (want.len() - 1) as f64 / 2.0, "{ratio}");
     }
+}
+
+/// `craven_apod` pins its passband at 20 kHz at every source rate: the Hz
+/// field carries the pin, the fraction stays the one at 44.1 kHz (the
+/// design's bits there), and the kernel shortens as the rate rises.
+#[test]
+fn craven_pins_its_passband_at_20_khz() {
+    let k = kernel_design(FilterPreset::CravenApod);
+    let Shape::WindowedSinc {
+        cutoff: Cutoff::Band(band),
+        length: Length::Band,
+        ..
+    } = k.shape
+    else {
+        panic!("a band-length design");
+    };
+    assert_eq!(band.passband_end_hz, Some(CRAVEN_PASSBAND_HZ));
+    assert_eq!(CRAVEN_PASSBAND_HZ, 20_000.0);
+    assert_eq!(band.passband_end, 20_000.0 / 22_050.0);
+    assert_eq!(band.stopband_start, 1.0);
+    assert_eq!(band.attenuation_db, CRAVEN_ATTENUATION_DB);
+    // 44.1 kHz is the fraction itself, bit for bit; 48 kHz is its own.
+    assert_eq!(
+        crate::design::band_passband_end(&band, 44_100),
+        band.passband_end
+    );
+    assert_eq!(
+        crate::design::band_passband_end(&band, 48_000),
+        20_000.0 / 24_000.0
+    );
+    let taps = |rate| {
+        crate::design::grid_taps(
+            &design(FilterPreset::CravenApod),
+            rate,
+            RateRatio::integer(2),
+        )
+        .unwrap()
+    };
+    assert!(taps(96_000) < taps(48_000));
+    assert_eq!(taps(44_100), 477);
+}
+
+/// Recommended pins its passband at 20 kHz from the lower Nyquist; where
+/// 20 kHz does not fit the band (a 32 or 22.05 kHz source) it falls back to
+/// its fraction, and the design check says so.
+#[test]
+fn recommended_pins_its_passband_at_20_khz() {
+    use crate::design::paths::standard::legacy_config_for;
+    use crate::design::{band_of, band_passband_end, band_pin_misfit, band_pin_note};
+    let d = recommended();
+    let band = *band_of(&d).unwrap();
+    assert_eq!(band.passband_end_hz, Some(RECOMMENDED_PASSBAND_HZ));
+    assert_eq!(band.passband_end, RECOMMENDED_PASSBAND_END);
+    for rate in [44_100, 48_000, 96_000, 192_000, 768_000] {
+        assert_eq!(band_pin_misfit(&band, rate), None, "{rate}");
+        assert_eq!(band_passband_end(&band, rate), 40_000.0 / f64::from(rate));
+        assert_eq!(band_pin_note(&d, rate, RateRatio::integer(2)), None);
+    }
+    for rate in [22_050, 32_000] {
+        assert!(band_pin_misfit(&band, rate).is_some(), "{rate}");
+        assert_eq!(band_passband_end(&band, rate), RECOMMENDED_PASSBAND_END);
+        let note = band_pin_note(&d, rate, RateRatio::integer(2)).unwrap();
+        assert!(note.contains("0.908"), "{note}");
+    }
+    // The Custom builder's config: converted at the source rate when
+    // upsampling, at the output rate when decimating.
+    let FilterDesign::Kernel(k) = &d else {
+        unreachable!()
+    };
+    let at = |rate, ratio| legacy_config_for(k, rate, ratio).unwrap().band;
+    let up = at(96_000, RateRatio::integer(2));
+    assert_eq!(up.passband_end, 20_000.0 / 48_000.0);
+    assert_eq!(up.passband_end_hz, None);
+    let down = at(96_000, RateRatio::new(1, 2));
+    assert_eq!(down.passband_end, 20_000.0 / 24_000.0);
+    // A pin past the band at 44.1 kHz (30 kHz) falls back there and fits
+    // from 64 kHz up.
+    let wide = BandSpec {
+        passband_end_hz: Some(30_000.0),
+        ..band
+    };
+    assert_eq!(band_passband_end(&wide, 44_100), RECOMMENDED_PASSBAND_END);
+    assert_eq!(band_passband_end(&wide, 96_000), 30_000.0 / 48_000.0);
+}
+
+/// Decimating, the band is of the lower (output) Nyquist on the general
+/// path too: `craven_apod` from 96 to 48 kHz stays flat to 20 kHz (it fell
+/// to about 12 kHz when the pin was converted at the source rate).
+#[test]
+fn craven_decimating_stays_flat_to_20_khz() {
+    use std::f64::consts::PI;
+    let ratio = RateRatio::new(1, 2);
+    let k = crate::design::kernel(&design(FilterPreset::CravenApod), 96_000, ratio).unwrap();
+    // The kernel runs at the 96 kHz input (L = 1): its gain at `hz`.
+    let gain = |hz: f64| {
+        let w = 2.0 * PI * hz / 96_000.0;
+        let (re, im) = k
+            .taps
+            .iter()
+            .enumerate()
+            .fold((0.0, 0.0), |(re, im), (n, &h)| {
+                let x = w * n as f64;
+                (re + h * x.cos(), im - h * x.sin())
+            });
+        (re * re + im * im).sqrt()
+    };
+    let dc = gain(0.0);
+    for hz in [5_000.0, 12_000.0, 16_000.0, 20_000.0] {
+        let db = 20.0 * (gain(hz) / dc).log10();
+        assert!(db.abs() < 1e-3, "{hz} Hz: {db:.4} dB");
+    }
+    // And fully down by the 24 kHz output Nyquist.
+    assert!(20.0 * (gain(24_000.0) / dc).log10() < -140.0);
+    // The note agrees: 20 kHz fits the 48 kHz band.
+    assert_eq!(
+        crate::design::band_pin_note(&design(FilterPreset::CravenApod), 96_000, ratio),
+        None
+    );
 }

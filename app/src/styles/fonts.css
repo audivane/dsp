@@ -1,9 +1,9 @@
-/* Audivane Sans Latin and Audivane Mono Latin: Latin subsets of IBM Plex Sans
-   and Mono, renamed for the Reserved Font Name "Plex" (SIL Open Font License
-   1.1, see src/assets/fonts/OFL.txt and docs/font-licensing.md). Other glyphs
-   fall back. */
-@font-face { font-family: "Audivane Sans Latin"; font-style: normal; font-weight: 400; font-display: swap; src: url("../assets/fonts/ibm-plex-sans-latin-400-normal.woff2") format("woff2"); }
-@font-face { font-family: "Audivane Sans Latin"; font-style: normal; font-weight: 500; font-display: swap; src: url("../assets/fonts/ibm-plex-sans-latin-500-normal.woff2") format("woff2"); }
-@font-face { font-family: "Audivane Sans Latin"; font-style: normal; font-weight: 600; font-display: swap; src: url("../assets/fonts/ibm-plex-sans-latin-600-normal.woff2") format("woff2"); }
+/* Geist (interface text): Latin subset of the variable font, weights 400 to
+   600, under its own names (SIL Open Font License 1.1, see
+   src/assets/fonts/OFL-Geist.txt). Audivane Mono Latin (numbers and values):
+   Latin subsets of IBM Plex Mono, renamed for the Reserved Font Name "Plex"
+   (see src/assets/fonts/OFL-IBM-Plex.txt). docs/font-licensing.md records
+   both. Other glyphs fall back. */
+@font-face { font-family: "Geist"; font-style: normal; font-weight: 400 600; font-display: swap; src: url("../assets/fonts/geist-latin-wght.woff2") format("woff2"); }
 @font-face { font-family: "Audivane Mono Latin"; font-style: normal; font-weight: 400; font-display: swap; src: url("../assets/fonts/ibm-plex-mono-latin-400-normal.woff2") format("woff2"); }
 @font-face { font-family: "Audivane Mono Latin"; font-style: normal; font-weight: 500; font-display: swap; src: url("../assets/fonts/ibm-plex-mono-latin-500-normal.woff2") format("woff2"); }

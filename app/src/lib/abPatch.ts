@@ -29,7 +29,17 @@ export function mergePatch(target: unknown, patch: unknown): unknown {
 export function patchError(patch: unknown): string | null {
   if (!isObject(patch)) return "ab.b.patch must be a JSON object";
   if ("limiter" in patch) return "ab.b.patch.limiter may not differ from chain A (both sides share the limiter after the mix)";
-  if ("output" in patch) return "ab.b.patch.output may not differ from chain A (both sides share one quantizer)";
+  if ("output" in patch) {
+    if (!isObject(patch.output)) return "ab.b.patch.output must be an object (side B may set its own bits and dither)";
+    const bad = Object.keys(patch.output).find((k) => k !== "bits" && k !== "dither");
+    if (bad) {
+      const why =
+        bad === "headroom_db"
+          ? "both sides take the same output headroom before the mix"
+          : "side B may set only its own bits and dither; the device, its format and the rate are shared";
+      return `ab.b.patch.output.${bad} may not differ from chain A (${why})`;
+    }
+  }
   if ("upsampler" in patch) {
     if (!isObject(patch.upsampler)) return "ab.b.patch.upsampler must be an object (B runs at chain A's ratio; a filter may differ)";
     if ("target" in patch.upsampler) {

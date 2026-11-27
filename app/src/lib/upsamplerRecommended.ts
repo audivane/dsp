@@ -12,7 +12,7 @@ export const RECOMMENDED_LABEL = "Recommended";
 export const RECOMMENDED_BLURB = "Set it and forget it";
 export const RECOMMENDED_TIP =
   "A clean, steep linear-phase filter, its length sized automatically for each rate to the output's resolution, upsampling to the highest rate of the same family the DAC takes (up to 768 kHz, never a fractional ratio). Applies the whole setting at once; Custom then opens it for editing.";
-export const RECOMMENDED_DETAIL = "Kaiser, automatic length (matches the output), linear phase, flat to 0.908 (20 kHz at 44.1 kHz) and stopped from 1.00 × the source Nyquist; the highest rate of the same family, up to 768 kHz.";
+export const RECOMMENDED_DETAIL = "Kaiser, automatic length (matches the output), linear phase, flat to 20 kHz at every source rate (0.908 × Nyquist below 44.1 kHz) and stopped from 1.00 × the source Nyquist, so higher source rates get a gentler, shorter filter; the highest rate of the same family, up to 768 kHz.";
 
 /**
  * The config to send: `preset: "recommended"`; while upsampling is on, also

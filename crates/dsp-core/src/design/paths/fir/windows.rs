@@ -277,8 +277,8 @@ pub fn tukey_periodic(n: usize, taper: f64) -> Vec<f64> {
 /// The samples of the design window `w` over `n` taps, for the windows and
 /// samplings the preset paths build besides their legacy ones: every window
 /// except the `standard` path's Gaussian, sampled
-/// `periodic` or `symmetric` (`integer_centre`: the Gaussian only). `None`
-/// for the others.
+/// `periodic` or `symmetric` (`integer_centre`: the Gaussian only; DPSS:
+/// `symmetric` only). `None` for the others.
 pub(crate) fn sample(w: crate::design::Window, n: usize) -> Option<Vec<f64>> {
     use crate::design::{FlattopSet, Sampling::*, Window as W};
     let set = |s| match s {
@@ -334,6 +334,10 @@ pub(crate) fn sample(w: crate::design::Window, n: usize) -> Option<Vec<f64>> {
             taper,
             sampling: Periodic,
         } => tukey_periodic(n, taper),
+        W::Dpss {
+            nw: Some(nw),
+            sampling: Symmetric,
+        } => crate::window::dpss(n, nw),
         _ => return None,
     })
 }

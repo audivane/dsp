@@ -1,13 +1,16 @@
 // Equalizer APO / AutoEQ `ParametricEQ.txt` import and export.
 //
 // The parser follows crates/dsp-core/src/eq_apo.rs (same tokens, same BW and
-// S conversions, same defaults): APO import fills the linked section and warns
-// on directives it does not know. `Channel: L` / `Channel: R` put the
-// filters (and a Preamp) that follow into that channel's own section, and
-// `Channel: all` goes back to the linked one. Shelves are written as LSC/HSC (the Q form Equalizer
-// APO and AutoEQ use).
+// S conversions, same defaults): import fills the linked section and warns on
+// directives it does not know. `Channel: L` / `Channel: R` put the filters
+// (and a Preamp) that follow into that channel's own section, `Channel: all`
+// goes back to the linked one. Shelves are written as LSC/HSC (the Q form
+// Equalizer APO and AutoEQ use). The tone knobs export as the last two linked
+// filters and import back from a matching pair at the end of the linked
+// filters.
 
-import type { Band, EqProfile, FilterType } from "../api/types";
+import type { Band, EqProfile, FilterType, ToneConfig } from "../api/types";
+import { isToneShelf, toneBands } from "./tone";
 
 export interface ApoParseResult {
   profile: EqProfile;
@@ -168,6 +171,8 @@ export function parseApo(text: string, name = ""): ApoParseResult {
     linked_enabled: true,
     bands: sets.all.bands,
   };
+  const tone = takeTone(profile.bands);
+  if (tone) profile.tone = tone;
   const side = (s: { preamp_db: number; bands: Band[] }) => (s.bands.length || s.preamp_db ? { enabled: true, ...s } : undefined);
   const left = side(sets.L);
   const right = side(sets.R);
@@ -176,6 +181,19 @@ export function parseApo(text: string, name = ""): ApoParseResult {
     profile.right = right ?? { enabled: true, preamp_db: 0, bands: [] };
   }
   return { profile, warnings };
+}
+
+/** Pull the tone shelves (bass then treble, either alone) off the end of `bands`, as `toApo` writes them. */
+function takeTone(bands: Band[]): ToneConfig | null {
+  const tone: ToneConfig = { bass_db: 0, treble_db: 0 };
+  for (const knob of ["treble_db", "bass_db"] as const) {
+    const last = bands[bands.length - 1];
+    if (last && isToneShelf(last) === knob) {
+      tone[knob] = last.gain_db;
+      bands.pop();
+    }
+  }
+  return tone.bass_db || tone.treble_db ? tone : null;
 }
 
 function writeSet(lines: string[], preamp: number, bands: readonly Band[]) {
@@ -193,7 +211,7 @@ function writeSet(lines: string[], preamp: number, bands: readonly Band[]) {
  *  per-channel bands under `Channel: L` / `Channel: R`. */
 export function toApo(profile: EqProfile): string {
   const lines: string[] = [];
-  writeSet(lines, profile.preamp_db, profile.bands);
+  writeSet(lines, profile.preamp_db, [...profile.bands, ...toneBands(profile.tone)]);
   for (const [name, c] of [["L", profile.left], ["R", profile.right]] as const) {
     if (!c || !c.enabled || (!c.bands.length && !c.preamp_db)) continue;
     lines.push(`Channel: ${name}`);

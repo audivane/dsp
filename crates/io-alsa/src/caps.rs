@@ -9,7 +9,7 @@
 use crate::error::{AlsaError, Result};
 use alsa::PCM;
 use alsa::pcm::{Access, Format, HwParams};
-use audivane_protocol::ipc::{DeviceCapabilities, FormatCapability, RateCapability};
+use audivane_protocol::ipc::{ChannelMode, DeviceCapabilities, FormatCapability, RateCapability};
 use audivane_protocol::{RateRatio, SampleFormat};
 
 /// Formats the engine can pack, in the order the probe reports them.
@@ -97,11 +97,17 @@ pub fn plan_open(
 }
 
 /// Probe `pcm` (opened, not configured) for every rate in `rates` with
-/// `channels` channels and RW-interleaved access, per format.
+/// RW-interleaved access, per format, at every channel count of at least
+/// `min_channels` (the engine's) the device takes: one
+/// [`audivane_protocol::ipc::ChannelMode`] each, in
+/// [`DeviceCapabilities::modes`]. `channels` and `rates` are the narrowest
+/// mode that plays anything; [`DeviceCapabilities::for_output`] picks the
+/// one for an output pair and the configured formats. A device with no
+/// such count reports `min_channels` and no rates.
 pub fn probe_pcm(
     pcm: &PCM,
     device: &str,
-    channels: u32,
+    min_channels: u32,
     rates: &[u32],
 ) -> Result<DeviceCapabilities> {
     let base = HwParams::any(pcm)?;
@@ -122,7 +128,38 @@ pub fn probe_pcm(
             supported: "only mmap or non-interleaved access".into(),
         });
     }
+    let codec_bits = crate::reserve::card_index_from_device(device)
+        .ok()
+        .and_then(hda_codec_bits);
+    let modes: Vec<ChannelMode> = crate::pcm::channel_counts(&base, min_channels)
+        .into_iter()
+        .map(|channels| ChannelMode {
+            channels,
+            rates: probe_mode(pcm, &base, channels, rates, codec_bits),
+        })
+        .collect();
+    let caps = DeviceCapabilities {
+        device: device.to_string(),
+        channels: min_channels,
+        channels_min,
+        channels_max,
+        rates: Vec::new(),
+        rate_min,
+        rate_max,
+        formats: native_formats,
+        modes,
+    };
+    Ok(caps.for_output(min_channels, &[]))
+}
 
+/// The usable (rate, format) pairs at `channels` channels.
+fn probe_mode(
+    pcm: &PCM,
+    base: &HwParams<'_>,
+    channels: u32,
+    rates: &[u32],
+    codec_bits: Option<u32>,
+) -> Vec<RateCapability> {
     let mut per_rate: Vec<RateCapability> = rates
         .iter()
         .map(|&rate| RateCapability {
@@ -130,7 +167,6 @@ pub fn probe_pcm(
             formats: Vec::new(),
         })
         .collect();
-
     for fmt in PROBE_FORMATS {
         let afmt = to_alsa_format(fmt);
         if base.test_format(afmt).is_err() {
@@ -157,23 +193,10 @@ pub fn probe_pcm(
         }
     }
     per_rate.retain(|r| !r.formats.is_empty());
-    if let Some(bits) = crate::reserve::card_index_from_device(device)
-        .ok()
-        .and_then(hda_codec_bits)
-    {
+    if let Some(bits) = codec_bits {
         cap_sbits(&mut per_rate, bits);
     }
-
-    Ok(DeviceCapabilities {
-        device: device.to_string(),
-        channels,
-        channels_min,
-        channels_max,
-        rates: per_rate,
-        rate_min,
-        rate_max,
-        formats: native_formats,
-    })
+    per_rate
 }
 
 /// Bits the converter of an HD-Audio card resolves, from the codecs' own
@@ -348,6 +371,7 @@ mod tests {
                     sbits: Some(16),
                 }],
             }],
+            modes: Vec::new(),
         }
     }
 
@@ -468,6 +492,7 @@ mod tests {
                         }],
                     })
                     .collect(),
+                modes: Vec::new(),
             }
         };
         let high = dac(3_072_000);
@@ -526,6 +551,7 @@ mod tests {
             rate_max: 192_000,
             formats: vec![SampleFormat::S16, SampleFormat::S32],
             rates,
+            modes: Vec::new(),
         };
         assert_eq!(
             plan(&caps, 48_000, 4, &PREF).unwrap(),

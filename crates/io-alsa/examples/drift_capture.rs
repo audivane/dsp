@@ -102,6 +102,7 @@ fn run(a: &Args, index: usize, barrier: &Barrier, waited: &mut bool) -> Result<S
         device: device.clone(),
         rate: a.rate,
         channels: 2,
+        channel_map: Vec::new(),
         period_frames: a.period,
         buffer_periods: a.periods,
         preferred_format: None,

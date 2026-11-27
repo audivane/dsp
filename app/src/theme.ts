@@ -33,7 +33,7 @@ function prefersDark(): boolean {
 }
 
 export function resolvedSkin(s: Skin = current): Exclude<Skin, "system"> {
-  return s === "system" ? (prefersDark() ? "midnight" : "light") : s;
+  return s === "system" ? (prefersDark() ? "graphite" : "light") : s;
 }
 
 function apply() {

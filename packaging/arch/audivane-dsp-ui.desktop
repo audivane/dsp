@@ -2,7 +2,7 @@
 Type=Application
 Name=Audivane DSP
 GenericName=Audio DSP
-Comment=Bit-perfect system-wide equalizer, convolution and loudness engine for PipeWire
+Comment=System-wide upsampling, harmonics, equalizer and convolution for PipeWire
 Exec=audivane-dsp-ui
 Icon=audivane-dsp
 Terminal=false

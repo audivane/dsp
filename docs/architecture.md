@@ -4,9 +4,9 @@ Linux with PipeWire only. How to build and test is in [DEV.md](../DEV.md); the
 wire protocol is in [control-plane.md](control-plane.md); how the engine drives
 PipeWire from the DAC clock is in [pipewire-driver.md](pipewire-driver.md).
 
-A desktop app with a background engine that applies high-quality DSP to
-system-wide or single-app audio. With processing off, its output is
-bit-perfect, and the app checks and shows that.
+A desktop app with a background engine that applies DSP to system-wide or
+single-app audio. With processing off, its output is bit-perfect, and the app
+checks and shows that.
 
 ## Goals and scope
 
@@ -19,8 +19,8 @@ bit-perfect, and the app checks and shows that.
 | Bypass | Bit-perfect output, checked and shown in the UI |
 | Sample rate | DAC follows the source rate (44.1k and 48k families) |
 | Clock | No drift; the DAC clock paces everything |
-| Upsampling | Built in; linear or minimum phase, up to 8M taps |
-| A/B | Compare two DSP chains with K-weighted, never-boost level matching; optional blind mode |
+| Upsampling | Built in; linear, minimum or blended phase, up to 8M taps |
+| A/B | Compare two DSP chains with K-weighted, never-boost level matching; blind tests in the app |
 | UI | Desktop app + tray; engine keeps running when the UI is closed |
 
 Out of scope: Windows/macOS, DSD output, a raw 32-bit-integer input path,
@@ -47,8 +47,8 @@ What this gives us:
 - The graph runs at the source rate; the engine writes to ALSA at source × N
   on integer ratios up to ×64 (44.1 → 176.4 / 352.8 / 705.6 / 1411.2 /
   2822.4, 48 → 192 / 384 / 768 / 1536 / 3072 kHz).
-- Integer output (S24/S32) with our own TPDF or noise-shaped dither, applied
-  exactly once.
+- Integer output (S16, S24, S24_3 or S32) with our own dither, applied exactly
+  once.
 - True bypass: samples copied to ALSA unchanged.
 - Rate following: reopen the ALSA device with new hw params when the source
   rate changes.
@@ -68,13 +68,13 @@ an in-process PipeWire module; see [pipewire-driver.md](pipewire-driver.md).
  Sources              PipeWire graph            Engine (f64)                 DAC
                       (source rate)
 
- System audio ──────► Audivane DSP ───────────► DC block (optional)
+ System audio ──────► Audivane DSP ───────────► DC block
  (browsers, games)    (f32 in)                    │
                           ▲                       ▼
- Music player ────────────┤                     Pitch shift (optional)
+ Music player ────────────┤                     Pitch shift, varispeed
  (routed per app)         │                       │
         │                 │                       ▼
-        │                 │                     Crossfeed (optional, stereo)
+        │                 │                     Stereo image (crossfeed, width)
         │                 │                       │
         │                 │                       ▼
         │                 │                     EQ (f64 biquads)
@@ -86,7 +86,7 @@ an in-process PipeWire module; see [pipewire-driver.md](pipewire-driver.md).
         │                 │                     Upsampler ×N
         │                 │                       │
         │                 │                       ▼
-        │                 │                     Harmonics (optional)
+        │                 │                     Harmonics
         │                 │                       │
         │                 │                       ▼
         │                 │                     Volume/balance → Limiter
@@ -94,33 +94,38 @@ an in-process PipeWire module; see [pipewire-driver.md](pipewire-driver.md).
         │                 │                       ▼
         │                 │                     Dither, once ──────────► ALSA hw:
         │                 │                                             rate × N
-        └───────────────► Audivane Direct ────► Bypass: exact copy ───► S24 / S32
-                          (no DSP)            (digital volume, if           │
-                                               any, + TPDF dither)          │
-                              ▲                                             │
-                              └──── DAC buffer position drives each ────────┘
+        └───────────────► Audivane Direct ────► Bypass: exact copy ───► S16/S24/
+                          (no DSP)            (digital volume, if         S24_3/S32
+                                               any, + dither)              │
+                              ▲                                            │
+                              └──── DAC buffer position drives each ───────┘
                                     graph cycle (one clock, no drift)
 ```
 
+Every processing stage can be switched off. The DSP path always has the final
+volume/balance, quantizer and dither; the Direct sink has none of the chain.
+
 ## Peak protection
 
-The optional linked limiter lives in `dsp-core::limiter`, after digital
-volume/balance and immediately before the shared quantizer. A/B runs one
-limiter after mixing/level matching, and both sides share its config. This
-allows volume attenuation to provide headroom before limiting. True-peak
-detection interpolates only the sidechain, with a density set by the output
-rate family (8 points per 44.1/48 kHz sample, the output samples alone from
-352.8 kHz); at unity gain the audio is an exact delayed copy, and release
-snaps back to exactly unity. Monotonic queues schedule bounded linear attack
-and hold over the detector support; release is exponential. The full
-look-ahead contributes to chain latency. All memory is allocated during
-construction; processing/reset accept arbitrary call sizes without heap
-operations. Auto headroom learns the material's need before the digital
-volume (the chain passes the block's volume gain) in 0.5 dB steps (cap
-12 dB), never releases it mid-stream, and subtracts the volume's own
-attenuation; the daemon carries it across rebuilds with an unchanged limiter
-config and output rate and keeps a warming chain from deciding. `ClipStats` carries incremental events and the window's largest
-attenuation through the atomic meter bank. Direct and DSP-off paths do not run this stage.
+The linked limiter lives in `dsp-core::limiter`, after digital volume/balance
+and immediately before the shared quantizer, so volume attenuation provides
+headroom before limiting. A/B runs one limiter after mixing and level
+matching, and both sides share its config. True-peak detection interpolates
+only the sidechain, at a density set by the output rate family (8 points per
+44.1/48 kHz sample, the output samples alone from ×8, 352.8 or 384 kHz). At
+unity gain the audio is an exact delayed copy, and release snaps back to
+exactly unity. Monotonic queues schedule a bounded linear attack and hold over
+the detector support; release is exponential. The full look-ahead contributes
+to chain latency. All memory is allocated during construction, and
+processing/reset accept arbitrary call sizes without heap operations.
+
+Auto headroom learns the material's need in 0.5 dB steps (cap 12 dB) before
+the digital volume (the chain passes the block's volume gain), never releases
+it mid-stream, and subtracts the volume's own attenuation. The daemon carries
+it across rebuilds with an unchanged limiter config and output rate, and keeps
+a warming chain from deciding. `ClipStats` carries incremental events and the
+window's largest attenuation through the atomic meter bank. Direct and DSP-off
+paths do not run this stage.
 
 ## Feature design
 
@@ -134,20 +139,20 @@ before it turns real-time), logged the same way.
 
 ### PCM quantization and noise shaping
 
-After gain/volume, `dither::Quantizer` converts planar f64 to interleaved,
-left-justified i32 at the negotiated output word length. It adds no signal
-latency and accepts arbitrary block lengths. Fixed dither/feedback modes
-keep a KISS generator, up to fifteen integrator states, five clean-input
-error delays and a sixth-order coloured-noise filter per channel. All memory
-is allocated at construction; process and reset perform no heap operations.
+After volume and the limiter, `dither::Quantizer` converts planar f64 to
+interleaved, left-justified i32 at the negotiated output word length. It adds
+no signal latency and accepts arbitrary block lengths. Fixed dither and feedback modes
+keep a KISS generator, up to fifteen integrator states, five clean-input error
+delays and a sixth-order coloured-noise filter per channel. All memory is
+allocated at construction; process and reset perform no heap operations.
 Dither enters inside the feedback loop, with `w = scaled_input - raw_q`, so
 both dither and rounding error are shaped. Input headroom is specified in
 LSBs. A final packing clamp prevents signed-word wraparound without feeding
-the saturated value back into the fixed loops. The original full-scale-gain
-`tpdf` generator and the rate-adaptive `shaped` filter remain unchanged;
-`headroom_tpdf` selects the per-channel KISS alternative.
-Explicit fixed modes enable a quantizer-only DSP path; Direct and the master
-DSP bypass still copy samples unchanged.
+the saturated value back into the fixed loops. `tpdf` uses the original
+generator at full-scale gain, `shaped` a rate-adaptive filter, and
+`headroom_tpdf` the per-channel KISS source. Explicit fixed modes enable a
+quantizer-only DSP path; Direct and the master DSP bypass still copy samples
+unchanged.
 
 ### Input and routing
 
@@ -158,14 +163,13 @@ DSP bypass still copy samples unchanged.
   pavucontrol does.
 - Read MPRIS to show the current track and its native rate.
 - Input through the graph is f32, which is exact for sources up to 24-bit.
-  True 32-bit-integer passthrough would need a raw-format input path; deferred.
 
 ### DC blocking
 
-- Optional high-pass stage (`crates/dsp-core/src/dc_block.rs`) placed first at
-  the source rate, before pitch shifting and crossfeed. Off by default.
+- High-pass stage (`crates/dsp-core/src/dc_block.rs`), first at the source
+  rate, before pitch shifting and the stereo image. Off by default.
 - 2nd-order Butterworth high-pass (`Q = 1/sqrt(2)`, prewarped bilinear/RBJ) in
-  Direct Form I `f64`, configurable cutoff `1.0..=20.0` Hz (default 5 Hz, where
+  Direct Form I `f64`, cutoff `1.0..=20.0` Hz (default 5 Hz, where the
   magnitude response is −0.017 dB at 20 Hz and −0.0097 dB at 23 Hz), zero
   latency, per channel.
 - Bounded-input sample-peak maximum (L1 norm) is `‖h‖₁ ≈ 2.4345` (+7.73 dB on a
@@ -176,41 +180,63 @@ DSP bypass still copy samples unchanged.
   automatic gain compensation is applied (handled by EQ preamp or limiter if
   needed). Direct and DSP-off paths skip it.
 
-### Headphone crossfeed
+### Stereo image
 
-- Optional stereo-only stage (`crates/dsp-core/src/crossfeed.rs`) at the
-  source rate, placed before EQ so headphone-correction EQ stays last before
-  the transducer.
-- bs2b modes (`default`, `chu_moy`, `jan_meier`, `custom`) implement the
-  published bs2b design (cross low-pass, direct high shelf with its own
-  corner); `linkwitz` is a mono-flat complementary pair with a 0.3 ms
-  interaural delay. First-order IIRs, zero latency.
-- The stage scales both paths by one constant chosen at build time by
-  `level`: `matched` (default) keeps the A-weighted loudness of stereo pink
-  noise (correlation 0.5) unchanged; rare worst-case overs then clip at the
-  output unless the limiter is on or enough digital attenuation precedes the
-  quantizer; `peak_safe` uses the inverse of the worst-case
-  peak gain (L1 norm), so it never raises peaks. The EQ preamp stays
-  independent.
+- Stereo-only stage (`crates/dsp-core/src/crossfeed.rs`) at the source rate,
+  placed before EQ so headphone-correction EQ stays last before the
+  transducer.
+- Crossfeed modes `bs2b_default`, `bs2b_chu_moy`, `bs2b_jan_meier`,
+  `bs2b_custom` and `linkwitz` implement the published bs2b design (cross
+  low-pass, direct high shelf with its own corner), or Linkwitz's mono-flat
+  complementary pair with a 0.3 ms interaural delay. `bs2b_custom` takes a
+  cutoff (300..=2000 Hz) and feed (1..=15 dB); `none` runs the stage for its
+  width alone. First-order IIRs, zero latency.
+- Width (`width`, side gain 0..=2, 1 leaves the image unchanged) scales the
+  side signal after the crossfeed: 0 is mono, 2 twice as wide. `width_shape`
+  applies it at every frequency (`flat`) or above a corner only
+  (`above_bass`, corner 200..=2000 Hz), with a first-order high-pass on the
+  side's change. The mid is never changed, so mono passes bit-exact at every
+  width.
+- The crossfeed part scales both paths by one constant chosen at build time
+  that keeps the A-weighted loudness of stereo pink noise (correlation 0.5)
+  unchanged. The width is not loudness-compensated, so a step wider is
+  louder. Nothing cuts for safety: worst-case signals can exceed the input
+  peak by +1.4 to +5.6 dB, more with widening, and the limiter and the output
+  headroom catch it. The EQ preamp stays independent.
 
 ### Harmonic distortion
 
-- Optional Chebyshev polynomial waveshaper (`crates/dsp-core/src/harmonics.rs`)
-  placed after the upsampler (at the output rate) and before volume/quantizer.
-- Supports `triode` (dominant 2nd harmonic), `pentode` (dominant 3rd harmonic),
-  and `custom` per-harmonic levels (`h2_db`, `h3_db`, optional `h4_db`/`h5_db`).
+- The stage (`crates/dsp-core/src/harmonics.rs`) runs after the upsampler, at
+  the output rate, and before volume and the quantizer, so H2…H9 sit below
+  Nyquist when the ratio is high enough.
+- A Chebyshev layer sets H2…H9 (`levels_db`, dB relative to the
+  fundamental for a full-scale sine at drive 0 dB, `null` = off), a sign per
+  order (`signs`, `invert_even`), `drive_db` and `amount`, and can add a
+  frequency tilt, supply sag and bias shift.
   `y = x + Σ a_k (T_k(x) − T_k(0))` gives exact levels for a full-scale sine.
-  A 5 Hz DC blocker filters only the even (DC-making) part, and a certified
-  peak bound for the whole stage sets the output scale.
+  The terms are evaluated one by one (Chebyshev recurrence) as pure
+  distortion `D_k = T_k − T_k'(0)·x − T_k(0)`, with the linear parts on the
+  direct path (`L = 1 + Σ_odd a_k T_k'(0)`), ready for a filter per order.
+  A 5 Hz DC blocker filters only the even (DC-making) terms. The stage plays
+  at its natural gain; its certified peak bound is reported (and counted by
+  the A/B headroom), never applied as a cut.
+- The stage is a list of layers (Chebyshev curves, transformer or tape-core
+  flux, tape hysteresis), added in parallel or run in series. A layer preset
+  (`harmonics_presets.json`) fills one layer; a system preset
+  (`harmonics_systems.json`: a single-ended triode amp, a tube preamp into a
+  solid-state power amp, push-pull amps, a tube output stage, tape then
+  tubes) replaces the whole stage with layers and routing in one step. Either
+  way every layer stays editable and can be reset to its layer preset. The
+  Harmonics page offers systems at the top of its Layers panel (`avdsp ctl
+  harmonics systems` and `system <id>` on the command line).
 
 ### Bit-perfect bypass
 
 - Bypass copies samples straight through: no f64 round trip, exact
-  f32 → S24/S32 conversion.
-- The UI shows **Bit-perfect**, or **Not bit-perfect** because a volume is
-  not 100%, streams are mixing, the rate differs, or DSP is on (DSP and
-  upsampling are a choice, not a fault). Volumes are shown on the cubic
-  scale desktop sliders use (linear 0.27 is 65%).
+  f32 → S16/S24/S24_3/S32 conversion.
+- The UI shows "Bit-perfect", or "Not bit-perfect" because a volume is not
+  100%, streams are mixing, the rate differs, or DSP is on. Volumes are shown
+  on the cubic scale desktop sliders use (linear 0.27 is 65%).
 - Self-test: play a known signal and hash the bytes handed to ALSA. Users with
   S/PDIF loopback can also hash at the DAC input.
 
@@ -260,19 +286,16 @@ DSP bypass still copy samples unchanged.
   natively plays ×1, bit-perfect. At a rate the DAC lacks, the engine
   bypass resampler (`rate.bypass_resampler: "engine"`, the default) keeps
   the graph at the source rate and converts it to the native rate PipeWire
-  would have moved to, at a fixed L/M (the resample-only mode below; the
-  rate it picks is `DesiredDspConfig::bypass_landing`, which the arbiter,
-  the policies and the open ladder share). The converted rates are added
-  to each sink's native ones, never in their place, and only an app at
-  exactly such a rate runs the graph there (any other rate maps to a
-  native one), so a native rate is never converted and nothing is
-  converted twice. With `"pipewire"`, or for a pair the engine cannot
-  build (or is still building), the stream moves the graph to a native rate and
-  is resampled by PipeWire (reported as not bit-perfect); with no native
+  would have moved to, at a fixed L/M (the resample-only mode; the rate is
+  `DesiredDspConfig::bypass_landing`). Converted rates are added to each
+  sink's native ones, never in their place, and only an app at exactly such
+  a rate runs the graph there, so a native rate is never converted and
+  nothing is converted twice. With `"pipewire"`, or a pair the engine cannot
+  build (or is still building), the stream moves the graph to a native rate
+  and PipeWire resamples it (reported as not bit-perfect); with no native
   rate at all, Direct reports an error and the DSP path keeps working. DSP
-  off does the same on the DSP sink. If the graph does not follow the move
-  (another client fixes its rate), the open gives up with an error after a
-  bounded time (see "Playback modes and reopens").
+  off does the same on the DSP sink. A move the graph does not follow fails
+  the open after a bounded time (see "Playback modes and reopens").
 - The DAC period is the quantum PipeWire actually runs at the graph rate
   (power-of-two rounding included), so one graph cycle feeds one period.
   When PipeWire runs another quantum anyway, the extra cycles are spread out
@@ -297,31 +320,31 @@ DSP bypass still copy samples unchanged.
   high rates are large in bytes: S32 stereo at 3.072 MHz is 24.6 MB/s, and
   ALSA's `*_near` sizing shortens the buffer where a driver caps its size
   (USB audio commonly at 1 MiB, 42 ms there).
-- Dither targets at most the bit depth of the negotiated format (S16 → 16).
+- Dither targets the negotiated format's bit depth (S16 to 16 bits).
 
 Which rate wins is decided by `crates/io-pw/src/rate_arbiter.rs`, a pure
 function of the running clients, the current rate and the time since the
 last switch (unit-tested without PipeWire):
 
-- **Direct first.** Whatever plays into Audivane Direct (bit-perfect) decides,
-  and takes priority over the DSP sink, mapped onto the native (×1) rates
-  only.
-- **Agreeing clients are followed.** Each client's native rate is mapped to
-  an allowed rate; if all running DSP-sink clients map to the same one, the
+- Direct comes first: whatever plays into Audivane Direct (bit-perfect)
+  decides, takes priority over the DSP sink, and maps onto the native (×1)
+  rates only.
+- Agreeing clients are followed: each client's native rate is mapped to an
+  allowed rate, and if all running DSP-sink clients map to the same one, the
   graph runs at it.
-- **Disagreeing clients** follow `rate.conflict`: `keep_current` (default)
-  keeps the current rate while any client still plays at it, otherwise the
-  client that *started running first* wins (a per-client start sequence
-  number, never map iteration order); `highest` takes the highest native
-  rate; `default_rate` uses the default rate while they disagree.
-- **Minimum dwell.** No switch within 2 s of the previous one. A switch that
-  is still wanted when the dwell ends is made then (the PipeWire thread's
+- Disagreeing clients follow `rate.conflict`. `keep_current` (default) keeps
+  the current rate while any client still plays at it, otherwise the client
+  that started running first wins (a per-client start sequence number, never
+  map iteration order). `highest` takes the highest native rate, and
+  `default_rate` uses the default rate while they disagree.
+- Minimum dwell: no switch within 2 s of the previous one. A switch that is
+  still wanted when the dwell ends is made then (the PipeWire thread's
   100 ms timer re-checks), so it is delayed, not dropped.
-- **Our own fallout is ignored.** A switch reopens ALSA and makes clients
-  pause and resume. For 1.5 s after a switch (longer while the driver still
-  reports `Switching`, at most 6 s), a client that pauses and resumes keeps
-  its place in the start order, and no new switch is made while the driver
-  is still switching.
+- Our own fallout is ignored: a switch reopens ALSA and makes clients pause
+  and resume. For 1.5 s after a switch (longer while the driver still reports
+  `Switching`, at most 6 s), a client that pauses and resumes keeps its place
+  in the start order, and no new switch is made while the driver is still
+  switching.
 - Each distinct decision is logged once at info level with its reason, e.g.
   `Rate: kept 48000: Brave still playing at 48000; others are resampled`.
 
@@ -339,7 +362,7 @@ the registry map yields last wins the next round
   convolution, the upsampler, A/B, swaps) get its planar f64 output at the
   nominal rate and never see a variable ratio
   (`crates/daemon/src/engine/varispeed.rs`). With the stage off they get
-  the source block as before.
+  the source block unchanged.
 - The driver pulls about `s` times more source frames per period and
   schedules graph cycles by watermark instead of one per quantum
   (`crates/io-pw/src/varispeed_sched.rs`, `varispeed_rt.rs`); the speed
@@ -368,23 +391,24 @@ the registry map yields last wins the next round
   the master's chain, built for its device. Chain edits reach every
   follower; A/B stays on the master; followers mute in Direct and with DSP
   off.
-- The master is delayed up to 60 ms so the followers have source ahead; a
-  follower that needs more plays late by the rest (`unaligned`). While a
+- The master is delayed up to 120 ms so the followers have source ahead; a
+  follower that needs more plays late by the rest (`unaligned`), and steps
+  back to aligned once it no longer needs it. While a
   follower is configured the master's speed is capped at 1.996.
 - Configured in `EngineConfig.outputs.followers`, controlled live with
   `set_follower`, reported in `Status.outputs` (see
-  [control-plane.md](control-plane.md#multi-device-output)). With no
-  follower nothing changes.
+  [control-plane.md](control-plane.md#multi-device-output)).
 
 ### Pitch shift
 
 - Tempo-preserving, phase-coherent multichannel pitch shift in `f64`
   (Signalsmith Stretch, `crates/dsp-core/src/pitch.rs`), running at the source
   rate before EQ and convolution so transducer/room corrections stay at their
-  fixed physical frequencies.
-- Omitted from the chain (bit-exact bypass) when `cents == 0` or disabled;
-  reports its input + output latency in `latency_out` so A/B comparison stays
-  time-aligned.
+  fixed physical frequencies. Set in cents or semitones, or from one tuning
+  frequency to another (440 to 432 Hz); quality Low, High or Max.
+- Omitted from the chain (bit-exact bypass) when the effective shift is zero
+  or it is disabled; reports its input + output latency in `latency_out` so
+  A/B comparison stays time-aligned.
 
 ### EQ
 
@@ -405,13 +429,26 @@ the registry map yields last wins the next round
   (`tilt_high`) makes a two-section tilt: bass below X, treble above Y,
   0 dB between, both in one cascade. Bands lie within 20 Hz–20 kHz. Status
   exposes effective bounds and clamping for both A/B chains.
+- Bass and treble knobs (`tone`): a low shelf at 140 Hz and a high shelf at
+  4.9 kHz on every channel, ±6 dB, outside the band lists.
 - Automatic preamp from the peak boost, plus a clip and inter-sample-over meter.
 
 ### Convolution
 
 - Non-uniform partitioned FFT convolution: small first partitions for low
   latency, larger ones for long IRs.
-- On each rate change, resample the IR offline at high quality and swap it in.
+- On each rate change, resample the IR offline (its frequency response
+  kept) and swap it in.
+- An edit before an unchanged convolution (an EQ band) takes the playing
+  chain over in place: the new chain moves in its convolver and later
+  stages with their state, replaces it in the next period, and fades the
+  edit in at the convolution's input. An IR whose far taps cancel can take
+  the output past both settings' during the fade, so the chain bounds that
+  at build (`fade_bound.rs`) and picks the shortest fade within 0.125 FS,
+  or warms up instead. An edit that keeps the convolver's input copies its
+  state (budgeted per period); a new IR warms up for its ring (at most 1 s).
+  See [control-plane.md](control-plane.md#chain-wire-shapes-eq--convolution),
+  "Edits with a convolution loaded".
 
 ### Upsampling
 
@@ -428,7 +465,13 @@ the registry map yields last wins the next round
   `attenuation_db`), where the engine picks beta and the shortest length
   from the same calibrated transition width as "stop at Nyquist". Manual
   `taps` can count output taps or taps per input sample (the kernel then
-  lasts the same time at every ratio); band designs always do.
+  lasts the same time at every ratio); band designs always do. A band's
+  passband end may be an absolute frequency (`passband_end_hz`), converted
+  to a fraction of the Nyquist when the design is built (Recommended's and
+  the apodizing preset's 20 kHz at every rate, or a Custom design's "Hz"
+  unit), so its kernel shortens as the source rate rises; where the
+  frequency does not fit the band at a rate, the band's fraction stands in
+  and the design check notes it.
 - The fixed output headroom (`output.headroom_db`, 0..12 dB, at the end of
   the chain at every ratio) is folded into the kernel when no harmonics
   stage follows, so it costs nothing per sample there.
@@ -443,13 +486,59 @@ the registry map yields last wins the next round
   taper over the outer fraction of each half. Its stopband slopes down rather
   than sitting at a floor (65,535 taps x8, taper 0.25: about -111 dB from 2%
   past the cutoff, -152 dB from 10%), so it has no calibrated length formula
-  and is limited to fraction mode with linear phase.
+  and is limited to fraction mode with linear phase. On the preset paths
+  the Custom builder also takes the DPSS (Slepian) window, the sequence with
+  the most energy within `NW / N` of DC (Kaiser approximates it at `beta =
+  pi NW`). It is built in O(N) at any length: the Slepian tridiagonal
+  eigenproblem rewritten as a Sturm-Liouville recurrence in a small
+  eigenvalue (its row sums are constant), solved by bisection on the
+  solution shot from the edge; checked against scipy. Its stopband model is
+  Kaiser's at `beta = pi NW`, 12 dB short of the formula (Kaiser: 14); at
+  one length it is within about 2 dB of a Kaiser window of the best beta,
+  mostly deeper.
+- Optimal designs (the `optimal` kind): an equiripple (Parks-McClellan)
+  or least-squares low-pass over a band, no window, on the fir paths, with
+  every phase. Equiripple is a short-filter design: about 16 M^2 work per
+  exchange, capped at 4 095 grid taps (past 4.6k it fails at clusters of
+  lengths from about 90 dB) and a 150 dB automatic budget (f64 stops
+  levelling the ripple near 1e-10); started from the least-squares
+  design's error peaks. Its flat stopband adds up in every polyphase
+  branch, so it also needs the depth that keeps the branches' DC gains
+  within the safety gate (about 76 dB at x8): fixed lengths short of it,
+  or past what f64 levels, are refused from Kaiser's estimate. Least
+  squares is solved by conjugate gradients with FFT products, up to 65 535
+  taps; its error floors at 137 to 153 dB. Against Kaiser at one length
+  (x8, band 0.9 to 1.0 of the Nyquist, the engine's error against the DC
+  gain): equiripple within 2.5 dB of the best Kaiser beta, least squares 5
+  to 10 dB short; the automatic lengths for one budget: equiripple 4 to 8 %
+  shorter than Kaiser's, least squares 1 to 2 %.
+- `craven_apod`: Peter Craven's apodizing filter (JAES 52(3), 2004), fully
+  down by the source Nyquist so the recording's own brick-wall ringing
+  there is removed and replaced by a gentle transition from 20 kHz, at
+  every source rate (the passband is the audio band, not a fraction of the
+  Nyquist, so the kernel shortens as the rate rises), minimum phase: a
+  Kaiser band design at 150 dB with the reflected phase.
 - "Keep the input samples" (`preserve_samples`): a linear-phase design at
   cutoff 1.0 made into an exact Nyquist (M-th band) filter, 1 at the centre
   and 0 at every `ratio`-th tap from it, odd length. The response reports
   the leak at the input sample instants for every design.
 - FFT-based (zero-stuff, then FFT-convolve at the output rate). Direct
   polyphase with 100k taps at 16× costs about 9 GMAC/s, which is too much CPU.
+- The FFT polyphase engine (`resample::Upsampler`) convolves the `ratio`
+  polyphase branches with non-uniform partitions, on the convolver's engine
+  (`dsp_core::nupc`): stage 0 is uniform at the input block (the chain
+  block's power of two, 64..1024, so the latency is that block times the
+  ratio for every kernel), and a long kernel's later taps run in stages of
+  4x larger blocks up to 32768 (lower above x16, to bound the output
+  buffers), each with one forward transform and one delay line shared by
+  every branch, time-sliced over its period so the heaviest callback stays
+  close to the mean. The schedule (`nupc::polyphase_plan`) merges a stage
+  into the one before it while that is cheaper by the job cost model;
+  kernels up to about 20 base blocks per branch keep one stage, the
+  uniformly partitioned engine, bit for bit. 8M taps x16 from 44.1 kHz on
+  512-frame blocks costs about 6 % of a core per channel instead of 110 %,
+  no more than from 48 kHz; resident about 130 MiB of shared spectra plus
+  20-37 MiB per channel.
 - Kernels up to 8M taps (`design::budget::MAX_KERNEL_TAPS`). Building
   one may allocate at most the machine's design workspace, a quarter of
   the total RAM within 1.5 to 4 GiB, read once at start-up. Latency grows
@@ -465,7 +554,7 @@ sources use.
 
 - The ratio is `out / in = L/M`, reduced (`RateRatio`,
   `crates/protocol/src/ratio.rs`). Integer upsampling (`M = 1`) keeps the
-  FFT polyphase engine and is bit-identical to before; everything else runs
+  FFT polyphase engine; everything else runs
   on `crates/dsp-core/src/rational.rs`, a direct polyphase resampler: the
   kernel lives on the intermediate grid at `in × L`, and output `m` is one
   dot product of branch `(m M) mod L` (T taps) with the newest T input
@@ -519,18 +608,14 @@ sources use.
   an unbuildable ratio. A config change that alters the mask reopens the
   device when the running pair is no longer buildable or a fresh open would
   pick another ratio. The reopen checks predict a fresh open from what the
-  last one found: with a device probe, the first ladder entry the device
-  plays in a configured format (the check ALSA's open plan makes; the
-  `max_rate_any` ladder itself only lists such rates); without one, the
-  first entry the last open did not see refused. So DSP on/off, Direct/DSP
-  switches and edits always end where a fresh open would, and never reopen
-  into the same result; the states and transitions are in "Playback modes
-  and reopens" below. If a chain
+  last one found (see "Playback modes and reopens" below), so DSP on/off,
+  Direct/DSP switches and edits end where a fresh open would, and never
+  reopen into the same result. If a chain
   still fails to build at a fractional ratio, the upsampler on both A/B
   sides (always equal) is replaced by a safe design (256 taps per sample at
   the lower of the two rates, flat to about 0.93 of the lower Nyquist); EQ,
   convolution and A/B keep running, and status says so. The last resort plays chain A's upsampler with
-  its limiter (a safety stage, always kept) and pitch, crossfeed and
+  its limiter (a safety stage, always kept) and pitch, stereo image and
   harmonics where they build, and says what was dropped (EQ, convolution,
   A/B, and any of those stages that did not build).
 
@@ -585,18 +670,16 @@ the resample-only chain, and the DSP sink never plays it.
   refills, then builds ahead of time, in a bounded queue; an edit of the
   output section or quantum drops queued work for the old ones, and a
   device or bypass mode change drops all queued work but what the edit
-  itself waits for. A design only answers for the negotiation and the edit
-  that asked for it: an edit's chain is published only in the negotiation
-  it was asked in, and a design from an older design epoch (bumped by an
-  edit of the device, the capped output section, the quantum or the bypass
-  mode) is not reported to the driver; the driver hears of the new epoch
-  instead and releases the pairs it held for the old designs. An edit
+  itself waits for. A design answers only the negotiation and edit that
+  asked for it: an edit's chain is published only in that negotiation, and a
+  design from an older epoch (bumped by an edit of the device, the capped
+  output section, the quantum or the bypass mode) is not reported; the
+  driver hears of the new epoch and releases the pairs it held. An edit
   waiting for its chain (a DSP toggle at the same ratio) carries over a
-  volume change; when the design fails or the edit is superseded, the
-  outgoing chain's hold ends (silence until the reopen, as a toggle with
-  no chain on its way). Only the chain the toggle waits for ends the hold
-  when it installs: an older swap of the outgoing kind (an edit just
-  before the toggle) does not.
+  volume change; if the design fails or the edit is superseded, the
+  outgoing chain's hold ends (silence until the reopen). Only the chain the
+  toggle waits for ends the hold when it installs: an older swap of the
+  outgoing kind (an edit just before the toggle) does not.
 - A sink switch or an edit reopens the device when a fresh open would land
   on another ratio (`decide_rt_reopen`), and never into the same result.
   A switch to a sink that has no chain for the running ratio (none
@@ -668,6 +751,66 @@ The states, as the control and RT threads see them:
    daemon may pause the players whose streams go through Audivane over
    MPRIS when the device goes (`device_lost`, see control-plane.md).
 
+### Channel workers
+
+With `channel_workers` on (the default), the main output's DSP chains run
+their per-channel stages on one thread per channel (`dsp_core::workers`,
+`dsp_core::chain` "Channel workers"). The split point is the stereo image: DC
+block, pitch (phase-coherent across channels) and the stereo image run whole
+on the audio thread; then each channel's EQ → convolution → upsampler →
+harmonics → output headroom runs as its own single-channel copy of each
+stage (kernel spectra, IR spectra and FFT tables shared, read-only; scratch
+and per-channel state per thread), channel 0 on the
+audio thread and channel 1 on a worker; then everything that couples the
+channels runs on the audio thread (A/B delay, meter, mix and
+level, volume and balance, the limiter's one gain, quantizer and dither,
+peaks and clip counts). Each copy computes its channel exactly as the
+whole stage does, so the output is bit for bit the single-threaded one. A
+convolution filter matrix (`dsp_core::matrix`) couples the channels too:
+with one, the EQ and the matrix also run whole on the audio thread, and
+the lanes start at the upsampler.
+
+- Handoff: per block the audio thread copies each channel in, stores
+  the lane into the worker's slot (an `Arc` clone and one futex wake), runs
+  its own lane, then waits: a 20 µs spin, then a futex wait on the slot
+  with a timeout. The worker sleeps on a futex between blocks. No locks, no
+  allocation. A worker takes lanes only once its start (the rtkit call)
+  has returned; until then the audio thread runs them. The worker drops
+  its reference to a lane before it hands it back, and a chain dropped
+  while a worker still holds one of its lanes waits for it (off the audio
+  thread, up to 10 s, then leaks it), so a lane's memory is always freed
+  where the chain is dropped, never on a worker.
+- Deadline: two block durations (at least 2 ms) from the handoff. Up to
+  one block late the stream underruns as an overloaded single-threaded
+  chain would, and the overload fallback sees it. Past the deadline the
+  worker still holds that lane's state, so the chain plays digital silence,
+  block by block with its frame grid advancing, until the lane is back,
+  then resets (as `reset_to` at its grid position) and plays on. A worker
+  still busy when a block starts gets no lane: the audio thread runs it.
+  A panic on a worker poisons the chain: from that block on it plays
+  silence (never the lane's half-written buffers) until it is rebuilt.
+  Volume, balance and mute ramps keep moving through silent blocks, so a
+  mute set during a stall is done when sound comes back. The pool counts
+  late blocks, inline lanes and panics; the daemon logs them every
+  overload tick (100 ms).
+- Priority: the pool (one worker for the engine's two channels, none on
+  a single core) starts with the first chain that wants it; each worker
+  asks rtkit for real time at the audio thread's priority, best effort, as
+  the audio thread does. A worker is under the audio loop's overload guard
+  (see "Overload"): it registers as a helper of the audio thread, so the
+  `SIGXCPU` handler demotes it by id whichever thread takes the signal,
+  and it runs a `RunGuard` between jobs (a 100 µs nap after 50 ms without
+  a sleep). Its priority follows the audio thread's: every overload tick
+  the daemon demotes a real-time worker while the audio thread is demoted,
+  and promotes it again (through rtkit, retried every 30 s when refused)
+  once the audio thread is real-time again.
+- Measuring: `cargo run --profile fastrel -p audivane-dsp-core
+  --example bench_channel_workers -- 16 8388608` times a block with and
+  without the worker and checks the two outputs are identical. On one
+  test machine, 44.1 kHz ×16 with an 8 Mi-tap kernel goes from 94 %
+  of a block to 49 % (1.9×); light chains lose about 0.1 ms per block to
+  the handoff.
+
 ### Overload
 
 A chain that costs more than real time must never take the engine down.
@@ -678,10 +821,10 @@ uses without sleeping (reset only when it wakes from a sleep), sends
 `SIGXCPU` at the soft limit (then raises the soft limit by 1 s), and
 `SIGKILL`s the process at the hard one. An overloaded audio thread never
 sleeps (the device buffer is always short), so with soft = hard the process
-was killed 200 ms in, restarted with the same config by systemd, and killed
-again until the unit's start limit stopped it.
+would be killed 200 ms in, restarted with the same config by systemd, and
+killed again until the unit's start limit stopped it.
 
-- **Prevention** (`io_alsa::RunGuard`, in the RT loop and after its wait):
+- Prevention (`io_alsa::RunGuard`, in the RT loop and after its wait):
   the thread's voluntary context switch count tells when it last really
   slept. After 50 ms without one, and only while the thread is real-time,
   it sleeps 100 µs, which resets the kernel's count (any sleep that blocks
@@ -690,12 +833,14 @@ again until the unit's start limit stopped it.
   30 ms soft limit): an overloaded thread stays real-time and keeps playing
   (with underruns) for 0.2 % less work. 50 ms is half the soft limit and
   counts work only (a period that waits for the device sleeps in it).
-- **Backstop** (`io_alsa::rt`): the soft limit is half the hard one
+- Backstop (`io_alsa::rt`): the soft limit is half the hard one
   (100 ms), with a `SIGXCPU` handler. The kernel sends the signal to the
   process and delivers it to the thread that ran over, or to any other
   thread when that one blocks it, so the handler demotes the thread it runs
-  on when that one is real-time, and the registered audio thread by its id
-  (`register_audio_thread`), each with one `sched_setscheduler` call
+  on when that one is real-time, the registered audio thread by its id
+  (`register_audio_thread`), and every registered helper by its id
+  (`register_helper_thread`: the channel workers), each with one
+  `sched_setscheduler` call
   keeping `SCHED_RESET_ON_FORK` (an unprivileged thread cannot clear it).
   It counts the signal and, separately, each demotion of the audio thread
   the kernel accepted. Signal masks are left alone: blocking `SIGXCPU`
@@ -709,7 +854,7 @@ again until the unit's start limit stopped it.
   priority already is no demotion. It restores the soft limit the kernel
   raised; the driver's control thread keeps the soft limit at half and promotes the
   thread again through rtkit after 2 s under 80 % load with no xrun.
-- **PipeWire contexts** (`io_pw::rt_context`): PipeWire's RT module, which
+- PipeWire contexts (`io_pw::rt_context`): PipeWire's RT module, which
   the default `client.conf` loads for client contexts from PipeWire 1.4.0
   on (1.0.5 and 1.2.8 do not; 1.0.5 loads it in `client-rt.conf` only),
   sets `RLIMIT_RTTIME` for the whole process, through rtkit to soft =
@@ -720,7 +865,7 @@ again until the unit's start limit stopped it.
   the engine's own limits and the data threads stay real-time.
   (`rlimits.enabled = false` would not help: the rtkit path sets the limits
   regardless.) The periodic repair stays as the second line.
-- **Fallback** (`daemon::control::overload`): a second of load at or above
+- Fallback (`daemon::control::overload`): a second of load at or above
   real time, underruns in 10 % of the processed periods, or a latched
   demotion makes the engine run, as staged steps committed only once the
   engine accepts them and only where the device can play them: while
@@ -729,55 +874,61 @@ again until the unit's start limit stopped it.
   through `Engine::set_varispeed_hold`, with no config change, so the
   attempt is the running chain's generation under the hold's sequence,
   which lands once the audio thread acknowledges it, and later steps keep
-  the stage off), then the last
-  upsampler that ran in this daemon run, then the upsampler off, then
-  bypass (through the engine bypass resampler's resample-only chain where
-  the DAC lacks the graph rate), and only when neither lands (every DAC
-  rate above the graph rates) the bypass resampler's design at the
-  requested rate. Nothing is judged until the step's chain runs (or ten
-  seconds pass). Each config accepted for the step in effect, and each
-  new DAC behind the same name, is an attempt with its own readiness,
-  timeout and confirmation: an `Error` fails it only after the device
-  answered a probe during it (the driver re-probes after a failed open and
-  drops stale capabilities), and ten seconds in `Switching` with a client
-  streaming fails it. A failed attempt, a refusal or a lost landing moves
-  to the next step that plays (lighter first, then from the top, each once
-  per device and policy); when none is left the fallback ends, retried
-  while the engine refuses. The startup config is judged like an edit, so
-  it can be the one step 1 goes back to. A demotion is published with the
-  generation that ran on the audio thread
+  the stage off), then A/B off (keeping chain A), then the last upsampler
+  that ran in this daemon run, then the upsampler off, then bypass (through
+  the engine bypass resampler's resample-only chain where the DAC lacks the
+  graph rate), and only when bypass does not land (every DAC rate above the
+  graph rates) the bypass resampler's design at the requested rate. Nothing
+  is judged until the step's chain runs (or ten seconds pass). Each config
+  accepted for the step in effect, and each new DAC behind the same name, is
+  an attempt with its own readiness, timeout and confirmation: an `Error`
+  fails it only after the device answered a probe during it (the driver
+  re-probes after a failed open and drops stale capabilities), and ten
+  seconds in `Switching` with a client streaming fails it. A failed attempt,
+  a refusal or a lost landing moves to the next step that plays (lighter
+  first, then from the top, each once per device and policy); when none is
+  left the fallback ends, retried while the engine refuses. The startup
+  config is judged like an edit, so it can be the one step 1 goes back to. A
+  demotion is published with the generation that ran on the audio thread
   (`EngineAudioProcessor::running_generation`: the active chain or one
   warming up next to it) and counts against that chain only. The notice
-  names the cause (load, underruns, demotion). The `SIGXCPU` handler is installed when the process starts,
-  before any filter design. The saved config is never touched, so a restart with the
-  same config falls back the same way.
-- **Admission** (`daemon::control::cpu_budget`): a new upsampler is
+  names the cause (load, underruns, demotion). The `SIGXCPU` handler is
+  installed when the process starts, before any filter design. The saved
+  config is never touched, so a restart with the same config falls back the
+  same way.
+- Admission (`daemon::control::cpu_budget`): a new upsampler is
   estimated per runtime path (the design's `Plan::callback`,
   `design::budget::Callback`) where the driver would land it (its rate
   policy and ratio ladder, `engine::predicted_landings`; integer FFT
   polyphase: blocks of partitions × branches × bins plus `1 + r`
-  transforms; rational: output rate × taps per output frame; cascades,
+  transforms, and with non-uniform partitions the heaviest callback: each
+  tail stage's period sliced as the runtime slices it, its jobs priced per
+  kind at the measured FFT and spectral rates, the heaviest callback-long
+  window anywhere in the period plus a 15 % margin; rational: output rate × taps per output frame; cascades,
   interpolators and block FFT from their structure) against kernel rates
   measured at engine start (`dsp_core::cpu_bench`, ~0.2 s; measured again
-  when under a conservative floor, then floored), and refused above three
-  quarters of a core (`RT_BUDGET`, published as `status.limits.cpu_share`
+  when under a conservative floor, then floored), and refused above 90 % of
+  a core (`RT_BUDGET`, published as `status.limits.cpu_share`
   with the tap limits and the design workspace cap). Measured against real callbacks (stereo, 1024-frame
   blocks, optimised build): 0.9 to 1.2x for the FFT engine, cascades, table
   sinc and block FFT, about 2x (on the safe side) for the rational runtime,
-  the recursive cascades and the polynomial interpolators.
+  the recursive cascades and the polynomial interpolators. On non-uniform
+  partitions (1M to 8M taps, 44.1 to 192 kHz) the estimate is 1.4 to 1.6x the
+  measured mean and 1.15 to 1.4x the 99th percentile of a callback (held to
+  at least 1x).
 
 ### Known limitations
 
 Rare timing cases the driver does not handle yet:
 
-- **An underrun during the carry's room check.** If ALSA reports an
-  underrun while the driver asks how much room there is (`avail()`
-  recovers by preparing the device), the carried frames go into the
-  prepared device and the following prefill discards them.
-- **A missing clock read counts as a landing.** When the PipeWire clock
-  cannot be read, the driver assumes the graph runs at the opened rate,
-  which counts as the graph having followed a move. An unstable clock can
-  so restart the 3 s give-up of a pinned graph more than once.
+- An underrun during the carry's room check: if ALSA reports an underrun
+  while the driver asks how much room there is (`avail()` recovers by
+  preparing the device), the carried frames go into the prepared device and
+  the following prefill discards them.
+- A missing clock read counts as a landing: when the PipeWire clock cannot be
+  read, the driver assumes the graph runs at the opened rate, which counts as
+  the graph having followed a move. An unstable clock can so restart the 3 s
+  give-up of a pinned graph more than once.
 
 ### Volume
 
@@ -805,12 +956,13 @@ Rare timing cases the driver does not handle yet:
 
 - Applied exactly once, at the final quantization to the DAC's integer format:
   TPDF by default, noise shaping optional.
-- Never applied in bypass.
+- In bypass it runs only where the engine applies digital volume; at unity the
+  path is bit-exact and no dither is added.
 
 ### A/B level matching
 
 - Both chains run in parallel all the time, so switching is a ~10 ms crossfade
-  with no gap.
+  with no gap (a 5 ms fade out then in when their delays differ).
 - Level matching is static per comparison, never a moving AGC (which would
   pump). It never boosts: for B's offset `o`, A plays at `min(0, −o)` dB and
   B at that plus `o`. A shared headroom (`auto` from each side's predicted
@@ -818,8 +970,8 @@ Rare timing cases the driver does not handle yet:
   not clip and the comparison stays fair.
 - Default (analytic): integrate |H_A(f)|² and |H_B(f)|² over a 20 Hz–20 kHz
   pink reference, K-weighted (BS.1770, as LUFS; A-weighting optional). The
-  terms: DC block, EQ, crossfeed at correlation 0.5, the IRs' magnitude, and
-  the upsamplers' when their designs differ. It matches LUFS on that
+  terms: DC block, EQ, stereo image at correlation 0.5, the IRs' magnitude,
+  and the upsamplers' when their designs differ. It matches LUFS on that
   reference to about 0.01 dB.
 - Alternative (measured): live track matching via `ab_measure`, or offline
   via `avdsp levelmatch --measure` over a file.
@@ -839,7 +991,7 @@ React/TypeScript.
 | File I/O | `hound` | Impulse responses, test WAVs |
 | IPC | Newline-delimited JSON over a Unix socket | See [control-plane.md](control-plane.md) |
 | UI | Tauri 2 + React/TypeScript | Canvas meters and plots; tray via StatusNotifierItem |
-| Packaging | `.deb`, `.rpm`, Arch package + systemd user unit | Flatpak is a poor fit for direct ALSA access and a user service |
+| Packaging | `.deb`, `.rpm`, Arch package, AppImage + systemd user unit | Flatpak is a poor fit for direct ALSA access and a user service |
 
 **Licensing (AGPL-3.0-only):** PipeWire libraries are MIT; alsa-lib is LGPL,
 fine to link dynamically.

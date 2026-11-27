@@ -1,10 +1,9 @@
 //! The stopband model of each window on the preset paths: how deep a
 //! windowed sinc with a given window can go (its nominal attenuation), and
-//! how far past
-//! the cutoff its response stays within an error of `-a` dB (its half
-//! transition). The band and stop-at-Nyquist rules take their lengths and
-//! cutoffs from it, the automatic search its start, the reflected phase
-//! its contract.
+//! how far past the cutoff its response stays within an error of `-a` dB
+//! (its half transition). The band and stop-at-Nyquist rules take their
+//! lengths and cutoffs from it, the automatic search its start, the
+//! reflected phase its contract.
 //!
 //! Distances are in window bins (`1 / N` cycles per grid sample for an
 //! N-tap kernel): a cosine-sum window's spectrum has the same shape in bins
@@ -19,6 +18,7 @@
 //! | Gaussian alpha | `10 / (alpha^2 ln 10) + 15` dB (the truncation edge's depth + 15), at most 270 | `1.1 sqrt(2) / (pi alpha) erfcinv(2 delta)` bins |
 //! | Chebyshev r, `symmetric` | `-20 log10 r + 2` dB | the main lobe, exactly: `N acos(1 / x0) / pi`, `x0 = cosh(acosh(1/r) / (N - 1))` |
 //! | Chebyshev r, `periodic` | as symmetric, less `0.17 (S - 150)` above `S = 150` dB sidelobes | as symmetric |
+//! | DPSS nw (1 ..= 10), `symmetric` | `beta / 0.1102 + 8.7 - 12` dB at `beta = pi nw`, at most 270 | the main lobe, `sqrt(nw^2 + 1)` bins (Kaiser's at `beta = pi nw`) |
 //! | Hann, Nuttall, flat-top | 90, 120, 210 / 230 / 250 dB | measured table ([`TABLES`]) |
 //!
 //! Tukey has no model (no calibrated stopband), nor has the `standard`
@@ -34,6 +34,37 @@ pub const KAISER_SHORTFALL_DB: f64 = 14.0;
 
 /// The Kaiser beta range the model is measured over.
 pub const KAISER_BETA_RANGE: (f64, f64) = (2.0, 30.0);
+
+/// The DPSS time-bandwidth range the model is measured over (Kaiser's
+/// [`KAISER_BETA_RANGE`] at `beta = pi nw`, about).
+pub const DPSS_NW_RANGE: (f64, f64) = (1.0, 10.0);
+
+/// How far short of Kaiser's formula at `beta = pi nw` a DPSS-windowed
+/// sinc's error is past `dpss_half_bins` (measured by `calibrate_dpss`:
+/// at most 11.5 dB, nw 7; 9.3 at nw 4; Kaiser's own is 14).
+pub const DPSS_SHORTFALL_DB: f64 = 12.0;
+
+/// The DPSS model's factor on Kaiser's main lobe at `beta = pi nw`
+/// (measured by `calibrate_dpss`: the error is under the nominal level
+/// from 0.99 of it on, every nw).
+const DPSS_FACTOR: f64 = 1.0;
+
+/// The DPSS half transition in bins: the main lobe, `sqrt(nw^2 + 1)` times
+/// [`DPSS_FACTOR`].
+fn dpss_half_bins(nw: f64) -> f64 {
+    DPSS_FACTOR * (nw * nw + 1.0).sqrt()
+}
+
+/// The DPSS nominal attenuation, dB.
+fn dpss_nominal_db(nw: f64) -> f64 {
+    (crate::resample::kaiser_attenuation_db(PI * nw) - DPSS_SHORTFALL_DB).min(F64_FLOOR_DB)
+}
+
+/// The time-bandwidth product whose nominal attenuation is `a` dB (the
+/// model inverted; a band or automatic length derives it so).
+pub fn dpss_nw_for(a: f64) -> f64 {
+    crate::window::kaiser_beta_for_attenuation(a + DPSS_SHORTFALL_DB) / PI
+}
 
 /// The Gaussian model's factor over the analytic transition (measured at
 /// most 1.067, alpha 0.05, up to 15 dB past the truncation edge).
@@ -219,6 +250,9 @@ pub fn nominal_db(w: &Window) -> Option<f64> {
             };
             (s + 2.0 - periodic).min(F64_FLOOR_DB)
         }
+        Window::Dpss { nw: Some(nw), .. } if (DPSS_NW_RANGE.0..=DPSS_NW_RANGE.1).contains(&nw) => {
+            dpss_nominal_db(nw)
+        }
         _ => table(w)?.last()?.0,
     })
 }
@@ -246,6 +280,7 @@ pub fn half_width_bins(w: &Window, a: f64, n: usize) -> Option<f64> {
     let a = a.min(nominal);
     match *w {
         Window::Kaiser { beta: Some(b), .. } => Some((b * b + PI * PI).sqrt() / PI),
+        Window::Dpss { nw: Some(nw), .. } => Some(dpss_half_bins(nw)),
         Window::Gaussian { alpha, .. } => {
             let delta = 10f64.powf(-a.max(1.0) / 20.0);
             Some(
@@ -611,6 +646,42 @@ mod calibration {
                 }
             }
             println!("gauss {alpha}: edge {edge:.1} dB, factor (+15/20/25) {k_worst:.3?}");
+        }
+    }
+
+    /// The DPSS model: the attenuation from `dpss_half_bins` on, against
+    /// Kaiser's formula at `beta = pi nw` (the shortfall), and the factor
+    /// on the main lobe the error needs to fall under the nominal level.
+    #[test]
+    #[ignore]
+    fn calibrate_dpss() {
+        use crate::design::{Sampling, Window as W};
+        for nw in [
+            1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 8.5, 9.0, 9.5, 10.0,
+        ] {
+            let a = crate::resample::kaiser_attenuation_db(std::f64::consts::PI * nw);
+            let b = (nw * nw + 1.0f64).sqrt();
+            let mut short = f64::NEG_INFINITY;
+            let mut fac = [0.0f64; 3];
+            for &(t, l) in CASES {
+                for &fc in &[0.9, 0.95, 1.0] {
+                    for s in [Sampling::Symmetric] {
+                        let win = Window::Other(W::Dpss {
+                            nw: Some(nw),
+                            sampling: s,
+                        });
+                        let p = profile(&proto(win, t, l, fc), l, fc);
+                        short = short.max(a - att_at(&p, b));
+                        for (j, m) in [12.0, 14.0, 16.0].into_iter().enumerate() {
+                            fac[j] = fac[j].max(x_for(&p, a - m) / b);
+                        }
+                    }
+                }
+            }
+            println!(
+                "dpss {nw}: A {a:.1}, shortfall at sqrt(nw^2+1) = {b:.2} bins: {short:.2} dB; \
+                 x(A - 12/14/16) / B {fac:.3?}"
+            );
         }
     }
 

@@ -17,8 +17,9 @@ use audivane_dsp_core::resample::{Upsampler, UpsamplerDesign};
 use audivane_dsp_core::tempo::{TempoSpec, TempoStretch};
 use audivane_dsp_core::varispeed::{MAX_FRAMES, Varispeed, VarispeedSpec};
 use audivane_protocol::{
-    Band, ChainConfig, ChannelEq, ConvolutionConfig, CrossfeedConfig, CrossfeedMode, DcBlockConfig,
-    DitherKind, EqProfile, FilterPhase, FilterType, HarmonicsCharacter, HarmonicsConfig,
+    Band, ChainConfig, ChannelEq, ChebyshevLayer, ConvolutionConfig, CrossfeedConfig,
+    CrossfeedMode, DcBlockConfig, DitherKind, EqProfile, FilterPhase, FilterType,
+    HARMONICS_DEFAULT_SIGNS, HarmonicsBias, HarmonicsConfig, HarmonicsLayer, HarmonicsSag,
     OutputConfig, PitchConfig, PitchQuality, RateTarget, TiltConfig, TiltPivot, UpsamplerConfig,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -29,7 +30,13 @@ struct Counting;
 thread_local! {
     static ARMED: Cell<bool> = const { Cell::new(false) };
     static COUNT: Cell<usize> = const { Cell::new(0) };
+    /// A channel worker's thread: everything it does after its start hook
+    /// counts in [`WORKER_COUNT`].
+    static WORKER: Cell<bool> = const { Cell::new(false) };
 }
+
+/// Heap operations on channel worker threads since their start.
+static WORKER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn note() {
     let _ = ARMED.try_with(|armed| {
@@ -37,6 +44,34 @@ fn note() {
             COUNT.with(|c| c.set(c.get() + 1));
         }
     });
+    let _ = WORKER.try_with(|worker| {
+        if worker.get() {
+            WORKER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
+/// A pool whose workers count their heap operations.
+fn counted_pool(workers: usize) -> std::sync::Arc<audivane_dsp_core::workers::LanePool> {
+    let pool =
+        audivane_dsp_core::workers::LanePool::spawn(workers, |_| WORKER.with(|w| w.set(true)))
+            .unwrap();
+    // Started: the lanes go to the workers, not inline.
+    assert!(pool.wait_started(std::time::Duration::from_secs(10)));
+    pool
+}
+
+/// [`assert_no_alloc`] on this thread and on every channel worker.
+fn assert_no_alloc_with_workers<R>(what: &str, f: impl FnOnce() -> R) -> R {
+    use std::sync::atomic::Ordering;
+    let before = WORKER_COUNT.load(Ordering::SeqCst);
+    let result = assert_no_alloc(what, f);
+    let count = WORKER_COUNT.load(Ordering::SeqCst) - before;
+    assert_eq!(
+        count, 0,
+        "{what}: {count} heap operations on channel workers"
+    );
+    result
 }
 
 unsafe impl GlobalAlloc for Counting {
@@ -169,6 +204,8 @@ fn full_config(dither: DitherKind) -> ChainConfig {
             enabled: true,
             ir_path: "unused.wav".into(),
             gain_db: -1.0,
+            matrix: None,
+            calibration: false,
         }],
         upsampler: audivane_dsp_core::resample::ManualConfig {
             target: RateTarget::Ratio(2),
@@ -182,10 +219,89 @@ fn full_config(dither: DitherKind) -> ChainConfig {
             cents: -31.77,
             ..Default::default()
         },
+        // Every order up to H9, so the whole term-by-term loop runs, a
+        // tilted layer (the filtered loop), plus two flux layers.
         harmonics: Some(HarmonicsConfig {
+            system: None,
             enabled: true,
-            character: HarmonicsCharacter::Triode,
-            ..Default::default()
+            layers: vec![
+                HarmonicsLayer::Chebyshev(ChebyshevLayer {
+                    enabled: true,
+                    preset: None,
+                    levels_db: [
+                        Some(-40.0),
+                        Some(-58.0),
+                        Some(-70.0),
+                        Some(-75.0),
+                        Some(-80.0),
+                        Some(-85.0),
+                        Some(-90.0),
+                        Some(-95.0),
+                    ],
+                    signs: HARMONICS_DEFAULT_SIGNS,
+                    invert_even: false,
+                    drive_db: -3.0,
+                    amount: 0.8,
+                    tilt: None,
+                    sag: None,
+                    bias: None,
+                }),
+                // A layer with sag and bias (runs on its own).
+                HarmonicsLayer::Chebyshev(ChebyshevLayer {
+                    sag: Some(HarmonicsSag {
+                        depth_db: 3.0,
+                        attack_ms: 1.0,
+                        release_ms: 20.0,
+                    }),
+                    bias: Some(HarmonicsBias {
+                        depth: -0.1,
+                        attack_ms: 5.0,
+                        release_ms: 50.0,
+                    }),
+                    ..match HarmonicsConfig::from_preset("se_triode_high_mu")
+                        .unwrap()
+                        .layers
+                        .remove(0)
+                    {
+                        HarmonicsLayer::Chebyshev(l) => l,
+                        _ => unreachable!(),
+                    }
+                }),
+                // A tilted layer with sag and bias (per-order filters in
+                // its own run).
+                HarmonicsLayer::Chebyshev(ChebyshevLayer {
+                    sag: Some(HarmonicsSag {
+                        depth_db: 2.0,
+                        attack_ms: 1.0,
+                        release_ms: 20.0,
+                    }),
+                    bias: Some(HarmonicsBias {
+                        depth: 0.1,
+                        attack_ms: 5.0,
+                        release_ms: 50.0,
+                    }),
+                    ..match HarmonicsConfig::from_preset("pp_pentode_feedback")
+                        .unwrap()
+                        .layers
+                        .remove(0)
+                    {
+                        HarmonicsLayer::Chebyshev(l) => l,
+                        _ => unreachable!(),
+                    }
+                }),
+                HarmonicsConfig::from_preset("solid_state_feedback")
+                    .unwrap()
+                    .layers[0]
+                    .clone(),
+                HarmonicsConfig::from_preset("output_transformer")
+                    .unwrap()
+                    .layers[0]
+                    .clone(),
+                HarmonicsConfig::from_preset("tape").unwrap().layers[0].clone(),
+                HarmonicsConfig::from_preset("tape_studio").unwrap().layers[0].clone(),
+            ],
+            dc_block: true,
+            routing: Default::default(),
         }),
         output: OutputConfig {
             bits: 16,
@@ -217,7 +333,7 @@ fn chain_and_ab_chain_do_not_allocate() {
         channels,
         max_block,
         // Long enough for every non-uniform stage, including the capped one.
-        irs: Some(long_irs(channels, 100_000)),
+        irs: Some(long_irs(channels, 100_000).into()),
     };
     let mut chain = Chain::new(spec(DitherKind::Shaped));
     // Analytic K offset and auto headroom, as the daemon builds a pair.
@@ -227,6 +343,10 @@ fn chain_and_ab_chain_do_not_allocate() {
     );
     let mut b_config = full_config(DitherKind::Shaped);
     b_config.eq = None;
+    // B runs the same harmonics layers in series.
+    if let Some(h) = &mut b_config.harmonics {
+        h.routing = audivane_protocol::HarmonicsRouting::Series;
+    }
     let mut ab = AbChain::new(
         spec(DitherKind::Shaped),
         ChainSpec {
@@ -332,6 +452,146 @@ fn chain_and_ab_chain_do_not_allocate() {
     });
 }
 
+/// The chains of [`chain_and_ab_chain_do_not_allocate`] on channel workers:
+/// the handoff, the waits, the lanes, a late worker's silence and the
+/// recovery reset allocate nothing, on the audio thread or the workers.
+#[test]
+fn chains_on_channel_workers_do_not_allocate() {
+    let channels = 2;
+    let max_block = 256;
+    let workers = counted_pool(1);
+    let spec = |config| ChainSpec {
+        config,
+        sample_rate: 48_000,
+        channels,
+        max_block,
+        irs: Some(long_irs(channels, 100_000).into()),
+    };
+    let mut chain = Chain::new(spec(full_config(DitherKind::Shaped)));
+    assert!(chain.attach_workers(&workers));
+    let level = audivane_dsp_core::ab_level::AbLevel::from_config(
+        &audivane_protocol::ipc::LevelMatch::default(),
+        audivane_protocol::ipc::AbHeadroom::Auto,
+    );
+    let mut b_config = full_config(DitherKind::Resonant5);
+    b_config.eq = None;
+    // Series here.
+    if let Some(h) = &mut b_config.harmonics {
+        h.routing = audivane_protocol::HarmonicsRouting::Series;
+    }
+    b_config.output.bits = 16;
+    let mut ab =
+        AbChain::new(spec(full_config(DitherKind::Shaped)), spec(b_config), level).unwrap();
+    assert!(ab.attach_workers(&workers));
+    let mut seed = 19;
+    let input: Vec<f32> = (0..max_block * channels)
+        .map(|_| (lcg(&mut seed) * 0.5) as f32)
+        .collect();
+    let mut out = vec![0i32; max_block * channels * 2];
+    let plan = sizes(max_block, 105_000);
+    assert_no_alloc_with_workers("Chain on workers", || {
+        for &n in &plan {
+            chain.process_f32(&input[..n * channels], &mut out);
+        }
+        chain.reset();
+        for &n in &plan[..200] {
+            chain.process_f32(&input[..n * channels], &mut out);
+        }
+    });
+    assert_no_alloc_with_workers("AbChain on workers", || {
+        for (i, &n) in plan.iter().enumerate() {
+            if i % 300 == 0 {
+                let side = if (i / 300) % 2 == 0 { Side::B } else { Side::A };
+                ab.select(side, 480);
+            }
+            ab.process_f32(&input[..n * channels], &mut out);
+        }
+        ab.reset();
+    });
+    // A late worker: silence, then the reset when its lane is back.
+    workers.stall_next(0, std::time::Duration::from_millis(40));
+    assert_no_alloc_with_workers("Chain with a late worker", || {
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_millis(80) {
+            chain.process_f32(&input[..max_block * channels], &mut out);
+        }
+        for _ in 0..50 {
+            chain.process_f32(&input[..max_block * channels], &mut out);
+        }
+    });
+    assert!(
+        workers
+            .stats()
+            .late_blocks
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 1
+    );
+}
+
+/// The live harmonics tap ([`Chain::set_harmonics_tap`]): the copies of
+/// the stage's input and output, the sag/bias reads and the tap's view, on
+/// one thread and on channel workers, in a single chain and chain A of a
+/// pair, allocate nothing.
+#[test]
+fn harmonics_tap_does_not_allocate() {
+    let channels = 2;
+    let max_block = 256;
+    let spec = |config| ChainSpec {
+        config,
+        sample_rate: 48_000,
+        channels,
+        max_block,
+        irs: Some(long_irs(channels, 100_000).into()),
+    };
+    let level = audivane_dsp_core::ab_level::AbLevel::from_config(
+        &audivane_protocol::ipc::LevelMatch::default(),
+        audivane_protocol::ipc::AbHeadroom::Auto,
+    );
+    let mut seed = 29;
+    let input: Vec<f32> = (0..max_block * channels)
+        .map(|_| (lcg(&mut seed) * 0.5) as f32)
+        .collect();
+    let mut out = vec![0i32; max_block * channels * 2];
+    let plan = sizes(max_block, 30_000);
+    let workers = counted_pool(1);
+    for on_workers in [false, true] {
+        let mut chain = Chain::new(spec(full_config(DitherKind::Shaped)));
+        let mut series = full_config(DitherKind::Shaped);
+        if let Some(h) = &mut series.harmonics {
+            h.routing = audivane_protocol::HarmonicsRouting::Series;
+        }
+        let mut ab =
+            AbChain::new(spec(series), spec(full_config(DitherKind::Shaped)), level).unwrap();
+        if on_workers {
+            assert!(chain.attach_workers(&workers));
+            assert!(ab.attach_workers(&workers));
+        }
+        assert!(chain.has_harmonics() && ab.has_harmonics());
+        let mut seen = 0usize;
+        assert_no_alloc_with_workers("harmonics tap", || {
+            for (i, &n) in plan.iter().enumerate() {
+                // On and off again mid-stream.
+                let on = (i / 100) % 3 != 2;
+                chain.set_harmonics_tap(on);
+                ab.set_harmonics_tap(on);
+                // The pair's tap follows the side playing.
+                if i % 150 == 0 {
+                    ab.select(if (i / 150) % 2 == 0 { Side::B } else { Side::A }, 480);
+                }
+                chain.process_f32(&input[..n * channels], &mut out);
+                ab.process_f32(&input[..n * channels], &mut out);
+                for tap in [chain.harmonics_tap(), ab.harmonics_tap()]
+                    .into_iter()
+                    .flatten()
+                {
+                    seen += tap.input.len() + tap.output.len() + tap.layers.len();
+                }
+            }
+        });
+        assert!(seen > 0);
+    }
+}
+
 #[test]
 fn stages_and_meters_do_not_allocate() {
     let max_block = 512;
@@ -358,6 +618,19 @@ fn stages_and_meters_do_not_allocate() {
         conv.reset();
     });
 
+    let mut m = audivane_dsp_core::matrix::FilterMatrix::new(2);
+    let taps = long_irs(2, 100_000);
+    m.set(0, 0, taps[0].clone());
+    m.set(0, 1, taps[1].clone());
+    m.set(1, 1, taps[0].clone());
+    let mut matrix = audivane_dsp_core::matrix::MatrixConvolver::new(&m, max_block);
+    assert_no_alloc("MatrixConvolver::process", || {
+        for &n in &plan {
+            matrix.process(&mut [&mut a[..n], &mut b[..n]]);
+        }
+        matrix.reset();
+    });
+
     let design = UpsamplerDesign {
         ratio: 4,
         taps: 8192,
@@ -380,6 +653,29 @@ fn stages_and_meters_do_not_allocate() {
             );
         }
         up.reset();
+    });
+
+    // A long kernel: non-uniform partitions (four-step tail stages up to
+    // 32768 frames), over a few periods of the largest stage, then the
+    // channels split as the workers run them.
+    let kernel = long_irs(1, 4 * 70_000).pop().unwrap();
+    let mut up = Upsampler::from_kernel(&kernel, 4, 0, 2, max_block);
+    assert!(up.stages().len() > 2, "{:?}", up.stages());
+    assert_no_alloc("Upsampler::process (tail stages)", || {
+        for &n in &plan {
+            up.process(
+                &[&a[..n], &b[..n]],
+                &mut [&mut o0[..n * 4], &mut o1[..n * 4]],
+            );
+        }
+        up.reset();
+    });
+    let mut lanes = up.split_channels();
+    assert_no_alloc("split Upsampler::process (tail stages)", || {
+        for &n in &plan[..400] {
+            lanes[1].process(&[&b[..n]], &mut [&mut o1[..n * 4]]);
+        }
+        lanes[1].reset();
     });
 
     for kind in [
@@ -551,7 +847,7 @@ fn rational_chains_do_not_allocate() {
             sample_rate: rate,
             channels,
             max_block,
-            irs: Some(long_irs(channels, 5_000)),
+            irs: Some(long_irs(channels, 5_000).into()),
         };
         let mut chain = Chain::new(spec());
         let mut ab = AbChain::new(
@@ -798,7 +1094,7 @@ fn x64_chains_do_not_allocate() {
             sample_rate: 44_100,
             channels,
             max_block,
-            irs: Some(long_irs(channels, 4_096)),
+            irs: Some(long_irs(channels, 4_096).into()),
         }
     };
     let manual = audivane_dsp_core::resample::ManualConfig {
@@ -839,6 +1135,7 @@ fn x64_chains_do_not_allocate() {
         FilterPreset::KaiserSteepMp,
         FilterPreset::CascadeFir,
         FilterPreset::BlockFftFast,
+        FilterPreset::Nos,
         FilterPreset::CatmullRom,
     ] {
         let mut chain = Chain::try_new(spec(UpsamplerConfig {
@@ -1076,4 +1373,73 @@ fn drift_estimator_does_not_allocate() {
             }
         }
     });
+}
+
+#[test]
+fn tube_dynamics_does_not_allocate() {
+    use audivane_dsp_core::tube_dynamics::{
+        BiasConfig, SagConfig, TubeDynamics, TubeDynamicsConfig,
+    };
+
+    let max_block = 512;
+    let mut seed = 131;
+    let mut l: Vec<f64> = (0..max_block).map(|_| lcg(&mut seed) * 1.1).collect();
+    let mut r: Vec<f64> = (0..max_block).map(|_| lcg(&mut seed) * 1.1).collect();
+    let plan = sizes(max_block, 100_000);
+    let layer = ChebyshevLayer {
+        enabled: true,
+        preset: None,
+        levels_db: [
+            Some(-30.0),
+            Some(-40.0),
+            Some(-50.0),
+            None,
+            None,
+            None,
+            None,
+            Some(-80.0),
+        ],
+        signs: HARMONICS_DEFAULT_SIGNS,
+        invert_even: false,
+        drive_db: 0.0,
+        amount: 1.0,
+        tilt: None,
+        sag: None,
+        bias: None,
+    };
+    for (sag, bias) in [
+        (SagConfig::default(), BiasConfig::default()),
+        (
+            SagConfig::default(),
+            BiasConfig {
+                depth: 0.0,
+                ..BiasConfig::default()
+            },
+        ),
+    ] {
+        // Untilted, and tilted (per-order filters).
+        let tilted = ChebyshevLayer {
+            tilt: Some(Box::new(audivane_protocol::HarmonicsTilt {
+                low: audivane_protocol::TiltShelf::new(80.0, 12.0),
+                high: audivane_protocol::TiltShelf::new(4_000.0, 6.0),
+                low_even: true,
+                ..Default::default()
+            })),
+            ..layer.clone()
+        };
+        for (curve, rate) in [&layer, &tilted]
+            .into_iter()
+            .flat_map(|c| [44_100.0, 192_000.0, 768_000.0].map(|r| (c, r)))
+        {
+            let cfg = TubeDynamicsConfig::from_layer(curve, true, sag, bias).unwrap();
+            let mut st = TubeDynamics::try_new(&cfg, rate, 2).unwrap();
+            assert_no_alloc("TubeDynamics::process/reset", || {
+                for &n in &plan {
+                    st.process(&mut [&mut l[..n], &mut r[..n]]);
+                }
+                st.reset();
+                st.process(&mut [&mut l[..1], &mut r[..1]]);
+            });
+        }
+    }
 }

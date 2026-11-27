@@ -3,20 +3,21 @@
 // (crates/cli/src/ctl.rs `stage_patch`), and the words the A/B view and the
 // top bar use for side B and its level.
 
-import type { AbConfig, AbStatus, ChainConfig, EqProfile, FilterPreset, OverloadReport, TiltConfig } from "../api/types";
+import type { AbConfig, AbStatus, ChainConfig, DitherKind, EqProfile, FilterDesign, FilterPreset, OverloadReport, TiltConfig } from "../api/types";
 import { deepEqual } from "./chain";
-import { pitchActive, pitchCents } from "./effects";
+import { ditherInfo, pitchActive, pitchCents } from "./effects";
 import { presetEntry } from "./filterPresets";
 import { RECOMMENDED_PRESET } from "./filterDesign";
 import { fmtDb } from "./format";
 import { tiltSlope } from "./tilt";
+import { toneOn } from "./tone";
 import { FLAT_PATCH } from "./abPatch";
 
 /** The stages a header Compare button can take out of (or put into) side B. */
 export type CompareStage = "crossfeed" | "eq" | "tilt" | "conv" | "dc" | "pitch" | "harmonics";
 
 export const COMPARE_STAGE_NAME: Record<CompareStage, string> = {
-  crossfeed: "Crossfeed",
+  crossfeed: "Stereo image",
   eq: "EQ",
   tilt: "Tilt",
   conv: "Convolution",
@@ -47,7 +48,7 @@ function toggle(key: string, name: string, active: boolean, canEnable: boolean):
 function eqBandsActive(eq: EqProfile | null | undefined): boolean {
   if (!eq) return false;
   const ch = (c: EqProfile["left"]) => !!c && c.enabled && (c.preamp_db !== 0 || c.bands.some((b) => b.enabled));
-  return eq.preamp_db !== 0 || ((eq.linked_enabled ?? true) && eq.bands.some((b) => b.enabled)) || ch(eq.left) || ch(eq.right);
+  return eq.preamp_db !== 0 || ((eq.linked_enabled ?? true) && eq.bands.some((b) => b.enabled)) || ch(eq.left) || ch(eq.right) || toneOn(eq);
 }
 
 /**
@@ -61,8 +62,13 @@ function eqBandsActive(eq: EqProfile | null | undefined): boolean {
 export function stagePatch(a: ChainConfig, stage: CompareStage, memory: CompareMemory = {}): StagePatchResult {
   switch (stage) {
     case "crossfeed":
-      // A missing crossfeed turns on with the engine's defaults.
-      return toggle("crossfeed", "Crossfeed", !!a.crossfeed?.enabled, true);
+    {
+      // A missing crossfeed turns on with the engine's defaults. None with
+      // width 0 (k = 1) does nothing either way, so there is nothing to compare.
+      const cf = a.crossfeed;
+      const shaping = !cf || cf.mode !== "none" || (cf.width ?? 1) !== 1;
+      return toggle("crossfeed", "Stereo image", !!cf?.enabled && shaping, shaping);
+    }
     case "dc":
       return toggle("dc_block", "DC block", !!a.dc_block?.enabled, true);
     case "harmonics":
@@ -75,15 +81,21 @@ export function stagePatch(a: ChainConfig, stage: CompareStage, memory: CompareM
       const shapedOf = (t: TiltConfig) => (tiltSlope(t) ?? 0) !== 0;
       const shaped = keys.some((k) => shapedOf(a.eq![k]!));
       const running = keys.some((k) => a.eq![k]!.enabled && shapedOf(a.eq![k]!));
-      // Off removes both sections from B, whatever shape A takes later
-      // (an `enabled: false` merged onto a section A drops would leave B
-      // a section without a slope).
+      // Off removes both sections from B, whatever shape A takes later (an
+      // `enabled: false` merged onto a section A drops would leave B a section
+      // without a slope). On snapshots the full section(s): dropping a section
+      // on A later must not leave B with a partial `{ enabled: true }`.
       if (running) return { patch: { eq: { tilt: null, tilt_high: null } }, label: "Tilt off" };
-      if (shaped) return { patch: { eq: Object.fromEntries(keys.map((k) => [k, { enabled: true }])) }, label: "Tilt on" };
+      if (shaped) {
+        return {
+          patch: { eq: Object.fromEntries(keys.map((k) => [k, { ...structuredClone(a.eq![k]!), enabled: true }])) },
+          label: "Tilt on",
+        };
+      }
       return { error: "Tilt has no settings in chain A to compare; set a slope first." };
     }
     case "eq": {
-      if (eqBandsActive(a.eq)) return { patch: { eq: { preamp_db: 0, bands: [], left: null, right: null } }, label: "EQ off" };
+      if (eqBandsActive(a.eq)) return { patch: { eq: { preamp_db: 0, bands: [], left: null, right: null, tone: null } }, label: "EQ off" };
       const last = memory.eq;
       if (!a.eq && last && eqBandsActive(last)) {
         return { patch: { eq: structuredClone(last) as unknown as Record<string, unknown> }, label: "EQ on" };
@@ -105,9 +117,31 @@ export function filterName(preset: string): string {
   return presetEntry(preset as FilterPreset)?.label ?? preset;
 }
 
+/** Label for a custom filter design pinned as side B. */
+export function customFilterLabel(design: FilterDesign | null | undefined): string {
+  const base = design?.based_on ? filterName(design.based_on) : null;
+  return base ? `Filter: Custom (${base})` : "Filter: Custom";
+}
+
 /** Side B for a filter compare: A with another upsampling filter (the CLI's `ab filter`). */
 export function filterPatch(preset: string): BPatch {
   return { patch: { upsampler: { preset, design: null } }, label: `Filter: ${filterName(preset)}` };
+}
+
+/** Side B for a custom filter compare: A with a pinned custom filter design. */
+export function filterDesignPatch(design: FilterDesign, label?: string): BPatch {
+  return { patch: { upsampler: { preset: null, design: structuredClone(design) } }, label: label ?? customFilterLabel(design) };
+}
+
+/** Label for an output compare side B ("Output: 16-bit TPDF"). */
+export function outputLabel(bits: number, dither: DitherKind): string {
+  const d = ditherInfo(dither)?.label ?? dither;
+  return `Output: ${bits}-bit ${d}`;
+}
+
+/** Side B for an output compare: A with another bit depth and/or dither. */
+export function outputPatch(bits: number, dither: DitherKind): BPatch {
+  return { patch: { output: { bits, dither } }, label: outputLabel(bits, dither) };
 }
 
 /** Whether A/B already compares against this side B (the button then stops it). */
@@ -126,7 +160,7 @@ export function comparedStage(ab: AbConfig | null | undefined, a: ChainConfig, m
   return null;
 }
 
-export type BKind = "flat" | "preset" | "stage" | "filter" | "patch";
+export type BKind = "flat" | "preset" | "stage" | "filter" | "output" | "custom" | "patch";
 
 /** What side B is, for the A/B view: a kind and plain words. */
 export function describeB(ab: AbConfig): { kind: BKind; title: string; detail: string } {
@@ -140,27 +174,37 @@ export function describeB(ab: AbConfig): { kind: BKind; title: string; detail: s
   }
   const keys = patch && typeof patch === "object" ? Object.keys(patch) : [];
   if (keys.length === 1 && keys[0] === "upsampler") {
-    const ups = (patch as { upsampler: { preset?: string | null } }).upsampler;
-    const title = ab.label || (ups.preset ? `Filter: ${filterName(ups.preset)}` : "Another filter");
+    const ups = (patch as { upsampler: { preset?: string | null; design?: FilterDesign | null } }).upsampler;
+    const title = ab.label || (ups.preset ? `Filter: ${filterName(ups.preset)}` : ups.design ? customFilterLabel(ups.design) : "Another filter");
     return { kind: "filter", title, detail: "A with another upsampling filter at the same ratio. Every other stage follows A." };
   }
+  if (keys.length === 1 && keys[0] === "output") {
+    const out = (patch as { output: { bits?: number; dither?: DitherKind } }).output;
+    const fallback = out.bits !== undefined && out.dither !== undefined ? outputLabel(out.bits, out.dither) : "Output";
+    return { kind: "output", title: ab.label || fallback, detail: "A with another output bit depth or dither. Every other stage follows A." };
+  }
   const title = ab.label || "Changed";
+  // A custom B (the A/B view's builder) changes several stages at once.
+  if (keys.length > 1) {
+    return { kind: "custom", title, detail: "A with several settings changed at once. Everything else follows A." };
+  }
   const stage = /^(.*) (off|on)$/.exec(title);
-  if (stage) {
+  if (stage && (Object.values(COMPARE_STAGE_NAME) as string[]).includes(stage[1])) {
     return { kind: "stage", title, detail: `A with ${stage[1].toLowerCase()} switched ${stage[2]}. Every other setting follows A as you change it.` };
   }
   return { kind: "patch", title, detail: "A with some settings changed. Everything else follows A." };
 }
 
-/** The level line: which side is cut and by how much (never boost). */
+/** The level line: which side is cut and by how much (never boost), and the shared headroom. */
 export function levelText(ab: AbStatus): string {
   const o = ab.offset_db;
-  const parts: string[] = [];
-  if (Math.abs(o) < 0.05) parts.push("A and B play at the same level");
-  else if (o < 0) parts.push(`B is ${fmtDb(-o, 2, false)} dB louder, so B is cut ${fmtDb(-o, 2, false)} dB`);
-  else parts.push(`B is ${fmtDb(o, 2, false)} dB quieter, so A is cut ${fmtDb(o, 2, false)} dB`);
-  if (ab.headroom_db > 0.05) parts.push(`both sides ${fmtDb(ab.headroom_db, 1, false)} dB more for headroom`);
-  return parts.join("; ") + ".";
+  const main =
+    Math.abs(o) < 0.05
+      ? "A and B play at the same level"
+      : o < 0
+        ? `B is ${fmtDb(-o, 2, false)} dB louder, so B is cut ${fmtDb(-o, 2, false)} dB`
+        : `B is ${fmtDb(o, 2, false)} dB quieter, so A is cut ${fmtDb(o, 2, false)} dB`;
+  return `${main} · headroom ${fmtDb(-ab.headroom_db, 2)} dB`;
 }
 
 /** "B was limited 3×", from the attributed overs, or null when there were none. */
@@ -183,7 +227,7 @@ export function abStoppedByOverload(ab: AbConfig | null | undefined, overload: O
   return !overload.action.startsWith("varispeed");
 }
 
-/** The top bar's side-B text: "B: Crossfeed off". */
+/** The top bar's side-B text: "B: Stereo image off". */
 export function topBarLabel(ab: AbConfig | null | undefined): string | null {
   if (!ab) return null;
   return `B: ${describeB(ab).title}`;

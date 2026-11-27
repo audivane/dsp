@@ -23,6 +23,8 @@ pub(crate) struct TrayModel {
     pub active_preset: Option<String>,
     pub routing_apps: bool,
     pub rules: Value,
+    /// Relaunching after an upgrade failed: offer a restart.
+    pub update_pending: bool,
 }
 
 pub(crate) struct AvTray<const MENU_ON_LEFT: bool> {
@@ -173,7 +175,9 @@ impl<const MENU_ON_LEFT: bool> ksni::Tray for AvTray<MENU_ON_LEFT> {
         let m = &self.model;
         ksni::ToolTip {
             title: "Audivane DSP".into(),
-            description: if m.up {
+            description: if m.update_pending {
+                "Updated: restart to finish".into()
+            } else if m.up {
                 m.line.clone()
             } else {
                 "Engine not running".into()
@@ -245,7 +249,19 @@ impl<const MENU_ON_LEFT: bool> ksni::Tray for AvTray<MENU_ON_LEFT> {
                 .into()
             })
             .collect();
-        vec![
+        let mut items: Vec<MenuItem<Self>> = Vec::new();
+        if m.update_pending {
+            items.push(
+                StandardItem {
+                    label: "Restart to finish the update".into(),
+                    activate: act("restart"),
+                    ..Default::default()
+                }
+                .into(),
+            );
+            items.push(MenuItem::Separator);
+        }
+        items.extend([
             StandardItem {
                 label: "Show Audivane DSP".into(),
                 activate: act("show"),
@@ -272,8 +288,23 @@ impl<const MENU_ON_LEFT: bool> ksni::Tray for AvTray<MENU_ON_LEFT> {
                 m.up,
                 m.up && !m.dsp_enabled,
             ),
-            check("ab-a", "Listen to A", ab_on, ab_on && side == "a"),
-            check("ab-b", "Listen to B", ab_on, ab_on && side == "b"),
+        ]);
+        if side == "blind" {
+            // A blind test runs in the app: no side shown, and no switching
+            // from here.
+            items.push(
+                StandardItem {
+                    label: "A/B: blind".into(),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        } else {
+            items.push(check("ab-a", "Listen to A", ab_on, ab_on && side == "a"));
+            items.push(check("ab-b", "Listen to B", ab_on, ab_on && side == "b"));
+        }
+        items.extend([
             SubMenu {
                 label: "Preset".into(),
                 enabled: m.up && !m.presets.is_empty(),
@@ -308,6 +339,7 @@ impl<const MENU_ON_LEFT: bool> ksni::Tray for AvTray<MENU_ON_LEFT> {
                 ..Default::default()
             }
             .into(),
-        ]
+        ]);
+        items
     }
 }

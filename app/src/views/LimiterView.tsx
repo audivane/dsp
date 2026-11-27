@@ -90,10 +90,10 @@ function ReductionMeter({ mode }: { mode: LimiterMode }) {
         peak.current.style.left = pct(hold);
         peak.current.style.opacity = hold > 0.05 ? "1" : "0";
       }
-      text(now.current, meter.inPath ? `${fmtDb(-gr, 1)} dB` : "—");
-      text(held.current, meter.inPath ? `${fmtDb(-hold, 1)} dB` : "—");
-      text(headroom.current, meter.inPath ? `${fmtDb(-(lim!.headroom_db ?? 0), 1)} dB` : "—");
-      text(events.current, lim ? fmtInt(lim.events) : "—");
+      text(now.current, meter.inPath ? `${fmtDb(-gr, 1)} dB` : "-");
+      text(held.current, meter.inPath ? `${fmtDb(-hold, 1)} dB` : "-");
+      text(headroom.current, meter.inPath ? `${fmtDb(-(lim!.headroom_db ?? 0), 1)} dB` : "-");
+      text(events.current, lim ? fmtInt(lim.events) : "-");
       text(state.current, meter.text);
     };
     raf = requestAnimationFrame(frame);
@@ -119,15 +119,15 @@ function ReductionMeter({ mode }: { mode: LimiterMode }) {
       <div className="facts">
         <div className="fact" title="The largest reduction in the last meter window (1/30 s)">
           <div className="k">Now</div>
-          <div className="v" ref={now}>—</div>
+          <div className="v" ref={now}>-</div>
         </div>
         <div className="fact" title={`The largest reduction in the last ${PEAK_HOLD_MS / 1000} s`}>
           <div className="k">Peak</div>
-          <div className="v" ref={held}>—</div>
+          <div className="v" ref={held}>-</div>
         </div>
         <div className="fact" title="Auto headroom: the level drop applied now (what the music needs minus what the volume already takes off). Limit mode keeps it at 0.">
           <div className="k">Applied headroom</div>
-          <div className="v" ref={headroom}>—</div>
+          <div className="v" ref={headroom}>-</div>
         </div>
         <div
           className="fact"
@@ -138,7 +138,7 @@ function ReductionMeter({ mode }: { mode: LimiterMode }) {
           }
         >
           <div className="k">{limiterEventLabel(mode)}</div>
-          <div className="v" ref={events}>—</div>
+          <div className="v" ref={events}>-</div>
         </div>
       </div>
     </div>
@@ -158,7 +158,7 @@ export function LimiterView() {
   const offMode = useApp((s) => s.limiterOffMode);
   return (
     <section className="view" aria-labelledby="lim-title">
-      <StageHead id="lim-title" title="Limiter" on={on} onPower={missing ? undefined : () => st.setStageEnabled("limiter", !on)} />
+      <StageHead id="lim-title" title="Limiter" part={missing ? undefined : "output"} on={on} onPower={missing ? undefined : () => st.setStageEnabled("limiter", !on)} />
       {missing && <MissingNotice id="limiter" />}
       {!missing && <ClipWarning />}
       <div className="panel">

@@ -28,15 +28,17 @@ use audivane_dsp_core::minphase::INTERMEDIATE_MAX_GROWTH;
 use audivane_dsp_core::resample::{ManualConfig, band_design_for};
 use audivane_protocol::ipc::{
     AB_HEADROOM_MAX_DB, AbB, AbConfig, AbHeadroom, BALANCE_MAX_DB, DeviceInfo, EngineConfig,
-    FOLLOWED_MAX_SPEED, FOLLOWER_MAX_TRIM_MS, LevelMatch, MAX_FOLLOWERS, MAX_QUANTUM, MIN_QUANTUM,
-    RatePolicy, RoutingMode, VOLUME_MAX_DB, VOLUME_MIN_DB,
+    FOLLOWED_MAX_SPEED, FOLLOWER_MAX_TRIM_MS, FOLLOWER_PERIOD_MS_RANGE, LevelMatch, MAX_FOLLOWERS,
+    MAX_QUANTUM, MIN_QUANTUM, OutputChannels, RatePolicy, RoutingMode, VOLUME_MAX_DB,
+    VOLUME_MIN_DB,
 };
 use audivane_protocol::{
     CROSSFEED_CUTOFF_MAX_HZ, CROSSFEED_CUTOFF_MIN_HZ, CROSSFEED_FEED_MAX_DB, CROSSFEED_FEED_MIN_DB,
     ChainConfig, CrossfeedConfig, DC_BLOCK_CUTOFF_MAX_HZ, DC_BLOCK_CUTOFF_MIN_HZ, DcBlockConfig,
-    DitherKind, FilterPhase, HARMONICS_MAX_DB, HARMONICS_MIN_DB, HarmonicsConfig, OutputConfig,
-    PitchConfig, RateRatio, RateTarget, SampleFormat, TILT_MAX_HZ, TILT_MIN_HZ, TiltConfig,
-    TiltPivot, UpsamplerConfig, check_tilt_sections, resolve_rate_ratio,
+    DitherKind, FilterPhase, HARMONICS_MAX_LAYERS, HarmonicsConfig, OutputConfig, PitchConfig,
+    RateRatio, RateTarget, STEREO_WIDTH_CORNER_MAX_HZ, STEREO_WIDTH_CORNER_MIN_HZ,
+    STEREO_WIDTH_MAX, STEREO_WIDTH_MIN, SampleFormat, TILT_MAX_HZ, TILT_MIN_HZ, TONE_MAX_DB,
+    TiltConfig, TiltPivot, UpsamplerConfig, check_tilt_sections, resolve_rate_ratio,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -115,9 +117,11 @@ impl ConfigStore {
     /// file) when anything is wrong.
     pub fn load(&self) -> Loaded {
         let mut warnings = Vec::new();
+        let mut migrated = false;
         let mut config = match fs::read_to_string(&self.path) {
-            Ok(text) => match parse_document(&text) {
-                Ok((mut cfg, dropped)) => {
+            Ok(text) => match parse_migrating(&text) {
+                Ok((mut cfg, dropped, was_migrated)) => {
+                    migrated = was_migrated;
                     if let Some(note) = dropped {
                         warnings.push(format!("{}: {note}", self.path.display()));
                     }
@@ -126,6 +130,12 @@ impl ConfigStore {
                     // would otherwise look "invalid" and be moved aside.
                     if let Some(note) = normalize_config(&mut cfg) {
                         warnings.push(format!("{}: {note}", self.path.display()));
+                    }
+                    // A room calibration whose files are gone is dropped on
+                    // its own (the followers' settings from before it put
+                    // back), not the whole config with it.
+                    for w in super::calibration::drop_if_unreadable(&mut cfg) {
+                        warnings.push(format!("{}: {w}", self.path.display()));
                     }
                     // A file can parse and still be unusable (e.g. an empty
                     // device copied from another machine). Repair what we can,
@@ -141,6 +151,7 @@ impl ConfigStore {
                                     None => String::new(),
                                 }
                             ));
+                            migrated = false;
                             EngineConfig::default()
                         } else {
                             warnings.push(format!(
@@ -180,6 +191,17 @@ impl ConfigStore {
                 Some(device) => config.device = device,
                 None => warnings.push(
                     "no ALSA playback device found; set `device` in the config file".to_string(),
+                ),
+            }
+        }
+        // A migrated file is written back once, so the next start reads the
+        // new format (best effort: a failed write migrates again next time).
+        if migrated {
+            match self.save(&config) {
+                Ok(()) => log::info!("config: {} migrated and saved", self.path.display()),
+                Err(err) => log::warn!(
+                    "config: {} migrated but not saved ({err}); it migrates again next start",
+                    self.path.display()
                 ),
             }
         }
@@ -277,6 +299,12 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// Parse the versioned envelope, or a bare [`EngineConfig`] for older/hand
 /// written files. The note says what was dropped to read it.
 fn parse_document(text: &str) -> Result<(EngineConfig, Option<String>), String> {
+    parse_migrating(text).map(|(cfg, note, _)| (cfg, note))
+}
+
+/// [`parse_document`], and whether a format migration changed what was
+/// read (the caller writes it back once).
+fn parse_migrating(text: &str) -> Result<(EngineConfig, Option<String>, bool), String> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|err| format!("not valid JSON: {err}"))?;
     let object = value
@@ -297,8 +325,10 @@ fn parse_document(text: &str) -> Result<(EngineConfig, Option<String>), String> 
         .get("config")
         .cloned()
         .unwrap_or_else(|| value.clone());
+    let migrated = migrate_follow_volume(&mut cfg_value);
+    let migrated = migrate_safety_modes(&mut cfg_value) || migrated;
     match serde_json::from_value::<EngineConfig>(cfg_value.clone()) {
-        Ok(cfg) => Ok((cfg, None)),
+        Ok(cfg) => Ok((cfg, None, migrated)),
         Err(err) => {
             // An A/B setup from an earlier version (0.9.x wrote `chain_b`)
             // must not cost the rest of the settings: drop only that section.
@@ -312,11 +342,152 @@ fn parse_document(text: &str) -> Result<(EngineConfig, Option<String>), String> 
                     Some(format!(
                         "the A/B setup could not be read ({err}) and was dropped"
                     )),
+                    migrated,
                 ));
             }
             Err(format!("bad config: {err}"))
         }
     }
+}
+
+/// A config from before `follow_volume` (a follower without the field):
+/// the followers a room calibration calibrates follow the master's volume
+/// (a subwoofer must keep its level to the mains), the others keep their
+/// own, as they did. Their reference is the master's level now
+/// ([`normalize_followers`]). Returns whether it changed anything (the
+/// file is then written back once, [`ConfigStore::load`]).
+fn migrate_follow_volume(cfg: &mut serde_json::Value) -> bool {
+    let calibrated: Vec<String> = cfg
+        .pointer("/calibration/followers")
+        .and_then(serde_json::Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p.get("device")?.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let Some(list) = cfg
+        .pointer_mut("/outputs/followers")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for f in list {
+        let Some(o) = f.as_object_mut() else {
+            continue;
+        };
+        if o.contains_key("follow_volume") {
+            continue;
+        }
+        let device = o.get("device").and_then(|d| d.as_str()).unwrap_or("");
+        let on = calibrated.iter().any(|d| d == device);
+        log::info!(
+            "config: follower {device} {}",
+            if on {
+                "is calibrated: it follows the main volume"
+            } else {
+                "keeps its own volume"
+            }
+        );
+        o.insert("follow_volume".into(), serde_json::Value::Bool(on));
+        changed = true;
+    }
+    changed
+}
+
+/// Drop the level modes that only cut the level for safety, now the
+/// limiter's and the output headroom's job: a crossfeed's `level` (`matched`
+/// or `peak_safe`), since the stage always plays at its matched level, and
+/// the harmonics routing `series_makeup`, which becomes `series` (with no
+/// trims the two are the same chain). A 0.10 harmonics stage becomes layers
+/// (`migrate_legacy_harmonics`). Walks the whole document, so the main
+/// chain, chain B, followers' patches and presets are all covered. Returns
+/// whether it changed anything (the file is then written back once).
+pub(crate) fn migrate_safety_modes(value: &mut serde_json::Value) -> bool {
+    let mut changed = false;
+    match value {
+        serde_json::Value::Object(o) => {
+            if let Some(level) = o
+                .get_mut("crossfeed")
+                .and_then(serde_json::Value::as_object_mut)
+                .and_then(|xf| xf.remove("level"))
+            {
+                if level.as_str() == Some("peak_safe") {
+                    log::info!(
+                        "config: crossfeed `peak_safe` level dropped; it plays at its matched level (the limiter and output headroom handle peaks)"
+                    );
+                }
+                changed = true;
+            }
+            if let Some(routing) = o
+                .get_mut("harmonics")
+                .and_then(serde_json::Value::as_object_mut)
+                .and_then(|h| h.get_mut("routing"))
+                .filter(|r| r.as_str() == Some("series_makeup"))
+            {
+                log::info!("config: harmonics routing `series_makeup` is now `series`");
+                *routing = serde_json::Value::String("series".into());
+                changed = true;
+            }
+            if let Some(h) = o
+                .get_mut("harmonics")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                changed |= migrate_legacy_harmonics(h);
+            }
+            for v in o.values_mut() {
+                changed |= migrate_safety_modes(v);
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for v in a {
+                changed |= migrate_safety_modes(v);
+            }
+        }
+        _ => {}
+    }
+    changed
+}
+
+/// A 0.10 harmonics stage (`character` with `h2_db`..`h5_db`, no `layers`)
+/// becomes one Chebyshev layer with the same levels and signs (H3
+/// negative, the others positive). The old fields are dropped. Returns
+/// whether it changed anything.
+fn migrate_legacy_harmonics(h: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    const OLD: [&str; 5] = ["character", "h2_db", "h3_db", "h4_db", "h5_db"];
+    if h.contains_key("layers") || !OLD.iter().any(|k| h.contains_key(*k)) {
+        return false;
+    }
+    let num = |k: &str| h.get(k).and_then(serde_json::Value::as_f64);
+    let (h2, h3, h4, h5) = match h.get("character").and_then(|c| c.as_str()) {
+        Some("pentode") => (Some(-56.0), Some(-42.0), None, Some(-66.0)),
+        Some("custom") => (
+            Some(num("h2_db").unwrap_or(-40.0)),
+            Some(num("h3_db").unwrap_or(-58.0)),
+            num("h4_db"),
+            num("h5_db"),
+        ),
+        _ => (Some(-40.0), Some(-58.0), Some(-72.0), None),
+    };
+    let mut levels = vec![serde_json::Value::Null; audivane_protocol::HARMONICS_ORDERS];
+    for (slot, db) in levels.iter_mut().zip([h2, h3, h4, h5]) {
+        if let Some(db) = db {
+            *slot = serde_json::json!(db.clamp(-120.0, -20.0));
+        }
+    }
+    for k in OLD {
+        h.remove(k);
+    }
+    h.insert(
+        "layers".into(),
+        serde_json::json!([{ "kind": "chebyshev", "levels_db": levels }]),
+    );
+    log::info!(
+        "config: the 0.10 harmonics setting is now one Chebyshev layer with the same levels"
+    );
+    true
 }
 
 /// Fill in a missing device. Returns true when something was changed.
@@ -385,9 +556,12 @@ pub fn stable_device_name_in(device: &str, cards: &str) -> Option<String> {
 
 /// Whether `device` names a playback device that exists right now (any
 /// spelling [`mark_active`] understands).
+///
+/// A device whose card name is pinned to another USB device
+/// ([`super::device_identity`]) does not count.
 pub fn device_present(device: &str) -> bool {
     let mut devices = playback_devices();
-    mark_active(&mut devices, device)
+    mark_active(&mut devices, device) && audivane_io_alsa::device_present(device)
 }
 
 // ---------------------------------------------------------------- devices
@@ -400,7 +574,44 @@ pub fn device_present(device: &str) -> bool {
 pub fn playback_devices() -> Vec<DeviceInfo> {
     let pcm = fs::read_to_string("/proc/asound/pcm").unwrap_or_default();
     let cards = fs::read_to_string("/proc/asound/cards").unwrap_or_default();
-    devices_from_listing(&pcm, &cards)
+    let mut devices = devices_from_listing(&pcm, &cards);
+    let index_of = parse_card_indexes(&cards);
+    for d in &mut devices {
+        let card = index_of.get(&d.card.to_ascii_lowercase()).copied();
+        let dev =
+            d.id.rsplit_once("DEV=")
+                .and_then(|(_, n)| n.parse::<u32>().ok())
+                .unwrap_or(0);
+        if let Some(card) = card
+            && let Ok(text) = fs::read_to_string(format!("/proc/asound/card{card}/stream{dev}"))
+        {
+            d.channels = usb_playback_channels(&text);
+        }
+    }
+    devices
+}
+
+/// The playback channel counts a USB audio stream file
+/// (`/proc/asound/cardN/streamM`) lists, ascending: the `Channels:` lines
+/// of its `Playback:` section.
+pub fn usb_playback_channels(stream: &str) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
+    let mut in_playback = false;
+    for line in stream.lines() {
+        if !line.starts_with(char::is_whitespace) && !line.is_empty() {
+            in_playback = line.trim_end() == "Playback:";
+            continue;
+        }
+        if in_playback
+            && let Some(n) = line.trim().strip_prefix("Channels:")
+            && let Ok(n) = n.trim().parse::<u32>()
+        {
+            out.push(n);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// Parse `/proc/asound/pcm` (`00-00: ALC892 Analog : ... : playback 1`) and
@@ -448,6 +659,9 @@ pub fn devices_from_listing(pcm: &str, cards: &str) -> Vec<DeviceInfo> {
             hdmi: lower.contains("hdmi"),
             loopback: lower.contains("loopback"),
             active: false,
+            suffix: None,
+            identity: None,
+            channels: Vec::new(),
         });
     }
     devices
@@ -569,6 +783,9 @@ pub fn validate(cfg: &EngineConfig) -> Result<(), String> {
     if cfg.formats.is_empty() {
         return Err("formats must list at least one sample format".into());
     }
+    if let Some(e) = cfg.output_channels.and_then(|p| p.error()) {
+        return Err(e);
+    }
     if !(MIN_QUANTUM..=MAX_QUANTUM).contains(&cfg.quantum) || !cfg.quantum.is_power_of_two() {
         return Err(format!(
             "quantum must be a power of two between {MIN_QUANTUM} and {MAX_QUANTUM} (got {})",
@@ -576,15 +793,21 @@ pub fn validate(cfg: &EngineConfig) -> Result<(), String> {
         ));
     }
     validate_rate_policy(&cfg.rate)?;
+    cfg.convolution_safety.validate()?;
     if let Some(name) = &cfg.active_preset {
         crate::control::presets::normalize_name(name)
             .map_err(|message| format!("active_preset: {message}"))?;
     }
-    validate_chain_at(
+    for (part, name) in &cfg.active_part_presets {
+        crate::control::presets::normalize_name(name)
+            .map_err(|message| format!("active_part_presets.{}: {message}", part.name()))?;
+    }
+    validate_chain_with(
         "chain",
         &cfg.chain,
         &cfg.rate.allowed_rates,
         rational_pipelines(cfg.ab.is_some()),
+        Some(cfg),
     )?;
     if let Some(ab) = &cfg.ab {
         validate_ab(ab, &cfg.chain, &cfg.rate)?;
@@ -665,6 +888,33 @@ pub fn validate_outputs(cfg: &EngineConfig) -> Result<(), String> {
                 f.volume_db
             ));
         }
+        if let Some(e) = f.output_channels.and_then(|p| p.error()) {
+            return Err(format!("{at}.{e}"));
+        }
+        if let Some(p) = f.period_ms
+            && (!p.is_finite() || !FOLLOWER_PERIOD_MS_RANGE.contains(&p))
+        {
+            return Err(format!(
+                "{at}.period_ms must be between {} and {} ms (got {p})",
+                FOLLOWER_PERIOD_MS_RANGE.start(),
+                FOLLOWER_PERIOD_MS_RANGE.end()
+            ));
+        }
+        if f.chain_patch.is_some() {
+            // Its own chain, checked as chain A is (its filter at every
+            // allowed rate, with the fallbacks of a custom design).
+            let own = super::follower_chain::chain(cfg, f, i)?;
+            let mut view = cfg.clone();
+            view.ab = None;
+            view.chain = own;
+            validate_chain_with(
+                &format!("{at}.chain"),
+                &view.chain,
+                &cfg.rate.allowed_rates,
+                rational_pipelines(false),
+                Some(&view),
+            )?;
+        }
     }
     if followers.is_empty() {
         return Ok(());
@@ -695,27 +945,37 @@ pub fn validate_followers_budget(cfg: &EngineConfig, cores: usize) -> Result<(),
     if n == 0 {
         return Ok(());
     }
-    let mut chain_a = cfg.clone();
-    chain_a.ab = None;
+    // Each follower's own chain (chain A without a patch).
+    let views: Vec<EngineConfig> = cfg
+        .outputs
+        .followers
+        .iter()
+        .map(|f| super::follower_chain::config(cfg, f))
+        .collect();
     let threads = (n + 1).min(cores.max(1)) as f64;
     for &rate in &cfg.rate.allowed_rates {
         let ratio = resolve_rate_ratio(cfg.chain.upsampler.target, rate);
         let stage = audivane_dsp_core::varispeed::worst_case_macs_per_second(rate)
             .map_err(|e| format!("varispeed: {e}"))?;
-        let follower = stage + 2.0 * rational_side_cost(&chain_a, None, rate, ratio);
-        if follower > MAX_RATIONAL_MACS_PER_SECOND {
-            return Err(format!(
-                "a follower at {rate} Hz needs {:.0} M multiply-adds per second per channel (its \
-                 clock correction and the chain's {ratio} resampling), more than the {:.0} M \
-                 budget; use a shorter filter or a lower output rate",
-                follower / 1e6,
-                MAX_RATIONAL_MACS_PER_SECOND / 1e6
-            ));
+        let mut followers = 0.0;
+        for view in &views {
+            let ratio = resolve_rate_ratio(view.chain.upsampler.target, rate);
+            let follower = stage + 2.0 * rational_side_cost(view, None, rate, ratio);
+            if follower > MAX_RATIONAL_MACS_PER_SECOND {
+                return Err(format!(
+                    "a follower at {rate} Hz needs {:.0} M multiply-adds per second per channel \
+                     (its clock correction and the chain's {ratio} resampling), more than the \
+                     {:.0} M budget; use a shorter filter or a lower output rate",
+                    follower / 1e6,
+                    MAX_RATIONAL_MACS_PER_SECOND / 1e6
+                ));
+            }
+            followers += follower;
         }
         let sides = if cfg.ab.is_some() { 2.0 } else { 1.0 };
         let master = rational_side_cost(cfg, None, rate, ratio) * sides
             + if cfg.varispeed.enabled { stage } else { 0.0 };
-        let total = master + n as f64 * follower;
+        let total = master + followers;
         if total > MAX_RATIONAL_MACS_PER_SECOND * threads {
             return Err(format!(
                 "the main output and {n} follower(s) at {rate} Hz need {:.0} M multiply-adds per \
@@ -1089,14 +1349,25 @@ fn validate_upsampler_variants(
     let is_auto = matches!(
         &named.design,
         FilterDesign::Kernel(k)
-            if matches!(k.shape, Shape::WindowedSinc { length: Length::Auto(_), .. })
+            if matches!(
+                k.shape,
+                Shape::WindowedSinc { length: Length::Auto(_), .. }
+                    | Shape::Optimal { length: Length::Auto(_), .. }
+            )
     );
     if is_auto {
         validate_automatic(field, variants, pipelines)?;
-        for v in variants {
-            for &(rate, r) in &rational {
-                check_rational_at(field, v, rate, r, pipelines)?;
-            }
+        // Each pair runs its own search (a novel design's): in parallel,
+        // the first refusal in order reported.
+        let jobs: Vec<_> = variants
+            .iter()
+            .flat_map(|v| rational.iter().map(move |&(rate, r)| (v, rate, r)))
+            .collect();
+        let results = run_parallel(&jobs, |&(v, rate, r)| {
+            check_rational_at(field, v, rate, r, pipelines)
+        });
+        for result in results {
+            result.unwrap_or_else(|| Err(format!("{field}: the check did not complete")))?;
         }
         return Ok(());
     }
@@ -1181,6 +1452,162 @@ fn validate_upsampler_variants(
     Ok(())
 }
 
+/// Whether a custom design (not a preset) is checked per rate in chain A:
+/// one that builds at some of its allowed rates is applied there, and the
+/// others play Recommended ([`super::cpu_budget::plan_rates`]).
+pub fn falls_back_per_rate(up: &UpsamplerConfig) -> bool {
+    up.preset.is_none() && up.design.is_some() && up.target != RateTarget::Off
+}
+
+/// [`validate_upsampler_variants`] for chain A of `cfg`: a custom design
+/// ([`falls_back_per_rate`]) that fails the check passes when it builds at
+/// one of the landings the driver's ladder picks at least
+/// ([`chain_a_verdict`]: the same landings and checks as `check_design` and
+/// the per-rate plan); refused with plain words when it builds at none
+/// ([`plain_refusal`]).
+fn validate_chain_a_upsampler(
+    field: &str,
+    variants: &[UpsamplerConfig],
+    rates: &[u32],
+    pipelines: usize,
+    cfg: &EngineConfig,
+) -> Result<(), String> {
+    let strict = validate_upsampler_variants(field, variants, rates, pipelines);
+    let up = &variants[0];
+    let Err(e) = strict else {
+        return Ok(());
+    };
+    // A target the graph cannot run is the target's error, not the design's.
+    if !falls_back_per_rate(up) || target_error(up.target, rates).is_some() {
+        return Err(e);
+    }
+    // The per-field bounds hold at every rate.
+    let named = design::Named::of(up).map_err(|e| format!("{field}: {e}"))?;
+    if design::check::check(&named.design).is_err() {
+        return Err(e);
+    }
+    match chain_a_verdict(cfg, &cfg.chain.upsampler, rates) {
+        Ok(_) => Ok(()),
+        Err(cases) => Err(plain_refusal(field, up, cfg, &cases).unwrap_or(e)),
+    }
+}
+
+/// `cfg` with chain A's upsampler `up` and DSP on: where it would land.
+fn with_chain_a(cfg: &EngineConfig, up: &UpsamplerConfig) -> EngineConfig {
+    let mut c = cfg.clone();
+    c.dsp_enabled = true;
+    c.chain.upsampler = up.clone();
+    c
+}
+
+/// The landings of chain A's upsampler `up` in `cfg` at `rates`, as the
+/// driver's ladder picks them without a device probe (the design's
+/// buildable pairs, Recommended's from a rate it builds at no reachable
+/// rung of: [`engine_buildable_rate_pairs`]); the target's own ratio at a
+/// rate the ladder does not offer. x1 left out.
+pub fn chain_a_landings(
+    cfg: &EngineConfig,
+    up: &UpsamplerConfig,
+    rates: &[u32],
+) -> Vec<(u32, RateRatio)> {
+    let ladder =
+        crate::engine::predicted_landings(&with_chain_a(cfg, up), None).unwrap_or_default();
+    rates
+        .iter()
+        .map(|&rate| {
+            let r = ladder
+                .iter()
+                .find(|l| l.0 == rate)
+                .map_or_else(|| resolve_rate_ratio(up.target, rate), |l| l.1);
+            (rate, r)
+        })
+        .filter(|(_, r)| !r.is_unity())
+        .collect()
+}
+
+/// Whether chain A's custom design `up` is applied in `cfg`: it builds
+/// ([`chain_a_builds_at`]) at one of its landings at `rates` at least
+/// ([`chain_a_landings`]); `Ok` with the landings, or the landings with
+/// their refusals (for [`design::explain`]) when it builds at none. What
+/// the config validation and `check_design` both decide on.
+pub fn chain_a_verdict(
+    cfg: &EngineConfig,
+    up: &UpsamplerConfig,
+    rates: &[u32],
+) -> Result<Vec<(u32, RateRatio)>, Vec<design::explain::Case>> {
+    let c = with_chain_a(cfg, up);
+    let ladder = chain_a_landings(cfg, up, rates);
+    // Where the ladder upsamples nowhere though the target does (neither
+    // the design nor Recommended builds there), the target's own ratios
+    // decide: a design that plays nowhere is refused.
+    let landings = if ladder.is_empty() {
+        rates
+            .iter()
+            .map(|&rate| (rate, resolve_rate_ratio(up.target, rate)))
+            .filter(|(_, r)| !r.is_unity())
+            .collect()
+    } else {
+        ladder.clone()
+    };
+    if landings.is_empty() {
+        return Ok(ladder);
+    }
+    let results = run_parallel(&landings, |&(rate, r)| chain_a_builds_at(&c, rate, r).err());
+    if results.iter().any(|r| matches!(r, Some(None))) {
+        return Ok(ladder);
+    }
+    let pipelines = rational_pipelines(cfg.ab.is_some());
+    Err(landings
+        .iter()
+        .zip(results)
+        .map(|(&(rate, r), e)| design::explain::Case {
+            cx: BuildContext {
+                output: cfg.chain.output,
+                ..design_context(rate, r, pipelines)
+            },
+            error: Some(e.flatten().map_or_else(
+                || design::DesignError::Failed("the check did not complete".into()),
+                ChainAFailure::into_design_error,
+            )),
+        })
+        .collect())
+}
+
+/// A one-click fix's check: `d` as chain A's custom design of `cfg` builds
+/// at the case's rate and ratio, as the config validation checks it
+/// ([`design_builds_at`]), so applying it is never refused there.
+fn fix_builds(cfg: &EngineConfig) -> impl Fn(&FilterDesign, &BuildContext) -> bool + '_ {
+    move |d, cx| design_builds_at(cfg, d, cx.source_rate, cx.ratio)
+}
+
+/// The refusal of chain A's custom design `up` in `cfg` that builds at none
+/// of its landings (`cases`, [`chain_a_verdict`]), in plain words
+/// ([`design::explain`]), under the field its first landing's refusal is
+/// about, with the engine's own words there last:
+/// `chain.upsampler.design.length: 1,279 taps is too short at ... (At
+/// 44.1k ×16: an equiripple design of 1279 taps ...)`.
+fn plain_refusal(
+    field: &str,
+    up: &UpsamplerConfig,
+    cfg: &EngineConfig,
+    cases: &[design::explain::Case],
+) -> Option<String> {
+    let d = up.design.as_ref()?;
+    let c = with_chain_a(cfg, up);
+    let x = design::explain::explain_with(d, cases, false, &fix_builds(&c));
+    let first = x.rates.first()?;
+    // The engine's own words at the first rate, after the plain ones (the
+    // error has no details disclosure; `check_design` lists every rate's).
+    Some(format!(
+        "{field}.{}: {} (At {} {}: {}.)",
+        first.path,
+        x.message,
+        design::explain::rate_label(first.source_rate),
+        design::explain::ratio_label(first.ratio),
+        first.detail
+    ))
+}
+
 /// Whether `up` can be built at the non-integer ratio `r` from `rate`: the
 /// design's ratio rules, length and cost limits with `pipelines` copies
 /// running at once ([`rational_pipelines`]). `field` prefixes the messages.
@@ -1227,7 +1654,7 @@ pub fn check_rational_at(
                 ..
             }
         )
-        && let Ok(manual) = design::paths::standard::legacy_config(k, rate)
+        && let Ok(manual) = design::paths::standard::legacy_config_for(k, rate, r)
     {
         let lower = audivane_dsp_core::filter_design::automatic_taps_lower_bound(&manual, r)
             .map_err(|e| format!("{field}.design.length: at {rate} Hz ({r}), {e}"))?;
@@ -1271,6 +1698,9 @@ pub fn check_rational_at(
 /// probed: [`crate::engine::preview_landings`]), each rate's plan is for
 /// the ratio the engine would open the device at, and a rate it does not
 /// offer there gets none; the refusals stay at the target's own ratio.
+/// `notes` holds one entry per played rate where a band's passband end in
+/// Hz does not fit and the band's fraction stands in
+/// ([`design::band_pin_note`]).
 pub fn check_design(
     stored: &StoredDesign,
     target: Option<RateTarget>,
@@ -1281,10 +1711,14 @@ pub fn check_design(
     landings: Option<&[(u32, RateRatio)]>,
 ) -> audivane_protocol::ipc::DesignCheck {
     use audivane_protocol::design::FieldError;
-    use audivane_protocol::ipc::{DesignCheck, RatePlan};
+    use audivane_protocol::ipc::{
+        DesignAdvice, DesignCheck, DesignFix, RateDetail, RateNote, RatePlan,
+    };
     let mut out = DesignCheck {
         errors: Vec::new(),
         plans: Vec::new(),
+        notes: Vec::new(),
+        advice: None,
     };
     let fail = |out: &mut DesignCheck, path: &str, message: String| {
         out.errors.push(FieldError {
@@ -1294,8 +1728,7 @@ pub fn check_design(
     };
     let target = target.unwrap_or(cfg.chain.upsampler.target);
     let policy = &cfg.rate.allowed_rates;
-    let explicit: Vec<u32>;
-    let (checked, planned): (&[u32], &[u32]) = match source_rate {
+    let planned: Vec<u32> = match source_rate {
         Some(rate) => {
             let top = audivane_protocol::MAX_OUTPUT_RATE;
             if !(8_000..=top).contains(&rate) {
@@ -1306,12 +1739,11 @@ pub fn check_design(
                 );
                 return out;
             }
-            explicit = vec![rate];
-            (&explicit, &explicit)
+            vec![rate]
         }
-        None => (ALLOWED_RATES, policy),
+        None => policy.clone(),
     };
-    if let Some(e) = target_error(target, planned) {
+    if let Some(e) = target_error(target, &planned) {
         let e = e.trim_start_matches([':', ' ']).to_string();
         fail(&mut out, "target", e);
     }
@@ -1321,84 +1753,154 @@ pub fn check_design(
         return out;
     }
     let pipelines = rational_pipelines(cfg.ab.is_some());
-    // One refusal per field and message, at the first rate it happens.
-    let mut seen: Vec<(String, String)> = Vec::new();
-    let preserves = matches!(&d, FilterDesign::Kernel(k) if k.preserve_samples);
-    for &rate in checked {
-        let r = resolve_rate_ratio(target, rate);
-        let plays = planned.contains(&rate);
-        // On a probed device each rate is planned where the engine opens it
-        // (`None`: it does not offer the rate there, PipeWire converts it).
-        let landing = match landings {
-            Some(l) => l.iter().find(|x| x.0 == rate).map(|x| x.1),
-            None => Some(r),
+    let context = |rate: u32, ratio: RateRatio| BuildContext {
+        source_rate: rate,
+        ratio,
+        channels: 2,
+        max_block: audivane_io_pw::scaled_quantum(cfg.quantum, rate).clamp(512, 8192) as usize,
+        pipelines,
+        output: *output,
+        workspace: design::budget::design_workspace(),
+    };
+    let up = UpsamplerConfig {
+        target,
+        preset: None,
+        design: Some(stored.clone()),
+    };
+    let c = with_chain_a(cfg, &up);
+    let verify = fix_builds(&c);
+    let explain_at = |cases: &[design::explain::Case], applied: bool| {
+        let x = design::explain::explain_with(&stored.design, cases, applied, &verify);
+        let advice = DesignAdvice {
+            message: x.message.clone(),
+            applied,
+            details: x
+                .rates
+                .iter()
+                .map(|r| RateDetail {
+                    source_rate: r.source_rate,
+                    ratio: r.ratio,
+                    path: r.path.clone(),
+                    message: r.detail.clone(),
+                })
+                .collect(),
+            fixes: x
+                .fixes
+                .iter()
+                .map(|f| DesignFix {
+                    label: f.label.clone(),
+                    design: StoredDesign {
+                        based_on: stored.based_on.clone(),
+                        design: f.design.clone(),
+                    },
+                })
+                .collect(),
         };
-        let max_block = audivane_io_pw::scaled_quantum(cfg.quantum, rate).clamp(512, 8192) as usize;
-        let context = |ratio: RateRatio| BuildContext {
+        (x, advice)
+    };
+    // Whether the design is applied, as the config validation decides it
+    // ([`chain_a_verdict`]: at the landings the ladder picks): refused, in
+    // plain words, when it builds at none of them.
+    let ladder = match chain_a_verdict(cfg, &up, &planned) {
+        Ok(ladder) => ladder,
+        Err(cases) => {
+            let (x, advice) = explain_at(&cases, false);
+            let path = x.rates.first().map_or("design", |r| r.path.as_str());
+            fail(&mut out, path, x.message);
+            out.advice = Some(advice);
+            return out;
+        }
+    };
+    let push_plan = |out: &mut DesignCheck, rate: u32, ratio: RateRatio, plan: design::Plan| {
+        let load = plan
+            .callback
+            .seconds(rates, rate, context(rate, ratio).max_block)
+            .ok()
+            .map(|secs| super::cpu_budget::thread_load(secs, cfg));
+        out.plans.push(RatePlan {
             source_rate: rate,
             ratio,
-            channels: 2,
-            max_block,
-            pipelines,
-            output: *output,
-            workspace: design::budget::design_workspace(),
+            plan: plan.wire(load, None),
+        });
+    };
+    // Each rate where the engine opens it (on a probed device, `landings`;
+    // `None` there: it does not offer the rate, PipeWire converts it; else
+    // where the ladder lands it): the design's plan, or its substitute's
+    // where it does not build there ([`super::cpu_budget::played_at`], the
+    // per-rate plan's choice).
+    let mut played: Vec<design::explain::Case> = Vec::new();
+    let mut plays: Vec<(u32, &'static str)> = Vec::new();
+    for &rate in &planned {
+        let landing = match landings {
+            Some(l) => l.iter().find(|x| x.0 == rate).map(|x| x.1),
+            None => ladder.iter().find(|x| x.0 == rate).map(|x| x.1),
         };
-        let push_plan = |out: &mut DesignCheck, ratio: RateRatio, plan: design::Plan| {
-            let load = plan
-                .callback
-                .seconds(rates, rate, max_block)
-                .ok()
-                .map(|secs| secs * 2.0);
-            out.plans.push(RatePlan {
-                source_rate: rate,
-                ratio,
-                plan: plan.wire(load, None),
-            });
+        let Some(q) = landing.filter(|q| !q.is_unity()) else {
+            continue;
         };
-        // Integer ratios are checked at every engine rate (as the config
-        // validation does), rational ones only where the graph can run.
-        if !(r.is_unity() || (!r.is_integer() && !plays)) {
-            let at = format!("at {rate} Hz ({r})");
-            if preserves && r.is_decimating() {
-                let message = "needs an output rate at or above the input rate".to_string();
-                if !seen
-                    .iter()
-                    .any(|s| s.0 == "design.preserve_samples" && s.1 == message)
-                {
-                    seen.push(("design.preserve_samples".into(), message.clone()));
-                    fail(
-                        &mut out,
-                        "design.preserve_samples",
-                        format!("{at}, {message}"),
-                    );
+        let error = chain_a_builds_at(&c, rate, q)
+            .err()
+            .map(ChainAFailure::into_design_error);
+        match &error {
+            None => {
+                if let Ok(plan) = design::feasibility(&d, &context(rate, q)) {
+                    push_plan(&mut out, rate, q, plan);
                 }
-            } else {
-                match design::feasibility(&d, &context(r)) {
-                    Ok(plan) if plays && landing == Some(r) => push_plan(&mut out, r, plan),
-                    Ok(_) => {}
-                    Err(e) => {
-                        let f = design::check::refusal(&e, &d);
-                        if !seen.iter().any(|s| s.0 == f.path && s.1 == f.message) {
-                            seen.push((f.path.clone(), f.message.clone()));
-                            fail(&mut out, &f.path, format!("{at}, {}", f.message));
-                        }
-                    }
+                // A pinned passband end that falls back here: at the
+                // landing, whose lower rate the band is of.
+                if let Some(message) = design::band_pin_note(&d, rate, q) {
+                    out.notes.push(RateNote {
+                        source_rate: rate,
+                        path: "design.cutoff.passband_end_hz".into(),
+                        message,
+                        plays: None,
+                    });
+                }
+            }
+            Some(_) => {
+                if let Some(sub) =
+                    super::cpu_budget::design_substitute(Some(rates), &c, None, rate, q)
+                    && let Ok(named) = design::Named::of(&sub.up)
+                    && let Ok(plan) =
+                        design::feasibility(&named.design.with_output(output), &context(rate, q))
+                {
+                    push_plan(&mut out, rate, q, plan);
+                    plays.push((rate, plays_name(sub.action)));
                 }
             }
         }
-        // The device lands elsewhere: plan that ratio (the driver's ladder
-        // only holds ratios the chain can be built for).
-        if let Some(q) = landing
-            && plays
-            && q != r
-            && !q.is_unity()
-            && !(preserves && q.is_decimating())
-            && let Ok(plan) = design::feasibility(&d, &context(q))
-        {
-            push_plan(&mut out, q, plan);
+        played.push(design::explain::Case {
+            cx: context(rate, q),
+            error,
+        });
+    }
+    if played.iter().any(|c| c.error.is_some()) {
+        let (x, advice) = explain_at(&played, true);
+        for r in &x.rates {
+            let name = plays
+                .iter()
+                .find(|p| p.0 == r.source_rate)
+                .map_or(design::RECOMMENDED_PRESET, |p| p.1);
+            out.notes.push(RateNote {
+                source_rate: r.source_rate,
+                path: r.path.clone(),
+                message: r.short.clone(),
+                plays: Some(name.to_string()),
+            });
         }
+        out.notes.sort_by_key(|n| n.source_rate);
+        out.advice = Some(advice);
     }
     out
+}
+
+/// [`audivane_protocol::ipc::RateNote::plays`] for a substitute:
+/// `recommended`, or `recommended_light` for a lighter form of it.
+fn plays_name(action: audivane_protocol::ipc::OverloadAction) -> &'static str {
+    match action {
+        audivane_protocol::ipc::OverloadAction::LightUpsampler => "recommended_light",
+        _ => design::RECOMMENDED_PRESET,
+    }
 }
 
 /// The build context the daemon checks a design in: `rate` at `r` with
@@ -1427,6 +1929,7 @@ fn custom_feasibility_at(
     searched: bool,
 ) -> Result<(), String> {
     let named = design::Named::of(up).map_err(|e| format!("{field}: {e}"))?;
+    nyquist_stop_at(&named.design, r).map_err(|e| format!("{field}.{e}"))?;
     let cx = design_context(rate, r, pipelines);
     if searched {
         design::searched_feasibility(&named.design, &cx)
@@ -1508,9 +2011,21 @@ pub fn check_stage_budget_for(
         ));
     }
     let sides = |c: &EngineConfig| if c.ab.is_some() { 2.0 } else { 1.0 };
+    // The chains that run here: chain A's custom design where it builds,
+    // its per-rate substitute where it does not (the outgoing one too).
+    let rates = super::cpu_budget::measured();
+    let played = |c: &EngineConfig| {
+        if ratio.is_integer() {
+            // No rational cost: nothing to select.
+            return c.clone();
+        }
+        super::cpu_budget::played_at(rates, c, None, graph_rate, ratio).into_owned()
+    };
+    let cfg = &played(cfg);
     let new = rational_side_cost(cfg, format, graph_rate, ratio) * sides(cfg);
     let old = outgoing.map_or(new, |o| {
-        rational_side_cost(o, format, graph_rate, ratio) * sides(o)
+        let o = played(o);
+        rational_side_cost(&o, format, graph_rate, ratio) * sides(&o)
     });
     let chains = new + new.max(old);
     if stage + chains > MAX_RATIONAL_MACS_PER_SECOND {
@@ -1606,16 +2121,166 @@ pub fn engine_buildable_rate_pairs(cfg: &EngineConfig) -> audivane_io_pw::RatePa
     let pipelines = rational_pipelines(cfg.ab.is_some());
     let mut mask = audivane_io_pw::RatePairMask::ALL;
     let mut seen: Vec<UpsamplerConfig> = Vec::new();
-    for chain in super::ab_side::designed_chains(cfg) {
+    for (i, chain) in super::ab_side::designed_chains(cfg).into_iter().enumerate() {
         // Every budget `match_output` can resolve to on the device.
         for up in upsampler_variants(&chain) {
             if !seen.contains(&up) {
-                mask = mask.intersect(buildable_rate_pairs(&up, pipelines));
+                let mut own = buildable_rate_pairs(&up, pipelines);
+                // Chain A's custom design plays Recommended from a rate it
+                // does not build at: the ladder follows Recommended there.
+                // Recommended as it builds (its `match_output` budget
+                // resolved for every output the device may open in), only
+                // needed where the design reaches no pair.
+                if i == 0 && falls_back_per_rate(&up) {
+                    let reach = reachable_rate_pairs(up.target);
+                    let reaches = |input: u32, mask: audivane_io_pw::RatePairMask| {
+                        audivane_io_pw::lifecycle::MASK_OUTPUT_RATES
+                            .iter()
+                            .any(|&output| {
+                                output != input
+                                    && reach.allows(input, output)
+                                    && mask.allows(input, output)
+                            })
+                    };
+                    let stranded = ALLOWED_RATES.iter().any(|&input| {
+                        reaches(input, audivane_io_pw::RatePairMask::ALL) && !reaches(input, own)
+                    });
+                    if stranded {
+                        let rec = ChainConfig {
+                            upsampler: recommended_upsampler(&up),
+                            ..chain.clone()
+                        };
+                        let rec = upsampler_variants(&rec)
+                            .iter()
+                            .fold(audivane_io_pw::RatePairMask::ALL, |m, v| {
+                                m.intersect(buildable_rate_pairs(v, pipelines))
+                            });
+                        own = own.or_where_none(rec, reach);
+                    }
+                }
+                mask = mask.intersect(own);
                 seen.push(up);
             }
         }
     }
     mask
+}
+
+/// Recommended at `up`'s target: what a custom design plays at a rate it
+/// does not build at ([`falls_back_per_rate`]).
+pub fn recommended_upsampler(up: &UpsamplerConfig) -> UpsamplerConfig {
+    UpsamplerConfig {
+        target: up.target,
+        preset: Some(catalogue::RECOMMENDED.to_string()),
+        design: None,
+    }
+}
+
+/// Whether chain A's upsampler in `cfg` builds from `rate` at `r`, for a
+/// custom design ([`falls_back_per_rate`]); `Ok` at x1, with DSP or the
+/// upsampler off, or for a preset (checked by the variant validation).
+/// [`chain_builds_at`] does the check.
+pub fn chain_a_builds_at(cfg: &EngineConfig, rate: u32, r: RateRatio) -> Result<(), ChainAFailure> {
+    if r.is_unity() || !cfg.dsp_enabled || !falls_back_per_rate(&cfg.chain.upsampler) {
+        return Ok(());
+    }
+    chain_builds_at(cfg, rate, r)
+}
+
+/// Whether chain A's upsampler in `cfg`, whatever it is, builds from `rate`
+/// at `r` (every form `match_output` resolves to), with the checks the
+/// config validation applies: the design's refusal there as
+/// [`design::searched_feasibility`] gives it (an automatic length
+/// searched), a kept-samples design at a decimating ratio, and at a
+/// rational ratio the rational check ([`check_rational_at`]).
+pub fn chain_builds_at(cfg: &EngineConfig, rate: u32, r: RateRatio) -> Result<(), ChainAFailure> {
+    if r.is_unity() || cfg.chain.upsampler.target == RateTarget::Off {
+        return Ok(());
+    }
+    let pipelines = rational_pipelines(cfg.ab.is_some());
+    for v in upsampler_variants(&cfg.chain) {
+        let named = design::Named::of(&v).map_err(|e| ChainAFailure::Message(e.to_string()))?;
+        let d = &named.design;
+        if matches!(d, FilterDesign::Kernel(k) if k.preserve_samples) && r.is_decimating() {
+            return Err(ChainAFailure::Design(design::DesignError::Ratio {
+                ratio: r,
+                need: "an output rate at or above the input rate (it keeps the original samples)",
+            }));
+        }
+        nyquist_stop_at(d, r).map_err(ChainAFailure::Message)?;
+        let cx = design_context(rate, r, pipelines);
+        if let Err(e) = design::searched_feasibility(d, &cx) {
+            return Err(ChainAFailure::Design(e));
+        }
+        if !r.is_integer() {
+            check_rational_at("upsampler", &v, rate, r, pipelines)
+                .map_err(ChainAFailure::Message)?;
+        }
+    }
+    Ok(())
+}
+
+/// Stop at Nyquist's calibrated range at the ratio `r` (on its design
+/// grid), as [`validate_upsampler_variants`] checks it at every rate.
+fn nyquist_stop_at(d: &FilterDesign, r: RateRatio) -> Result<(), String> {
+    let FilterDesign::Kernel(k) = d else {
+        return Ok(());
+    };
+    if !matches!(
+        k.shape,
+        Shape::WindowedSinc {
+            cutoff: audivane_protocol::design::Cutoff::NyquistStop,
+            ..
+        }
+    ) {
+        return Ok(());
+    }
+    let Ok(manual) = design::paths::standard::legacy_config(k, ALLOWED_RATES[0]) else {
+        return Ok(());
+    };
+    let grid_ratio = design::paths::standard::design_ratio(r);
+    let taps = match manual.taps_unit {
+        audivane_protocol::TapsUnit::Output => manual.taps.saturating_mul(r.down as usize),
+        audivane_protocol::TapsUnit::Input => manual.taps.saturating_mul(r.up as usize),
+    };
+    audivane_dsp_core::resample::nyquist_stop_check_for(
+        manual.window,
+        taps,
+        grid_ratio,
+        manual.kaiser_beta,
+    )
+    .map(|_| ())
+    .map_err(|e| format!("design.cutoff: {e}"))
+}
+
+/// Whether `d` builds from `rate` at `r` as chain A's custom design of
+/// `cfg` (its target, output and pipelines): [`chain_builds_at`]. What a
+/// one-click fix is held to before it is offered.
+pub fn design_builds_at(cfg: &EngineConfig, d: &FilterDesign, rate: u32, r: RateRatio) -> bool {
+    let mut c = cfg.clone();
+    c.chain.upsampler = UpsamplerConfig {
+        target: c.chain.upsampler.target,
+        preset: None,
+        design: Some(StoredDesign::new(d.clone())),
+    };
+    chain_builds_at(&c, rate, r).is_ok()
+}
+
+/// Why [`chain_a_builds_at`] says no.
+#[derive(Debug)]
+pub enum ChainAFailure {
+    Design(design::DesignError),
+    Message(String),
+}
+
+impl ChainAFailure {
+    /// As a design error, for [`design::explain`].
+    pub fn into_design_error(self) -> design::DesignError {
+        match self {
+            ChainAFailure::Design(e) => e,
+            ChainAFailure::Message(m) => design::DesignError::Failed(m),
+        }
+    }
 }
 
 /// A new install's config (no config file yet): the defaults, upsampling
@@ -1705,10 +2370,16 @@ fn bypass_pair_builds(output_cfg: &OutputConfig, input: u32, output: u32) -> boo
     if r.is_integer() {
         return true;
     }
+    // Recommended's band (a passband end in Hz converted at the lower
+    // rate, as the build does), at the output's budget.
+    let Some(rec) = design::band_of(&catalogue::recommended()).copied() else {
+        return false;
+    };
     let band = audivane_protocol::BandSpec {
-        passband_end: 0.908,
-        stopband_start: 1.0,
+        passband_end: design::band_passband_end(&rec, input.min(output)),
+        passband_end_hz: None,
         attenuation_db: audivane_protocol::filter_error_budget_db(output_cfg),
+        ..rec
     };
     band_design_for(
         audivane_protocol::WindowKind::Kaiser,
@@ -1797,6 +2468,25 @@ pub fn upsampler_variants(chain: &ChainConfig) -> Vec<UpsamplerConfig> {
     }
 }
 
+/// The `(input, output)` pairs `target`'s ladder can land at (x1 aside):
+/// its integer rungs, and the fractional outputs it reaches.
+pub fn reachable_rate_pairs(target: RateTarget) -> audivane_io_pw::RatePairMask {
+    let term = audivane_io_pw::lifecycle::MAX_RATIONAL_TERM;
+    audivane_io_pw::RatePairMask::from_fn(|input, output| {
+        let r = audivane_protocol::RateRatio::from_rates(input, output);
+        match (target, r.as_integer()) {
+            (RateTarget::Off, _) => false,
+            (RateTarget::Rate(rate), _) => output == rate,
+            (RateTarget::Ratio(k), _) => u64::from(output) == u64::from(input) * u64::from(k),
+            (RateTarget::MaxRate(cap), Some(_)) | (RateTarget::MaxRateAny(cap), Some(_)) => {
+                output <= cap
+            }
+            (RateTarget::MaxRateAny(cap), None) => output <= cap && r.up <= term && r.down <= term,
+            (RateTarget::MaxRate(_), None) => false,
+        }
+    })
+}
+
 /// The `(input, output)` rate pairs `up` can be built for, for the ratio
 /// ladders.
 pub fn buildable_rate_pairs(
@@ -1819,7 +2509,7 @@ pub fn buildable_rate_pairs(
     let Ok(named) = design::Named::of(up) else {
         return audivane_io_pw::RatePairMask::NONE;
     };
-    audivane_io_pw::RatePairMask::from_fn(|input, output| {
+    let pair_builds = |input: u32, output: u32| {
         let r = audivane_protocol::RateRatio::from_rates(input, output);
         match (r.as_integer(), named.preset) {
             (Some(k), Some(_)) => design::feasibility(
@@ -1839,6 +2529,37 @@ pub fn buildable_rate_pairs(
                     && check_rational_at("upsampler", up, input, r, pipelines).is_ok()
             }
         }
+    };
+    if named.preset.is_some() {
+        return audivane_io_pw::RatePairMask::from_fn(pair_builds);
+    }
+    // A custom design searches each pair's length: on the validation
+    // workers, one pair per ratio first (the other source rates at that
+    // ratio then find its prototypes designed).
+    let mut first = Vec::new();
+    let mut rest = Vec::new();
+    for &input in ALLOWED_RATES {
+        for output in audivane_io_pw::lifecycle::MASK_OUTPUT_RATES {
+            if input == output {
+                continue;
+            }
+            let r = audivane_protocol::RateRatio::from_rates(input, output);
+            if first.iter().any(|&(i, o)| RateRatio::from_rates(i, o) == r) {
+                rest.push((input, output));
+            } else {
+                first.push((input, output));
+            }
+        }
+    }
+    let mut builds = std::collections::HashMap::new();
+    for wave in [first, rest] {
+        let results = run_parallel(&wave, |&(i, o)| pair_builds(i, o));
+        for (&(i, o), ok) in wave.iter().zip(results) {
+            builds.insert((i, o), ok.unwrap_or_else(|| pair_builds(i, o)));
+        }
+    }
+    audivane_io_pw::RatePairMask::from_fn(|input, output| {
+        builds.get(&(input, output)) == Some(&true)
     })
 }
 
@@ -1850,6 +2571,19 @@ pub fn worst_case_ratio(target: RateTarget) -> u32 {
         .filter_map(|&rate| resolve_rate_ratio(target, rate).as_integer())
         .max()
         .unwrap_or(1)
+}
+
+/// The probe's view for `cfg`'s output pair and formats
+/// ([`audivane_protocol::ipc::DeviceCapabilities::for_output`]): the
+/// channel count the engine would open the device at for that pair.
+pub fn caps_view(
+    cfg: &EngineConfig,
+    caps: &audivane_protocol::ipc::DeviceCapabilities,
+) -> audivane_protocol::ipc::DeviceCapabilities {
+    let min = cfg
+        .output_channels
+        .map_or(2, |p| p.min_device_channels().max(2));
+    caps.for_output(min, &cfg.formats)
 }
 
 /// The source rates in [`ALLOWED_RATES`] at which `target` resolves to a
@@ -1874,6 +2608,9 @@ pub fn validate_against_device(
     let Some(caps) = caps.filter(|c| c.device == cfg.device) else {
         return Ok(());
     };
+    // What `cfg`'s own output pair plays, not the pair the probe was
+    // viewed for: a return to a pair with more rates is never refused.
+    let caps = &caps_view(cfg, caps);
     let formats: &[audivane_protocol::SampleFormat] = if cfg.formats.is_empty() {
         &audivane_io_alsa::FORMAT_PREFERENCE
     } else {
@@ -1955,13 +2692,26 @@ fn validate_automatic(
             novel_variants.push((up, named.design));
         }
     }
-    // Novel (step 4) automatic designs: check via searched_feasibility.
-    for (up, d) in novel_variants {
-        for r in design_ratios(up.target) {
-            if r.is_integer() {
-                design::searched_feasibility(&d, &design_context(ALLOWED_RATES[0], r, pipelines))
-                    .map_err(|e| refused_at(field, &d, &r.to_string(), &e))?;
-            }
+    // Novel (step 4) automatic designs: check via searched_feasibility, the
+    // ratios in parallel (longest first), the smallest refused reported.
+    let mut novel_jobs: Vec<(&FilterDesign, audivane_protocol::RateRatio)> = novel_variants
+        .iter()
+        .flat_map(|(up, d)| {
+            design_ratios(up.target)
+                .into_iter()
+                .filter(|r| r.is_integer())
+                .map(move |r| (d, r))
+        })
+        .collect();
+    novel_jobs.sort_by_key(|&(_, r)| std::cmp::Reverse(r.up));
+    let results = run_parallel(&novel_jobs, |&(d, r)| {
+        design::searched_feasibility(d, &design_context(ALLOWED_RATES[0], r, pipelines)).map(|_| ())
+    });
+    for (&(d, r), result) in novel_jobs.iter().zip(results).rev() {
+        match result {
+            Some(Ok(())) => {}
+            Some(Err(e)) => return Err(refused_at(field, d, &r.to_string(), &e)),
+            None => return Err(format!("{field}: the design check did not complete")),
         }
     }
     if standard_variants.is_empty() {
@@ -1980,7 +2730,7 @@ fn validate_automatic(
             jobs.push((idx, r, a));
         }
     }
-    // Wave 1, integer ratios: longest designs first, so the total is close
+    // Integer ratios first, longest designs first, so the total is close
     // to the slowest single design. They must all design; the smallest
     // failing ratio is reported before anything rational runs.
     let (mut integer, rational): (Vec<_>, Vec<_>) =
@@ -2010,9 +2760,10 @@ fn validate_automatic(
         .into_iter()
         .filter_map(|(idx, r, _)| cheapest_input(r).map(|input| (idx, r, input)))
         .collect();
-    // Wave 2 runs one ratio per grid scale (ratios of one scale share the
+    // One ratio per grid scale goes first (ratios of one scale share the
     // real-grid check, which would otherwise run several times at once),
-    // the cheapest per output frame; wave 3 the rest, mostly cache hits.
+    // the cheapest per output frame first; the rest follow, mostly cache
+    // hits.
     let cost =
         |&(_, r, input): &(usize, RateRatio, u32)| u64::from(input) * 4096 / u64::from(r.down);
     rational.sort_by_key(|job| (design::paths::standard::design_ratio(job.1), cost(job)));
@@ -2139,6 +2890,33 @@ pub fn runtime_outputs(output: &OutputConfig) -> Vec<OutputConfig> {
     outputs
 }
 
+/// A convolution item's filter matrix: its shape
+/// ([`audivane_dsp_core::matrix::check_item_shape`], the rule `avdsp
+/// process` applies too) and, when enabled, every file present.
+fn validate_conv_matrix(
+    field: &str,
+    conv: &audivane_protocol::ConvolutionConfig,
+    matrix: &[audivane_protocol::MatrixEntry],
+) -> Result<(), String> {
+    audivane_dsp_core::matrix::check_item_shape(conv, crate::engine::DEFAULT_CHANNELS)
+        .map_err(|e| format!("{field}{e}"))?;
+    if conv.enabled {
+        for (k, e) in matrix.iter().enumerate() {
+            let at = format!("{field}.matrix[{k}]");
+            if e.ir_path.as_os_str().is_empty() {
+                return Err(format!("{at}.ir_path must not be empty"));
+            }
+            if !e.ir_path.is_file() {
+                return Err(format!(
+                    "{at}.ir_path does not exist or is not a file: {}",
+                    e.ir_path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate a pitch-shift configuration.
 pub fn validate_pitch(field: &str, pitch: &PitchConfig) -> Result<(), String> {
     if !pitch.cents.is_finite() || !(-1200.0..=1200.0).contains(&pitch.cents) {
@@ -2218,27 +2996,40 @@ pub fn validate_crossfeed(field: &str, cf: &CrossfeedConfig) -> Result<(), Strin
             cf.feed_db
         ));
     }
-    Ok(())
-}
-
-fn validate_harmonic_level(field: &str, db: f64) -> Result<(), String> {
-    if !db.is_finite() || !(HARMONICS_MIN_DB..=HARMONICS_MAX_DB).contains(&db) {
+    if !cf.width.is_finite() || !(STEREO_WIDTH_MIN..=STEREO_WIDTH_MAX).contains(&cf.width) {
         return Err(format!(
-            "{field} must be between {HARMONICS_MIN_DB} and {HARMONICS_MAX_DB} dB (got {db})"
+            "{field}.width must be between {STEREO_WIDTH_MIN} and {STEREO_WIDTH_MAX} (got {})",
+            cf.width
+        ));
+    }
+    if !cf.width_corner_hz.is_finite()
+        || !(STEREO_WIDTH_CORNER_MIN_HZ..=STEREO_WIDTH_CORNER_MAX_HZ).contains(&cf.width_corner_hz)
+    {
+        return Err(format!(
+            "{field}.width_corner_hz must be between {STEREO_WIDTH_CORNER_MIN_HZ} and {STEREO_WIDTH_CORNER_MAX_HZ} Hz (got {})",
+            cf.width_corner_hz
         ));
     }
     Ok(())
 }
 
-/// Validate harmonic distortion parameters.
+/// Validate harmonic distortion parameters: at most
+/// [`HARMONICS_MAX_LAYERS`] layers, each checked by its kind
+/// ([`audivane_dsp_core::harmonics::validate_layer`]: every layer, enabled
+/// or not; flux and hysteresis layers are also calibrated once at 96 kHz,
+/// so a target they cannot reach fails here rather than when the chain
+/// builds). Series routing needs no check of its own: its peak bound is
+/// composed from each layer's certified one (each layer scaled by its own
+/// trim), so a series config is valid wherever its layers are.
 pub fn validate_harmonics(field: &str, h: &HarmonicsConfig) -> Result<(), String> {
-    validate_harmonic_level(&format!("{field}.h2_db"), h.h2_db)?;
-    validate_harmonic_level(&format!("{field}.h3_db"), h.h3_db)?;
-    if let Some(h4) = h.h4_db {
-        validate_harmonic_level(&format!("{field}.h4_db"), h4)?;
+    if h.layers.len() > HARMONICS_MAX_LAYERS {
+        return Err(format!(
+            "{field}.layers holds at most {HARMONICS_MAX_LAYERS} layers (got {})",
+            h.layers.len()
+        ));
     }
-    if let Some(h5) = h.h5_db {
-        validate_harmonic_level(&format!("{field}.h5_db"), h5)?;
+    for (i, layer) in h.layers.iter().enumerate() {
+        audivane_dsp_core::harmonics::validate_layer(&format!("{field}.layers[{i}]"), layer)?;
     }
     Ok(())
 }
@@ -2257,6 +3048,18 @@ pub fn validate_chain_at(
     chain: &ChainConfig,
     rates: &[u32],
     pipelines: usize,
+) -> Result<(), String> {
+    validate_chain_with(field, chain, rates, pipelines, None)
+}
+
+/// [`validate_chain_at`]; with `chain_a` (the config it is chain A of),
+/// its custom design may fall back per rate ([`validate_chain_a_upsampler`]).
+fn validate_chain_with(
+    field: &str,
+    chain: &ChainConfig,
+    rates: &[u32],
+    pipelines: usize,
+    chain_a: Option<&EngineConfig>,
 ) -> Result<(), String> {
     if let Some(dc) = &chain.dc_block {
         validate_dc_block(&format!("{field}.dc_block"), dc)?;
@@ -2287,12 +3090,23 @@ pub fn validate_chain_at(
         }
         check_tilt_sections(eq.tilt.as_ref(), eq.tilt_high.as_ref())
             .map_err(|e| format!("{field}.eq: {e}"))?;
+        if let Some(tone) = &eq.tone {
+            for (name, db) in [("bass_db", tone.bass_db), ("treble_db", tone.treble_db)] {
+                if !db.is_finite() || db.abs() > TONE_MAX_DB {
+                    return Err(format!(
+                        "{field}.eq.tone.{name} ({db}) must be within ±{TONE_MAX_DB} dB"
+                    ));
+                }
+            }
+        }
     }
     for (i, conv) in chain.convolution.iter().enumerate() {
         if !conv.gain_db.is_finite() {
             return Err(format!("{field}.convolution[{i}].gain_db must be finite"));
         }
-        if conv.enabled {
+        if let Some(matrix) = &conv.matrix {
+            validate_conv_matrix(&format!("{field}.convolution[{i}]"), conv, matrix)?;
+        } else if conv.enabled {
             if conv.ir_path.as_os_str().is_empty() {
                 return Err(format!(
                     "{field}.convolution[{i}].ir_path must not be empty"
@@ -2326,7 +3140,12 @@ pub fn validate_chain_at(
             variants.push(up);
         }
     }
-    validate_upsampler_variants(&format!("{field}.upsampler"), &variants, rates, pipelines)?;
+    let field = format!("{field}.upsampler");
+    if let Some(cfg) = chain_a {
+        validate_chain_a_upsampler(&field, &variants, rates, pipelines, cfg)?;
+    } else {
+        validate_upsampler_variants(&field, &variants, rates, pipelines)?;
+    }
     Ok(())
 }
 
@@ -2403,6 +3222,13 @@ fn validate_ab(ab: &AbConfig, a: &ChainConfig, rate: &RatePolicy) -> Result<(), 
 /// validation: [`normalize_rates`], [`normalize_ab`] and
 /// [`normalize_volume`]. Returns the notes of what had to change.
 pub fn normalize_config(cfg: &mut EngineConfig) -> Option<String> {
+    // The room calibration's items first: side B is materialised from A.
+    super::calibration::normalize(cfg);
+    // `[0, 1]` is the default pair: stored as no setting.
+    cfg.output_channels = OutputChannels::normalized(cfg.output_channels);
+    for f in &mut cfg.outputs.followers {
+        f.output_channels = OutputChannels::normalized(f.output_channels);
+    }
     let notes: Vec<String> = [
         normalize_rates(&mut cfg.rate),
         normalize_ab(cfg),
@@ -2411,6 +3237,7 @@ pub fn normalize_config(cfg: &mut EngineConfig) -> Option<String> {
     .into_iter()
     .flatten()
     .collect();
+    normalize_followers(cfg);
     (!notes.is_empty()).then(|| notes.join("; "))
 }
 
@@ -2430,6 +3257,25 @@ pub fn normalize_volume(volume: &mut audivane_protocol::ipc::VolumeConfig) -> Op
     );
     volume.volume_db = ceiling;
     Some(note)
+}
+
+/// A follower that follows the master's volume has the master level its own
+/// `volume_db` is relative to (`follow_ref_db`): one without it (a hand
+/// edit, an older file) takes the master's configured level now, so it
+/// keeps the level it has; one that does not follow has none.
+pub fn normalize_followers(cfg: &mut EngineConfig) {
+    let master = crate::engine::volume::target_db(&cfg.volume);
+    for f in &mut cfg.outputs.followers {
+        f.follow_ref_db = if !f.follow_volume {
+            None
+        } else {
+            Some(
+                f.follow_ref_db
+                    .filter(|r| r.is_finite())
+                    .map_or(master, |r| r.clamp(VOLUME_MIN_DB, VOLUME_MAX_DB)),
+            )
+        };
+    }
 }
 
 /// Keep the rate policy consistent instead of rejecting it: `allowed_rates`
@@ -2498,7 +3344,12 @@ pub fn normalize_ab(cfg: &mut EngineConfig) -> Option<String> {
         }
     }
     match super::ab_side::materialize(a, &ab.b) {
-        Ok(chain_b) => {
+        Ok(mut chain_b) => {
+            super::calibration::place_b(
+                &mut chain_b,
+                cfg.calibration.as_ref(),
+                ab.calibration_b.as_ref(),
+            );
             ab.chain_b = chain_b;
             note
         }
@@ -2541,12 +3392,59 @@ fn describe_target(target: RateTarget) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use audivane_protocol::ipc::{AbConfig, AppRule, SinkChoice};
     use audivane_protocol::{
-        DitherKind, EqProfile, OutputConfig, RateTarget, UpsamplerConfig, WindowKind,
+        DitherKind, EqProfile, HarmonicsLayer, OutputConfig, RateTarget, UpsamplerConfig,
+        WindowKind,
     };
+
+    /// A probed device plans a rate where the engine opens it, and the pin's
+    /// fallback note follows that landing: a 30 kHz pin fits ×2 at 96 kHz,
+    /// but not 96 -> 48 kHz, where the band is of the 24 kHz Nyquist.
+    #[test]
+    fn check_design_notes_a_pin_at_the_landing() {
+        let mut d = catalogue::recommended();
+        if let FilterDesign::Kernel(k) = &mut d
+            && let Shape::WindowedSinc {
+                cutoff: audivane_protocol::design::Cutoff::Band(b),
+                ..
+            } = &mut k.shape
+        {
+            b.passband_end_hz = Some(30_000.0);
+        }
+        let stored = StoredDesign::new(d);
+        let cfg = EngineConfig::default();
+        let output = OutputConfig::default();
+        let rates = audivane_dsp_core::cpu_bench::KernelRates::floor();
+        let target = Some(RateTarget::Ratio(2));
+        let check = |landings: Option<&[(u32, RateRatio)]>| {
+            check_design(
+                &stored,
+                target,
+                Some(96_000),
+                &cfg,
+                &output,
+                &rates,
+                landings,
+            )
+        };
+        let free = check(None);
+        assert!(free.errors.is_empty(), "{:?}", free.errors);
+        assert!(free.notes.is_empty(), "{:?}", free.notes);
+        let down = [(96_000, RateRatio::new(1, 2))];
+        let probed = check(Some(&down));
+        assert!(probed.errors.is_empty(), "{:?}", probed.errors);
+        assert_eq!(probed.plans.len(), 1);
+        assert_eq!(probed.plans[0].ratio, RateRatio::new(1, 2));
+        assert_eq!(probed.notes.len(), 1, "{:?}", probed.notes);
+        assert!(
+            probed.notes[0].message.contains("1.250 of the Nyquist"),
+            "{}",
+            probed.notes[0].message
+        );
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -2714,7 +3612,7 @@ mod tests {
         cfg.chain.upsampler = up(189.0);
         let err = validate(&cfg).unwrap_err();
         assert!(
-            err.contains("on the 160x grid") && err.contains("(147/160)"),
+            err.contains("on the 160x grid") && err.contains("48k ×147/160"),
             "{err}"
         );
         cfg.chain.upsampler = up(133.0);
@@ -2858,6 +3756,74 @@ mod tests {
                 .to_string_lossy()
                 .contains(".tmp."))
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A room calibration whose IR is gone at start-up is dropped on its
+    /// own: the followers get their settings from before it back, the rest
+    /// of the config stays (not moved aside for defaults), and the warning
+    /// says why.
+    #[test]
+    fn a_calibration_with_a_missing_ir_is_dropped_alone_at_start() {
+        let dir = temp_dir("calmissing");
+        let wav = |name: &str, ch: u16| {
+            let spec = hound::WavSpec {
+                channels: ch,
+                sample_rate: 48_000,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            let mut w = hound::WavWriter::create(dir.join(name), spec).unwrap();
+            for _ in 0..ch {
+                w.write_sample(0.5f32).unwrap();
+            }
+            w.finalize().unwrap();
+        };
+        wav("ll.wav", 1);
+        wav("sub.wav", 2);
+        let manifest = dir.join("bundle.json");
+        fs::write(
+            &manifest,
+            serde_json::json!({"bundle_version": 1, "label": "desk", "design_rate_hz": 48000,
+                "devices": [
+                  {"role": "master", "matrix": [{"in": 0, "out": 0, "ir": "ll.wav"}]},
+                  {"role": "follower", "device": "hw:CARD=USB_1,DEV=0", "trim_ms": 1.5,
+                   "matrix": [{"in": 0, "out": 1, "ir": "sub.wav", "channel": 0}]}]})
+            .to_string(),
+        )
+        .unwrap();
+        let mut cfg = valid();
+        cfg.quantum = 512;
+        let mut f = audivane_protocol::ipc::FollowerConfig::new("hw:CARD=USB_1,DEV=0");
+        f.trim_ms = -2.0;
+        f.chain_patch = Some(serde_json::json!({"limiter": {"mode": "limit"}}));
+        cfg.outputs.followers.push(f);
+        let before = cfg.clone();
+        let l = super::super::calibration::read(manifest.to_str().unwrap(), &cfg, 2).unwrap();
+        let master = crate::engine::volume::target_db(&cfg.volume);
+        super::super::calibration::install(&mut cfg, l.calibration, master);
+        assert!(validate(&cfg).is_ok());
+        let store = ConfigStore::new(dir.join("config.json"));
+        store.save(&cfg).unwrap();
+        assert_eq!(
+            store.load().config,
+            cfg,
+            "loads as saved while the files are there"
+        );
+        fs::remove_file(dir.join("sub.wav")).unwrap();
+        let loaded = store.load();
+        // Put back as before it, but the follower keeps following (an
+        // unload never changes a follower's level or following).
+        let mut want = before.clone();
+        want.outputs.followers[0].follow_volume = true;
+        want.outputs.followers[0].follow_ref_db = Some(0.0);
+        assert_eq!(loaded.config, want);
+        let w = loaded.warning.expect("a warning");
+        assert!(
+            w.contains("room calibration \"desk\" is not loaded") && w.contains("sub.wav"),
+            "{w}"
+        );
+        assert!(dir.join("config.json").exists(), "not moved aside");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3091,10 +4057,12 @@ mod tests {
         assert_eq!(worst_case_ratio(m.target), 16);
         m.taps = min16 - 1;
         set_m(&mut cfg, &m);
-        assert!(
-            validate(&cfg).is_err(),
-            "x16 at 44.1/48 kHz must be checked"
-        );
+        // x16 at 44.1/48 kHz is checked: the ladder skips it, and the
+        // design plays at x8 there.
+        validate(&cfg).unwrap();
+        let mask = engine_buildable_rate_pairs(&cfg);
+        assert!(!mask.allows(44_100, 705_600) && !mask.allows(48_000, 768_000));
+        assert!(mask.allows(44_100, 352_800) && mask.allows(48_000, 384_000));
         m.taps = min16;
         set_m(&mut cfg, &m);
         assert!(validate(&cfg).is_ok());
@@ -3292,6 +4260,8 @@ mod tests {
             enabled: true,
             ir_path: "/nonexistent/t5b.ir.wav".into(),
             gain_db: 0.0,
+            matrix: None,
+            calibration: false,
         }];
         assert!(validate(&cfg).unwrap_err().contains("ir_path"));
         cfg.chain.convolution.clear();
@@ -3351,6 +4321,43 @@ mod tests {
     }
 
     #[test]
+    fn convolution_matrix_entries_are_checked() {
+        let dir = std::env::temp_dir().join(format!("audivane_cfg_matrix_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ir = dir.join("f.wav");
+        std::fs::write(&ir, b"x").unwrap();
+        let entry = |input, output| audivane_protocol::MatrixEntry {
+            input,
+            output,
+            ir_path: ir.clone(),
+            channel: None,
+            gain_db: 0.0,
+        };
+        let with = |matrix: Vec<audivane_protocol::MatrixEntry>, ir_path: &str| {
+            let mut cfg = valid();
+            cfg.chain.convolution = vec![audivane_protocol::ConvolutionConfig {
+                name: None,
+                enabled: true,
+                ir_path: ir_path.into(),
+                gain_db: 0.0,
+                matrix: Some(matrix),
+                calibration: false,
+            }];
+            validate(&cfg)
+        };
+        assert!(with(vec![entry(0, 0), entry(1, 0)], "").is_ok());
+        let err = |r: Result<(), String>| r.unwrap_err();
+        assert!(err(with(vec![], "")).contains("at least one entry"));
+        assert!(err(with(vec![entry(0, 2)], "")).contains("below 2"));
+        assert!(err(with(vec![entry(1, 0), entry(1, 0)], "")).contains("given twice"));
+        assert!(err(with(vec![entry(0, 0)], "/x.wav")).contains("both ir_path and matrix"));
+        let mut missing = entry(0, 0);
+        missing.ir_path = dir.join("none.wav");
+        assert!(err(with(vec![missing], "")).contains("matrix[0].ir_path does not exist"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn convolution_may_be_disabled_without_a_file() {
         let mut cfg = valid();
         cfg.chain.convolution = vec![audivane_protocol::ConvolutionConfig {
@@ -3358,6 +4365,8 @@ mod tests {
             enabled: false,
             ir_path: "/nonexistent/t5b.ir.wav".into(),
             gain_db: 0.0,
+            matrix: None,
+            calibration: false,
         }];
         assert!(validate(&cfg).is_ok());
     }
@@ -3481,6 +4490,35 @@ mod tests {
             RateTarget::Ratio(4)
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn usb_stream_files_give_the_playback_channel_counts() {
+        let stream = "\
+USB Audio Interface at usb-0000:02:00.3-1, high speed : USB Audio
+
+Playback:
+  Status: Stop
+  Interface 1
+    Altset 1
+    Format: S32_LE
+    Channels: 8
+    Endpoint: 0x01 (1 OUT) (ASYNC)
+    Rates: 44100, 48000, 88200, 96000, 176400, 192000
+  Interface 1
+    Altset 2
+    Format: S16_LE
+    Channels: 2
+
+Capture:
+  Status: Stop
+  Interface 2
+    Altset 1
+    Format: S32_LE
+    Channels: 10
+";
+        assert_eq!(usb_playback_channels(stream), [2, 8]);
+        assert!(usb_playback_channels("Capture:\n  Channels: 2\n").is_empty());
     }
 
     #[test]
@@ -3645,6 +4683,203 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A file from before `follow_volume`: the calibrated follower follows
+    /// the main volume from the level it has (unloading turns it off), the
+    /// one added by hand keeps its own.
+    #[test]
+    fn followers_from_before_follow_volume_follow_when_calibrated() {
+        let text = serde_json::json!({"version": 1, "config": {
+            "device": "hw:CARD=USB,DEV=0",
+            "volume": {"volume_db": -24.0},
+            "outputs": {"followers": [
+                {"device": "hw:CARD=SUB,DEV=0", "volume_db": -3.0},
+                {"device": "hw:CARD=DEN,DEV=0", "volume_db": -9.0}]},
+            "calibration": {"path": "/c/desk.json", "label": "desk", "design_rate_hz": 48000,
+                "followers": [{"device": "hw:CARD=SUB,DEV=0",
+                    "item": {"ir_path": "/c/sub.wav"}, "trim_ms": 0.0,
+                    "restore": {"trim_ms": 0.0}}]}
+        }})
+        .to_string();
+        let (mut cfg, _) = parse_document(&text).unwrap();
+        normalize_config(&mut cfg);
+        let f = &cfg.outputs.followers;
+        assert!(f[0].follow_volume, "calibrated");
+        assert_eq!((f[0].volume_db, f[0].follow_ref_db), (-3.0, Some(-24.0)));
+        assert!(!f[1].follow_volume && f[1].follow_ref_db.is_none());
+        // Written back, it reads the same.
+        let again: EngineConfig =
+            serde_json::from_value(serde_json::to_value(&cfg).unwrap()).unwrap();
+        assert_eq!(again.outputs, cfg.outputs);
+    }
+
+    /// Following ticked by hand, then a bundle loaded, then a restart: the
+    /// saved file reads back unmigrated, and unloading after the restart
+    /// leaves the follower following at its level.
+    #[test]
+    fn a_hand_set_follow_survives_a_restart_and_an_unload() {
+        let d = std::env::temp_dir().join(format!("avdsp-follow-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let ir = |name: &str| {
+            let p = d.join(name);
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 48_000,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            let mut w = hound::WavWriter::create(&p, spec).unwrap();
+            w.write_sample(0.5f32).unwrap();
+            w.finalize().unwrap();
+        };
+        ir("mains.wav");
+        ir("sub.wav");
+        let manifest = d.join("desk.json");
+        std::fs::write(
+            &manifest,
+            serde_json::json!({"bundle_version": 1, "label": "desk", "design_rate_hz": 48000,
+                "devices": [
+                    {"role": "master", "matrix": [{"in": 0, "out": 0, "ir": "mains.wav"},
+                                                  {"in": 1, "out": 1, "ir": "mains.wav"}]},
+                    {"role": "follower", "device": "hw:CARD=SUB,DEV=0",
+                     "matrix": [{"in": 0, "out": 0, "ir": "sub.wav"}]}]})
+            .to_string(),
+        )
+        .unwrap();
+        let mut cfg = EngineConfig {
+            device: "hw:CARD=USB,DEV=0".into(),
+            ..EngineConfig::default()
+        };
+        cfg.volume.volume_db = -20.0;
+        let mut f = audivane_protocol::ipc::FollowerConfig::new("hw:CARD=SUB,DEV=0");
+        f.volume_db = -6.0;
+        f.follow_volume = true;
+        f.follow_ref_db = Some(-20.0);
+        cfg.outputs.followers.push(f);
+        let l = super::super::calibration::read(manifest.to_str().unwrap(), &cfg, 2).unwrap();
+        super::super::calibration::install(&mut cfg, l.calibration, -20.0);
+        let saved = serde_json::json!({"version": CONFIG_VERSION, "config": cfg}).to_string();
+        let (mut back, _, migrated) = parse_migrating(&saved).unwrap();
+        assert!(!migrated);
+        normalize_config(&mut back);
+        assert_eq!(back.calibration, cfg.calibration);
+        super::super::calibration::uninstall(&mut back).unwrap();
+        let f = &back.outputs.followers[0];
+        assert!(f.follow_volume, "still the user's: {f:?}");
+        assert_eq!((f.volume_db, f.follow_ref_db), (-6.0, Some(-20.0)));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A file from before `follow_volume` is migrated and written back on
+    /// the load that reads it; the next load reads the new format and
+    /// writes nothing.
+    #[test]
+    fn a_follow_volume_migration_is_written_once() {
+        let dir = temp_dir("follow-migrate");
+        let path = dir.join("config.json");
+        let legacy = serde_json::json!({"version": 1, "config": {
+            "device": "hw:0,0",
+            "outputs": {"followers": [{"device": "hw:CARD=DEN,DEV=0", "volume_db": -9.0}]}
+        }})
+        .to_string();
+        fs::write(&path, &legacy).unwrap();
+        let store = ConfigStore::new(path.clone());
+        let first = store.load();
+        assert!(first.warning.is_none(), "{:?}", first.warning);
+        assert!(!first.config.outputs.followers[0].follow_volume);
+        let written = fs::read_to_string(&path).unwrap();
+        assert_ne!(written, legacy, "written back");
+        assert!(written.contains("\"follow_volume\": false"), "{written}");
+        let (_, _, again) = parse_migrating(&written).unwrap();
+        assert!(!again, "the next start migrates nothing");
+        let second = store.load();
+        assert_eq!(second.config, first.config);
+        assert_eq!(fs::read_to_string(&path).unwrap(), written);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A 0.10 harmonics stage reads as one Chebyshev layer with its levels
+    /// (the main chain, and anywhere in a preset document).
+    #[test]
+    fn harmonics_from_0_10_become_one_chebyshev_layer() {
+        let legacy = serde_json::json!({"version": 1, "config": {
+            "device": "hw:0,0",
+            "chain": {"harmonics": {"enabled": true, "character": "custom",
+                "h2_db": -45.0, "h3_db": -60.0, "h5_db": -70.0, "dc_block": true}}
+        }})
+        .to_string();
+        let (cfg, note, migrated) = parse_migrating(&legacy).unwrap();
+        assert!(migrated && note.is_none(), "{note:?}");
+        let h = cfg.chain.harmonics.as_ref().unwrap();
+        assert!(h.enabled && h.dc_block);
+        let [audivane_protocol::HarmonicsLayer::Chebyshev(l)] = h.layers.as_slice() else {
+            panic!("{:?}", h.layers);
+        };
+        assert_eq!(
+            &l.levels_db[..4],
+            &[Some(-45.0), Some(-60.0), None, Some(-70.0)]
+        );
+        assert_eq!(l.signs, audivane_protocol::HARMONICS_DEFAULT_SIGNS);
+        let mut v =
+            serde_json::json!({"presets": [{"chain": {"harmonics": {"character": "pentode"}}}]});
+        assert!(migrate_safety_modes(&mut v));
+        let b = &v["presets"][0]["chain"]["harmonics"];
+        assert_eq!(b["layers"][0]["levels_db"][1], -42.0, "{b}");
+        assert!(b.get("character").is_none());
+        assert!(
+            !migrate_safety_modes(&mut v),
+            "the next start migrates nothing"
+        );
+    }
+
+    /// The safety-only modes: a crossfeed `peak_safe` level (main chain,
+    /// chain B, a follower's patch) is dropped and `series_makeup` becomes
+    /// `series`; the file is written back once.
+    #[test]
+    fn safety_level_modes_migrate_to_the_natural_ones_once() {
+        let dir = temp_dir("safety-migrate");
+        let path = dir.join("config.json");
+        let legacy = serde_json::json!({"version": 1, "config": {
+            "device": "hw:0,0",
+            "chain": {
+                "crossfeed": {"mode": "bs2b_chu_moy", "level": "peak_safe"},
+                "harmonics": {"enabled": true, "routing": "series_makeup", "layers": [
+                    {"kind": "chebyshev", "preset": "triode", "levels_db": [-40.0, -58.0, null, null, null, null, null, null]},
+                    {"kind": "chebyshev", "preset": "pentode", "levels_db": [-56.0, -42.0, null, null, null, null, null, null]}
+                ]}
+            },
+            "outputs": {"followers": [{
+                "device": "hw:CARD=DEN,DEV=0",
+                "follow_volume": false,
+                "chain_patch": {"crossfeed": {"level": "matched", "width": 1.25}}
+            }]}
+        }})
+        .to_string();
+        fs::write(&path, &legacy).unwrap();
+        let (_, _, migrated) = parse_migrating(&legacy).unwrap();
+        assert!(migrated);
+        let store = ConfigStore::new(path.clone());
+        let first = store.load();
+        assert!(first.warning.is_none(), "{:?}", first.warning);
+        let chain = &first.config.chain;
+        assert_eq!(
+            chain.crossfeed.as_ref().unwrap().mode,
+            audivane_protocol::CrossfeedMode::Bs2bChuMoy
+        );
+        assert_eq!(
+            chain.harmonics.as_ref().unwrap().routing,
+            audivane_protocol::HarmonicsRouting::Series
+        );
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("peak_safe"), "{written}");
+        assert!(!written.contains("series_makeup"), "{written}");
+        assert!(!written.contains("\"level\""), "{written}");
+        assert!(written.contains("\"width\": 1.25"), "{written}");
+        let (_, _, again) = parse_migrating(&written).unwrap();
+        assert!(!again, "the next start migrates nothing");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn old_split_eq_config_migrates_to_layered_v2() {
         let dir = temp_dir("legacy-split");
@@ -3807,7 +5042,7 @@ mod tests {
         .unwrap();
         validate(&with(long.clone(), &[44_100, 48_000])).unwrap();
         let err = validate(&with(long.clone(), &[44_100, 768_000])).unwrap_err();
-        assert!(err.contains("768000 Hz"), "{err}");
+        assert!(err.contains("768k"), "{err}");
         assert!(err.contains("budget") || err.contains("more than"), "{err}");
         // The full-range check (presets on disk, tools) covers every rate.
         assert!(validate_upsampler("chain.upsampler", &long).is_err());
@@ -3863,8 +5098,11 @@ mod tests {
         .into_upsampler_config()
         .unwrap();
         validate(&with(preserve.clone(), &[44_100, 48_000])).unwrap();
-        let err = validate(&with(preserve, &[44_100, 96_000])).unwrap_err();
-        assert!(err.contains("preserve_samples"), "{err}");
+        // It plays from 44.1 kHz, so 96 kHz falls back to Recommended; from
+        // 96 kHz alone it plays nowhere.
+        validate(&with(preserve.clone(), &[44_100, 96_000])).unwrap();
+        let err = validate(&with(preserve, &[96_000, 192_000])).unwrap_err();
+        assert!(err.contains("keeps the original samples"), "{err}");
 
         // A/B sides must open the device at the same rate.
         let mut ab = with(target(RateTarget::Rate(48_000)), &common);
@@ -3893,6 +5131,7 @@ mod tests {
             rate_min: 48_000,
             rate_max: 48_000,
             formats: vec![SampleFormat::S32],
+            modes: Vec::new(),
         };
         let at48 = with(target(RateTarget::Rate(48_000)), &common);
         validate_against_device(&at48, Some(&caps)).unwrap();
@@ -3905,6 +5144,40 @@ mod tests {
             ..caps.clone()
         };
         validate_against_device(&at96, Some(&other)).unwrap();
+
+        // A pair is checked against its own channel count: stereo plays
+        // 96 kHz, the 8-channel mode a wider pair needs only 48 kHz. The
+        // probe viewed for pair 7/8 still lets 1/2 go back to 96 kHz.
+        let row = |rate| RateCapability {
+            rate,
+            formats: vec![FormatCapability {
+                format: SampleFormat::S32,
+                sbits: Some(24),
+            }],
+        };
+        let probe = DeviceCapabilities {
+            channels_max: 8,
+            modes: vec![
+                audivane_protocol::ipc::ChannelMode {
+                    channels: 2,
+                    rates: vec![row(48_000), row(96_000)],
+                },
+                audivane_protocol::ipc::ChannelMode {
+                    channels: 8,
+                    rates: vec![row(48_000)],
+                },
+            ],
+            ..caps.clone()
+        };
+        let mut wide = at96.clone();
+        wide.output_channels = Some(OutputChannels([6, 7]));
+        let viewed_wide = caps_view(&wide, &probe);
+        assert_eq!(viewed_wide.channels, 8);
+        assert!(!viewed_wide.supports(96_000, SampleFormat::S32));
+        validate_against_device(&at96, Some(&viewed_wide)).unwrap();
+        let err = validate_against_device(&wide, Some(&viewed_wide)).unwrap_err();
+        assert!(err.contains("does not play 96000 Hz"), "{err}");
+        assert_eq!(caps_view(&at96, &viewed_wide).channels, 2);
 
         // And in one of the configured formats: 768 kHz only in S16 does
         // not pass for an S32 config (ALSA would plan x1), but does when
@@ -4292,6 +5565,7 @@ mod tests {
         };
         let band = BandSpec {
             passband_end: 0.9,
+            passband_end_hz: None,
             stopband_start: 1.0,
             attenuation_db: 120.0,
         };
@@ -4454,6 +5728,7 @@ mod tests {
             cutoff_mode: audivane_protocol::CutoffMode::Band,
             band: audivane_protocol::BandSpec {
                 passband_end: 0.8,
+                passband_end_hz: None,
                 stopband_start: 1.0,
                 attenuation_db: 150.0,
             },
@@ -4800,9 +6075,29 @@ mod tests {
             mode: audivane_protocol::CrossfeedMode::Bs2bCustom,
             cutoff_hz: 700.0,
             feed_db: 4.5,
-            level: audivane_protocol::CrossfeedLevel::PeakSafe,
+            ..CrossfeedConfig::default()
         };
         assert!(validate_crossfeed("chain.crossfeed", &ok).is_ok());
+        for (width, corner, good) in [
+            (0.0, 200.0, true),
+            (2.0, 2000.0, true),
+            (2.1, 700.0, false),
+            (-0.1, 700.0, false),
+            (f64::NAN, 700.0, false),
+            (1.5, 150.0, false),
+            (1.5, 2500.0, false),
+        ] {
+            let cf = CrossfeedConfig {
+                width,
+                width_corner_hz: corner,
+                ..ok.clone()
+            };
+            assert_eq!(
+                validate_crossfeed("chain.crossfeed", &cf).is_ok(),
+                good,
+                "{width} {corner}"
+            );
+        }
 
         let bad_cutoff = CrossfeedConfig {
             cutoff_hz: 200.0,
@@ -4819,28 +6114,227 @@ mod tests {
 
     #[test]
     fn validates_harmonics_bounds() {
-        let ok = HarmonicsConfig {
+        use audivane_protocol::{ChebyshevLayer, FluxLayer, HARMONICS_DEFAULT_SIGNS};
+        let cheb = ChebyshevLayer {
             enabled: true,
-            character: audivane_protocol::HarmonicsCharacter::Custom,
-            h2_db: -40.0,
-            h3_db: -55.0,
-            h4_db: Some(-70.0),
-            h5_db: Some(-80.0),
+            preset: None,
+            levels_db: [
+                Some(-40.0),
+                Some(-55.0),
+                Some(-70.0),
+                Some(-80.0),
+                None,
+                None,
+                None,
+                Some(-90.0),
+            ],
+            signs: HARMONICS_DEFAULT_SIGNS,
+            invert_even: false,
+            drive_db: -6.0,
+            amount: 0.5,
+            tilt: None,
+            sag: None,
+            bias: None,
+        };
+        let flux = FluxLayer {
+            enabled: true,
+            preset: None,
+            corner_hz: 100.0,
+            max_boost_db: 12.0,
+            target_h3_db: -24.0,
+            calibration_hz: 20.0,
+        };
+        let with = |c: ChebyshevLayer, f: FluxLayer| HarmonicsConfig {
+            system: None,
+            enabled: true,
+            layers: vec![HarmonicsLayer::Chebyshev(c), HarmonicsLayer::Flux(f)],
             dc_block: true,
+            routing: Default::default(),
         };
-        assert!(validate_harmonics("chain.harmonics", &ok).is_ok());
+        assert!(validate_harmonics("chain.harmonics", &with(cheb.clone(), flux.clone())).is_ok());
 
-        let too_hot = HarmonicsConfig {
-            h2_db: -10.0,
-            ..ok.clone()
-        };
-        assert!(validate_harmonics("chain.harmonics", &too_hot).is_err());
+        let mut hot = cheb.clone();
+        hot.levels_db[0] = Some(-10.0);
+        assert!(validate_harmonics("chain.harmonics", &with(hot, flux.clone())).is_err());
 
-        let bad_h4 = HarmonicsConfig {
-            h4_db: Some(-150.0),
-            ..ok
+        let mut bad_h7 = cheb.clone();
+        bad_h7.levels_db[5] = Some(-19.0);
+        bad_h7.enabled = false;
+        let err = validate_harmonics("chain.harmonics", &with(bad_h7, flux.clone())).unwrap_err();
+        assert!(
+            err.contains("chain.harmonics.layers[0].levels_db[5] (H7)"),
+            "{err}"
+        );
+
+        let mut tilted = cheb.clone();
+        tilted.tilt = Some(Box::new(audivane_protocol::HarmonicsTilt {
+            low: audivane_protocol::TiltShelf::new(60.0, 12.0),
+            ..Default::default()
+        }));
+        assert!(validate_harmonics("h", &with(tilted.clone(), flux.clone())).is_ok());
+        if let Some(t) = &mut tilted.tilt {
+            t.high.hz = 25_000.0;
+        }
+        let err = validate_harmonics("h", &with(tilted, flux.clone())).unwrap_err();
+        assert!(err.contains("h.layers[0].tilt.high.hz"), "{err}");
+
+        // Sag and bias: ranges named; a tilt on the same layer is fine.
+        let sag = audivane_protocol::HarmonicsSag {
+            depth_db: 3.0,
+            attack_ms: 20.0,
+            release_ms: 200.0,
         };
-        assert!(validate_harmonics("chain.harmonics", &bad_h4).is_err());
+        let bias = audivane_protocol::HarmonicsBias {
+            depth: -0.1,
+            attack_ms: 300.0,
+            release_ms: 2_000.0,
+        };
+        let dynamic = ChebyshevLayer {
+            sag: Some(sag),
+            bias: Some(bias),
+            ..cheb.clone()
+        };
+        assert!(validate_harmonics("h", &with(dynamic.clone(), flux.clone())).is_ok());
+        for (bad, field) in [
+            (
+                ChebyshevLayer {
+                    sag: Some(audivane_protocol::HarmonicsSag {
+                        depth_db: 7.0,
+                        ..sag
+                    }),
+                    ..dynamic.clone()
+                },
+                "h.layers[0].sag.depth_db",
+            ),
+            (
+                ChebyshevLayer {
+                    bias: Some(audivane_protocol::HarmonicsBias {
+                        release_ms: 20_000.0,
+                        ..bias
+                    }),
+                    ..dynamic.clone()
+                },
+                "h.layers[0].bias.release_ms",
+            ),
+        ] {
+            let err = validate_harmonics("h", &with(bad, flux.clone())).unwrap_err();
+            assert!(err.contains(field), "{err}");
+        }
+        let tilted_dynamic = ChebyshevLayer {
+            tilt: Some(Box::new(audivane_protocol::HarmonicsTilt {
+                low: audivane_protocol::TiltShelf::new(60.0, 12.0),
+                ..Default::default()
+            })),
+            ..dynamic.clone()
+        };
+        assert!(validate_harmonics("h", &with(tilted_dynamic, flux.clone())).is_ok());
+
+        for (drive_db, amount) in [(0.5, 1.0), (-41.0, 1.0), (0.0, 1.1), (0.0, f64::NAN)] {
+            let bad = ChebyshevLayer {
+                drive_db,
+                amount,
+                ..cheb.clone()
+            };
+            assert!(validate_harmonics("h", &with(bad, flux.clone())).is_err());
+        }
+
+        for bad in [
+            FluxLayer {
+                corner_hz: 0.5,
+                ..flux.clone()
+            },
+            FluxLayer {
+                max_boost_db: 41.0,
+                ..flux.clone()
+            },
+            FluxLayer {
+                target_h3_db: -11.0,
+                ..flux.clone()
+            },
+            FluxLayer {
+                calibration_hz: 2000.0,
+                ..flux.clone()
+            },
+        ] {
+            let err = validate_harmonics("h", &with(cheb.clone(), bad)).unwrap_err();
+            assert!(err.contains("h.layers[1]: flux: "), "{err}");
+        }
+
+        let many = HarmonicsConfig {
+            layers: vec![HarmonicsLayer::Flux(flux); HARMONICS_MAX_LAYERS + 1],
+            ..HarmonicsConfig::default()
+        };
+        assert!(validate_harmonics("h", &many).is_err());
+
+        let hyst = audivane_protocol::HysteresisLayer {
+            enabled: true,
+            preset: None,
+            saturation: 0.5,
+            width: 0.35,
+            amount: 1.0,
+            target_h3_db: -30.0,
+            calibration_hz: 1_000.0,
+            bass_eq: None,
+            asymmetry: None,
+        };
+        let with_hyst = |hy: audivane_protocol::HysteresisLayer| HarmonicsConfig {
+            system: None,
+            enabled: true,
+            layers: vec![HarmonicsLayer::Hysteresis(hy)],
+            dc_block: true,
+            routing: Default::default(),
+        };
+        assert!(validate_harmonics("h", &with_hyst(hyst.clone())).is_ok());
+        for bad in [
+            audivane_protocol::HysteresisLayer {
+                saturation: -0.1,
+                ..hyst.clone()
+            },
+            audivane_protocol::HysteresisLayer {
+                width: 1.1,
+                ..hyst.clone()
+            },
+            audivane_protocol::HysteresisLayer {
+                amount: f64::NAN,
+                ..hyst.clone()
+            },
+            audivane_protocol::HysteresisLayer {
+                target_h3_db: -11.0,
+                ..hyst.clone()
+            },
+            audivane_protocol::HysteresisLayer {
+                calibration_hz: 10.0,
+                ..hyst.clone()
+            },
+            audivane_protocol::HysteresisLayer {
+                calibration_hz: 6_000.0,
+                ..hyst.clone()
+            },
+            audivane_protocol::HysteresisLayer {
+                asymmetry: Some(1.5),
+                ..hyst.clone()
+            },
+            audivane_protocol::HysteresisLayer {
+                bass_eq: Some(audivane_protocol::HysteresisBassEq {
+                    hz: 10.0,
+                    ..Default::default()
+                }),
+                ..hyst.clone()
+            },
+            // Checked while switched off too.
+            audivane_protocol::HysteresisLayer {
+                bass_eq: Some(audivane_protocol::HysteresisBassEq {
+                    enabled: false,
+                    hz: 120.0,
+                    db: 13.0,
+                }),
+                ..hyst.clone()
+            },
+        ] {
+            let err = validate_harmonics("h", &with_hyst(bad)).unwrap_err();
+            assert!(err.contains("h.layers[0]: hysteresis"), "{err}");
+        }
+        assert!(validate_harmonics("h", &HarmonicsConfig::default()).is_ok());
     }
 
     #[test]
@@ -4950,6 +6444,21 @@ mod tests {
     }
 
     #[test]
+    fn validate_tone_range() {
+        let chain = |bass_db: f64, treble_db: f64| ChainConfig {
+            eq: Some(audivane_protocol::EqProfile {
+                tone: Some(audivane_protocol::ToneConfig { bass_db, treble_db }),
+                ..Default::default()
+            }),
+            ..ChainConfig::neutral()
+        };
+        assert!(validate_chain("chain", &chain(6.0, -6.0)).is_ok());
+        let err = validate_chain("chain", &chain(0.0, 6.5)).unwrap_err();
+        assert!(err.starts_with("chain.eq.tone.treble_db"), "{err}");
+        assert!(validate_chain("chain", &chain(f64::NAN, 0.0)).is_err());
+    }
+
+    #[test]
     fn bypass_mask_covers_the_native_moves_and_follows_the_mode() {
         let cfg = EngineConfig::default();
         assert_eq!(
@@ -5019,6 +6528,7 @@ mod tests {
         };
         let band = BandSpec {
             passband_end: 0.8,
+            passband_end_hz: None,
             stopband_start: 1.0,
             attenuation_db: 90.0,
         };
@@ -5189,6 +6699,7 @@ mod tests {
             cutoff_mode: CutoffMode::Band,
             band: audivane_protocol::BandSpec {
                 passband_end: 0.7,
+                passband_end_hz: None,
                 stopband_start: 1.2,
                 attenuation_db: 200.0,
             },
@@ -5268,5 +6779,152 @@ mod tests {
         v.sort_unstable();
         v.dedup();
         assert_eq!(v, audivane_io_pw::lifecycle::MASK_OUTPUT_RATES);
+    }
+    /// An equiripple design of 1,279 taps over 0.9..1.0: too short at x16,
+    /// too deep at x4 and x2, fine at x8.
+    /// 1,279 fixed equiripple taps: too short at x16, builds at x8.
+    pub(crate) fn equiripple_1279(target: RateTarget) -> UpsamplerConfig {
+        use audivane_protocol::design::{ArithmeticPath, OptimalMethod, Phase};
+        let mut d = catalogue::recommended();
+        if let FilterDesign::Kernel(k) = &mut d {
+            k.shape = Shape::Optimal {
+                method: OptimalMethod::Equiripple,
+                length: Length::Fixed(1279),
+                passband_end: 0.9,
+                stopband_start: 1.0,
+            };
+            k.phase = Phase::Linear;
+            k.numerics.path = ArithmeticPath::Fir;
+        }
+        UpsamplerConfig {
+            target,
+            preset: None,
+            design: Some(StoredDesign::new(d)),
+        }
+    }
+
+    fn at_rates(up: UpsamplerConfig, rates: &[u32]) -> EngineConfig {
+        let mut cfg = valid();
+        cfg.chain.upsampler = up;
+        cfg.rate.allowed_rates = rates.to_vec();
+        cfg.rate.default_rate = rates[0];
+        cfg
+    }
+
+    /// Acceptance and the design check decide at the landings the ladder
+    /// picks: under a 768 kHz cap from 44.1 and 48 kHz, the ladder skips the
+    /// x16 rung the design does not build at and lands both at x8, where it
+    /// builds. Applied, with nothing falling back.
+    #[test]
+    fn a_design_that_builds_at_the_ladders_landings_is_applied() {
+        let cfg = at_rates(
+            equiripple_1279(RateTarget::MaxRate(768_000)),
+            &[44_100, 48_000],
+        );
+        validate(&cfg).unwrap();
+        let check = check_design(
+            cfg.chain.upsampler.design.as_ref().unwrap(),
+            None,
+            None,
+            &cfg,
+            &cfg.chain.output,
+            &audivane_dsp_core::cpu_bench::KernelRates::floor(),
+            None,
+        );
+        assert!(check.errors.is_empty(), "{:?}", check.errors);
+        assert!(check.advice.is_none(), "{:?}", check.advice);
+        assert!(
+            check.plans.iter().all(|p| p.ratio == RateRatio::integer(8)),
+            "{:?}",
+            check.plans
+        );
+        // Where no rung builds (x16 fixed), refused in the same words.
+        let x16 = at_rates(equiripple_1279(RateTarget::Ratio(16)), &[44_100, 48_000]);
+        let err = validate(&x16).unwrap_err();
+        assert!(
+            err.starts_with("chain.upsampler.design.length: 1,279 taps is too short"),
+            "{err}"
+        );
+    }
+
+    /// The varispeed budget charges the chains that run: a 10,000 taps per
+    /// input design builds from 48 kHz (x2) but not from 44.1 kHz (160/147,
+    /// over the rational limits), where Recommended plays; varispeed on
+    /// does not refuse the edit for the custom filter that never runs there.
+    #[test]
+    fn varispeed_is_budgeted_with_the_fallback_that_runs() {
+        let up = ManualConfig {
+            target: RateTarget::Rate(96_000),
+            taps: 10_000,
+            taps_unit: audivane_protocol::TapsUnit::Input,
+            ..Default::default()
+        }
+        .into_upsampler_config()
+        .unwrap();
+        let mut cfg = at_rates(up.clone(), &[44_100, 48_000]);
+        assert!(chain_a_builds_at(&cfg, 44_100, RateRatio::from_rates(44_100, 96_000)).is_err());
+        assert!(chain_a_builds_at(&cfg, 48_000, RateRatio::integer(2)).is_ok());
+        cfg.varispeed.enabled = true;
+        validate(&cfg).unwrap();
+    }
+
+    /// A fix offered is held to the checks that apply it: 352.8 to 384 kHz
+    /// with a Kaiser band 0.990..1.000 refuses an automatic length over the
+    /// rational budget, so it is not offered, and every fix that is
+    /// validates.
+    #[test]
+    fn every_offered_fix_validates() {
+        let mut d = catalogue::recommended();
+        if let FilterDesign::Kernel(k) = &mut d
+            && let Shape::WindowedSinc { length, cutoff, .. } = &mut k.shape
+        {
+            *length = Length::Band;
+            if let audivane_protocol::design::Cutoff::Band(b) = cutoff {
+                b.passband_end = 0.99;
+                b.passband_end_hz = None;
+                b.stopband_start = 1.0;
+            }
+        }
+        let up = UpsamplerConfig {
+            target: RateTarget::Rate(384_000),
+            preset: None,
+            design: Some(StoredDesign::new(d)),
+        };
+        let cfg = at_rates(up, &[352_800]);
+        let check = check_design(
+            cfg.chain.upsampler.design.as_ref().unwrap(),
+            None,
+            None,
+            &cfg,
+            &cfg.chain.output,
+            &audivane_dsp_core::cpu_bench::KernelRates::floor(),
+            None,
+        );
+        assert_eq!(check.errors.len(), 1, "{check:?}");
+        let advice = check.advice.unwrap_or_else(|| panic!("{:?}", check.errors));
+        // The automatic length needs about 970 M multiply-adds per second
+        // per channel there, over the 800 M budget.
+        let auto = cfg.chain.upsampler.design.as_ref().unwrap().design.clone();
+        let mut auto = auto;
+        if let FilterDesign::Kernel(k) = &mut auto
+            && let Shape::WindowedSinc { length, .. } = &mut k.shape
+        {
+            *length = Length::Auto(audivane_protocol::FilterErrorBudget::MatchOutput);
+        }
+        let mut with_auto = cfg.clone();
+        with_auto.chain.upsampler.design = Some(StoredDesign::new(auto));
+        assert!(validate(&with_auto).is_err());
+        assert!(
+            advice
+                .fixes
+                .iter()
+                .all(|f| f.label != "Use automatic length"),
+            "{advice:?}"
+        );
+        for fix in &advice.fixes {
+            let mut c = cfg.clone();
+            c.chain.upsampler.design = Some(fix.design.clone());
+            validate(&c).unwrap_or_else(|e| panic!("{}: {e}", fix.label));
+        }
     }
 }

@@ -1,4 +1,4 @@
-# Builds the .deb, .rpm and Arch packages on a GitHub ubuntu-24.04 runner
+# Builds the .deb, .rpm and Arch packages and the AppImage on a GitHub ubuntu-24.04 runner
 # (the same glibc 2.39 baseline as the local packaging/release/release.sh)
 # and uploads them as a workflow artifact. Manual only: releases are normally
 # built locally, and this is the fallback when no local machine is at hand.
@@ -60,6 +60,7 @@ jobs:
           version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml)
           echo "VERSION=$version" >> "$GITHUB_ENV"
           packaging/release/package.sh target/stage "dist/release/$version" "$version"
+          packaging/release/appimage.sh target/stage "dist/release/$version" "$version"
 
       - uses: actions/upload-artifact@v4
         with:

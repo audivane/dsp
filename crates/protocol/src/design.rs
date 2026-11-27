@@ -80,7 +80,8 @@ impl Deref for StoredDesign {
 /// An upsampling filter design, independent of the rate.
 #[derive(Clone, Debug, PartialEq)]
 pub enum FilterDesign {
-    /// A kernel run by the polyphase engines (windowed sinc or Lanczos).
+    /// A kernel run by the polyphase engines (windowed sinc, Lanczos or an
+    /// optimal design).
     Kernel(KernelDesign),
     /// x3 stages first, then x2 stages, from the input side.
     Cascade(CascadeStage),
@@ -129,6 +130,9 @@ impl FilterDesign {
                 shape: Shape::WindowedSinc {
                     length: Length::Auto(FilterErrorBudget::MatchOutput),
                     ..
+                } | Shape::Optimal {
+                    length: Length::Auto(FilterErrorBudget::MatchOutput),
+                    ..
                 },
                 ..
             })
@@ -136,20 +140,32 @@ impl FilterDesign {
     }
 
     /// The design with an output-dependent automatic budget
-    /// ([`FilterErrorBudget::MatchOutput`]) resolved for `output`. A design
-    /// without one is returned unchanged.
+    /// ([`FilterErrorBudget::MatchOutput`]) resolved for `output`; an
+    /// optimal design's to at most its method's depth
+    /// ([`OptimalMethod::max_budget_db`]). A design without one is returned
+    /// unchanged.
     pub fn with_output(&self, output: &OutputConfig) -> Self {
         let mut d = self.clone();
-        if let FilterDesign::Kernel(KernelDesign {
-            shape:
-                Shape::WindowedSinc {
-                    length: Length::Auto(budget @ FilterErrorBudget::MatchOutput),
-                    ..
-                },
-            ..
-        }) = &mut d
-        {
-            *budget = FilterErrorBudget::Db(filter_error_budget_db(output));
+        let db = filter_error_budget_db(output);
+        match &mut d {
+            FilterDesign::Kernel(KernelDesign {
+                shape:
+                    Shape::WindowedSinc {
+                        length: Length::Auto(budget @ FilterErrorBudget::MatchOutput),
+                        ..
+                    },
+                ..
+            }) => *budget = FilterErrorBudget::Db(db),
+            FilterDesign::Kernel(KernelDesign {
+                shape:
+                    Shape::Optimal {
+                        method,
+                        length: Length::Auto(budget @ FilterErrorBudget::MatchOutput),
+                        ..
+                    },
+                ..
+            }) => *budget = FilterErrorBudget::Db(db.min(method.max_budget_db())),
+            _ => {}
         }
         d
     }
@@ -182,6 +198,51 @@ pub enum Shape {
     /// `sinc(x) sinc(x / a)` over exactly `+-a` lobes: `2a + 1` taps per
     /// input sample, no separate cutoff.
     Lanczos { lobes: usize },
+    /// A linear-phase low-pass designed directly for its band (no window):
+    /// unit gain up to `passband_end`, zero from `stopband_start` (fractions
+    /// of the lower Nyquist), equal weight on both errors. The length is
+    /// `fixed`, `per_input` or `auto` (the shortest that keeps the budget
+    /// over the band); an even length is designed one tap shorter (odd,
+    /// symmetric about its centre tap).
+    Optimal {
+        method: OptimalMethod,
+        length: Length,
+        passband_end: f64,
+        stopband_start: f64,
+    },
+}
+
+/// How an [`Shape::Optimal`] kernel is designed.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+#[serde(rename_all = "snake_case")]
+pub enum OptimalMethod {
+    /// Parks-McClellan: the smallest largest error in either band (the
+    /// errors ripple at one level). Short kernels only.
+    #[default]
+    Equiripple,
+    /// The smallest summed squared error over both bands: its largest error
+    /// sits at the band edges and falls away from them. Longer kernels.
+    LeastSquares,
+}
+
+/// The deepest automatic budget of an equiripple design, dB (f64 levels its
+/// ripple to about 1e-10 on short kernels).
+pub const EQUIRIPPLE_MAX_DB: f64 = 150.0;
+
+/// The deepest automatic budget of a least-squares design, dB (its solve
+/// floors at 137 to 153 dB).
+pub const LEAST_SQUARES_MAX_DB: f64 = 135.0;
+
+impl OptimalMethod {
+    /// The deepest automatic budget of the method, dB: a `match_output`
+    /// budget resolves to at most this.
+    pub fn max_budget_db(self) -> f64 {
+        match self {
+            OptimalMethod::Equiripple => EQUIRIPPLE_MAX_DB,
+            OptimalMethod::LeastSquares => LEAST_SQUARES_MAX_DB,
+        }
+    }
 }
 
 /// A window with its sampling convention.
@@ -226,6 +287,14 @@ pub enum Window {
     /// Flat over `1 - taper` of the length, cosine tapers at the ends.
     Tukey {
         taper: f64,
+        sampling: Sampling,
+    },
+    /// Discrete prolate spheroidal (Slepian): the most energy within
+    /// `nw / N` cycles per sample of any N-tap window (Kaiser approximates
+    /// it with `beta = pi nw`). `nw: None` derives it from the band
+    /// attenuation, as a Kaiser beta.
+    Dpss {
+        nw: Option<f64>,
         sampling: Sampling,
     },
 }
@@ -492,6 +561,7 @@ pub enum CascadeStage {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case")]
 pub enum InterpMethod {
+    Nos,
     Cosine,
     CatmullRom,
     TableSinc,
@@ -590,6 +660,13 @@ pub struct DesignPlan {
 fn default_accept(shape: &Shape, preserve_samples: bool) -> Accept {
     match shape {
         Shape::Lanczos { .. } => Accept::Upsampling,
+        Shape::Optimal { length, .. } => {
+            if matches!(length, Length::PerInput(Stepped::BySourceRate(_))) {
+                Accept::Upsampling
+            } else {
+                Accept::Any
+            }
+        }
         Shape::WindowedSinc { length, cutoff, .. } => {
             if matches!(length, Length::OutputSpan(_)) {
                 Accept::Integer
@@ -817,6 +894,10 @@ enum WireWindow {
         taper: f64,
         sampling: Sampling,
     },
+    Dpss {
+        nw: Option<f64>,
+        sampling: Sampling,
+    },
 }
 
 #[derive(Deserialize)]
@@ -859,6 +940,12 @@ enum RawWindow {
         #[serde(default)]
         sampling: Sampling,
     },
+    Dpss {
+        #[serde(default)]
+        nw: Option<f64>,
+        #[serde(default)]
+        sampling: Sampling,
+    },
 }
 
 impl Serialize for Window {
@@ -881,6 +968,7 @@ impl Serialize for Window {
             Self::Nuttall { sampling } => WireWindow::Nuttall { sampling },
             Self::Hann { sampling } => WireWindow::Hann { sampling },
             Self::Tukey { taper, sampling } => WireWindow::Tukey { taper, sampling },
+            Self::Dpss { nw, sampling } => WireWindow::Dpss { nw, sampling },
         };
         out.serialize(serializer)
     }
@@ -915,7 +1003,17 @@ impl<'de> Deserialize<'de> for Window {
             RawWindow::Nuttall { sampling } => Ok(Self::Nuttall { sampling }),
             RawWindow::Hann { sampling } => Ok(Self::Hann { sampling }),
             RawWindow::Tukey { taper, sampling } => Ok(Self::Tukey { taper, sampling }),
+            RawWindow::Dpss { nw, sampling } => Ok(Self::Dpss { nw, sampling }),
         }
+    }
+}
+
+/// The optimal designs' default numerics: the `fir` path (they are not on
+/// the `standard` path), the `scaled` grid cutoff.
+fn fir_numerics() -> Numerics {
+    Numerics {
+        path: ArithmeticPath::Fir,
+        grid_cutoff: GridCutoff::Scaled,
     }
 }
 
@@ -949,6 +1047,24 @@ enum WireDesignKind {
         #[serde(default)]
         rates: Option<Rates>,
         #[serde(default)]
+        numerics: Numerics,
+    },
+    Optimal {
+        method: OptimalMethod,
+        length: Length,
+        passband_end: f64,
+        stopband_start: f64,
+        #[serde(default)]
+        decimation: Decimation,
+        #[serde(default)]
+        phase: Phase,
+        /// Always false (an optimal low-pass is not a Nyquist filter); on
+        /// the wire so the design kinds share their fields.
+        #[serde(default)]
+        preserve_samples: bool,
+        #[serde(default)]
+        rates: Option<Rates>,
+        #[serde(default = "fir_numerics")]
         numerics: Numerics,
     },
     Cascade {
@@ -986,6 +1102,22 @@ impl From<&FilterDesign> for WireDesignKind {
                     length: length.clone(),
                     decimation: k.decimation,
                     cutoff: cutoff.clone(),
+                    phase: k.phase,
+                    preserve_samples: k.preserve_samples,
+                    rates: Some(k.rates),
+                    numerics: k.numerics,
+                },
+                Shape::Optimal {
+                    method,
+                    length,
+                    passband_end,
+                    stopband_start,
+                } => Self::Optimal {
+                    method: *method,
+                    length: length.clone(),
+                    passband_end: *passband_end,
+                    stopband_start: *stopband_start,
+                    decimation: k.decimation,
                     phase: k.phase,
                     preserve_samples: k.preserve_samples,
                     rates: Some(k.rates),
@@ -1063,6 +1195,36 @@ impl From<WireDesignKind> for FilterDesign {
                     numerics,
                 })
             }
+            WireDesignKind::Optimal {
+                method,
+                length,
+                passband_end,
+                stopband_start,
+                decimation,
+                phase,
+                preserve_samples,
+                rates,
+                numerics,
+            } => {
+                let shape = Shape::Optimal {
+                    method,
+                    length,
+                    passband_end,
+                    stopband_start,
+                };
+                let rates = rates.unwrap_or_else(|| Rates {
+                    accept: default_accept(&shape, false),
+                    fallback_window: None,
+                });
+                FilterDesign::Kernel(KernelDesign {
+                    shape,
+                    decimation,
+                    phase,
+                    preserve_samples,
+                    rates,
+                    numerics,
+                })
+            }
             WireDesignKind::Cascade { stage } => FilterDesign::Cascade(stage),
             WireDesignKind::Interpolator { method } => FilterDesign::Interpolator(method),
             WireDesignKind::BlockFft { block, overlap } => {
@@ -1107,6 +1269,44 @@ impl<'de> Deserialize<'de> for StoredDesign {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An optimal design's `match_output` resolves to at most its method's
+    /// depth; a windowed sinc's to the output's own.
+    #[test]
+    fn match_output_is_clamped_for_optimal_designs() {
+        let json = |method: &str| {
+            format!(
+                r#"{{
+                "kind": "optimal",
+                "method": "{method}",
+                "length": {{ "rule": "auto", "budget": "match_output" }},
+                "passband_end": 0.9,
+                "stopband_start": 1.0,
+                "phase": {{ "type": "linear" }}
+            }}"#
+            )
+        };
+        let out = OutputConfig {
+            bits: 32,
+            dither: crate::DitherKind::Tpdf,
+            headroom_db: 0.0,
+        };
+        for (method, want) in [("least_squares", 135.0), ("equiripple", 141.4688)] {
+            let d: StoredDesign = serde_json::from_str(&json(method)).unwrap();
+            let FilterDesign::Kernel(KernelDesign {
+                shape:
+                    Shape::Optimal {
+                        length: Length::Auto(FilterErrorBudget::Db(a)),
+                        ..
+                    },
+                ..
+            }) = d.design.with_output(&out)
+            else {
+                panic!("not resolved");
+            };
+            assert!((a - want).abs() < 1e-3, "{method}: {a}");
+        }
+    }
 
     #[test]
     fn spec_examples_round_trip() {

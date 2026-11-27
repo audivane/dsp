@@ -6,9 +6,11 @@ import { useRef, useState, type ReactNode } from "react";
 import { parseNumber } from "../lib/format";
 import { STAGE_NAME, store, useApp, type ErrorSlot, type StageId } from "../store/store";
 import { Close, Power } from "./Icons";
+import { PresetControl } from "./PresetMenu";
+import type { PresetPart } from "../api/types";
 import { COMPARE_STAGE_NAME, comparing, stagePatch, type CompareStage } from "../lib/abCompare";
 
-export function StageHead({ id, title, on, onPower, powerTitle, children }: { id: string; title: string; on: boolean; onPower?: () => void; powerTitle?: string; children?: ReactNode }) {
+export function StageHead({ id, title, on, onPower, powerTitle, part, children }: { id: string; title: string; on: boolean; onPower?: () => void; powerTitle?: string; part?: PresetPart; children?: ReactNode }) {
   return (
     <div className="view-head">
       {onPower && (
@@ -20,6 +22,7 @@ export function StageHead({ id, title, on, onPower, powerTitle, children }: { id
       <span className={"tag" + (on ? " on" : "")}>{on ? "On" : "Off"}</span>
       <div className="spacer" />
       {children}
+      {part && <PresetControl part={part} />}
     </div>
   );
 }

@@ -281,29 +281,44 @@ pub fn card_index_from_device(device: &str) -> Result<u32> {
 /// `plughw:`, by card index or id, `DEV=` or positional device, default 0)
 /// are in the system now. Reads `/proc/asound` only; nothing is opened, so
 /// it is cheap enough to poll and never disturbs a device someone holds.
+///
+/// A card the daemon pinned to a USB device ([`crate::identity::set_pins`])
+/// counts only while the card of that name is that device: identical DACs
+/// named in another order after a replug are not opened under the other
+/// one's name.
 pub fn device_present(device: &str) -> bool {
-    device_present_in(std::path::Path::new("/proc/asound"), device)
+    device_present_gated_in(&crate::identity::Roots::default(), device)
 }
 
-/// [`device_present`] against another `/proc/asound` tree (tests).
+/// [`device_present`] against another `/proc/asound` + `/sys` tree (tests).
+pub fn device_present_gated_in(roots: &crate::identity::Roots, device: &str) -> bool {
+    playback_card_dir(&roots.asound, device)
+        .is_some_and(|dir| crate::identity::pinned_card_allowed(roots, device, &dir))
+}
+
+/// [`device_present`] against another `/proc/asound` tree, without the
+/// pins (tests).
 pub fn device_present_in(root: &std::path::Path, device: &str) -> bool {
-    let Some(rest) = device
+    playback_card_dir(root, device).is_some()
+}
+
+/// The `cardN` directory of `device`'s card while its playback PCM is
+/// there.
+fn playback_card_dir(root: &std::path::Path, device: &str) -> Option<std::path::PathBuf> {
+    let rest = device
         .strip_prefix("hw:")
-        .or_else(|| device.strip_prefix("plughw:"))
-    else {
-        return false;
-    };
+        .or_else(|| device.strip_prefix("plughw:"))?;
     let mut parts = rest.split(',').map(str::trim);
     let card = parts.next().unwrap_or("");
     let card = card.strip_prefix("CARD=").unwrap_or(card);
     if card.is_empty() {
-        return false;
+        return None;
     }
     let dev = match parts.next() {
         None => 0,
         Some(p) => match p.strip_prefix("DEV=").unwrap_or(p).parse::<u32>() {
             Ok(d) => d,
-            Err(_) => return false,
+            Err(_) => return None,
         },
     };
     let card_dir = if card.bytes().all(|b| b.is_ascii_digit()) {
@@ -312,7 +327,7 @@ pub fn device_present_in(root: &std::path::Path, device: &str) -> bool {
         // The `/proc/asound/<id>` symlink is not always there: match the
         // id file of each card instead.
         let Ok(entries) = std::fs::read_dir(root) else {
-            return false;
+            return None;
         };
         let found = entries.flatten().find(|e| {
             let name = e.file_name();
@@ -321,12 +336,12 @@ pub fn device_present_in(root: &std::path::Path, device: &str) -> bool {
                 .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
                 && std::fs::read_to_string(e.path().join("id")).is_ok_and(|id| id.trim() == card)
         });
-        match found {
-            Some(e) => e.path(),
-            None => return false,
-        }
+        found?.path()
     };
-    card_dir.join(format!("pcm{dev}p")).exists()
+    card_dir
+        .join(format!("pcm{dev}p"))
+        .exists()
+        .then_some(card_dir)
 }
 
 #[cfg(test)]

@@ -5,4 +5,4 @@ import type { Sampling } from "./Sampling";
 /**
  * A window with its sampling convention.
  */
-export type Window = { "type": "kaiser", beta: number | null, sampling: Sampling, } | { "type": "gaussian", alpha: number, sampling: Sampling, } | { "type": "gaussian", stopband_db: number | null, sampling: Sampling, } | { "type": "flattop", set: FlattopSet, sampling: Sampling, } | { "type": "chebyshev", sidelobe_ratio: number, sampling: Sampling, } | { "type": "nuttall", sampling: Sampling, } | { "type": "hann", sampling: Sampling, } | { "type": "tukey", taper: number, sampling: Sampling, };
+export type Window = { "type": "kaiser", beta: number | null, sampling: Sampling, } | { "type": "gaussian", alpha: number, sampling: Sampling, } | { "type": "gaussian", stopband_db: number | null, sampling: Sampling, } | { "type": "flattop", set: FlattopSet, sampling: Sampling, } | { "type": "chebyshev", sidelobe_ratio: number, sampling: Sampling, } | { "type": "nuttall", sampling: Sampling, } | { "type": "hann", sampling: Sampling, } | { "type": "tukey", taper: number, sampling: Sampling, } | { "type": "dpss", nw: number | null, sampling: Sampling, };

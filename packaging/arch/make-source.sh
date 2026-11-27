@@ -8,7 +8,7 @@
 # Output: packaging/arch/audivane-dsp-<version>.tar.zst, where <version> is
 # [workspace.package] version from Cargo.toml. The archive has one top-level
 # directory, audivane-dsp-<version>/, holding the repository root (cargo
-# workspace, LICENSE, assets/brand/) — exactly what the PKGBUILD expects.
+# workspace, LICENSE, assets/brand/): exactly what the PKGBUILD expects.
 #
 # Then build the package:  cd packaging/arch && makepkg -si
 
@@ -35,6 +35,11 @@ fi
 
 command -v zstd >/dev/null || { echo "error: zstd is required" >&2; exit 1; }
 
+pkgbuild_ver=$(sed -n 's/^pkgver=//p' "$arch_dir/PKGBUILD")
+if [[ "$pkgbuild_ver" != "$version" ]]; then
+  echo "error: PKGBUILD pkgver is $pkgbuild_ver but Cargo.toml says $version; update packaging/arch/PKGBUILD" >&2
+  exit 1
+fi
 out="$arch_dir/audivane-dsp-$version.tar.zst"
 prefix="audivane-dsp-$version/"
 

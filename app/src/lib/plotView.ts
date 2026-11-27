@@ -191,7 +191,7 @@ function group(n: string): string {
 
 /** Frequency label with as many decimals as the visible span needs. */
 export function fmtHzPrecise(hz: number, spanHz: number): string {
-  if (!Number.isFinite(hz)) return "—";
+  if (!Number.isFinite(hz)) return "-";
   if (spanHz >= 2000 && hz >= 1000) {
     const k = hz / 1000;
     const d = spanHz >= 20000 ? 0 : spanHz >= 5000 ? 1 : 2;

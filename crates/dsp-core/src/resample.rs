@@ -7,7 +7,8 @@ pub use crate::design::paths::standard::{
 };
 pub use crate::design::phase::reflect::minimum_phase_contract;
 
-use crate::fft::{RealFftPair, RingFifo, SplitSpectrum, complex_mac_split, complex_mul_split};
+use crate::fft::{RealFftPair, RingFifo, SplitSpectrum};
+use crate::nupc::{HeadChannel, HeadStage, StagePlan, TailChannel, TailStage};
 use crate::window::{bessel_i0, kaiser_beta_for_attenuation};
 #[cfg(doc)]
 use audivane_protocol::CutoffMode;
@@ -332,9 +333,26 @@ fn lin_to_db_floor(x: f64) -> f64 {
 /// 226.5 dB), rounded inwards.
 pub const BAND_ATTENUATION_RANGE_DB: (f64, f64) = (55.0, 225.0);
 
-/// Smallest passband end of a [`CutoffMode::Band`] design (fraction of the
-/// source Nyquist). Keeps the cutoff inside the calibrated domain (>= 0.5).
+/// Smallest passband end of a [`CutoffMode::Band`] design given as a
+/// fraction of the source Nyquist. An absolute passband end resolved at a
+/// high source rate may sit lower, as long as the half transition stays in
+/// the calibrated domain (at most 0.5).
 pub const BAND_MIN_PASSBAND_END: f64 = 0.5;
+
+/// Extra depth (dB) a band-length design ([`band_length_design_for`])
+/// takes under a passband end of [`BAND_MIN_PASSBAND_END`] (only a resolved
+/// passband end in Hz gets there). The transition is then wide enough that
+/// a Kaiser design's passband ripples more than its stopband's relative
+/// error, by up to 2.67 times at the widest; 10 dB (3.16 times) covers the
+/// whole range.
+pub const BAND_WIDE_PASSBAND_MARGIN_DB: f64 = 10.0;
+
+/// Largest half transition a band-length design keeps under a 0.5
+/// passband end when [`BAND_WIDE_PASSBAND_MARGIN_DB`] does not fit under
+/// the depth limit (above 215 dB): the passband end is raised to the
+/// stopband start minus twice this (at most 1.0), so the kernel is longer
+/// and the passband still flat to (past) the requested end.
+pub const BAND_WIDE_CAPPED_HALF_WIDTH: f64 = 0.2;
 
 /// Largest stopband start of a [`CutoffMode::Band`] design (fraction of the
 /// source Nyquist). Past 1.0 images of the top of the band leak through.
@@ -349,6 +367,10 @@ pub enum BandError {
         passband_end: f64,
         stopband_start: f64,
     },
+    /// An absolute passband end (Hz), which needs the source rate to
+    /// become a fraction of the Nyquist: the design paths resolve it
+    /// ([`crate::design::band_passband_end`]) before the band is designed.
+    Hertz(f64),
     /// Attenuation outside [`BAND_ATTENUATION_RANGE_DB`].
     Attenuation(f64),
     Automatic(String),
@@ -360,6 +382,11 @@ impl std::fmt::Display for BandError {
         match self {
             Self::Length => write!(f, "band transition needs an unrepresentable kernel length"),
             Self::Automatic(reason) => write!(f, "automatic taps: {reason}"),
+            Self::Hertz(hz) => write!(
+                f,
+                "the passband end ({hz} Hz) is a frequency, not a fraction of the Nyquist: it is \
+                 resolved at the source rate before the band is designed"
+            ),
             Self::Edges {
                 passband_end,
                 stopband_start,
@@ -397,8 +424,47 @@ pub struct BandDesign {
     pub cutoff: f64,
 }
 
+/// The Kaiser [`band_length_design_for`].
 pub fn band_design(spec: &BandSpec, ratio: usize) -> Result<BandDesign, BandError> {
-    band_design_for(WindowKind::Kaiser, spec, ratio)
+    band_length_design_for(WindowKind::Kaiser, spec, ratio)
+}
+
+/// The design of a band length ([`band_design_for`]), kept to the band's
+/// promise in its passband under a 0.5 passband end: designed
+/// [`BAND_WIDE_PASSBAND_MARGIN_DB`] deeper, or, where that would pass the
+/// top of [`BAND_ATTENUATION_RANGE_DB`] (above 215 dB), at the top with its
+/// transition narrowed to [`BAND_WIDE_CAPPED_HALF_WIDTH`]. From 0.5 up it
+/// is [`band_design_for`] itself. An automatic length measures both bands
+/// and takes [`band_design_for`] as its estimate.
+pub fn band_length_design_for(
+    window: WindowKind,
+    spec: &BandSpec,
+    ratio: usize,
+) -> Result<BandDesign, BandError> {
+    // The band as given is validated (edges and depth) first.
+    let plain = band_design_for(window, spec, ratio)?;
+    if spec.passband_end >= BAND_MIN_PASSBAND_END {
+        return Ok(plain);
+    }
+    let hi = BAND_ATTENUATION_RANGE_DB.1;
+    let deeper = spec.attenuation_db + BAND_WIDE_PASSBAND_MARGIN_DB;
+    let wide = if deeper <= hi {
+        BandSpec {
+            attenuation_db: deeper,
+            ..*spec
+        }
+    } else {
+        BandSpec {
+            attenuation_db: hi,
+            // At most the Nyquist (a stopband start above 1.4 keeps a
+            // little more than the capped half width).
+            passband_end: spec
+                .passband_end
+                .max((spec.stopband_start - 2.0 * BAND_WIDE_CAPPED_HALF_WIDTH).min(1.0)),
+            ..*spec
+        }
+    };
+    band_design_for(window, &wide, ratio)
 }
 
 /// [`band_design`] for any window. The Gaussian window's length comes from
@@ -409,8 +475,16 @@ pub fn band_design_for(
     ratio: usize,
 ) -> Result<BandDesign, BandError> {
     let (pe, se, a) = (spec.passband_end, spec.stopband_start, spec.attenuation_db);
+    if let Some(hz) = spec.passband_end_hz {
+        return Err(BandError::Hertz(hz));
+    }
+    // A passband end under `BAND_MIN_PASSBAND_END` only comes from an
+    // absolute one resolved at a high source rate (the field bounds keep a
+    // fraction at or above it); the length stays calibrated while the half
+    // transition is at most 0.5.
     if !(pe.is_finite() && se.is_finite())
-        || pe < BAND_MIN_PASSBAND_END
+        || pe <= 0.0
+        || (pe < BAND_MIN_PASSBAND_END && se - pe > 1.0)
         || pe > 1.0
         || se <= pe
         || se > BAND_MAX_STOPBAND_START
@@ -472,11 +546,21 @@ use crate::design::budget::RATIONAL_SWAP_PIPELINES;
 struct UpsamplerChannel {
     in_fifo: RingFifo,
     out_fifo: RingFifo,
-    prev_in: Vec<f64>,
-    fdl: Vec<SplitSpectrum>,
-    fdl_head: usize,
+    head: HeadChannel,
+    /// One entry per tail stage (`None` never happens for the one kernel
+    /// an upsampler has: its stages end where the kernel does).
+    tails: Vec<Option<TailChannel>>,
 }
 
+/// The FFT polyphase engine: the `ratio` polyphase branches of one kernel
+/// (`h_r[n] = h[n * ratio + r]`) convolved with the input by
+/// non-uniformly partitioned overlap-save (`crate::nupc`). Stage 0 is
+/// uniform at the input block `block_in` (the chain block's power of two,
+/// 64 ..= 1024), so the latency is `block_in * ratio` output frames for
+/// every kernel; a long kernel's later taps run in larger, time-sliced
+/// stages (`crate::nupc::polyphase_plan`), one forward transform and one
+/// delay line per stage shared by every branch. A kernel short enough for
+/// one stage runs the uniformly partitioned engine alone.
 pub struct Upsampler {
     ratio: usize,
     channels: usize,
@@ -487,20 +571,65 @@ pub struct Upsampler {
     kernel_delay: usize,
     block_in: usize,
     block_latency_out: usize,
-    num_parts: usize,
-    /// Polyphase IR partition spectra, indexed `[partition][branch]`.
-    /// Each branch `r` holds `h_r[p] = h[p * ratio + r]` scaled by `1 / (2 * block_in)`.
-    part_branch_ir: Vec<Vec<SplitSpectrum>>,
-    fft: Option<RealFftPair>,
+    /// Stage 0: partitions `[0][partition][branch]`, each branch `r` holding
+    /// `h_r[p * block_in ..]` scaled by `1 / (2 * block_in)`. `None` at
+    /// ratio 1 or without channels.
+    head: Option<HeadStage>,
+    tails: Vec<TailStage>,
     ch_states: Vec<UpsamplerChannel>,
     curr_in: Vec<f64>,
-    acc_branches: Vec<SplitSpectrum>,
-    time_out: Vec<f64>,
     block_out_interleaved: Vec<f64>,
+    /// Estimated work (model units) of the last `process` call.
+    last_cost: f64,
 }
 
 /// Largest integer ratio [`Upsampler`] runs at (44.1 kHz x64 = 2.8224 MHz).
 pub const MAX_UPSAMPLER_RATIO: usize = audivane_protocol::MAX_INTEGER_RATIO as usize;
+
+/// The spectra of the polyphase branches of `kernel` over the branch
+/// samples `[offset, end)` in `block`-frame partitions, `[partition][branch]`:
+/// as many partitions as the longest branch needs (`at_least_one`: one for
+/// an empty range too), a shorter branch padded with zeros.
+fn polyphase_partitions(
+    fft: &mut RealFftPair,
+    kernel: &[f64],
+    ratio: usize,
+    offset: usize,
+    block: usize,
+    end: usize,
+    at_least_one: bool,
+) -> Vec<Vec<SplitSpectrum>> {
+    let inv_n = 1.0 / (2 * block) as f64;
+    let max_branch_len = kernel.len().div_ceil(ratio);
+    let stage_end = max_branch_len.min(end);
+    let mut num_parts = stage_end.saturating_sub(offset).div_ceil(block);
+    if at_least_one {
+        num_parts = num_parts.max(1);
+    }
+    let mut branch_buf = vec![0.0; block];
+    (0..num_parts)
+        .map(|p| {
+            (0..ratio)
+                .map(|r| {
+                    branch_buf.fill(0.0);
+                    let mut count = 0usize;
+                    let first = offset + p * block;
+                    for (i, slot) in branch_buf.iter_mut().enumerate() {
+                        let n = first + i;
+                        let k_idx = n * ratio + r;
+                        if n < end && k_idx < kernel.len() {
+                            *slot = kernel[k_idx];
+                            count = i + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    fft.forward_padded_scaled(&branch_buf[..count], inv_n)
+                })
+                .collect()
+        })
+        .collect()
+}
 
 impl Upsampler {
     /// Panics when the kernel cannot be designed (see [`Upsampler::try_new`]).
@@ -543,14 +672,12 @@ impl Upsampler {
                 kernel_delay: 0,
                 block_in: 0,
                 block_latency_out: 0,
-                num_parts: 0,
-                part_branch_ir: Vec::new(),
-                fft: None,
+                head: None,
+                tails: Vec::new(),
                 ch_states: Vec::new(),
                 curr_in: Vec::new(),
-                acc_branches: Vec::new(),
-                time_out: Vec::new(),
                 block_out_interleaved: Vec::new(),
+                last_cost: 0.0,
             });
         }
 
@@ -597,7 +724,8 @@ impl Upsampler {
         Self::build_from_kernel(kernel, ratio, kernel_delay, channels, max_block_in, None)
     }
 
-    /// [`Self::from_kernel`] with the offline measurement's block size.
+    /// [`Self::from_kernel`] with the offline measurement's block size
+    /// (one uniformly partitioned stage).
     pub(crate) fn from_kernel_with_block(
         kernel: &[f64],
         ratio: usize,
@@ -606,6 +734,28 @@ impl Upsampler {
         block: usize,
     ) -> Self {
         Self::build_from_kernel(kernel, ratio, kernel_delay, channels, block, Some(block))
+    }
+
+    /// [`Self::from_kernel`] on one uniformly partitioned stage whatever
+    /// the kernel's length (the engine before non-uniform partitions): a
+    /// reference for tests and benchmarks.
+    #[doc(hidden)]
+    pub fn from_kernel_uniform(
+        kernel: &[f64],
+        ratio: usize,
+        kernel_delay: usize,
+        channels: usize,
+        max_block_in: usize,
+    ) -> Self {
+        let block = crate::design::budget::engine_block(max_block_in);
+        Self::build_from_kernel(
+            kernel,
+            ratio,
+            kernel_delay,
+            channels,
+            max_block_in,
+            Some(block),
+        )
     }
 
     fn build_from_kernel(
@@ -618,8 +768,7 @@ impl Upsampler {
     ) -> Self {
         let block_in = match block_override {
             Some(block) => block.next_power_of_two().max(2),
-            None if max_block_in == 0 => 64,
-            None => max_block_in.next_power_of_two().clamp(64, 1024),
+            None => crate::design::budget::engine_block(max_block_in),
         };
         crate::test_support::record("upsampler", || {
             crate::test_support::words(
@@ -632,60 +781,70 @@ impl Upsampler {
                 kernel,
             )
         });
-        let fft_len = 2 * block_in;
-        let mut fft = RealFftPair::new(fft_len);
-        let spec_len = fft.spec_len();
-        let inv_n = 1.0 / (fft_len as f64);
-
-        let max_branch_len = if kernel.is_empty() {
-            0
-        } else {
-            kernel.len().div_ceil(ratio)
+        let max_branch_len = kernel.len().div_ceil(ratio);
+        let plan = match block_override {
+            Some(_) => vec![StagePlan {
+                offset: 0,
+                block: block_in,
+                end: usize::MAX,
+            }],
+            None => crate::nupc::polyphase_plan(block_in, ratio, max_branch_len),
         };
-        let num_parts = max_branch_len.div_ceil(block_in).max(1);
+        Self::with_plan(kernel, ratio, kernel_delay, channels, max_block_in, &plan)
+    }
 
-        let mut branch_buf = vec![0.0; block_in];
-        let mut part_branch_ir = Vec::with_capacity(num_parts);
-        for p in 0..num_parts {
-            let mut branches = Vec::with_capacity(ratio);
-            for r in 0..ratio {
-                branch_buf.fill(0.0);
-                let mut count = 0usize;
-                for (i, slot) in branch_buf.iter_mut().enumerate() {
-                    let k_idx = (p * block_in + i) * ratio + r;
-                    if k_idx < kernel.len() {
-                        *slot = kernel[k_idx];
-                        count = i + 1;
-                    } else {
-                        break;
+    /// Build on an explicit partition schedule (validated: see
+    /// `crate::nupc`); stage 0's block is the input block.
+    fn with_plan(
+        kernel: &[f64],
+        ratio: usize,
+        kernel_delay: usize,
+        channels: usize,
+        max_block_in: usize,
+        plan: &[StagePlan],
+    ) -> Self {
+        let block_in = plan[0].block;
+        crate::nupc::validate_plan(plan, block_in);
+        let mut fft = RealFftPair::new(2 * block_in);
+        let head_parts =
+            polyphase_partitions(&mut fft, kernel, ratio, 0, block_in, plan[0].end, true);
+        let head = HeadStage::from_spectra(block_in, ratio, vec![head_parts]);
+        let tails: Vec<TailStage> = plan[1..]
+            .iter()
+            .map(|&st| {
+                let mut fft = RealFftPair::new(2 * st.block);
+                let parts = polyphase_partitions(
+                    &mut fft, kernel, ratio, st.offset, st.block, st.end, false,
+                );
+                // `[partition][branch]` to `[branch][partition]`.
+                let mut by_branch: Vec<Vec<SplitSpectrum>> = (0..ratio)
+                    .map(|_| Vec::with_capacity(parts.len()))
+                    .collect();
+                for part in parts {
+                    for (branch, spec) in by_branch.iter_mut().zip(part) {
+                        branch.push(spec);
                     }
                 }
-                branches.push(fft.forward_padded_scaled(&branch_buf[..count], inv_n));
-            }
-            part_branch_ir.push(branches);
-        }
+                TailStage::from_spectra(vec![by_branch], st, block_in, ratio)
+            })
+            .collect();
 
         let block_latency_out = block_in * ratio;
         let in_fifo_cap = block_in + max_block_in.max(block_in);
         let out_fifo_cap = block_latency_out + max_block_in.max(block_in) * ratio;
 
-        let mut ch_states = Vec::with_capacity(channels);
-        for _ in 0..channels {
-            let mut out_fifo = RingFifo::with_capacity(out_fifo_cap);
-            out_fifo.reset_zeros(block_latency_out);
-            let fdl = (0..num_parts)
-                .map(|_| SplitSpectrum::new(spec_len))
-                .collect();
-            ch_states.push(UpsamplerChannel {
-                in_fifo: RingFifo::with_capacity(in_fifo_cap),
-                out_fifo,
-                prev_in: vec![0.0; block_in],
-                fdl,
-                fdl_head: 0,
-            });
-        }
-
-        let acc_branches = (0..ratio).map(|_| SplitSpectrum::new(spec_len)).collect();
+        let ch_states = (0..channels)
+            .map(|_| {
+                let mut out_fifo = RingFifo::with_capacity(out_fifo_cap);
+                out_fifo.reset_zeros(block_latency_out);
+                UpsamplerChannel {
+                    in_fifo: RingFifo::with_capacity(in_fifo_cap),
+                    out_fifo,
+                    head: head.new_channel(0),
+                    tails: tails.iter().map(|t| t.new_channel(0)).collect(),
+                }
+            })
+            .collect();
 
         Self {
             ratio,
@@ -695,14 +854,12 @@ impl Upsampler {
             kernel_delay,
             block_in,
             block_latency_out,
-            num_parts,
-            part_branch_ir,
-            fft: Some(fft),
+            head: Some(head),
+            tails,
             ch_states,
             curr_in: vec![0.0; block_in],
-            acc_branches,
-            time_out: vec![0.0; fft_len],
             block_out_interleaved: vec![0.0; block_latency_out],
+            last_cost: 0.0,
         }
     }
 
@@ -733,16 +890,60 @@ impl Upsampler {
         self.taps
     }
 
+    /// The engine's stages: `(block, partitions)` per stage, stage 0
+    /// first (empty at ratio 1 or without channels).
+    pub fn stages(&self) -> Vec<(usize, usize)> {
+        let Some(head) = &self.head else {
+            return Vec::new();
+        };
+        std::iter::once((self.block_in, head.parts(0)))
+            .chain(self.tails.iter().map(|t| (t.schedule().block, t.parts(0))))
+            .collect()
+    }
+
+    /// What the engine keeps, in bytes: the filter spectra its channels
+    /// share (after [`Self::split_channels`] too), and the buffers of one
+    /// channel (delay lines, stage blocks and outputs, FIFOs, the head's
+    /// accumulators; FFT plans and scratch not counted).
+    pub fn resident_bytes(&self) -> (usize, usize) {
+        let Some(head) = &self.head else {
+            return (0, 0);
+        };
+        let shared = head.shared_bytes()
+            + self
+                .tails
+                .iter()
+                .map(TailStage::shared_bytes)
+                .sum::<usize>();
+        let per_channel = self.ch_states.first().map_or(0, |ch| {
+            ch.head.bytes()
+                + ch.tails
+                    .iter()
+                    .flatten()
+                    .map(TailChannel::bytes)
+                    .sum::<usize>()
+                + 8 * (ch.in_fifo.capacity() + ch.out_fifo.capacity())
+        }) + head.own_bytes()
+            + 8 * (self.curr_in.len() + self.block_out_interleaved.len());
+        (shared, per_channel)
+    }
+
+    /// Estimated work of the last `process` call, in the stage cost
+    /// model's units (see [`crate::conv::Convolver::last_process_cost`]).
+    pub fn last_process_cost(&self) -> f64 {
+        self.last_cost
+    }
+
     /// Scale the output by `gain` (headroom). Exact: the gain is folded into
     /// the kernel spectra, so it costs nothing per sample.
     pub fn scale_output(&mut self, gain: f64) {
-        for part in &mut self.part_branch_ir {
-            for branch in part {
-                for (re, im) in branch.re.iter_mut().zip(branch.im.iter_mut()) {
-                    *re *= gain;
-                    *im *= gain;
-                }
-            }
+        // Unique until the upsampler is split (this runs right after
+        // construction), so this never copies.
+        if let Some(head) = &mut self.head {
+            head.scale(gain);
+        }
+        for tail in &mut self.tails {
+            tail.scale(gain);
         }
     }
 
@@ -768,6 +969,7 @@ impl Upsampler {
                 "output slice length must be input.len() * ratio"
             );
         }
+        self.last_cost = 0.0;
         if n_in == 0 {
             return;
         }
@@ -779,10 +981,8 @@ impl Upsampler {
             return;
         }
 
-        let fft = self.fft.as_mut().expect("fft must exist for ratio > 1");
+        let head = self.head.as_mut().expect("head stage exists for ratio > 1");
         let b = self.block_in;
-        let r = self.ratio;
-        let num_parts = self.num_parts;
 
         for c in 0..self.channels {
             let ch = &mut self.ch_states[c];
@@ -790,40 +990,53 @@ impl Upsampler {
 
             while ch.in_fifo.len() >= b {
                 ch.in_fifo.pop_slice(&mut self.curr_in);
-
-                // Share one forward FFT across all R polyphase branches.
-                ch.fdl_head = (ch.fdl_head + 1) % num_parts;
-                fft.forward_pair_into_split(&ch.prev_in, &self.curr_in, &mut ch.fdl[ch.fdl_head]);
-
-                let ir_p0 = &self.part_branch_ir[0];
-                let x0 = &ch.fdl[ch.fdl_head];
-                for branch in 0..r {
-                    complex_mul_split(&mut self.acc_branches[branch], x0, &ir_p0[branch]);
-                }
-
-                for p in 1..num_parts {
-                    let fdl_idx = (ch.fdl_head + num_parts - p) % num_parts;
-                    let xp = &ch.fdl[fdl_idx];
-                    let ir_p = &self.part_branch_ir[p];
-                    for branch in 0..r {
-                        complex_mac_split(&mut self.acc_branches[branch], xp, &ir_p[branch]);
+                head.process_block(
+                    0,
+                    &mut ch.head,
+                    &self.curr_in,
+                    &mut self.block_out_interleaved,
+                );
+                self.last_cost += head.block_cost(0);
+                for (stage, tail) in self.tails.iter_mut().zip(ch.tails.iter_mut()) {
+                    if let Some(tail) = tail {
+                        self.last_cost +=
+                            stage.tick(0, tail, &self.curr_in, &mut self.block_out_interleaved);
                     }
                 }
-
-                for branch in 0..r {
-                    fft.inverse_from_split(&self.acc_branches[branch], &mut self.time_out);
-                    let tail = &self.time_out[b..];
-                    for i in 0..b {
-                        self.block_out_interleaved[i * r + branch] = tail[i];
-                    }
-                }
-
                 ch.out_fifo.push_slice(&self.block_out_interleaved);
-                ch.prev_in.copy_from_slice(&self.curr_in);
             }
 
             ch.out_fifo.pop_slice(output[c]);
         }
+    }
+
+    /// One single-channel upsampler per channel, each running its channel
+    /// exactly as this one does (bit for bit), from this one's state. The
+    /// kernel spectra and FFT tables are shared; each gets its own FFT
+    /// scratch. Off the real-time thread (it allocates); `self` is left
+    /// without channels.
+    pub fn split_channels(&mut self) -> Vec<Upsampler> {
+        // A ratio-1 upsampler keeps no channel state.
+        let mut states = std::mem::take(&mut self.ch_states).into_iter();
+        let n = self.channels;
+        self.channels = 0;
+        (0..n)
+            .map(|_| Upsampler {
+                ratio: self.ratio,
+                channels: 1,
+                max_block_in: self.max_block_in,
+                taps: self.taps,
+                kernel_delay: self.kernel_delay,
+                block_in: self.block_in,
+                block_latency_out: self.block_latency_out,
+                head: self.head.clone(),
+                tails: self.tails.clone(),
+                ch_states: states.next().into_iter().collect(),
+                curr_in: self.curr_in.clone(),
+                block_out_interleaved: self.block_out_interleaved.clone(),
+                last_cost: 0.0,
+            })
+            .collect()
     }
 
     pub fn reset(&mut self) {
@@ -833,12 +1046,12 @@ impl Upsampler {
         for ch in &mut self.ch_states {
             ch.in_fifo.clear();
             ch.out_fifo.reset_zeros(self.block_latency_out);
-            ch.prev_in.fill(0.0);
-            for spec in &mut ch.fdl {
-                spec.clear();
+            ch.head.reset();
+            for tail in ch.tails.iter_mut().flatten() {
+                tail.reset();
             }
-            ch.fdl_head = 0;
         }
+        self.last_cost = 0.0;
     }
 }
 
@@ -1107,6 +1320,19 @@ pub fn upsampler_response(
     measure_upsampler(cfg, source_rate).map(|m| m.response)
 }
 
+/// The engine block [`measure_upsampler`] reports the latency for: the
+/// [`crate::design::BuildContext`] default.
+pub const DEFAULT_MEASURE_MAX_BLOCK: usize = 1024;
+
+/// [`measure_upsampler_at`] for an engine whose largest input block is
+/// [`DEFAULT_MEASURE_MAX_BLOCK`].
+pub fn measure_upsampler(
+    cfg: &UpsamplerConfig,
+    source_rate: u32,
+) -> Result<MeasuredUpsampler, String> {
+    measure_upsampler_at(cfg, source_rate, DEFAULT_MEASURE_MAX_BLOCK)
+}
+
 /// Stopband detection threshold (dB) used when measuring a [`FilterPreset`]
 /// (presets do not carry a Kaiser beta).
 const PRESET_STOPBAND_TARGET_DB: f64 = 150.0;
@@ -1130,12 +1356,22 @@ const PRESET_STOPBAND_TARGET_DB: f64 = 150.0;
 /// Time-varying block FFT presets (`block_fft*`) give the response for one
 /// block position (an impulse at the start of a block).
 ///
+/// `latency_samples` is the delay the live engine adds for this design, in
+/// output frames, when its largest input block is `max_block` (the daemon
+/// builds its chains with `scaled_quantum(quantum, rate)` clamped to
+/// 512..8192): the filter's own delay (linear phase: half the kernel;
+/// otherwise its impulse peak) plus the partitioned convolution's block, as
+/// `status.filter_latency_ms` counts it for a chain with no other delayed
+/// stage. The offline partition block, chosen for speed, does not count.
+///
 /// Returns an error when the sizes do not fit in `usize` or the preset cannot
 /// be built (the control plane validates the config before calling this).
-pub fn measure_upsampler(
+pub fn measure_upsampler_at(
     cfg: &UpsamplerConfig,
     source_rate: u32,
+    max_block: usize,
 ) -> Result<MeasuredUpsampler, String> {
+    let max_block = max_block.max(1);
     let source_rate = source_rate.max(1);
     let rate_ratio = resolve_rate_ratio(cfg.target, source_rate);
     if !rate_ratio.is_integer() {
@@ -1199,12 +1435,12 @@ pub fn measure_upsampler(
     }
 
     let Some(manual) = standard_manual else {
-        const PRESET_MEASUREMENT_BLOCK: usize = 1024;
+        // Built as the engine builds it, so its latency is the live one.
         let cx = crate::design::BuildContext {
             source_rate,
             ratio: rate_ratio,
             channels: 1,
-            max_block: PRESET_MEASUREMENT_BLOCK,
+            max_block,
             pipelines: RATIONAL_SWAP_PIPELINES,
             output: audivane_protocol::OutputConfig::default(),
             workspace: crate::design::budget::design_workspace(),
@@ -1215,12 +1451,8 @@ pub fn measure_upsampler(
             .ok_or_else(|| format!("no upsampler at {rate_ratio}"))?;
         let latency_samples = rt.latency_out_frames();
         let impulse_len = rt.impulse_span_out_frames().max(1);
-        let (output, output_len, n_fft) = clock_impulse(
-            &mut *rt,
-            ratio as usize,
-            PRESET_MEASUREMENT_BLOCK,
-            impulse_len,
-        )?;
+        let (output, output_len, n_fft) =
+            clock_impulse(&mut *rt, ratio as usize, max_block, impulse_len)?;
         drop(rt);
 
         let phase = named.design.filter_phase();
@@ -1270,7 +1502,10 @@ pub fn measure_upsampler(
     let mut up =
         Upsampler::from_kernel_with_block(&kernel.taps, ratio as usize, kernel.delay, 1, block_in);
     let block_latency = up.block_latency_out_frames();
-    let latency_samples = up.latency_out_frames();
+    // The live engine's block, not the offline one: what
+    // `Upsampler::from_kernel` with `max_block` delays.
+    let latency_samples = crate::design::budget::engine_block(max_block) * ratio as usize
+        + (up.latency_out_frames() - block_latency);
 
     // The response is the kernel tail (`taps` output frames) shifted by the
     // upsampler's block latency. Anything after that is exactly zero, so there
@@ -1360,16 +1595,15 @@ fn analyze_measured_impulse(
     let nyquist_in = f64::from(meta.source_rate) / 2.0;
     let nyquist_out = f64::from(meta.output_rate) / 2.0;
 
+    // The first of several equal peaks (`max_by` would pick the last), so a
+    // flat hold kernel is plotted from its first sample.
     let peak_index = output
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| {
-            a.abs()
-                .partial_cmp(&b.abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
+        .fold((0usize, f64::NEG_INFINITY), |(bi, bv), (i, v)| {
+            if v.abs() > bv { (i, v.abs()) } else { (bi, bv) }
         })
-        .map(|(i, _)| i)
-        .unwrap_or(0);
+        .0;
     let mut impulse_start = peak_index.saturating_sub(128);
     let mut impulse_end = (impulse_start + 256).min(output.len());
     if impulse_end - impulse_start < 256 {
@@ -2460,9 +2694,25 @@ fn design_polyphase_row(
     }
 }
 
-/// Offline high-quality resampling between arbitrary rates (e.g. an IR
-/// recorded at 48 kHz used at 44.1 kHz). Output length is
-/// `round(x.len() * to / from)`. Not real-time.
+/// An impulse response designed at `from_hz`, for use at `to_hz`: the
+/// same filter (frequency response, DC gain), not the same sample values.
+/// [`resample_offline`] keeps a signal's amplitude, so the taps' sum (the
+/// DC gain) grows by `to / from` (+6.02 dB at 2x); the taps are scaled
+/// back by `from / to`. Not real-time.
+pub fn resample_ir(h: &[f64], from_hz: u32, to_hz: u32) -> Vec<f64> {
+    let mut out = resample_offline(h, from_hz, to_hz);
+    if from_hz != to_hz {
+        let k = f64::from(from_hz) / f64::from(to_hz);
+        for x in &mut out {
+            *x *= k;
+        }
+    }
+    out
+}
+
+/// Offline high-quality resampling of a signal between arbitrary rates
+/// (its amplitude kept; an impulse response takes [`resample_ir`]).
+/// Output length is `round(x.len() * to / from)`. Not real-time.
 pub fn resample_offline(x: &[f64], from_hz: u32, to_hz: u32) -> Vec<f64> {
     assert!(from_hz > 0 && to_hz > 0, "sample rates must be > 0");
     if x.is_empty() {
@@ -2604,6 +2854,7 @@ pub fn resample_offline(x: &[f64], from_hz: u32, to_hz: u32) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fft::complex_mul_split;
 
     fn upsampler_response(
         cfg: &ManualConfig,
@@ -2625,6 +2876,18 @@ mod tests {
             .into_upsampler_config()
             .map_err(|e| e.to_string())?;
         super::measure_upsampler(&up, source_rate)
+    }
+
+    fn measure_upsampler_at(
+        cfg: &ManualConfig,
+        source_rate: u32,
+        max_block: usize,
+    ) -> Result<MeasuredUpsampler, String> {
+        let up = cfg
+            .clone()
+            .into_upsampler_config()
+            .map_err(|e| e.to_string())?;
+        super::measure_upsampler_at(&up, source_rate, max_block)
     }
     use crate::lin_to_db;
     use audivane_protocol::CutoffMode;
@@ -3388,6 +3651,275 @@ mod tests {
                 max_err <= 1e-12 * peak,
                 "ratio {ratio}, taps {taps}: max_err {max_err:.3e} (peak {peak:.2})"
             );
+        }
+    }
+
+    /// Run `x` through `up` (one channel) in calls of varying size: full
+    /// blocks, 1, odd, 0, random.
+    fn run_varying(up: &mut Upsampler, x: &[f64], max_block: usize, seed: u64) -> Vec<f64> {
+        let r = up.ratio;
+        let mut seed = seed;
+        let mut y = Vec::with_capacity(x.len() * r);
+        let mut out = vec![0.0; max_block * r];
+        let (mut offset, mut step) = (0, 0usize);
+        while offset < x.len() {
+            let n = match step % 6 {
+                0 => max_block,
+                1 => 1,
+                2 => 0,
+                3 => (max_block / 2) | 1,
+                _ => {
+                    (((lcg(&mut seed) + 1.0) * 0.5 * max_block as f64) as usize).clamp(1, max_block)
+                }
+            }
+            .min(x.len() - offset);
+            step += 1;
+            up.process(&[&x[offset..offset + n]], &mut [&mut out[..n * r]]);
+            y.extend_from_slice(&out[..n * r]);
+            offset += n;
+        }
+        y
+    }
+
+    /// A kernel short enough for one stage runs the uniformly partitioned
+    /// engine unchanged, bit for bit (its latency too).
+    #[test]
+    fn short_kernels_run_the_uniform_engine_bit_for_bit() {
+        let mut seed = 21u64;
+        for (ratio, per_branch, max_block) in [
+            (2usize, 8192usize, 512usize),
+            (16, 8192, 1024),
+            (64, 4096, 512),
+            (3, 20 * 1024, 1024),
+        ] {
+            let kernel: Vec<f64> = (0..per_branch * ratio)
+                .map(|_| lcg(&mut seed) * 0.01)
+                .collect();
+            let mut up = Upsampler::from_kernel(&kernel, ratio, 17, 1, max_block);
+            let mut uni = Upsampler::from_kernel_uniform(&kernel, ratio, 17, 1, max_block);
+            assert_eq!(
+                up.stages().len(),
+                1,
+                "x{ratio} {per_branch}: {:?}",
+                up.stages()
+            );
+            assert_eq!(up.latency_out_frames(), uni.latency_out_frames());
+            let x: Vec<f64> = (0..3 * per_branch).map(|_| lcg(&mut seed)).collect();
+            let a = run_varying(&mut up, &x, max_block, 1);
+            let b = run_varying(&mut uni, &x, max_block, 1);
+            assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()));
+        }
+    }
+
+    /// Long kernels on non-uniform partitions against one big FFT
+    /// convolution of the zero-stuffed input: at most 1e-12 of the output
+    /// peak (-240 dB; measured about -290 dB), with the latency of the
+    /// uniform engine. Covers a non-power-of-two ratio, the output buffer
+    /// cap at x64, every chunk size and both base blocks.
+    #[test]
+    fn long_kernels_on_tail_stages_match_the_reference() {
+        let mut seed = 77u64;
+        for (ratio, per_branch, max_block, frames) in [
+            (16usize, 70_000usize, 512usize, 150_000usize),
+            (3, 300_000, 1024, 330_000),
+            (64, 40_000, 1024, 60_000),
+            (4, 140_000, 2048, 170_000),
+        ] {
+            let kernel: Vec<f64> = (0..per_branch * ratio)
+                .map(|i| lcg(&mut seed) * (-(i as f64) / (per_branch * ratio) as f64 * 3.0).exp())
+                .collect();
+            let mut up = Upsampler::from_kernel(&kernel, ratio, 0, 1, max_block);
+            let uni = Upsampler::from_kernel_uniform(&kernel, ratio, 0, 1, max_block);
+            assert!(up.stages().len() > 1, "{:?}", up.stages());
+            assert_eq!(up.latency_out_frames(), uni.latency_out_frames());
+            let lat = up.block_latency_out_frames();
+            let mut x: Vec<f64> = (0..frames).map(|_| lcg(&mut seed)).collect();
+            x.resize(frames + lat / ratio + 1, 0.0);
+            let y = run_varying(&mut up, &x, max_block, ratio as u64);
+            let expected = fft_zero_stuff_convolve(&x[..frames], &kernel, ratio);
+            let peak = expected.iter().fold(1e-30f64, |m, v| m.max(v.abs()));
+            let mut err = y[..lat].iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            for i in 0..frames * ratio {
+                err = err.max((y[i + lat] - expected[i]).abs());
+            }
+            let db = 20.0 * (err / peak).max(1e-30).log10();
+            eprintln!(
+                "x{ratio} {per_branch}/branch, block {max_block}, {:?}: {db:.1} dB",
+                up.stages()
+            );
+            assert!(err <= 1e-12 * peak, "x{ratio}: {err:.3e} of peak {peak:.3}");
+        }
+    }
+
+    /// The tail stages' work is spread over the base blocks of their
+    /// periods: no call does much more than the mean (in the model's units).
+    #[test]
+    fn tail_work_is_spread_evenly_across_calls() {
+        let mut seed = 4u64;
+        let ratio = 16;
+        let kernel: Vec<f64> = (0..ratio * 300_000)
+            .map(|_| lcg(&mut seed) * 1e-3)
+            .collect();
+        let block = 512;
+        let mut up = Upsampler::from_kernel(&kernel, ratio, 0, 1, block);
+        let largest = up.stages().iter().map(|s| s.0).max().unwrap();
+        assert_eq!(largest, 32_768);
+        let x = vec![0.1; block];
+        let mut out = vec![0.0; block * ratio];
+        let per = largest / block;
+        let mut costs = Vec::new();
+        for i in 0..4 * per {
+            up.process(&[&x], &mut [&mut out]);
+            if i >= per {
+                costs.push(up.last_process_cost());
+            }
+        }
+        let mean = costs.iter().sum::<f64>() / costs.len() as f64;
+        let max = costs.iter().fold(0.0f64, |m, &c| m.max(c));
+        eprintln!(
+            "work per call: mean {mean:.0}, max {max:.0} (x{:.3})",
+            max / mean
+        );
+        assert!(max <= 1.1 * mean, "max {max} vs mean {mean}");
+    }
+
+    #[test]
+    fn reset_and_split_channels_keep_tail_stages_exact() {
+        let mut seed = 8u64;
+        let ratio = 4;
+        let kernel: Vec<f64> = (0..ratio * 100_000)
+            .map(|_| lcg(&mut seed) * 1e-2)
+            .collect();
+        let x: Vec<f64> = (0..140_000).map(|_| lcg(&mut seed)).collect();
+        let mut fresh = Upsampler::from_kernel(&kernel, ratio, 0, 1, 512);
+        let reference = run_varying(&mut fresh, &x, 512, 3);
+        // Stopped mid-period of every stage, then reset.
+        let mut up = Upsampler::from_kernel(&kernel, ratio, 0, 2, 512);
+        let junk: Vec<f64> = (0..23_456).map(|_| lcg(&mut seed)).collect();
+        let mut o = vec![0.0; 512 * ratio];
+        let mut o2 = vec![0.0; 512 * ratio];
+        for c in junk.chunks(500) {
+            let n = c.len();
+            up.process(&[c, c], &mut [&mut o[..n * ratio], &mut o2[..n * ratio]]);
+        }
+        up.reset();
+        let mut lanes = up.split_channels();
+        let again = run_varying(&mut lanes[1], &x, 512, 3);
+        assert!(
+            reference
+                .iter()
+                .zip(&again)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+        // After a reset, zeros in give exact zeros out.
+        lanes[0].reset();
+        let z = run_varying(&mut lanes[0], &vec![0.0; 70_000], 512, 4);
+        assert!(z.iter().all(|&v| v == 0.0));
+    }
+
+    /// The design budget's resident estimate ([`crate::design::budget::kernel_resident`])
+    /// against what the engine keeps: within 10 % on many stages, 20 % on one.
+    #[test]
+    fn the_resident_estimate_matches_the_engine() {
+        let mut seed = 6u64;
+        for (ratio, taps, max_block) in [
+            (16usize, 65_536usize, 1024usize),
+            (16, 1 << 20, 512),
+            (4, 1 << 21, 4096),
+            (64, 1 << 21, 1024),
+        ] {
+            let kernel: Vec<f64> = (0..taps).map(|_| lcg(&mut seed) * 1e-3).collect();
+            let up = Upsampler::from_kernel(&kernel, ratio, 0, 2, max_block);
+            let (shared, per_channel) = up.resident_bytes();
+            let actual = (shared + 2 * per_channel) as f64;
+            let cx = crate::design::BuildContext {
+                source_rate: 48_000,
+                ratio: RateRatio::integer(ratio as u32),
+                channels: 2,
+                max_block,
+                pipelines: 1,
+                output: Default::default(),
+                workspace: crate::design::budget::design_workspace(),
+            };
+            let estimate = crate::design::budget::kernel_resident(taps, &cx) as f64;
+            eprintln!(
+                "x{ratio} {taps} {:?}: estimate {estimate:.0}, actual {actual:.0}",
+                up.stages()
+            );
+            // One stage: the formula from before non-uniform partitions,
+            // which leaves out the head's accumulators.
+            let tol = if up.stages().len() == 1 { 0.2 } else { 0.1 };
+            assert!(
+                (estimate / actual - 1.0).abs() < tol,
+                "{estimate} vs {actual}"
+            );
+        }
+    }
+
+    /// Mean seconds per base block of `up` (mono, one base block per
+    /// call) over `periods` periods of its largest stage after one.
+    fn time_per_block(up: &mut Upsampler, periods: usize) -> f64 {
+        let b = up.block_in;
+        let r = up.ratio;
+        let largest = up.stages().iter().map(|s| s.0).max().unwrap();
+        let per = largest / b;
+        let mut seed = 3u64;
+        let x: Vec<f64> = (0..b).map(|_| lcg(&mut seed)).collect();
+        let mut out = vec![0.0; b * r];
+        for _ in 0..per {
+            up.process(&[&x], &mut [&mut out]);
+        }
+        let calls = (periods * per).max(400);
+        let t0 = std::time::Instant::now();
+        for _ in 0..calls {
+            up.process(&[&x], &mut [&mut out]);
+        }
+        t0.elapsed().as_secs_f64() / calls as f64
+    }
+
+    /// Where non-uniform partitions start to pay: the uniform engine, the
+    /// planner's schedule and the unmerged default schedule, per base block,
+    /// over branch lengths around the planner's threshold.
+    #[test]
+    #[ignore = "benchmark: cargo test --release -p audivane-dsp-core --lib bench_plan_crossover -- --ignored --nocapture"]
+    fn bench_plan_crossover() {
+        let mut seed = 9u64;
+        for base in [512usize, 1024] {
+            for ratio in [2usize, 4, 16, 64] {
+                for mult in [8usize, 12, 16, 20, 24, 28, 32, 40, 48, 64, 96, 128, 256] {
+                    let len = mult * base;
+                    let kernel: Vec<f64> =
+                        (0..len * ratio).map(|_| lcg(&mut seed) * 1e-3).collect();
+                    let mut uni = Upsampler::from_kernel_uniform(&kernel, ratio, 0, 1, base);
+                    let mut auto = Upsampler::from_kernel(&kernel, ratio, 0, 1, base);
+                    let default = crate::nupc::plan_schedule_capped(
+                        base,
+                        len,
+                        crate::nupc::polyphase_max_part(base, ratio),
+                    );
+                    let mut def = Upsampler::with_plan(&kernel, ratio, 0, 1, base, &default);
+                    let tu = time_per_block(&mut uni, 3);
+                    let ta = time_per_block(&mut auto, 3);
+                    let td = time_per_block(&mut def, 3);
+                    let fmt = |u: &Upsampler| {
+                        u.stages()
+                            .iter()
+                            .map(|(b, p)| format!("{b}x{p}"))
+                            .collect::<Vec<_>>()
+                            .join("+")
+                    };
+                    eprintln!(
+                        "B0 {base:4} x{ratio:<2} len {mult:3}*B0: uniform {:8.1} us | plan {:8.1} us ({:5.2}x) {:28} | default {:8.1} us ({:5.2}x) {}",
+                        tu * 1e6,
+                        ta * 1e6,
+                        tu / ta,
+                        fmt(&auto),
+                        td * 1e6,
+                        tu / td,
+                        fmt(&def)
+                    );
+                }
+            }
         }
     }
 
@@ -4194,8 +4726,8 @@ mod tests {
     }
 
     /// `upsampler_response` reports a Custom minimum-phase design's peak in
-    /// `latency_samples`: at x4 the measurement block's latency plus the
-    /// peak; at 160/147 the grid peak / M rounded (823 / 147 = 5.6 -> 6).
+    /// `latency_samples`: at x4 the engine block's latency plus the peak;
+    /// at 160/147 the grid peak / M rounded (823 / 147 = 5.6 -> 6).
     #[test]
     fn upsampler_response_latency_of_custom_minimum_phase_is_its_peak() {
         let cfg = |target| ManualConfig {
@@ -4205,8 +4737,11 @@ mod tests {
             ..ManualConfig::default()
         };
         let x4 = upsampler_response(&cfg(audivane_protocol::RateTarget::Ratio(4)), 48_000).unwrap();
-        // Block latency 256 + peak 19.
-        assert_eq!(x4.latency_samples, 275);
+        // The default engine block (1024 x 4) + peak 19.
+        assert_eq!(x4.latency_samples, 4096 + 19);
+        let x4 = measure_upsampler_at(&cfg(audivane_protocol::RateTarget::Ratio(4)), 48_000, 512)
+            .unwrap();
+        assert_eq!(x4.response.latency_samples, 2048 + 19);
         let r =
             upsampler_response(&cfg(audivane_protocol::RateTarget::Rate(48_000)), 44_100).unwrap();
         assert_eq!(r.latency_samples, 6);
@@ -4593,6 +5128,7 @@ mod tests {
     fn band(pe: f64, se: f64, a: f64) -> BandSpec {
         BandSpec {
             passband_end: pe,
+            passband_end_hz: None,
             stopband_start: se,
             attenuation_db: a,
         }
@@ -4636,6 +5172,18 @@ mod tests {
         worst
     }
 
+    /// An absolute passband end (Hz) needs the source rate to become a
+    /// fraction: the band builder, which has only the ratio, refuses an
+    /// unresolved one.
+    #[test]
+    fn a_band_passband_in_hz_needs_the_source_rate() {
+        let spec = BandSpec {
+            passband_end_hz: Some(20_000.0),
+            ..band(0.9, 1.0, 150.0)
+        };
+        assert_eq!(band_design(&spec, 2), Err(BandError::Hertz(20_000.0)));
+    }
+
     #[test]
     fn band_design_meets_both_edges() {
         let specs = [
@@ -4647,6 +5195,22 @@ mod tests {
             band(0.99, 1.0, 140.0),
             band(1.0, 1.5, 225.0),
             band(0.9, 0.95, 55.0),
+            // Absolute passband ends resolved at high source rates (20 kHz
+            // from 96 to 768 kHz), designed deeper by the wide-band margin.
+            band(20_000.0 / 48_000.0, 1.0, 150.0),
+            band(20_000.0 / 96_000.0, 1.0, 150.0),
+            band(20_000.0 / 192_000.0, 1.0, 120.0),
+            band(20_000.0 / 192_000.0, 1.0, 150.0),
+            band(20_000.0 / 384_000.0, 1.0, 150.0),
+            band(0.3, 1.0, 205.0),
+            // A stopband past the Nyquist (23 kHz at 96 kHz, 1.45), a wide
+            // one deep, and bands past 215 dB, where the transition is
+            // narrowed instead of the margin.
+            band(23_000.0 / 48_000.0, 1.45, 160.0),
+            band(0.45, 1.4, 205.0),
+            band(0.3, 1.1, 225.0),
+            band(0.49, 1.1, 222.0),
+            band(0.46, 1.45, 222.0),
         ];
         for spec in specs {
             for ratio in [2usize, 3, 4, 8, 16] {
@@ -4679,7 +5243,17 @@ mod tests {
                         * kaiser_half_width(taps, ratio, b.kaiser_beta);
                     y * (1.0 + NYQUIST_STOP_SHORT_GAIN * y)
                 };
-                let w = 0.5 * (spec.stopband_start - spec.passband_end);
+                // A wide band past 215 dB is designed for a narrower
+                // transition (`BAND_WIDE_CAPPED_HALF_WIDTH`): longer.
+                let narrowed = spec.passband_end < BAND_MIN_PASSBAND_END
+                    && spec.attenuation_db + BAND_WIDE_PASSBAND_MARGIN_DB > 225.0;
+                let pe = if narrowed {
+                    spec.passband_end
+                        .max((spec.stopband_start - 2.0 * BAND_WIDE_CAPPED_HALF_WIDTH).min(1.0))
+                } else {
+                    spec.passband_end
+                };
+                let w = 0.5 * (spec.stopband_start - pe);
                 assert!(y(b.taps) <= w && (b.taps <= 2 || y(b.taps - 1) > w));
             }
         }
@@ -4693,7 +5267,11 @@ mod tests {
         // Same duration at every ratio: 8x the taps for 8x the rate.
         assert!((t16 / t2 - 8.0).abs() < 0.05, "{t2} {t16}");
         assert!(band_design(&band(0.9, 0.9, 140.0), 4).is_err());
-        assert!(band_design(&band(0.4, 0.9, 140.0), 4).is_err());
+        // Under 0.5 only while the half transition stays calibrated (a
+        // resolved passband end in Hz; the field bounds keep fractions at
+        // 0.5 and up).
+        assert!(band_design(&band(0.4, 1.5, 140.0), 4).is_err());
+        assert!(band_design(&band(0.4, 0.9, 140.0), 4).is_ok());
         assert!(band_design(&band(1.01, 1.2, 140.0), 4).is_err());
         assert!(band_design(&band(0.9, 1.6, 140.0), 4).is_err());
         assert!(band_design(&band(0.9, 1.0, 40.0), 4).is_err());
@@ -5202,10 +5780,58 @@ mod tests {
         assert_eq!(m.response.taps, k.len());
         assert_eq!(
             m.response.latency_samples,
-            Upsampler::try_new(&d, 1, measurement_block(d.taps, 4))
+            Upsampler::try_new(&d, 1, DEFAULT_MEASURE_MAX_BLOCK)
                 .unwrap()
                 .latency_out_frames()
         );
+    }
+
+    /// The measured latency is what the engine's own builder delays at the
+    /// same block (what `status.filter_latency_ms` shows), not the offline
+    /// partition block: a kernel preset, a block FFT, an IIR cascade and the
+    /// standard path, at x16 from 44.1 kHz with the 512-frame block of the
+    /// default quantum, and at a larger block.
+    #[test]
+    fn measured_latency_is_the_live_engines() {
+        let preset = |p| ManualConfig {
+            target: audivane_protocol::RateTarget::Ratio(16),
+            preset: Some(p),
+            ..Default::default()
+        };
+        let cfgs = [
+            preset(FilterPreset::KaiserSteep),
+            preset(FilterPreset::BlockFft),
+            preset(FilterPreset::CascadeElliptic),
+            response_config(16, 3393, FilterPhase::Linear),
+        ];
+        for max_block in [512, 2048] {
+            for cfg in &cfgs {
+                let up = cfg.clone().into_upsampler_config().unwrap();
+                let named = crate::design::Named::of(&up).unwrap();
+                let cx = crate::design::BuildContext {
+                    source_rate: 44_100,
+                    ratio: RateRatio::integer(16),
+                    channels: 1,
+                    max_block,
+                    pipelines: RATIONAL_SWAP_PIPELINES,
+                    output: audivane_protocol::OutputConfig::default(),
+                    workspace: crate::design::budget::design_workspace(),
+                };
+                let live = crate::design::upsampler::upsampler(&named, &cx, 0.0)
+                    .unwrap()
+                    .unwrap()
+                    .latency_out_frames();
+                let m = measure_upsampler_at(cfg, 44_100, max_block).unwrap();
+                assert_eq!(
+                    m.response.latency_samples, live,
+                    "{:?} at block {max_block}",
+                    cfg.preset
+                );
+            }
+        }
+        // kaiser_steep: its kernel's centre plus 512 x 16, 18.15 ms.
+        let m = measure_upsampler_at(&cfgs[0], 44_100, 512).unwrap();
+        assert_eq!(m.response.latency_samples, 4616 + 8192);
     }
 
     #[test]

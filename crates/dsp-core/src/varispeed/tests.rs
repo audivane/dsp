@@ -207,6 +207,7 @@ fn steep_filters_from_the_builder_equal_the_band_design() {
             band: BandSpec {
                 passband_end,
                 stopband_start: STEEP_STOPBAND,
+                passband_end_hz: None,
                 attenuation_db: STEEP_ATTENUATION_DB,
             },
             phase: FilterPhase::Linear,
@@ -777,6 +778,7 @@ fn rational_path_and_stage_at_the_same_instants() {
             band: BandSpec {
                 passband_end: STEEP_PASSBAND,
                 stopband_start: STEEP_STOPBAND,
+                passband_end_hz: None,
                 attenuation_db: STEEP_ATTENUATION_DB,
             },
             phase: FilterPhase::Linear,
@@ -1529,7 +1531,7 @@ fn a_cap_drop_at_every_phase_of_a_ramp() {
         assert_eq!(run.vs.fallbacks(), 0);
         if phase == 20 {
             println!(
-                "the reviewer's case (halfway, speed {before:.5}): peak_until_settled {peak:.5}, \
+                "a retarget halfway (speed {before:.5}): peak_until_settled {peak:.5}, \
                  {}",
                 if seen_fade { "faded" } else { "smooth" }
             );
@@ -1782,10 +1784,9 @@ fn cap_drop_with_commands(
 #[test]
 fn a_cap_drops_silence_ends_by_its_deadline() {
     let span = stage(G, 1, 1.0).mute_frames();
-    // The reviewer's case: once silent, the cap alternates between 1.05
-    // and 1.0 every 128 frames for 12 800 frames (each change used to
-    // restart the silence, and the output stayed silent throughout). The
-    // rise waits, the return to 1.0 drops it: the deadline never moves.
+    // Once silent, the cap alternates between 1.05 and 1.0 every 128
+    // frames for 12 800 frames. The rise waits, the return to 1.0 drops it:
+    // the deadline never moves.
     let (runs, vs) = cap_drop_with_commands(30_000, |vs, t| {
         if t < 12_800 && t % 128 == 0 {
             vs.set_speed_limit([1.05, 1.0][(t / 128) % 2]);
@@ -1967,10 +1968,9 @@ fn the_cap_is_exact() {
 }
 
 /// `peak_until_settled` covers a call already latched: a ramp latched,
-/// then a cap under it before `process` (the bound used to start from the
-/// state before the plan and give the cap, 1.0, while the call rose above
-/// it), and the reviewer's case (silent at 1.0, a cap of 1.2, a plan, then
-/// a cap of 0.9).
+/// then a cap under it before `process` (the bound must include the latched
+/// call, not just the cap it will settle to), and a case silent at 1.0, a
+/// cap of 1.2, a plan, then a cap of 0.9.
 #[test]
 fn the_peak_bound_covers_a_latched_call() {
     let follow = |vs: &mut Varispeed, n: usize, bound: f64| {
@@ -1996,8 +1996,8 @@ fn the_peak_bound_covers_a_latched_call() {
     follow(&mut vs, 4096, bound);
     assert_eq!(vs.speed(), 1.0);
 
-    // The reviewer's case: the rise waits for the fade-in, so the latched
-    // call holds at 1.0, and the bound says so.
+    // The rise waits for the fade-in, so the latched call holds at 1.0,
+    // and the bound says so.
     let mut vs = stage(G, 1, 1.5);
     pull_silence(&mut vs, 512);
     vs.set_speed_limit(1.0);

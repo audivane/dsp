@@ -288,6 +288,7 @@ struct StageState {
     y: Vec<f64>,
 }
 
+#[derive(Clone)]
 struct Stage {
     f: usize,
     table: &'static Table,
@@ -724,6 +725,33 @@ impl UpsamplerRuntime for IirCascade {
 
     fn impulse_span_out_frames(&self) -> usize {
         self.span
+    }
+
+    // The two-channel recursive pass runs each channel's operations in the
+    // one-channel order (`run_generic`), so a part is bit for bit its
+    // channel here.
+    fn split_channels(&mut self) -> Option<Vec<Box<dyn UpsamplerRuntime>>> {
+        let state = std::mem::take(&mut self.state);
+        self.channels = 0;
+        Some(
+            state
+                .into_iter()
+                .map(|st| {
+                    Box::new(IirCascade {
+                        ratio: self.ratio,
+                        channels: 1,
+                        max_block: self.max_block,
+                        stages: self.stages.clone(),
+                        state: vec![st],
+                        bsum: self.bsum.clone(),
+                        gain: self.gain,
+                        use_fma: self.use_fma,
+                        latency: self.latency,
+                        span: self.span,
+                    }) as Box<dyn UpsamplerRuntime>
+                })
+                .collect(),
+        )
     }
 }
 

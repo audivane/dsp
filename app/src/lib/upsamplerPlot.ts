@@ -97,7 +97,7 @@ export function windowRequestFor(
 
 /** "23,999.937" with a fixed number of decimals and thousands separators. */
 export function fmtHzStat(hz: number, digits: number): string {
-  if (!Number.isFinite(hz)) return "—";
+  if (!Number.isFinite(hz)) return "-";
   return hz.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
 

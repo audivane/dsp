@@ -36,6 +36,7 @@ pub mod catalogue;
 pub mod check;
 pub mod claim;
 pub(crate) mod ddouble;
+pub mod explain;
 pub mod grid;
 pub mod length;
 pub mod paths;
@@ -54,8 +55,8 @@ use audivane_protocol::RateRatio;
 pub use audivane_protocol::design::{
     Accept, ArithmeticPath, BlockFftDesign, BlockSize, CascadeStage, Cutoff, Decimation, Fallback,
     FallbackWhen, FilterDesign, FlattopSet, GridCutoff, InterpMethod, KernelDesign, Length,
-    Numerics, OddRule, Overlap, Phase, PhaseMethod, RECOMMENDED_PRESET, Rates, Sampling, Shape,
-    Span, Stepped, StoredDesign, Window,
+    Numerics, OddRule, OptimalMethod, Overlap, Phase, PhaseMethod, RECOMMENDED_PRESET, Rates,
+    Sampling, Shape, Span, Stepped, StoredDesign, Window,
 };
 pub use audivane_protocol::{BandSpec, FilterErrorBudget, FilterPreset};
 pub use grid::Grid;
@@ -163,6 +164,79 @@ impl BuildContext {
     }
 }
 
+/// The rate whose Nyquist a band's fractions are of, from `source_rate` at
+/// `ratio`: the lower of the input and output rates (the output rate when
+/// decimating), on every path. An absolute passband end converts there.
+pub fn band_rate(source_rate: u32, ratio: RateRatio) -> u32 {
+    ratio
+        .output_rate(source_rate)
+        .map_or(source_rate, |out| out.min(source_rate))
+}
+
+/// A band spec's passband end as a fraction of the Nyquist at
+/// `source_rate` (the [`band_rate`] of a build):
+/// [`BandSpec::passband_end_hz`] converted when set (so the band does not
+/// scale with the source rate), else its own fraction. A pinned frequency
+/// that does not fit the band at this rate ([`band_pin_misfit`]) falls
+/// back to the spec's own fraction, [`BandSpec::passband_end`], so the
+/// rate still builds.
+pub fn band_passband_end(spec: &BandSpec, source_rate: u32) -> f64 {
+    match spec.passband_end_hz {
+        Some(_) if band_pin_misfit(spec, source_rate).is_some() => spec.passband_end,
+        Some(hz) => hz / (f64::from(source_rate) / 2.0),
+        None => spec.passband_end,
+    }
+}
+
+/// The pinned passband end of `spec` as a fraction of the Nyquist at
+/// `source_rate`, when it is set and does not fit the band there: it must
+/// end below the stopband start and at most at the Nyquist, and leave a
+/// transition no wider than the source Nyquist (the band length's
+/// calibrated domain, a half transition of at most 0.5). `None` when the
+/// pin fits or there is none. 20 kHz fits from 44.1 kHz up with the
+/// stopband at the Nyquist; at 32 kHz it comes to 1.25 and falls back.
+pub fn band_pin_misfit(spec: &BandSpec, source_rate: u32) -> Option<f64> {
+    let hz = spec.passband_end_hz?;
+    let f = hz / (f64::from(source_rate) / 2.0);
+    let se = spec.stopband_start;
+    let fits = f.is_finite() && f > 0.0 && f <= 1.0 && f < se && se - f <= 1.0;
+    (!fits).then_some(f)
+}
+
+/// The band of a windowed-sinc kernel design with a band cutoff.
+pub fn band_of(d: &FilterDesign) -> Option<&BandSpec> {
+    match d {
+        FilterDesign::Kernel(KernelDesign {
+            shape:
+                Shape::WindowedSinc {
+                    cutoff: Cutoff::Band(b),
+                    ..
+                },
+            ..
+        }) => Some(b),
+        _ => None,
+    }
+}
+
+/// What a design does instead of its pinned passband end from
+/// `source_rate` at `ratio` when the pin does not fit the band there
+/// ([`band_pin_misfit`]), for the design check's notes; `None` when it fits
+/// or there is no pin. The band is of the lower Nyquist ([`band_rate`]).
+pub fn band_pin_note(d: &FilterDesign, source_rate: u32, ratio: RateRatio) -> Option<String> {
+    let b = band_of(d)?;
+    let band_rate = band_rate(source_rate, ratio);
+    let f = band_pin_misfit(b, band_rate)?;
+    let hz = b.passband_end_hz?;
+    let nyquist = f64::from(band_rate) / 2.0;
+    Some(format!(
+        "at {source_rate} Hz, the passband end {hz} Hz ({f:.3} of the Nyquist) does not fit \
+         below the stopband start ({}): the passband ends at {} of the Nyquist ({:.0} Hz) instead",
+        b.stopband_start,
+        b.passband_end,
+        b.passband_end * nyquist
+    ))
+}
+
 pub use budget::Plan;
 
 /// A design checked and designed for one context: what [`build`] turns
@@ -183,16 +257,18 @@ pub struct Prepared {
     pub safety: safety::Safety,
 }
 
+/// Whether the `standard` path builds `k` (its legacy builder or its new
+/// combinations): a design on that path but an optimal one, which only
+/// the general path builds (and refuses off the fir paths).
+fn on_combos(k: &KernelDesign) -> bool {
+    k.numerics.path == ArithmeticPath::Standard && !matches!(k.shape, Shape::Optimal { .. })
+}
+
 /// `d`'s kernel design when the `standard` path's legacy builder (the
 /// Custom builder) builds it.
 fn standard(d: &FilterDesign) -> Option<&KernelDesign> {
     match d {
-        FilterDesign::Kernel(k)
-            if k.numerics.path == ArithmeticPath::Standard
-                && paths::standard::combos::legacy(k) =>
-        {
-            Some(k)
-        }
+        FilterDesign::Kernel(k) if on_combos(k) && paths::standard::combos::legacy(k) => Some(k),
         _ => None,
     }
 }
@@ -210,7 +286,7 @@ fn general(d: &FilterDesign) -> Option<&KernelDesign> {
 /// Whether `k` is a new combination: the legacy builders keep every other
 /// design's bits and refusals.
 pub(crate) fn novel(k: &KernelDesign) -> bool {
-    if k.numerics.path == ArithmeticPath::Standard {
+    if on_combos(k) {
         !paths::standard::combos::legacy(k)
     } else {
         !paths::general::legacy(k)
@@ -225,7 +301,7 @@ fn novel_feasibility(
     cx: &BuildContext,
     search: bool,
 ) -> Result<Plan, DesignError> {
-    if k.numerics.path == ArithmeticPath::Standard {
+    if on_combos(k) {
         return paths::standard::combos::feasibility(d, k, cx);
     }
     paths::general::feasibility(d, k, cx, search).map(|(plan, _)| plan)
@@ -237,7 +313,7 @@ fn novel_kernel(
     source_rate: u32,
     ratio: RateRatio,
 ) -> Result<Kernel, DesignError> {
-    if k.numerics.path == ArithmeticPath::Standard {
+    if on_combos(k) {
         return paths::standard::combos::kernel_at(k, source_rate, ratio);
     }
     paths::general::kernel_at(k, source_rate, &Grid::new(source_rate, ratio))
@@ -250,7 +326,7 @@ pub(crate) fn novel_taps(
     source_rate: u32,
     ratio: RateRatio,
 ) -> Result<(usize, usize), DesignError> {
-    if k.numerics.path == ArithmeticPath::Standard {
+    if on_combos(k) {
         return paths::standard::combos::taps(k, source_rate, ratio);
     }
     paths::general::taps(k, source_rate, &Grid::new(source_rate, ratio))
@@ -259,7 +335,7 @@ pub(crate) fn novel_taps(
 /// The plan of the new combination `k` in `cx` with its length resolved,
 /// no budget checked.
 pub(crate) fn novel_plan(k: &KernelDesign, cx: &BuildContext) -> Result<Plan, DesignError> {
-    if k.numerics.path == ArithmeticPath::Standard {
+    if on_combos(k) {
         return paths::standard::combos::resolved_plan(k, cx);
     }
     paths::general::resolved_plan(k, cx)
@@ -446,7 +522,7 @@ pub fn offline_kernel(
     rates::check(d, ratio)?;
     if let Some(k) = general(d) {
         check::check(d).map_err(DesignError::Field)?;
-        if k.numerics.path != ArithmeticPath::Standard {
+        if !on_combos(k) {
             let plan = paths::general::resolved_plan(k, &cx)?;
             if paths::general::method(k) == Some(PhaseMethod::Cepstral) {
                 budget::check_cepstral(plan.grid_taps / paths::general::growth(k).0, ratio)?;
@@ -478,7 +554,7 @@ pub fn prototype(
         return Err(DesignError::NotAKernel);
     };
     let grid = Grid::new(source_rate, ratio);
-    if general(d).is_some() && k.numerics.path != ArithmeticPath::Standard {
+    if general(d).is_some() && !on_combos(k) {
         return paths::general::prototype_at(k, source_rate, &grid);
     }
     let r = paths::recipe(k, source_rate, &grid)?;
@@ -493,7 +569,7 @@ pub fn prepare(d: &FilterDesign, cx: &BuildContext) -> Result<Prepared, DesignEr
         let (plan, kernel) = paths::standard::prepare(&d, k, cx)?;
         (plan, Some(kernel))
     } else if let Some(k) = general(&d) {
-        let (plan, kernel) = if k.numerics.path == ArithmeticPath::Standard {
+        let (plan, kernel) = if on_combos(k) {
             paths::standard::combos::prepare(&d, k, cx)?
         } else {
             paths::general::prepare(&d, k, cx)?

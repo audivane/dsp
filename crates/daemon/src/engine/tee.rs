@@ -1,5 +1,4 @@
-//! Multi-device step 3: what the master's RT thread gives each follower,
-//! built in the processor
+//! What the master's RT thread gives each follower, built in the processor
 //! before the master's varispeed stage.
 //!
 //! - **The tee** ([`tee_ring`]): each follower gets a single-producer,
@@ -35,6 +34,7 @@
 //! follower attached the processor only counts source frames: its output
 //! and its cost are unchanged.
 
+use super::processor::SharedVolume;
 use audivane_dsp_core::drift::{FRAME, MAP_LEN, PositionMap, Reading};
 use audivane_protocol::ipc::EngineConfig;
 use std::collections::BTreeMap;
@@ -44,10 +44,25 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Most followers.
 pub const MAX_FOLLOWERS: usize = 3;
-/// The most the master is delayed for alignment, ms.
-pub const MAX_ALIGN_MS: f64 = 60.0;
+/// The most the master is delayed for alignment, ms: what a follower at
+/// the default quantum needs (up to about 60 ms, three periods queued on
+/// both sides) and the whole negative trim range on top.
+pub const MAX_ALIGN_MS: f64 = 120.0;
+/// The most chain latency the devices' compensation evens out, ms: the
+/// master's in its alignment delay ([`TeeCmd::SetComp`]), a follower's
+/// after its chain. A linear-phase room-correction filter of 64 k taps at
+/// 48 kHz is about 680 ms.
+pub const MAX_COMP_MS: f64 = 1000.0;
 /// The longest a speed command waits for the followers, ms.
 pub const MAX_LEAD_MS: f64 = 200.0;
+/// A source sample at most this large (−80 dBFS) counts as silence for a
+/// shrink of the alignment ([`TeeCmd::SetAlign`] `quiet`).
+pub const QUIET_LEVEL: f32 = 1e-4;
+/// The silence a shrink of the alignment waits for beyond the delay
+/// line's own history, ms: the master's device queue (about 64 ms at the
+/// default quantum) and the followers' read points behind the tee, so the
+/// step the followers take for it lands in silence too.
+pub const QUIET_MARGIN_MS: f64 = 150.0;
 /// The highest graph rate the delay line and the rings are sized for.
 pub const MAX_GRAPH_RATE: u32 = 768_000;
 /// The cross-fade of an alignment change, and the fade-in after the delay
@@ -75,8 +90,13 @@ pub fn max_align_frames(rate: u32) -> usize {
     ms_frames(MAX_ALIGN_MS, rate)
 }
 
-/// The most a follower plays late beyond the alignment, ms (owner
-/// decision 3: it plays unaligned).
+/// The compensation cap at `rate`, frames.
+pub fn max_comp_frames(rate: u32) -> usize {
+    ms_frames(MAX_COMP_MS, rate)
+}
+
+/// The most a follower plays late beyond the alignment, ms: past the
+/// alignment's cap it plays unaligned.
 pub const MAX_LAG_MS: f64 = 200.0;
 
 /// Frames a follower's ring holds: the largest alignment and lateness, a
@@ -648,6 +668,8 @@ impl PlaybackStateSlot {
 ///   and the first real ones fade in, so no stale audio and no step plays.
 /// - At a delay of zero (no fade) the block passes unchanged, bit for bit;
 ///   the history is still written so a later delay has it.
+/// - It counts the silent frames at the end of its history
+///   ([`Self::quiet_frames`]): a shrink of the alignment waits for them.
 pub struct AlignDelay {
     channels: usize,
     /// Frames of history.
@@ -664,6 +686,9 @@ pub struct AlignDelay {
     from: usize,
     fade_pos: usize,
     fade_len: usize,
+    /// Silent frames ([`QUIET_LEVEL`]) at the end of the history
+    /// (`u64::MAX` after a restart: the history reads as silence).
+    quiet: u64,
 }
 
 impl AlignDelay {
@@ -682,7 +707,27 @@ impl AlignDelay {
             from: 0,
             fade_pos: 0,
             fade_len: 1,
+            quiet: u64::MAX,
         }
+    }
+
+    /// Silent frames at the end of the history (saturating; `u64::MAX`
+    /// right after a restart).
+    pub fn quiet_frames(&self) -> u64 {
+        self.quiet
+    }
+
+    /// Count `input`'s silent frames into [`Self::quiet`].
+    fn note_quiet(&mut self, input: &[f32]) {
+        let ch = self.channels;
+        let frames = input.len() / ch;
+        let last_loud = input
+            .chunks_exact(ch)
+            .rposition(|f| f.iter().any(|x| x.abs() > QUIET_LEVEL));
+        self.quiet = match last_loud {
+            None => self.quiet.saturating_add(frames as u64),
+            Some(i) => (frames - 1 - i) as u64,
+        };
     }
 
     /// The most frames it delays.
@@ -723,6 +768,7 @@ impl AlignDelay {
     /// Restart the history (a reset): older frames read as silence.
     pub fn restart(&mut self) {
         self.valid_from = None;
+        self.quiet = u64::MAX;
     }
 
     /// The gain of history frame `r`: 0 before the real history, then a
@@ -746,9 +792,10 @@ impl AlignDelay {
         let ch = self.channels;
         let frames = input.len() / ch;
         if !full || channels != ch || frames > MAX_BLOCK_FRAMES {
-            self.valid_from = None;
+            self.restart();
             return input;
         }
+        self.note_quiet(input);
         let vf = *self.valid_from.get_or_insert(self.w);
         let cap = self.cap as u64;
         if self.is_identity() {
@@ -808,7 +855,18 @@ pub enum TeeCmd {
     /// Fade the delay to zero, then retire the line.
     RemoveDelay,
     /// The master's alignment delay, ms (capped at [`MAX_ALIGN_MS`]).
-    SetAlign { ms: f64 },
+    /// `quiet`: a shrink, applied only once the delay line's history has
+    /// been silent for the longer of the two delays plus
+    /// [`QUIET_MARGIN_MS`] (at once after a restart: a pause, a new
+    /// stream), never during a measurement; until then the alignment holds
+    /// and a later one replaces it. Without `quiet` it applies now and
+    /// drops a shrink waiting.
+    SetAlign { ms: f64, quiet: bool },
+    /// The master's chain compensation, graph frames (capped at
+    /// [`MAX_COMP_MS`]): on top of the alignment, in the same delay line,
+    /// but a chain latency to the followers, not a step
+    /// ([`TeeShared::comp_frames`]).
+    SetComp { frames: usize },
 }
 
 /// What the processor's tee slot hands back to be freed off the RT thread.
@@ -829,6 +887,9 @@ pub struct TeeShared {
     /// Counts the changes of the master's alignment delay: the master's
     /// position steps by the change, which a follower re-acquires.
     pub align_seq: Arc<AtomicU64>,
+    /// The master's alignment the RT side applies, ms (`f64` bits): a
+    /// shrink waiting for silence shows here once it lands.
+    pub align_ms: Arc<AtomicU64>,
     /// How long the master's stage holds a speed command back (ms, `f64`
     /// bits; set by the control side from the followers' leads), so each
     /// follower reads its log entry before its stage reaches it.
@@ -837,6 +898,16 @@ pub struct TeeShared {
     /// another latency): its position steps by the change, as a follower's
     /// does when it swaps its own; a follower holds its readings over both.
     pub chain_seq: Arc<AtomicU64>,
+    /// The master's chain latency as it maps its blocks, graph frames
+    /// (`f64` bits; `NaN` before its first block): a follower pads its own
+    /// path to it ([`Self::comp_frames`] included).
+    pub master_chain_graph: Arc<F64Cell>,
+    /// The master's chain compensation in its delay line, graph frames
+    /// (what applies, the alignment's history permitting): the delay that
+    /// makes its path as long as a follower's longer chain. A change counts
+    /// in [`Self::chain_seq`], not in [`Self::steps`]: a follower's own
+    /// padding moves with it.
+    pub comp_frames: Arc<AtomicU64>,
     /// The master's known steps so far (`i64` bits, 2^-32 source frames):
     /// the sum of the jumps of its position at the DAC that are not its
     /// chain's latency (an alignment change, a stage installed or retired),
@@ -844,6 +915,54 @@ pub struct TeeShared {
     /// the same step at once ([`MasterPoint::shift`] says when it has
     /// reached the master's DAC).
     pub steps: Arc<AtomicU64>,
+    /// Where the master's output jumped at its last known step: the source
+    /// position (whole frames, `i64` bits) it would have played next, in
+    /// the old mapping. Stored before [`Self::steps`] (release): a follower
+    /// that sees the step takes it once its own read point is there, so
+    /// the step lands at both DACs together.
+    pub step_at: Arc<AtomicU64>,
+    /// An alignment change the master has scheduled and not made yet: the
+    /// source position (whole frames, [`encode_pos`]; 0: none) its output
+    /// jumps at, at the earliest. A follower shuts before its read point
+    /// gets there and stays shut until it has taken the step. Cleared
+    /// after the step is published in [`Self::steps`].
+    pub step_announce: Arc<AtomicU64>,
+    /// The master's level as heard (set by the engine whenever it applies
+    /// its volume): the effective volume, hardware part included (a
+    /// follower's equivalent digital gain), balance and mute. A follower
+    /// with `follow_volume` plays at it plus its own volume.
+    pub master_level: Arc<SharedVolume>,
+}
+
+/// An `f64` shared between threads (`NaN` by default).
+#[derive(Debug)]
+pub struct F64Cell(AtomicU64);
+
+impl Default for F64Cell {
+    fn default() -> Self {
+        Self(AtomicU64::new(f64::NAN.to_bits()))
+    }
+}
+
+impl F64Cell {
+    pub fn get(&self) -> f64 {
+        f64::from_bits(self.0.load(Ordering::Relaxed))
+    }
+
+    pub fn set(&self, x: f64) {
+        self.0.store(x.to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// A source position (whole frames) as [`TeeShared::step_announce`]
+/// holds it (never 0).
+pub fn encode_pos(frames: i64) -> u64 {
+    ((frames as u64) ^ (1 << 63)).max(1)
+}
+
+/// [`encode_pos`] back (`None`: 0, nothing announced).
+pub fn decode_pos(v: u64) -> Option<i64> {
+    (v != 0).then_some((v ^ (1 << 63)) as i64)
 }
 
 /// One unit of [`TeeShared::steps`], in 64.64 source frames.
@@ -882,6 +1001,8 @@ pub struct StageView {
     /// The slowest speed it plays at until it settles (no further
     /// command).
     pub slowest: f64,
+    /// The fastest, a command waiting included.
+    pub fastest: f64,
 }
 
 impl StageView {
@@ -920,6 +1041,20 @@ pub struct TeeRt {
     delay: Option<Box<AlignDelay>>,
     retire_delay: bool,
     align_ms: f64,
+    /// A shrink of the alignment waiting for silence, ms; a measurement
+    /// runs (it holds it).
+    align_quiet: Option<f64>,
+    measuring: bool,
+    /// The alignment part of the delay applied (frames), and a change of
+    /// it scheduled at a source index (announced: [`TeeShared::step_announce`]);
+    /// the announcement goes once the step is published.
+    align_now: usize,
+    align_due: Option<(usize, u64)>,
+    announce_clear: bool,
+    /// The compensation asked for, and the part of the delay it has now
+    /// (graph frames).
+    comp_want: usize,
+    comp_now: usize,
     rate: u32,
     /// The next block's source index.
     index: u64,
@@ -936,6 +1071,9 @@ pub struct TeeRt {
     /// speed at the last block.
     cap_speed: f64,
     speed_now: f64,
+    /// The stage's fastest speed until it settles, at the last block (a
+    /// scheduled step's lead is playback time: source frames at it).
+    speed_fast: f64,
     /// A stream started: the next block fits the cap to its speed (the
     /// prime has reset the stage at the speed the stream plays at by then).
     refit: bool,
@@ -949,6 +1087,12 @@ pub struct TeeRt {
     /// The position after the last block without the chain's delay, and
     /// the known steps so far ([`TeeShared::steps`]).
     last_next: Option<i128>,
+    /// The last block's end as mapped (the position its next frame would
+    /// carry at the DAC, 64.64): a step is published there.
+    last_next_map: i128,
+    /// The last block's source frames (a scheduled change lands on a
+    /// block start: blocks keep their size in steady play).
+    last_block: usize,
     shift: i64,
     shared: TeeShared,
 }
@@ -981,6 +1125,13 @@ impl TeeRt {
             delay: None,
             retire_delay: false,
             align_ms: 0.0,
+            align_quiet: None,
+            measuring: false,
+            align_now: 0,
+            align_due: None,
+            announce_clear: false,
+            comp_want: 0,
+            comp_now: 0,
             rate: 48_000,
             index: 0,
             map: PositionMap::new(),
@@ -991,11 +1142,14 @@ impl TeeRt {
             span_len: 0,
             cap_speed: 1.0,
             speed_now: 1.0,
+            speed_fast: 1.0,
             refit: false,
             settled_frames: 0,
             staged: false,
             chain_graph: f64::NAN,
             last_next: None,
+            last_next_map: 0,
+            last_block: 0,
             shift: 0,
             shared,
         }
@@ -1098,6 +1252,16 @@ impl TeeRt {
         };
     }
 
+    /// The stage's fastest speed until it settles, before a block (1
+    /// without a stage).
+    pub fn note_fastest(&mut self, fastest: f64) {
+        self.speed_fast = if fastest.is_finite() && fastest > 0.0 {
+            fastest
+        } else {
+            1.0
+        };
+    }
+
     /// A delay line is installed.
     #[inline]
     pub fn has_delay(&self) -> bool {
@@ -1105,18 +1269,137 @@ impl TeeRt {
     }
 
     fn apply_align(&mut self) {
-        let frames = if self.retire_delay {
-            0
+        self.apply_align_with(false);
+    }
+
+    /// Apply the alignment and compensation asked for. A change of the
+    /// alignment while followers follow the master's position (its map
+    /// runs) is not made at once unless `immediate`: it is scheduled a
+    /// command lead and two fades ahead (the followers' stages run at most
+    /// their measured lead ahead of the master's) and announced, so each
+    /// follower shuts before it gets there, then takes the step at the
+    /// source position the master's output jumps at: the step lands at both
+    /// DACs together, whatever each one queues.
+    fn apply_align_with(&mut self, immediate: bool) {
+        let (align, comp) = if self.retire_delay {
+            (0, 0)
         } else {
-            self.align_frames()
+            (
+                self.align_frames(),
+                self.comp_want.min(max_comp_frames(self.rate)),
+            )
         };
+        let timed = !immediate && !self.retire_delay && self.active && !self.map.is_empty();
+        if align == self.align_now {
+            if self.align_due.take().is_some() {
+                self.announce_clear = true;
+            }
+        } else if !timed || self.delay.is_none() {
+            self.align_now = align;
+            if self.align_due.take().is_some() {
+                self.announce_clear = true;
+            }
+        } else if self.align_due.map(|d| d.0) != Some(align) {
+            // (A change while one waits keeps its place: announced already.)
+            let at = self.align_due.map_or_else(
+                || {
+                    // The followers' lead and the fades are playback
+                    // time: source frames at the fastest the stage plays
+                    // until the step (twice as many at 2×).
+                    let play = self.command_lead_frames() + 2 * ms_frames(ALIGN_FADE_MS, self.rate);
+                    let lead = (play as f64 * self.speed_fast.max(self.speed_now)).ceil() as usize;
+                    // On a block start (in whole blocks of the last one's
+                    // size), so it lands where it is announced.
+                    let n = self.last_block.max(1);
+                    self.index + (lead.div_ceil(n) * n) as u64
+                },
+                |d| d.1,
+            );
+            let varying = self.speed_fast != 1.0 || self.speed_now != 1.0;
+            let n_block = if varying { self.last_block.max(1) } else { 0 };
+            self.align_due = Some((align, at));
+            // As the step will be published: the position the master's
+            // output carries at the DAC there, at the earliest. The source
+            // runs that far past where its next frame is mapped now (the
+            // delay, the stage's filter and what it holds, the chain);
+            // off 1×, a block more (the stage pulls source in blocks of
+            // varying size, the step lands within one) and the chain's
+            // growth up to the fastest speed: a follower shuts a little
+            // early, never late.
+            let grow = if self.chain_graph.is_finite() {
+                self.chain_graph * (self.speed_fast.max(self.speed_now) - self.speed_now).max(0.0)
+            } else {
+                0.0
+            };
+            let now = self.last_next_map.div_euclid(FRAME) as i64;
+            let from =
+                now + (at as i64 - self.index as i64) - n_block as i64 - grow.ceil() as i64 - 1;
+            self.announce_clear = false;
+            self.shared
+                .step_announce
+                .store(encode_pos(from), Ordering::Release);
+        }
+        let align = self.align_now;
         let fade = ms_frames(ALIGN_FADE_MS, self.rate).max(1);
+        let mut comp_now = 0;
         if let Some(d) = self.delay.as_mut() {
-            if d.delay() != frames.min(d.max_delay()) {
+            let frames = (align + comp).min(d.max_delay());
+            comp_now = frames.saturating_sub(align);
+            if d.delay() != frames {
                 self.shared.align_seq.fetch_add(1, Ordering::Relaxed);
             }
             d.set_delay(frames, fade);
         }
+        if comp_now != self.comp_now {
+            // A chain latency to the followers (they pad to it), not a
+            // step: they hold their readings over it.
+            self.comp_now = comp_now;
+            self.shared.chain_seq.fetch_add(1, Ordering::Relaxed);
+        }
+        self.shared
+            .comp_frames
+            .store(comp_now as u64, Ordering::Relaxed);
+        self.shared
+            .align_ms
+            .store(self.align_ms.to_bits(), Ordering::Relaxed);
+    }
+
+    /// A measurement plays on this block (a shrink waiting for silence
+    /// holds: it would move the measured timing).
+    pub fn set_measuring(&mut self, on: bool) {
+        self.measuring = on;
+    }
+
+    /// Apply the shrink waiting ([`TeeCmd::SetAlign`] `quiet`) once the
+    /// delay line's history is silent for long enough.
+    fn try_quiet(&mut self) {
+        let Some(ms) = self.align_quiet else {
+            return;
+        };
+        if self.measuring {
+            return;
+        }
+        let quiet = match self.delay.as_deref() {
+            None => true,
+            Some(d) => {
+                let cap = (max_align_frames(self.rate) as f64 * self.cap_speed.min(1.0)).floor();
+                let new =
+                    ms_frames(ms.min(MAX_ALIGN_MS), self.rate).min(cap as usize) + self.comp_now;
+                let need = d.held().max(new) + ms_frames(QUIET_MARGIN_MS, self.rate);
+                d.quiet_frames() >= need as u64
+            }
+        };
+        if quiet {
+            // In silence the step is not heard on any device: at once.
+            self.align_quiet = None;
+            self.align_ms = ms;
+            self.apply_align_with(true);
+        }
+    }
+
+    /// The compensation in the delay now, graph frames.
+    pub fn comp_frames(&self) -> usize {
+        self.comp_now
     }
 
     /// Drain the control queue (RT, from `poll_updates`), at `graph_rate`.
@@ -1153,14 +1436,22 @@ impl TeeRt {
                     }
                 }
                 TeeCmd::RemoveDelay => self.retire_delay = true,
-                TeeCmd::SetAlign { ms } => {
-                    self.align_ms = if ms.is_finite() { ms.max(0.0) } else { 0.0 };
+                TeeCmd::SetAlign { ms, quiet } => {
+                    let ms = if ms.is_finite() { ms.max(0.0) } else { 0.0 };
+                    if quiet {
+                        self.align_quiet = Some(ms);
+                    } else {
+                        self.align_quiet = None;
+                        self.align_ms = ms;
+                    }
                 }
+                TeeCmd::SetComp { frames } => self.comp_want = frames,
             }
         }
         if changed {
             self.apply_align();
         }
+        self.try_quiet();
         if self.retire_delay
             && self.delay.as_ref().is_some_and(|d| d.is_identity())
             && self.can_retire()
@@ -1180,8 +1471,20 @@ impl TeeRt {
     #[inline]
     pub fn begin_block(&mut self, frames: usize) -> u64 {
         let i = self.index;
+        // The scheduled alignment change, at the first block from its
+        // index on (its step is published with the block, `note_block`).
+        if self.align_due.is_some_and(|d| i >= d.1) {
+            self.apply_align_with(true);
+        }
         self.index += frames as u64;
+        self.last_block = frames;
         i
+    }
+
+    /// The source index the next block starts at (what `begin_block`
+    /// returns next).
+    pub fn next_index(&self) -> u64 {
+        self.index
     }
 
     /// Write a block of source frames (interleaved, `channels`) carrying
@@ -1192,6 +1495,11 @@ impl TeeRt {
                 w.write(index, block);
             }
         }
+    }
+
+    /// The alignment is cross-fading to a new delay.
+    pub fn delay_fading(&self) -> bool {
+        self.delay.as_ref().is_some_and(|d| d.from != d.delay)
     }
 
     /// The alignment applied once a fade ends, frames.
@@ -1207,7 +1515,8 @@ impl TeeRt {
         if self.delay.is_none() || self.retire_delay {
             return self.delay_frames();
         }
-        ms_frames(self.align_ms.min(MAX_ALIGN_MS), self.rate).max(self.delay_frames())
+        (ms_frames(self.align_ms.min(MAX_ALIGN_MS), self.rate) + self.comp_now)
+            .max(self.delay_frames())
     }
 
     /// The most a block can be delayed until the alignment settles: what a
@@ -1220,8 +1529,11 @@ impl TeeRt {
             .max(self.max_delay_frames())
     }
 
-    /// Move the delay line out for a block (no allocation).
+    /// Move the delay line out for a block (no allocation). A shrink
+    /// waiting for silence applies first when the history before this
+    /// block is silent enough.
     pub fn take_delay(&mut self) -> Option<Box<AlignDelay>> {
+        self.try_quiet();
         self.delay.take()
     }
 
@@ -1249,8 +1561,11 @@ impl TeeRt {
                 // A jump from the last block's end, beside the chain's own
                 // latency (a follower's chain steps it there too): a known
                 // step.
+                // The compensation in the delay counts with the chain: a
+                // follower's padding moves with it.
+                let comp = self.comp_now as i128 * FRAME;
                 let chain = |s: f64| {
-                    if self.chain_graph.is_finite() {
+                    comp + if self.chain_graph.is_finite() {
                         fixed(self.chain_graph * s)
                     } else {
                         0
@@ -1263,12 +1578,19 @@ impl TeeRt {
                     let jump = first + chain(speed.0) - prev;
                     if jump.abs() >= STEP_MIN {
                         self.shift = self.shift.wrapping_add((jump >> STEP_UNIT_SHIFT) as i64);
+                        // Where the master's output jumped, as its frames
+                        // carry it at the DAC (its stage's filter delay,
+                        // its chain and compensation taken off): what a
+                        // follower's output carries is compared with it.
+                        let at = self.last_next_map.div_euclid(FRAME) as i64;
+                        self.shared.step_at.store(at as u64, Ordering::Relaxed);
                         self.shared
                             .steps
-                            .store(self.shift as u64, Ordering::Relaxed);
+                            .store(self.shift as u64, Ordering::Release);
                     }
                 }
                 self.last_next = Some(next + chain(speed.1));
+                self.last_next_map = next;
                 if out_frames > 0 {
                     self.map.push(self.out, next);
                     self.spans[self.span_head] = Span {
@@ -1287,6 +1609,11 @@ impl TeeRt {
                     self.clear_position();
                 }
             }
+        }
+        // The announced step is published (or nothing follows): the
+        // announcement goes after it.
+        if std::mem::take(&mut self.announce_clear) {
+            self.shared.step_announce.store(0, Ordering::Release);
         }
     }
 
@@ -1382,6 +1709,7 @@ impl TeeRt {
                 self.shared.chain_seq.fetch_add(1, Ordering::Relaxed);
             }
             self.chain_graph = chain_graph;
+            self.shared.master_chain_graph.set(chain_graph);
         }
     }
 
@@ -1405,6 +1733,12 @@ impl TeeRt {
     pub fn new_stream(&mut self) {
         if self.active {
             self.clear_position();
+        }
+        // The followers place themselves anew: a change waiting goes now.
+        if self.align_due.is_some() {
+            self.apply_align_with(true);
+            self.shared.step_announce.store(0, Ordering::Release);
+            self.announce_clear = false;
         }
         self.refit = true;
         if let Some(d) = self.delay.as_mut() {
@@ -1626,7 +1960,7 @@ impl TeeHost {
         if !self.delay_installed {
             let d = Box::new(AlignDelay::new(
                 self.channels,
-                max_align_frames(MAX_GRAPH_RATE),
+                max_align_frames(MAX_GRAPH_RATE) + max_comp_frames(MAX_GRAPH_RATE),
             ));
             self.send(TeeCmd::InstallDelay(d))?;
             self.delay_installed = true;
@@ -1655,7 +1989,11 @@ impl TeeHost {
         };
         self.send(TeeCmd::Detach { slot: s.slot })?;
         if self.slots.is_empty() && self.delay_installed {
-            self.send(TeeCmd::SetAlign { ms: 0.0 })?;
+            self.send(TeeCmd::SetAlign {
+                ms: 0.0,
+                quiet: false,
+            })?;
+            self.send(TeeCmd::SetComp { frames: 0 })?;
             self.send(TeeCmd::RemoveDelay)?;
             self.delay_installed = false;
         }
@@ -1684,8 +2022,32 @@ impl TeeHost {
         } else {
             ms.clamp(0.0, MAX_ALIGN_MS)
         };
-        self.send(TeeCmd::SetAlign { ms })?;
+        self.send(TeeCmd::SetAlign { ms, quiet: false })?;
         Ok(ms)
+    }
+
+    /// Shrink the master's alignment delay to `ms` at the next silence
+    /// ([`TeeCmd::SetAlign`] `quiet`): it holds while anything plays. A
+    /// later [`Self::set_alignment_ms`] drops it.
+    pub fn shrink_alignment_ms(&mut self, ms: f64) -> Result<(), String> {
+        let ms = if ms.is_finite() {
+            ms.clamp(0.0, MAX_ALIGN_MS)
+        } else {
+            return Ok(());
+        };
+        self.send(TeeCmd::SetAlign { ms, quiet: true })
+    }
+
+    /// The alignment the RT side applies, ms (0 before its first).
+    pub fn applied_alignment_ms(&self) -> f64 {
+        f64::from_bits(self.shared.align_ms.load(Ordering::Relaxed))
+    }
+
+    /// The master's chain compensation, graph frames ([`TeeCmd::SetComp`];
+    /// 0 without followers).
+    pub fn set_comp_frames(&mut self, frames: usize) -> Result<(), String> {
+        let frames = if self.slots.is_empty() { 0 } else { frames };
+        self.send(TeeCmd::SetComp { frames })
     }
 
     /// A chain edit: every follower's slot follows the master (v1).

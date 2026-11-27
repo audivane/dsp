@@ -2,15 +2,19 @@
 //! ("Audivane DSP", "Audivane Direct") and the DSP chains.
 
 pub mod bypass_design;
+pub mod clocks;
 pub mod failsafe;
 pub mod follower;
+pub mod harmonics_live;
 pub mod ir;
+pub mod measure;
 pub mod processor;
 pub mod spectrum;
 pub mod tee;
 pub mod varispeed;
 pub mod volume;
 pub mod waiting;
+pub(crate) mod workers;
 
 use crate::api::{Engine, EngineError, EngineSnapshot};
 use audivane_dsp_core::ab_level::{AbGains, AbLevel};
@@ -45,7 +49,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-const DEFAULT_CHANNELS: usize = 2;
+pub const DEFAULT_CHANNELS: usize = 2;
 const DEFAULT_BUFFER_PERIODS: u32 = 3;
 const DEFAULT_RT_PRIORITY: u32 = 20;
 /// Largest upsampling ratio the engine builds. [`engine_ratio`] is the one
@@ -351,7 +355,16 @@ struct BuilderState {
     /// in the protocol yet), and the master's alignment applied for them, ms.
     followers: follower::FollowerHost,
     align: follower::AlignControl,
+    /// The master's chain compensation (`TeeShared::comp_frames`).
+    comp: follower::CompControl,
     align_t0: Instant,
+    /// The per-rate upsampler plan ([`crate::api::RatePlan`]), and the
+    /// upsampler it put in the latest DSP chain built (`None`: the config's
+    /// own): an edit rebuilds when that moves.
+    /// Per-rate upsampler substitutes from CPU admission; shared with the
+    /// followers' chain builder so followers respect the same plan.
+    rate_plan: Arc<Mutex<crate::api::RatePlan>>,
+    built_substitute: Option<UpsamplerConfig>,
 }
 
 /// [`BuilderState::bypass_notify`].
@@ -415,10 +428,13 @@ impl BuilderState {
             .hw_known
             .filter(|_| self.hw_known_device.as_deref() == Some(self.cfg.device.as_str()))
             .map(|k| k.outcome);
+        // Where an earlier mode left the hardware, for `software` without a
+        // fixed level: only a card that has a control is at a level.
+        let left_at = known.filter(|o| o.hardware_volume).map(|o| o.volume_db);
         if !self.dac_held || self.driver_error {
             self.pending_hw = None;
             let applied = volume::resolve(&vol, &plan, known);
-            self.publish_volume(applied, known.map(|o| o.volume_db), mirror, waker);
+            self.publish_volume(applied, left_at, mirror, waker);
             return;
         }
         let Some(write) = plan.hardware else {
@@ -442,7 +458,7 @@ impl BuilderState {
                 }
             }
             let applied = volume::resolve(&vol, &plan, None);
-            self.publish_volume(applied, known.map(|o| o.volume_db), mirror, waker);
+            self.publish_volume(applied, left_at, mirror, waker);
             return;
         };
         // `software` sets its fixed level once per open, not on every volume
@@ -757,6 +773,16 @@ impl BuilderState {
             hardware_volume: false,
             hardware_mute: applied.hardware_mute,
         });
+        // The followers follow what the master's DAC plays: its effective
+        // volume (a hardware part becomes their digital gain), its balance
+        // and its mute (digital on them, whatever carries it here).
+        self.tee.shared().master_level.store(VolumeTarget {
+            volume_db: applied.volume_db,
+            balance_db: vol.balance_db,
+            muted: vol.muted,
+            hardware_volume: false,
+            hardware_mute: false,
+        });
         mirror.set_volume(VolumeStatus {
             volume_db: applied.volume_db,
             hardware: applied.hardware_volume,
@@ -965,6 +991,9 @@ impl BuilderState {
         mirror: &SharedMirror,
         waker: Option<&DriverWaker>,
     ) -> u64 {
+        // Every chain of the main output reaches the audio thread here.
+        let mut chain = chain;
+        workers::attach(&mut chain, cfg);
         self.pending_publication = None;
         self.has_pending_swap.store(false, Ordering::Release);
         // Recorded now, not when the RT queue accepts it: a deferred chain
@@ -1018,7 +1047,7 @@ impl BuilderState {
         let negotiated = !matches!(drv_state, EngineState::Idle | EngineState::Error)
             && self.out_format.is_some();
         let current_rate = if negotiated { self.last_rate } else { drv_rate }.max(8_000);
-        validate_engine_config(cfg, &mut self.ir_cache, current_rate)?;
+        let conv_warnings = validate_engine_config(cfg, &mut self.ir_cache, current_rate)?;
 
         let old_cfg = self.cfg.clone();
         let snapshot = driver.map(|d| d.snapshot());
@@ -1080,7 +1109,17 @@ impl BuilderState {
         old_without_volume.varispeed = cfg.varispeed;
         // The followers are their own threads: the master is untouched.
         old_without_volume.outputs = cfg.outputs.clone();
-        let volume_only = !force_reopen && (old_without_volume == *cfg || resample_kept);
+        // The per-rate plan's upsampler at this rate: a chain built with
+        // another one is rebuilt.
+        let substitute = self
+            .rate_plan
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .substitute(cfg, current_rate)
+            .cloned();
+        let plan_moved = !resample_only && substitute != self.built_substitute;
+        let volume_only =
+            !force_reopen && !plan_moved && (old_without_volume == *cfg || resample_kept);
         // Only A/B's level changes, to a fixed offset: the running pair takes it
         // through a 50 ms ramp instead of a rebuild, whose cold stages would be
         // heard. The audio thread applies it to every pair it holds; a chain not
@@ -1148,13 +1187,22 @@ impl BuilderState {
             };
             chain.map(|c| (c, None, chain_has_effect(cfg)))
         } else if !volume_only && !force_reopen {
-            Some(build_active_chain(
-                &cap_dither_bits(cfg, self.out_format),
+            let built = build_active_chain(
+                &cap_dither_bits(
+                    &self
+                        .rate_plan
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .apply(cfg, current_rate),
+                    self.out_format,
+                ),
                 &mut self.ir_cache,
                 current_rate,
                 target_ratio,
                 next_side,
-            )?)
+            )?;
+            self.built_substitute = substitute;
+            Some(built)
         } else {
             None
         };
@@ -1248,6 +1296,11 @@ impl BuilderState {
         }
         self.config_generation = next_gen;
         mirror.config_generation.store(next_gen, Ordering::Release);
+        if follower_paths_differ(&self.cfg, cfg) {
+            // What the followers needed of the alignment was for the old
+            // paths.
+            self.align.forget_need();
+        }
         self.cfg = cfg.clone();
         self.tee.master_config_changed(&self.cfg);
         self.followers.config_changed(&self.cfg);
@@ -1305,6 +1358,10 @@ impl BuilderState {
             if hold_ended && old_cfg.dsp_enabled == cfg.dsp_enabled {
                 self.end_bypass_hold(waker.as_ref());
             }
+            *mirror
+                .conv_warnings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = conv_warnings;
             return Ok(false);
         }
 
@@ -1402,6 +1459,11 @@ impl BuilderState {
             mirror.set_varispeed_error(self.varispeed.last_error.clone());
         }
 
+        // Status reports the guards' warnings of the config applied.
+        *mirror
+            .conv_warnings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = conv_warnings;
         Ok(force_reopen)
     }
 
@@ -1695,7 +1757,23 @@ impl BuilderState {
         mirror.set_varispeed_error(self.varispeed.last_error.clone());
         // The chain is built for the format just negotiated: dither never
         // targets more bits than the DAC format carries.
-        let cfg_clone = cap_dither_bits(&self.cfg, Some(format));
+        // The per-rate plan's upsampler at this rate, if any: an over-budget
+        // rate never builds the requested one.
+        let (substitute, planned) = {
+            let plan = self.rate_plan.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                plan.substitute(&self.cfg, graph_rate).cloned(),
+                plan.apply(&self.cfg, graph_rate),
+            )
+        };
+        if substitute.is_some() {
+            log::info!(
+                "{graph_rate} Hz: building the per-rate fallback upsampler in place of the \
+                 requested one (over the CPU budget at this rate)"
+            );
+        }
+        let cfg_clone = cap_dither_bits(&planned, Some(format));
+        self.built_substitute = substitute;
         let cur_side = self.ab_side;
         let cfg_gen = self.config_generation;
         ab_atomic.store(side_to_u8(cur_side), Ordering::Release);
@@ -2099,20 +2177,52 @@ impl BuilderState {
         }
         if self.followers.is_empty() {
             self.align.reset();
+            self.comp.reset();
         }
     }
 
     /// The followers the config lists run, with its controls.
     fn sync_followers(&mut self) {
         let master = self.cfg.device.clone();
+        let before = self.followers.devices();
         self.followers.sync(&mut self.tee, &master, &self.cfg);
+        if self.followers.devices() != before {
+            // Another set of followers: what the last one needed is not
+            // what this one needs.
+            self.align.forget_need();
+        }
+        // (Before a new follower opens: it is placed with what it needs.)
+        let now = (self.clock)().saturating_duration_since(self.align_t0);
+        self.floor_alignment(now.as_secs_f64());
         if self.followers.is_empty() {
             self.align.reset();
+            self.comp.reset();
+        }
+    }
+
+    /// Until the followers' need is measured, the alignment starts at what
+    /// they are expected to need (`AlignControl::floor`): a fresh follower
+    /// is placed with the source it needs, not grown into it while heard.
+    fn floor_alignment(&mut self, now_s: f64) {
+        if self.followers.is_empty() {
+            return;
+        }
+        let rate = self.tee.shared().graph_rate.load(Ordering::Relaxed);
+        let rate = if rate > 0 { rate } else { 48_000 };
+        let quantum_ms = f64::from(self.cfg.quantum.max(MIN_QUANTUM)) * 1e3 / f64::from(rate);
+        let lead = follower::master_lead_ms(quantum_ms, DEFAULT_BUFFER_PERIODS);
+        let expected = self.followers.expected_need_ms(&self.cfg, rate, lead);
+        self.followers.floor_lag(&self.cfg, rate, lead);
+        if let Some(ms) = self.align.floor(now_s, expected) {
+            log::info!("followers: alignment {ms} ms, what they are expected to need");
+            if let Err(e) = self.tee.set_alignment_ms(ms) {
+                log::warn!("followers: alignment {ms} ms not applied: {e}");
+            }
         }
     }
 
     /// The reaper's tick: the master's alignment grows with what the
-    /// followers need (when one ran out of source, capped at 60 ms); at
+    /// followers need (when one ran out of source, capped at 120 ms); at
     /// the cap, a follower that needs more plays late by the rest.
     fn tick_followers(&mut self) {
         if self.followers.is_empty() {
@@ -2122,14 +2232,69 @@ impl BuilderState {
         self.tee
             .set_command_lead_ms(self.followers.command_lead_ms());
         let now = (self.clock)().saturating_duration_since(self.align_t0);
+        self.floor_alignment(now.as_secs_f64());
         let least = self.followers.least_slack_ms();
-        if let Some(ms) = self.align.tick(now.as_secs_f64(), least)
-            && let Err(e) = self.tee.set_alignment_ms(ms)
-        {
-            log::warn!("followers: alignment {ms} ms not applied: {e}");
+        // A master that played with these followers before starts at the
+        // alignment it had (no second of starved followers after a
+        // restart); then it grows as usual.
+        let restored = self
+            .followers
+            .remembered_alignment()
+            .and_then(|ms| self.align.start_at(now.as_secs_f64(), ms));
+        if let Some(ms) = restored.or_else(|| self.align.tick(now.as_secs_f64(), least)) {
+            if let Err(e) = self.tee.set_alignment_ms(ms) {
+                log::warn!("followers: alignment {ms} ms not applied: {e}");
+            }
+            self.followers.note_alignment(ms);
+        }
+        // A shrink that waited for silence landed; what the followers need
+        // now; a shrink to it (applied by the RT side at the next silence,
+        // a pause or a new stream: never heard).
+        let now_s = now.as_secs_f64();
+        if self.align.landed(now_s, self.tee.applied_alignment_ms()) {
+            log::info!(
+                "followers: alignment down to {} ms (in silence)",
+                self.align.ms
+            );
+        }
+        self.align
+            .note_need(now_s, self.followers.alignment_need_ms(self.align.ms));
+        match self.align.shrink(now_s, !self.followers.any_late()) {
+            Some((ms, true)) => {
+                log::info!(
+                    "followers: need {:.1} ms; the alignment shrinks from {} to {ms} ms at the next silence",
+                    self.align.need_ms,
+                    self.align.ms
+                );
+                if let Err(e) = self.tee.shrink_alignment_ms(ms) {
+                    log::warn!("followers: alignment shrink to {ms} ms not sent: {e}");
+                }
+            }
+            Some((ms, false)) => {
+                if let Err(e) = self.tee.set_alignment_ms(ms) {
+                    log::warn!("followers: alignment {ms} ms not applied: {e}");
+                }
+            }
+            None => {}
         }
         let at_cap = self.align.settled_at_cap(now.as_secs_f64());
         self.followers.tick_lag(now.as_secs_f64(), at_cap);
+        self.followers.tick_clocks();
+        // The chain compensation: the master waits for the longest
+        // follower's chain (the followers pad to the master's).
+        let shared = self.tee.shared();
+        let master = shared.master_chain_graph.get();
+        let rate = shared.graph_rate.load(Ordering::Relaxed).max(8_000);
+        let need = self.followers.comp_need(master);
+        if let Some(frames) = self
+            .comp
+            .tick(now.as_secs_f64(), need, tee::max_comp_frames(rate))
+        {
+            log::info!("followers: chain compensation {frames} frames at {rate} Hz");
+            if let Err(e) = self.tee.set_comp_frames(frames) {
+                log::warn!("followers: compensation {frames} frames not applied: {e}");
+            }
+        }
     }
 
     /// The multi-device status, in config order.
@@ -2143,41 +2308,179 @@ impl BuilderState {
             .map(|f| {
                 let lag = self.followers.controls(&f.device).map(|c| c.lag_ms());
                 let snap = running.iter().find(|(d, _)| *d == f.device).map(|(_, s)| s);
-                follower::view(
+                let own = f.chain_patch.as_ref().map(|_| {
+                    let own = crate::control::follower_chain::config(&self.cfg, f);
+                    (
+                        crate::control::ab_side::differing_fields(&self.cfg.chain, &own.chain),
+                        own.chain,
+                    )
+                });
+                let mut v = follower::view(
                     f,
                     snap,
                     lag.unwrap_or(0.0),
                     self.followers.failure(&f.device),
-                )
+                    own,
+                );
+                v.need_ms = snap
+                    .and_then(|s| follower::need_ms_of(s, self.align.ms))
+                    .filter(|n| n.is_finite())
+                    .map(|n| (n * 10.0).round() / 10.0);
+                v
             })
             .collect();
+        let none = self.followers.is_empty();
         OutputsStatus {
-            alignment_ms: if self.followers.is_empty() {
-                0.0
-            } else {
-                self.align.ms
-            },
+            alignment_ms: if none { 0.0 } else { self.align.ms },
+            alignment_need_ms: (!none && self.align.need_ms.is_finite())
+                .then(|| (self.align.need_ms * 10.0).round() / 10.0),
+            alignment_shrink_ms: self.align.pending.filter(|_| !none),
+            master: self.master_latency(),
             followers,
+            settling: self.settling(),
         }
+    }
+
+    /// Why the multi-device alignment may still move (`None`: settled, or
+    /// no follower runs): a follower opening or locking, the master's
+    /// alignment or compensation moving.
+    fn settling(&self) -> Option<String> {
+        if self.followers.is_empty() {
+            return None;
+        }
+        if let Some((device, what)) = self.followers.first_unsettled() {
+            return Some(format!("follower {device} is {what}"));
+        }
+        let now = (self.clock)().saturating_duration_since(self.align_t0);
+        if let Some(why) = self
+            .align
+            .settling(now.as_secs_f64(), self.followers.least_slack_ms())
+        {
+            return Some(why);
+        }
+        let shared = self.tee.shared();
+        let rate = shared.graph_rate.load(Ordering::Relaxed).max(8_000);
+        let need = self.followers.comp_need(shared.master_chain_graph.get());
+        self.comp
+            .settling(need, tee::max_comp_frames(rate))
+            .then(|| "the master's chain compensation is moving".to_string())
+    }
+
+    /// The master's chain latency, compensation and alignment, as its
+    /// blocks are mapped (zeros without followers).
+    fn master_latency(&self) -> audivane_protocol::ipc::PathLatency {
+        let shared = self.tee.shared();
+        let chain = shared.master_chain_graph.get();
+        if self.followers.is_empty() || !chain.is_finite() {
+            return audivane_protocol::ipc::PathLatency::default();
+        }
+        let graph = shared.graph_rate.load(Ordering::Relaxed);
+        let ratio = self.last_dsp_ratio;
+        let out = |g: f64| g * ratio.as_f64();
+        let comp = shared.comp_frames.load(Ordering::Relaxed) as f64;
+        let align = (self.align.ms * 1e-3 * f64::from(graph)).round();
+        audivane_protocol::ipc::PathLatency::from_frames(
+            ratio.output_rate(graph).unwrap_or(graph),
+            out(chain).round(),
+            out(comp),
+            out(align),
+        )
     }
 }
 
-/// The followers' host: their chains are built as the master's, for the
-/// follower's device (its ratio and format), chain A only.
-fn follower_host() -> follower::FollowerHost {
-    let build: follower::ChainBuilder = Arc::new(|cfg, graph_rate, ratio, format| {
-        let mut ir_cache = IrCache::new();
-        let mut cfg = cap_dither_bits(cfg, Some(format));
-        cfg.ab = None;
-        build_active_chain(&cfg, &mut ir_cache, graph_rate, ratio, AbSide::A)
-            .map(|(chain, _, _)| chain)
-            .map_err(|e| e.message)
-    });
-    follower::FollowerHost::new(
-        build,
-        Arc::new(desired_ratio_for),
-        Arc::new(|cfg: &EngineConfig, rate| scaled_quantum(cfg.quantum.max(MIN_QUANTUM), rate)),
+/// A follower's chain for its device (its ratio and format), chain A only:
+/// the master's per-rate plan at `graph_rate`, and where chain A's custom
+/// design does not build at the ratio this device opened at, its
+/// substitute there ([`crate::control::cpu_budget::played_at`], the same
+/// choice made at this ratio), so a follower never retries a build that
+/// cannot succeed.
+fn follower_chain(
+    rate_plan: &Mutex<crate::api::RatePlan>,
+    cfg: &EngineConfig,
+    graph_rate: u32,
+    ratio: RateRatio,
+    format: SampleFormat,
+) -> Result<ActiveChain, String> {
+    let mut ir_cache = IrCache::new();
+    let planned = {
+        let plan = rate_plan.lock().unwrap_or_else(|e| e.into_inner());
+        plan.apply(cfg, graph_rate).into_owned()
+    };
+    let planned = crate::control::cpu_budget::played_at(
+        crate::control::cpu_budget::measured(),
+        &planned,
+        None,
+        graph_rate,
+        ratio,
     )
+    .into_owned();
+    let mut cfg = cap_dither_bits(&planned, Some(format));
+    cfg.ab = None;
+    // Its IRs are loaded fresh for each build (a reopen, a rate change):
+    // the guards run on them again.
+    build_active_chain_guarded(&cfg, &mut ir_cache, graph_rate, ratio, AbSide::A, true)
+        .map(|(chain, _, _)| chain)
+        .map_err(|e| e.message)
+}
+
+/// Whether an edit from `a` to `b` changes what the followers need of the
+/// master's alignment: either path (the chains, the quantum, the master's
+/// device) or a follower's own (its device, period, chain, output pair).
+fn follower_paths_differ(a: &EngineConfig, b: &EngineConfig) -> bool {
+    let own = |c: &EngineConfig| {
+        c.outputs
+            .followers
+            .iter()
+            .map(|f| {
+                (
+                    f.device.clone(),
+                    f.period_ms.map(f64::to_bits),
+                    f.chain_patch.clone(),
+                    f.output_channels,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    a.chain != b.chain || a.quantum != b.quantum || a.device != b.device || own(a) != own(b)
+}
+
+/// The followers' host: their chains are built as the master's, for the
+/// follower's device (its ratio and format), chain A only, respecting the
+/// shared per-rate `RatePlan`.
+fn follower_host(rate_plan: Arc<Mutex<crate::api::RatePlan>>) -> follower::FollowerHost {
+    let build: follower::ChainBuilder = Arc::new(move |cfg, graph_rate, ratio, format| {
+        follower_chain(&rate_plan, cfg, graph_rate, ratio, format)
+    });
+    let host = follower::FollowerHost::new(build, Arc::new(follower_ratio_for));
+    // (Unit tests keep the pairs' clocks in memory, off the user's state.)
+    if cfg!(test) {
+        return host;
+    }
+    match clocks::default_path() {
+        Some(path) => host.with_clock_store(clocks::ClockStore::open(path)),
+        None => host,
+    }
+}
+
+/// Seed the initial per-rate plan before the first chain is built at start-up.
+/// Skips the CPU benchmark when DSP or the upsampler is off.
+fn seed_rate_plan(cfg: &EngineConfig) -> crate::api::RatePlan {
+    if !cfg.dsp_enabled
+        || matches!(
+            cfg.chain.upsampler.target,
+            audivane_protocol::RateTarget::Off
+        )
+    {
+        return crate::api::RatePlan::default();
+    }
+    crate::control::cpu_budget::plan_rates(
+        Some(crate::control::cpu_budget::machine()),
+        cfg,
+        None,
+        None,
+        &[],
+    )
+    .0
 }
 
 struct SharedMirror {
@@ -2211,6 +2514,8 @@ struct SharedMirror {
     bypass_designing: Mutex<Option<String>>,
     /// Why the last varispeed stage build was refused (budget, design).
     varispeed_error: Mutex<Option<String>>,
+    /// The convolution guards' warnings of the config validated last.
+    conv_warnings: Mutex<Vec<audivane_protocol::ipc::ConvWarning>>,
     /// Accepted host-side varispeed request `(enabled, speed)` stored together
     /// under one lock so status never observes a torn pair across concurrent
     /// requests (independent of RT-applied state while idle, on Direct, with
@@ -2242,6 +2547,7 @@ impl SharedMirror {
             bypass_failure: Mutex::new(None),
             bypass_designing: Mutex::new(None),
             varispeed_error: Mutex::new(None),
+            conv_warnings: Mutex::new(Vec::new()),
             varispeed_request: Mutex::new((cfg.varispeed.enabled, cfg.varispeed.speed)),
             varispeed_keep_pitch: AtomicBool::new(cfg.varispeed.keep_pitch),
         }
@@ -2400,6 +2706,7 @@ pub struct RealEngine {
     mirror: Arc<SharedMirror>,
     meters: Arc<MeterBank>,
     spectrum: Mutex<Option<SpectrumWorker>>,
+    harmonics_live: Mutex<Option<harmonics_live::HarmonicsLiveWorker>>,
     chain_generation: Arc<AtomicU64>,
     driver: EngineDriverHandle,
     device_name: Mutex<String>,
@@ -2409,6 +2716,11 @@ pub struct RealEngine {
     reaper_thread: Mutex<Option<JoinHandle<()>>>,
     /// What the varispeed stage applies (the RT thread publishes it).
     varispeed_applied: Arc<varispeed::VarispeedApplied>,
+    /// The master's measurement slot (`measure_play`).
+    measure_slot: Arc<measure::MeasureSlot>,
+    /// Old measurement jobs an audio thread had not handed back when their
+    /// run ended: the reaper drops each once it has.
+    measure_retired: Arc<Mutex<Vec<Arc<measure::MeasureJob>>>>,
 }
 
 /// Varispeed status for the control plane: the applied state, the driver's
@@ -2658,7 +2970,7 @@ impl RealEngine {
         crate::control::cpu_budget::warm();
         let mut ir_cache = IrCache::new();
         let init_rate = cfg.rate.default_rate.max(8_000);
-        validate_engine_config(cfg, &mut ir_cache, init_rate)?;
+        let conv_warnings = validate_engine_config(cfg, &mut ir_cache, init_rate)?;
 
         let desired_ratio = desired_ratio_for(cfg, init_rate);
         let init_max_block = scaled_quantum(cfg.quantum, init_rate).clamp(512, 8192) as usize;
@@ -2673,6 +2985,10 @@ impl RealEngine {
             rtrb::RingBuffer::<Box<audivane_dsp_core::tempo::TempoStretch>>::new(8);
 
         let mirror = Arc::new(SharedMirror::new(cfg));
+        *mirror
+            .conv_warnings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = conv_warnings;
         let meters = MeterBank::new(DEFAULT_CHANNELS);
         let (spectrum_rt, spectrum_worker) = spectrum::SpectrumRt::create(DEFAULT_CHANNELS)
             .map_err(|e| {
@@ -2682,7 +2998,19 @@ impl RealEngine {
                 )
             })?;
 
+        let (live_rt, live_worker) = harmonics_live::create().map_err(|e| {
+            EngineError::new(
+                RpcError::INTERNAL,
+                format!("cannot start the harmonics live view: {e}"),
+            )
+        })?;
+        live_worker.set_config(
+            cfg.chain.harmonics.clone(),
+            cfg.ab.as_ref().and_then(|ab| ab.chain_b.harmonics.clone()),
+        );
+
         let ab_side_atomic = Arc::new(AtomicU8::new(0));
+        let measure_slot = Arc::new(measure::MeasureSlot::default());
         let processor = DaemonProcessor::new(
             ActiveChain::Bypass,
             cfg.dsp_enabled,
@@ -2697,9 +3025,11 @@ impl RealEngine {
             recycle_tx,
         )
         .with_spectrum(spectrum_rt)
+        .with_harmonics_live(live_rt)
         .with_initial_volume(initial_volume_target(cfg))
         .with_varispeed(vs_rx, vs_recycle_tx, DEFAULT_CHANNELS)
-        .with_stretch_recycle(stretch_recycle_tx);
+        .with_stretch_recycle(stretch_recycle_tx)
+        .with_measure(Arc::clone(&measure_slot), DEFAULT_CHANNELS);
         let varispeed_applied = processor.varispeed_applied();
         if std::env::var_os("AUDIVANE_TEST_PAUSE_RT_DRAIN").is_some_and(|v| v == "1" || v == "true")
         {
@@ -2714,6 +3044,11 @@ impl RealEngine {
 
         let mut vs_host = varispeed::VarispeedHost::new(vs_tx, DEFAULT_CHANNELS);
         let (tee_host, tee_rt) = tee::TeeHost::pair(DEFAULT_CHANNELS);
+        // The followers' level until the first apply: the master's planned one.
+        tee_host
+            .shared()
+            .master_level
+            .store(initial_volume_target(cfg));
         let processor = processor.with_tee(tee_rt);
         // Not enabled yet: only the kind is set, nothing is built.
         let _ = vs_host.set_keep_pitch(cfg.varispeed.keep_pitch, init_rate, Ok(()));
@@ -2735,6 +3070,7 @@ impl RealEngine {
         // Not holding the DAC until the first negotiation (the driver's
         // start below): a crash before it leaves the card alone.
         failsafe::engine_starting(failsafe::released_path().as_deref());
+        let rate_plan = Arc::new(Mutex::new(seed_rate_plan(cfg)));
         let builder = Arc::new(Mutex::new(BuilderState {
             cfg: cfg.clone(),
             ir_cache,
@@ -2788,9 +3124,12 @@ impl RealEngine {
             varispeed_hold: Default::default(),
             varispeed_hold_seq: 0,
             tee: tee_host,
-            followers: follower_host(),
+            followers: follower_host(Arc::clone(&rate_plan)),
             align: follower::AlignControl::default(),
+            comp: follower::CompControl::default(),
             align_t0: Instant::now(),
+            rate_plan,
+            built_substitute: None,
         }));
 
         let builder_cb = Arc::clone(&builder);
@@ -2884,6 +3223,9 @@ impl RealEngine {
         let reaper_waker = driver.waker();
         let builder_reaper = Arc::clone(&builder);
         let mirror_reaper = Arc::clone(&mirror);
+        let measure_retired: Arc<Mutex<Vec<Arc<measure::MeasureJob>>>> = Arc::default();
+        let retired_reaper = Arc::clone(&measure_retired);
+        let measure_slot_reaper = Arc::clone(&measure_slot);
         let reaper_thread = thread::Builder::new()
             .name("audivane-chain-reaper".to_string())
             .spawn(move || {
@@ -2913,6 +3255,13 @@ impl RealEngine {
                         st.reconcile_varispeed(&mirror_reaper);
                         st.tee.reap();
                         st.tick_followers();
+                        if let Ok(mut r) = retired_reaper.try_lock()
+                            && !r.is_empty()
+                        {
+                            measure_slot_reaper.reclaim();
+                            st.followers.reclaim_measure();
+                            r.retain(|j| Arc::strong_count(j) > 1);
+                        }
                     }
                     let pending_now = has_pending_swap.load(Ordering::Acquire);
                     if pending_now {
@@ -2951,6 +3300,7 @@ impl RealEngine {
             mirror,
             meters,
             spectrum: Mutex::new(Some(spectrum_worker)),
+            harmonics_live: Mutex::new(Some(live_worker)),
             chain_generation,
             driver,
             device_name: Mutex::new(cfg.device.clone()),
@@ -2959,11 +3309,33 @@ impl RealEngine {
             rt_drain_paused,
             varispeed_applied,
             reaper_thread: Mutex::new(Some(reaper_thread)),
+            measure_slot,
+            measure_retired,
         }))
     }
 }
 
 impl Engine for RealEngine {
+    fn load_conv(
+        &self,
+        convs: &[audivane_protocol::ConvolutionConfig],
+        rate: u32,
+    ) -> Result<Vec<audivane_dsp_core::matrix::LoadedConv>, EngineError> {
+        let mut st = self
+            .builder
+            .lock()
+            .map_err(|_| EngineError::new(RpcError::INTERNAL, "engine builder lock poisoned"))?;
+        load_conv_items(convs, &mut st.ir_cache, rate)
+    }
+
+    fn conv_warnings(&self) -> Vec<audivane_protocol::ipc::ConvWarning> {
+        self.mirror
+            .conv_warnings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     fn take_sink_volume_requests(&self) -> Option<std::sync::mpsc::Receiver<SinkVolumeRequest>> {
         self.sink_requests.lock().ok()?.take()
     }
@@ -3005,6 +3377,14 @@ impl Engine for RealEngine {
             cfg.chain.upsampler.target
         );
 
+        if let Ok(slot) = self.harmonics_live.lock()
+            && let Some(live) = slot.as_ref()
+        {
+            live.set_config(
+                cfg.chain.harmonics.clone(),
+                cfg.ab.as_ref().and_then(|ab| ab.chain_b.harmonics.clone()),
+            );
+        }
         if ab_changed {
             // A new comparison counts its overs from zero.
             self.meters.reset_ab_overs();
@@ -3065,11 +3445,22 @@ impl Engine for RealEngine {
             .map(|d| d.clone())
             .unwrap_or_default();
 
+        // The convolution runs at the graph rate: its delay counts there.
+        let conv_latency_ms = if drv.state != EngineState::Idle && drv.graph_rate > 0 {
+            drv.dsp_conv_graph_frames as f64 * 1000.0 / f64::from(drv.graph_rate)
+        } else {
+            0.0
+        };
         let (latency_ms, filter_latency_ms) =
             if drv.state != EngineState::Idle && drv.output_rate > 0 {
                 let ms_per_frame = 1000.0 / (drv.output_rate as f64);
-                let filter = drv.dsp_latency_out_frames as f64;
-                let total_out_frames = (drv.alsa_delay_frames.max(0) as f64) + filter;
+                // The multi-device alignment is in the total, not filter
+                // delay.
+                let dsp = drv.dsp_latency_out_frames as f64;
+                let filter = drv
+                    .dsp_latency_out_frames
+                    .saturating_sub(drv.dsp_align_out_frames) as f64;
+                let total_out_frames = (drv.alsa_delay_frames.max(0) as f64) + dsp;
                 (total_out_frames * ms_per_frame, filter * ms_per_frame)
             } else {
                 (0.0, 0.0)
@@ -3118,6 +3509,7 @@ impl Engine for RealEngine {
             quantum: drv.quantum,
             latency_ms,
             filter_latency_ms,
+            conv_latency_ms,
             xruns: drv.xruns,
             dsp_load: drv.dsp_load,
             dsp_active,
@@ -3174,6 +3566,21 @@ impl Engine for RealEngine {
             .ok()
             .and_then(|slot| slot.as_ref().map(SpectrumWorker::generation))
             .unwrap_or(0)
+    }
+
+    fn harmonics_live(&self) -> Option<audivane_protocol::ipc::HarmonicsLive> {
+        self.harmonics_live
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(harmonics_live::HarmonicsLiveWorker::poll))
+    }
+
+    fn harmonics_live_suspend(&self) {
+        if let Ok(slot) = self.harmonics_live.lock()
+            && let Some(worker) = slot.as_ref()
+        {
+            worker.suspend();
+        }
     }
 
     fn set_spectrum_enabled(&self, enabled: bool) {
@@ -3289,6 +3696,17 @@ impl Engine for RealEngine {
         self.mirror.config_generation.load(Ordering::Acquire)
     }
 
+    fn set_rate_plan(&self, plan: crate::api::RatePlan) {
+        if let Ok(mut st) = self.builder.lock() {
+            let old = {
+                let mut guard = st.rate_plan.lock().unwrap_or_else(|e| e.into_inner());
+                std::mem::replace(&mut *guard, plan.clone())
+            };
+            let cfg = st.cfg.clone();
+            st.followers.rebuild_for_rate_plan(&cfg, &old, &plan);
+        }
+    }
+
     fn set_varispeed_hold(&self, hold: crate::api::VarispeedHold) -> u64 {
         let Ok(mut st) = self.builder.lock() else {
             log::warn!("varispeed: builder lock poisoned, overload hold not applied");
@@ -3352,6 +3770,80 @@ impl Engine for RealEngine {
         self.builder.lock().ok().map(|st| st.outputs_status())
     }
 
+    fn measure_post(&self, job: Option<Arc<measure::MeasureJob>>) -> Result<(), EngineError> {
+        let st = self
+            .builder
+            .lock()
+            .map_err(|_| EngineError::new(RpcError::INTERNAL, "engine builder lock poisoned"))?;
+        match job {
+            Some(job) => {
+                if let Some(want) = &job.master_device {
+                    let now = self
+                        .device_name
+                        .lock()
+                        .map(|d| d.clone())
+                        .unwrap_or_default();
+                    if *want != now {
+                        return Err(EngineError::new(
+                            RpcError::BAD_STATE,
+                            format!("the main device changed ({want} to {now})"),
+                        ));
+                    }
+                }
+                for d in &job.devices {
+                    if let Some(f) = &d.follower
+                        && st.followers.controls(f).is_none()
+                    {
+                        return Err(EngineError::new(
+                            RpcError::BAD_STATE,
+                            format!("{f} is not a running follower"),
+                        ));
+                    }
+                }
+                let master = job
+                    .devices
+                    .iter()
+                    .position(|d| d.follower.is_none())
+                    .unwrap_or(measure::NO_DEVICE);
+                for (i, d) in job.devices.iter().enumerate() {
+                    if let Some(f) = &d.follower
+                        && let Some(c) = st.followers.controls(f)
+                    {
+                        c.measure_slot().post(Some((Arc::clone(&job), i)));
+                    }
+                }
+                // The master last: it arms and picks the start, which the
+                // followers then find.
+                self.measure_slot.post(Some((job, master)));
+            }
+            None => {
+                self.measure_slot.post(None);
+                for (device, _) in st.followers.status() {
+                    if let Some(c) = st.followers.controls(&device) {
+                        c.measure_slot().post(None);
+                    }
+                }
+            }
+        }
+        drop(st);
+        self.driver.wake_rt();
+        Ok(())
+    }
+
+    fn measure_reclaim(&self) {
+        self.measure_slot.reclaim();
+        if let Ok(st) = self.builder.lock() {
+            st.followers.reclaim_measure();
+        }
+    }
+
+    fn measure_retire(&self, job: Arc<measure::MeasureJob>) {
+        self.measure_retired
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(job);
+    }
+
     fn shutdown(&self) {
         if let Ok(mut st) = self.builder.lock() {
             let st = &mut *st;
@@ -3369,6 +3861,11 @@ impl Engine for RealEngine {
             && let Some(mut spectrum) = slot.take()
         {
             spectrum.stop();
+        }
+        if let Ok(mut slot) = self.harmonics_live.lock()
+            && let Some(mut live) = slot.take()
+        {
+            live.stop();
         }
     }
 }
@@ -3526,6 +4023,21 @@ fn desired_ratio_for(cfg: &EngineConfig, rate: u32) -> RateRatio {
         .resolve_ratio_for(SinkChoice::Dsp, rate)
 }
 
+/// The ratio a follower asks its device for at `rate`: the top of the
+/// master's ladder without a probe (the ratios chain A's upsamplers build
+/// at, [`crate::control::config::engine_buildable_rate_pairs`]), so a
+/// follower does not open a rung the master skips; the device then steps
+/// down from it as it can.
+fn follower_ratio_for(cfg: &EngineConfig, rate: u32) -> RateRatio {
+    let drv = to_driver_config(cfg);
+    drv.desired_dsp(0)
+        .ladder(SinkChoice::Dsp, rate, None)
+        .as_slice()
+        .first()
+        .copied()
+        .unwrap_or_else(|| desired_ratio_for(cfg, rate))
+}
+
 /// The ratio the DSP chain is kept warm for while Direct plays: where a
 /// switch to the DSP sink would land ([`open_landing`], as the RT thread
 /// predicts it), so a switch that needs no reopen finds its chain.
@@ -3574,7 +4086,11 @@ fn diff_requires_reopen(
     running: RateRatio,
     sink: Option<SinkChoice>,
 ) -> bool {
-    if old.device != new.device || old.formats != new.formats || old.quantum != new.quantum {
+    if old.device != new.device
+        || old.output_channels != new.output_channels
+        || old.formats != new.formats
+        || old.quantum != new.quantum
+    {
         return true;
     }
     let (drv_old, drv_new) = (to_driver_config(old), to_driver_config(new));
@@ -3679,16 +4195,25 @@ pub fn source_landings(
         return Vec::new();
     };
     let driver = to_driver_config(&preview);
-    let best = match up.target {
+    let best_target = match up.target {
         RateTarget::Off | RateTarget::Rate(_) | RateTarget::MaxRateAny(_) => None,
         RateTarget::MaxRate(cap) => Some(RateTarget::MaxRateAny(cap)),
         RateTarget::Ratio(_) => Some(RateTarget::MaxRateAny(BEST_FOR_DAC_CAP)),
-    }
-    .map(|target| {
-        let mut alt = preview.clone();
-        alt.chain.upsampler.target = target;
-        (target, to_driver_config(&alt))
-    });
+    };
+    // Made at the first rate that lands 1:1, if any: its driver config
+    // checks every pair the other family could reach, a search per pair for
+    // an automatic design (tens of seconds for a long least-squares one).
+    let mut best = None;
+    let mut best_for = |preview: &EngineConfig| {
+        best.get_or_insert_with(|| {
+            best_target.map(|target| {
+                let mut alt = preview.clone();
+                alt.chain.upsampler.target = target;
+                (target, to_driver_config(&alt))
+            })
+        })
+        .clone()
+    };
     let mut out = Vec::new();
     for &rate in rates {
         let Ok(landing) = audivane_io_pw::predicted_dsp_landing(&driver, Some(caps), rate) else {
@@ -3698,15 +4223,15 @@ pub fn source_landings(
             DspLanding::Opens(r) => (r, None),
             DspLanding::Converted(to) => (RateRatio::ONE, Some(to)),
         };
-        let best_for_dac = best
-            .as_ref()
-            .filter(|_| ratio.is_unity())
+        let best_for_dac = ratio
+            .is_unity()
+            .then(|| best_for(&preview))
+            .flatten()
             .and_then(|(target, alt)| {
-                match audivane_io_pw::predicted_dsp_landing(alt, Some(caps), rate) {
-                    Ok(DspLanding::Opens(r)) if !r.is_unity() => Some(BestForDac {
-                        target: *target,
-                        ratio: r,
-                    }),
+                match audivane_io_pw::predicted_dsp_landing(&alt, Some(caps), rate) {
+                    Ok(DspLanding::Opens(r)) if !r.is_unity() => {
+                        Some(BestForDac { target, ratio: r })
+                    }
                     _ => None,
                 }
             });
@@ -3726,6 +4251,7 @@ fn to_driver_config(cfg: &EngineConfig) -> EngineDriverConfig {
         device: cfg.device.clone(),
         formats: cfg.formats.clone(),
         channels: DEFAULT_CHANNELS as u32,
+        output_channels: cfg.output_channels,
         quantum: cfg.quantum.max(MIN_QUANTUM),
         buffer_periods: DEFAULT_BUFFER_PERIODS,
         dsp_enabled: cfg.dsp_enabled,
@@ -3742,64 +4268,181 @@ fn to_driver_config(cfg: &EngineConfig) -> EngineDriverConfig {
     }
 }
 
+/// The enabled convolution items of `convs`, loaded at `rate`.
+pub(crate) fn load_conv_items(
+    convs: &[audivane_protocol::ConvolutionConfig],
+    ir_cache: &mut IrCache,
+    rate: u32,
+) -> Result<Vec<audivane_dsp_core::matrix::LoadedConv>, EngineError> {
+    audivane_dsp_core::matrix::load_conv(convs, DEFAULT_CHANNELS, &mut |path| {
+        ir_cache.load_for_rate(path, rate).map_err(|e| e.message)
+    })
+    .map_err(|e| EngineError::new(RpcError::INVALID_PARAMS, e))
+}
+
+/// Load, check and combine one chain's convolution at `rate` (`None`
+/// without an enabled item).
 fn validate_chain_irs(
     convs: &[audivane_protocol::ConvolutionConfig],
     ir_cache: &mut IrCache,
     rate: u32,
-) -> Result<(), EngineError> {
-    let enabled: Vec<_> = convs.iter().filter(|c| c.enabled).collect();
-    if enabled.is_empty() {
-        return Ok(());
+) -> Result<Option<audivane_dsp_core::matrix::ConvIrs>, EngineError> {
+    let loaded = load_conv_items(convs, ir_cache, rate)?;
+    if loaded.is_empty() {
+        return Ok(None);
     }
-    let mut lengths = Vec::with_capacity(enabled.len());
-    for conv in enabled {
-        let ir = ir_cache.load_for_rate(&conv.ir_path, rate)?;
-        if ir.len() != 1 && ir.len() != DEFAULT_CHANNELS {
-            return Err(EngineError::new(
-                RpcError::INVALID_PARAMS,
-                format!(
-                    "IR '{}' has {} channels; expected 1 (mono) or {} (stereo)",
-                    conv.ir_path.display(),
-                    ir.len(),
-                    DEFAULT_CHANNELS
-                ),
-            ));
-        }
-        lengths.push(ir.iter().map(Vec::len).max().unwrap_or(0));
-    }
-    audivane_dsp_core::conv::combined_ir_length(&lengths)
+    let items: Vec<_> = loaded.iter().map(|l| l.as_item()).collect();
+    audivane_dsp_core::matrix::check_conv(&items, DEFAULT_CHANNELS)
         .map_err(|e| EngineError::new(RpcError::INVALID_PARAMS, e.to_string()))?;
-    Ok(())
+    let combined = audivane_dsp_core::matrix::combine_conv(&items, DEFAULT_CHANNELS)
+        .map_err(|e| EngineError::new(RpcError::INVALID_PARAMS, e.to_string()))?;
+    Ok(Some(combined))
+}
+
+/// A row's gain above a limit by less than this is taken as at it (the
+/// certified bound's own margin, float noise on a flat filter), dB.
+const CONV_GUARD_SLACK_DB: f64 = 0.01;
+/// The subsonic warning needs more than this much gain below the limit, dB:
+/// a flat filter (0 dB) never warns.
+const CONV_SUBSONIC_MIN_DB: f64 = 0.1;
+
+fn conv_row_name(output: usize) -> String {
+    match output {
+        0 => "L".into(),
+        1 => "R".into(),
+        n => format!("output {n}"),
+    }
+}
+
+/// Hold one chain's combined convolution to the guards
+/// (`convolution_safety`): a row over the boost cap is refused (the
+/// message names the row and its gain); energy below the subsonic limit,
+/// and a boost the output headroom does not cover with the limiter off,
+/// are warnings. Off the audio thread; reusable per chain.
+pub(crate) fn conv_guard(
+    chain: &ChainConfig,
+    side: AbSide,
+    safety: &audivane_protocol::ipc::ConvolutionSafety,
+    gains: &[audivane_dsp_core::conv_safety::RowGain],
+) -> Result<Vec<audivane_protocol::ipc::ConvWarning>, EngineError> {
+    use audivane_protocol::ipc::{ConvWarning, ConvWarningKind};
+    let prefix = match side {
+        AbSide::A => "",
+        AbSide::B => "A/B side B: ",
+    };
+    // The loudest row over the cap (the first of equals).
+    if let Some(over) = gains
+        .iter()
+        .filter(|g| g.peak_db > safety.max_boost_db + CONV_GUARD_SLACK_DB)
+        .fold(
+            None,
+            |best: Option<&audivane_dsp_core::conv_safety::RowGain>, g| match best {
+                Some(b) if b.peak_db >= g.peak_db => Some(b),
+                _ => Some(g),
+            },
+        )
+    {
+        return Err(EngineError::new(
+            RpcError::INVALID_PARAMS,
+            format!(
+                "{prefix}the convolution boosts up to {:+.1} dB on {}, over the {:+.1} dB cap \
+                 (convolution_safety.max_boost_db)",
+                over.peak_db,
+                conv_row_name(over.output),
+                safety.max_boost_db
+            ),
+        ));
+    }
+    let side_tag = match side {
+        AbSide::A => "",
+        AbSide::B => "B: ",
+    };
+    let mut warnings = Vec::new();
+    for g in gains {
+        if g.low_db > CONV_SUBSONIC_MIN_DB {
+            warnings.push(ConvWarning {
+                side,
+                device: None,
+                output: g.output as u32,
+                kind: ConvWarningKind::Subsonic,
+                gain_db: g.low_db,
+                freq_hz: Some(g.low_hz),
+                limit_hz: Some(safety.subsonic_hz),
+                headroom_db: None,
+                message: format!(
+                    "{side_tag}Below {} Hz: {:+.1} dB on {} (largest at {:.1} Hz)",
+                    safety.subsonic_hz,
+                    g.low_db,
+                    conv_row_name(g.output),
+                    g.low_hz
+                ),
+            });
+        }
+    }
+    let headroom = chain.output.headroom_db;
+    if chain.limiter.mode == audivane_protocol::LimiterMode::Off {
+        for g in gains {
+            if g.peak_db > headroom + CONV_GUARD_SLACK_DB {
+                warnings.push(ConvWarning {
+                    side,
+                    device: None,
+                    output: g.output as u32,
+                    kind: ConvWarningKind::ClipRisk,
+                    gain_db: g.peak_db,
+                    freq_hz: None,
+                    limit_hz: None,
+                    headroom_db: Some(headroom),
+                    message: format!(
+                        "{side_tag}Limiter off: the convolution peaks at {:+.1} dB on {}, more \
+                         than the {headroom} dB output headroom; loud passages can clip",
+                        g.peak_db,
+                        conv_row_name(g.output)
+                    ),
+                });
+            }
+        }
+    }
+    Ok(warnings)
+}
+
+/// Validate one chain's convolution and hold it to the guards
+/// ([`conv_guard`]).
+fn check_chain_conv(
+    chain: &ChainConfig,
+    side: AbSide,
+    safety: &audivane_protocol::ipc::ConvolutionSafety,
+    ir_cache: &mut IrCache,
+    rate: u32,
+) -> Result<Vec<audivane_protocol::ipc::ConvWarning>, EngineError> {
+    let Some(irs) = validate_chain_irs(&chain.convolution, ir_cache, rate)? else {
+        return Ok(Vec::new());
+    };
+    let gains = ir_cache.row_gains(&irs, rate, DEFAULT_CHANNELS, safety.subsonic_hz);
+    conv_guard(chain, side, safety, &gains)
 }
 
 fn load_and_combine_irs(
     convs: &[audivane_protocol::ConvolutionConfig],
     ir_cache: &mut IrCache,
     rate: u32,
-) -> Result<Option<Vec<Vec<f64>>>, EngineError> {
-    let enabled: Vec<_> = convs.iter().filter(|c| c.enabled).collect();
-    if enabled.is_empty() {
+) -> Result<Option<audivane_dsp_core::matrix::ConvIrs>, EngineError> {
+    let loaded = load_conv_items(convs, ir_cache, rate)?;
+    if loaded.is_empty() {
         return Ok(None);
     }
-    let mut loaded = Vec::with_capacity(enabled.len());
-    for conv in enabled {
-        let ir = ir_cache.load_for_rate(&conv.ir_path, rate)?;
-        loaded.push((ir, conv.gain_db));
-    }
-    let pairs: Vec<(&[Vec<f64>], f64)> = loaded
-        .iter()
-        .map(|(ir, gain)| (ir.as_slice(), *gain))
-        .collect();
-    let combined = audivane_dsp_core::conv::combine_irs(&pairs, DEFAULT_CHANNELS)
+    let items: Vec<_> = loaded.iter().map(|l| l.as_item()).collect();
+    let combined = audivane_dsp_core::matrix::combine_conv(&items, DEFAULT_CHANNELS)
         .map_err(|e| EngineError::new(RpcError::INVALID_PARAMS, e.to_string()))?;
     Ok(Some(combined))
 }
 
-fn validate_engine_config(
+/// Validate `cfg` for the engine at `rate`; the convolution guards'
+/// warnings of every chain on success.
+pub(crate) fn validate_engine_config(
     cfg: &EngineConfig,
     ir_cache: &mut IrCache,
     rate: u32,
-) -> Result<(), EngineError> {
+) -> Result<Vec<audivane_protocol::ipc::ConvWarning>, EngineError> {
     if cfg.device.trim().is_empty() {
         return Err(EngineError::new(
             RpcError::INVALID_PARAMS,
@@ -3859,12 +4502,46 @@ fn validate_engine_config(
                 format!("A/B upsampling ratios differ: {ratio_a} vs {ratio_b}"),
             ));
         }
-        validate_chain_irs(&ab.chain_b.convolution, ir_cache, rate)?;
     }
-
-    validate_chain_irs(&cfg.chain.convolution, ir_cache, rate)?;
-
-    Ok(())
+    cfg.convolution_safety
+        .validate()
+        .map_err(|e| EngineError::new(RpcError::INVALID_PARAMS, e))?;
+    let safety = &cfg.convolution_safety;
+    let mut warnings = check_chain_conv(&cfg.chain, AbSide::A, safety, ir_cache, rate)?;
+    if let Some(ab) = &cfg.ab {
+        warnings.extend(check_chain_conv(
+            &ab.chain_b,
+            AbSide::B,
+            safety,
+            ir_cache,
+            rate,
+        )?);
+    }
+    // Each follower's own chain, where its convolution differs from A's
+    // (chain A's is checked above).
+    for f in &cfg.outputs.followers {
+        if f.chain_patch.is_none() {
+            continue;
+        }
+        let own = crate::control::follower_chain::config(cfg, f);
+        validate_chain_params(&own.chain)?;
+        validate_tilt_at_rate(&own.chain, rate)?;
+        if own.chain.convolution == cfg.chain.convolution
+            && own.chain.limiter == cfg.chain.limiter
+            && own.chain.output.headroom_db == cfg.chain.output.headroom_db
+        {
+            continue;
+        }
+        let tag = |m: String| format!("follower {}: {m}", f.device);
+        let found = check_chain_conv(&own.chain, AbSide::A, safety, ir_cache, rate)
+            .map_err(|e| EngineError::new(e.code, tag(e.message)))?;
+        warnings.extend(found.into_iter().map(|mut w| {
+            w.device = Some(f.device.clone());
+            w.message = tag(std::mem::take(&mut w.message));
+            w
+        }));
+    }
+    Ok(warnings)
 }
 
 /// The overload hold's acknowledgement ([`crate::api::VarispeedRequest::hold_ack`]):
@@ -3946,13 +4623,15 @@ fn estimate_ab_gains(cfg: &EngineConfig, rate: u32) -> Result<AbGains, EngineErr
 fn ab_status(side: AbSide, gains: AbGains) -> AbStatus {
     AbStatus {
         enabled: true,
-        current: side,
+        current: Some(side),
         offset_db: gains.offset_db,
         gain_a_db: gains.gain_a_db,
         gain_b_db: gains.gain_b_db,
         headroom_db: gains.headroom_db,
         overs: Default::default(),
-        // The control plane fills in the level and the measurement.
+        // The control plane fills in the level, the measurement and the
+        // blind mask.
+        blind: false,
         level: Default::default(),
         measuring: None,
         measure_error: None,
@@ -3996,6 +4675,30 @@ fn build_active_chain(
     actual_ratio: RateRatio,
     current_ab_side: AbSide,
 ) -> Result<(ActiveChain, Option<AbGains>, bool), EngineError> {
+    build_active_chain_guarded(
+        cfg,
+        ir_cache,
+        graph_rate,
+        actual_ratio,
+        current_ab_side,
+        true,
+    )
+}
+
+/// [`build_active_chain`]; with `guard`, each side's combined IRs (chain A
+/// and, with A/B, chain B), exactly as loaded for the build at this graph
+/// rate, are held to the convolution guards first ([`conv_guard`]): a rate
+/// change, or a file replaced at the same path since the config was
+/// checked, cannot play a filter over the cap (the master's rebuild then
+/// falls back to a chain without convolution, reported in status).
+fn build_active_chain_guarded(
+    cfg: &EngineConfig,
+    ir_cache: &mut IrCache,
+    graph_rate: u32,
+    actual_ratio: RateRatio,
+    current_ab_side: AbSide,
+    guard: bool,
+) -> Result<(ActiveChain, Option<AbGains>, bool), EngineError> {
     let has_effect = chain_has_effect(cfg);
     if !cfg.dsp_enabled {
         // DSP off only ever opens x1 (until that reopen lands, nothing
@@ -4011,10 +4714,20 @@ fn build_active_chain(
     let a_cfg = with_actual_ratio(cfg.chain.clone(), graph_rate, actual_ratio);
 
     let irs_a = load_and_combine_irs(&a_cfg.convolution, ir_cache, graph_rate)?;
+    if guard && let Some(irs) = &irs_a {
+        let safety = &cfg.convolution_safety;
+        let gains = ir_cache.row_gains(irs, graph_rate, DEFAULT_CHANNELS, safety.subsonic_hz);
+        conv_guard(&cfg.chain, AbSide::A, safety, &gains)?;
+    }
 
     if let Some(ab) = &cfg.ab {
         let b_cfg = with_actual_ratio(ab.chain_b.clone(), graph_rate, actual_ratio);
         let irs_b = load_and_combine_irs(&b_cfg.convolution, ir_cache, graph_rate)?;
+        if guard && let Some(irs) = &irs_b {
+            let safety = &cfg.convolution_safety;
+            let gains = ir_cache.row_gains(irs, graph_rate, DEFAULT_CHANNELS, safety.subsonic_hz);
+            conv_guard(&ab.chain_b, AbSide::B, safety, &gains)?;
+        }
         let level = AbLevel::from_config(&ab.level, ab.headroom);
         let spec_a = ChainSpec {
             config: a_cfg,
@@ -4562,6 +5275,22 @@ mod tests {
             None
         ));
 
+        // Another output pair DOES reopen ALSA (another channel count).
+        let mut pair = base.clone();
+        pair.output_channels = Some(audivane_protocol::ipc::OutputChannels([2, 3]));
+        assert!(diff_requires_reopen(
+            &base,
+            &pair,
+            48_000,
+            None,
+            RateRatio::ONE,
+            None
+        ));
+        assert_eq!(
+            to_driver_config(&pair).output_channels,
+            pair.output_channels
+        );
+
         // Enabling 4x upsampling DOES reopen ALSA.
         let mut up_change = base.clone();
         up_change.chain.upsampler = UpsamplerConfig {
@@ -4807,6 +5536,139 @@ mod tests {
     }
 
     #[test]
+    fn the_rate_plan_builds_its_upsampler_at_the_rates_it_names() {
+        // A request with a per-rate plan for 96 kHz: an open there builds
+        // the plan's upsampler (the request stays the config), an open at
+        // 48 kHz the request's; an edit after the plan moved rebuilds.
+        let x2 = RateRatio::integer(2);
+        let mut cfg = test_cfg();
+        cfg.chain.upsampler = audivane_dsp_core::resample::ManualConfig {
+            target: RateTarget::Ratio(2),
+            taps: 4095,
+            ..Default::default()
+        }
+        .into_upsampler_config()
+        .unwrap();
+        let light = UpsamplerConfig {
+            target: cfg.chain.upsampler.target,
+            ..crate::control::config::bypass_upsampler()
+        };
+        let mut h = BuilderProcHarness::new(cfg.clone());
+        *h.state.rate_plan.lock().unwrap() = crate::api::RatePlan {
+            made_for: Some((cfg.chain.upsampler.clone(), cfg.chain.output)),
+            rates: vec![(96_000, light.clone())],
+        };
+        let n = h.negotiate(48_000, x2, SinkChoice::Dsp, SampleFormat::S32);
+        assert!(n.error.is_none(), "{n:?}");
+        assert_eq!(h.state.built_substitute, None);
+        let n = h.negotiate(96_000, x2, SinkChoice::Dsp, SampleFormat::S32);
+        assert!(n.error.is_none(), "{n:?}");
+        assert_eq!(h.state.built_substitute.as_ref(), Some(&light));
+        assert_eq!(h.state.cfg, cfg, "the request stays the config");
+        // The plan no longer names 96 kHz: the same config rebuilds.
+        *h.state.rate_plan.lock().unwrap() = crate::api::RatePlan::default();
+        h.state
+            .apply_config(
+                &cfg,
+                &h.mirror,
+                EngineState::Playing,
+                96_000,
+                Some(SinkChoice::Dsp),
+                None,
+            )
+            .unwrap();
+        assert_eq!(h.state.built_substitute, None);
+    }
+
+    /// A follower asks for the master's top rung, not the target's: under
+    /// a 768 kHz cap from 44.1 kHz, a design that does not build at x16 has
+    /// the master land at x8, and so does the follower's request. A
+    /// follower whose device opens at x16 anyway plays the substitute the
+    /// master would have played there instead of failing the build.
+    #[test]
+    fn a_follower_follows_the_masters_ladder_and_its_fallback() {
+        let mut cfg = test_cfg();
+        cfg.chain.upsampler =
+            crate::control::config::tests::equiripple_1279(RateTarget::MaxRate(768_000));
+        cfg.rate.allowed_rates = vec![44_100, 48_000];
+        cfg.rate.default_rate = 44_100;
+        let x16 = RateRatio::integer(16);
+        assert!(crate::control::config::chain_builds_at(&cfg, 44_100, x16).is_err());
+        assert_eq!(follower_ratio_for(&cfg, 44_100), RateRatio::integer(8));
+        let plan = Mutex::new(crate::api::RatePlan::default());
+        follower_chain(&plan, &cfg, 44_100, x16, SampleFormat::S32).unwrap();
+        follower_chain(
+            &plan,
+            &cfg,
+            44_100,
+            RateRatio::integer(8),
+            SampleFormat::S32,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn follower_chain_builder_applies_rate_plan_and_seed_skips_when_off() {
+        // Without DSP or upsampler, seed_rate_plan returns an empty plan immediately.
+        let mut off_cfg = test_cfg();
+        off_cfg.chain.upsampler.target = RateTarget::Off;
+        assert!(seed_rate_plan(&off_cfg).rates.is_empty());
+        let mut disabled_cfg = test_cfg();
+        disabled_cfg.dsp_enabled = false;
+        disabled_cfg.chain.upsampler.target = RateTarget::Ratio(2);
+        assert!(seed_rate_plan(&disabled_cfg).rates.is_empty());
+
+        // Followers use the shared RatePlan when building their chain.
+        let x2 = RateRatio::integer(2);
+        let mut cfg = test_cfg();
+        cfg.chain.upsampler = audivane_dsp_core::resample::ManualConfig {
+            target: RateTarget::Ratio(2),
+            taps: 4095,
+            ..Default::default()
+        }
+        .into_upsampler_config()
+        .unwrap();
+        let light = UpsamplerConfig {
+            target: cfg.chain.upsampler.target,
+            ..crate::control::config::bypass_upsampler()
+        };
+        let plan = Arc::new(Mutex::new(crate::api::RatePlan {
+            made_for: Some((cfg.chain.upsampler.clone(), cfg.chain.output)),
+            rates: vec![(96_000, light.clone())],
+        }));
+        let build = {
+            let rate_plan = Arc::clone(&plan);
+            move |c: &EngineConfig, graph_rate: u32, ratio: RateRatio, fmt: SampleFormat| {
+                let mut ir_cache = IrCache::new();
+                let planned = rate_plan.lock().unwrap().apply(c, graph_rate);
+                let mut c = cap_dither_bits(&planned, Some(fmt));
+                c.ab = None;
+                build_active_chain(&c, &mut ir_cache, graph_rate, ratio, AbSide::A).unwrap()
+            }
+        };
+        let (chain_48, _, _) = build(&cfg, 48_000, x2, SampleFormat::S32);
+        let (chain_96, _, _) = build(&cfg, 96_000, x2, SampleFormat::S32);
+        let mut light_cfg = cfg.clone();
+        light_cfg.chain.upsampler = light;
+        let (chain_light, _, _) = build_active_chain(
+            &cap_dither_bits(&light_cfg, Some(SampleFormat::S32)),
+            &mut IrCache::new(),
+            96_000,
+            x2,
+            AbSide::A,
+        )
+        .unwrap();
+        // 48 kHz builds the 4095-tap requested filter; 96 kHz builds the light substitute.
+        let lat_48 = chain_48.latency_out_frames();
+        let lat_96 = chain_96.latency_out_frames();
+        assert_eq!(lat_96, chain_light.latency_out_frames());
+        assert!(
+            lat_96 < lat_48,
+            "expected 96 kHz follower chain to use light substitute (lat_48={lat_48}, lat_96={lat_96})"
+        );
+    }
+
+    #[test]
     fn max_rate_target_resolves_against_actual_source_rates() {
         let mut cfg = test_cfg();
         cfg.chain.upsampler = UpsamplerConfig {
@@ -4906,6 +5768,7 @@ mod tests {
             let swap_state = proc.swap_state_handle();
             let varispeed_applied = proc.varispeed_applied();
             let initial_software_db = initial_volume_target(&init_cfg).volume_db;
+            let rate_plan = Arc::new(Mutex::new(crate::api::RatePlan::default()));
             let state = BuilderState {
                 cfg: init_cfg,
                 ir_cache: IrCache::new(),
@@ -4959,9 +5822,12 @@ mod tests {
                 varispeed_hold: Default::default(),
                 varispeed_hold_seq: 0,
                 tee: tee::TeeHost::detached(),
-                followers: follower_host(),
+                followers: follower_host(Arc::clone(&rate_plan)),
                 align: follower::AlignControl::default(),
+                comp: follower::CompControl::default(),
                 align_t0: Instant::now(),
+                rate_plan,
+                built_substitute: None,
             };
             Self {
                 state,
@@ -5311,12 +6177,17 @@ mod tests {
         apply(&mut h, &edited);
         let c = h.state.followers.controls(b).unwrap();
         assert_eq!((c.trim_ms(), c.lag_ms(), c.enabled()), (-2.0, 7.5, true));
-        // A later trim is taken as it is.
+        // A later trim takes the lateness back first: 3 ms later, 4.5 ms
+        // late; 10 ms later still, aligned again (the rest moves it).
         let mut later = edited.clone();
         later.outputs.followers[1].trim_ms = 1.0;
         apply(&mut h, &later);
         let c = h.state.followers.controls(b).unwrap();
-        assert_eq!((c.trim_ms(), c.lag_ms()), (1.0, 7.5));
+        assert_eq!((c.trim_ms(), c.lag_ms()), (1.0, 4.5));
+        later.outputs.followers[1].trim_ms = 11.0;
+        apply(&mut h, &later);
+        let c = h.state.followers.controls(b).unwrap();
+        assert_eq!((c.trim_ms(), c.lag_ms()), (11.0, 0.0));
         let edited = later;
 
         // Removed from the list: stopped; none left: no alignment.
@@ -5330,6 +6201,185 @@ mod tests {
         assert_eq!(h.state.align.ms, 0.0);
         assert_eq!(h.state.outputs_status(), OutputsStatus::default());
         assert_eq!(h.state.next_swap_seq, swap_seq);
+    }
+
+    /// A follower's chain patch: its slot holds chain A with the patch, an
+    /// edit of chain A reaches it except where the patch overrides, A/B
+    /// stays on the master, and the status names what differs.
+    #[test]
+    fn a_patched_follower_follows_chain_a_outside_its_patch() {
+        use audivane_protocol::ipc::{AbB, AbConfig, FollowerConfig};
+        let dev = "hw:CARD=NoSuchA,DEV=0";
+        let ir = temp_ir_path("follower_patch");
+        write_test_ir(&ir, 48_000);
+        let mut cfg = test_cfg();
+        cfg.outputs.followers = vec![FollowerConfig {
+            chain_patch: Some(serde_json::json!({
+                "convolution": [conv_cfg(&ir)],
+                "limiter": {"mode": "limit"},
+            })),
+            ..FollowerConfig::new(dev)
+        }];
+        let mut h = BuilderProcHarness::new(test_cfg());
+        h.negotiate(48_000, RateRatio::ONE, SinkChoice::Dsp, SampleFormat::S32);
+        let apply = |h: &mut BuilderProcHarness, c: &EngineConfig| {
+            h.state
+                .apply_config(
+                    c,
+                    &h.mirror,
+                    EngineState::Playing,
+                    48_000,
+                    Some(SinkChoice::Dsp),
+                    None,
+                )
+                .unwrap()
+        };
+        apply(&mut h, &cfg);
+        let own = h.state.followers.config_of(dev).unwrap();
+        assert_eq!(own.chain.convolution, vec![conv_cfg(&ir)]);
+        assert_eq!(
+            own.chain.limiter.mode,
+            audivane_protocol::LimiterMode::Limit
+        );
+        assert!(
+            h.state.cfg.chain.convolution.is_empty(),
+            "the master plays A's"
+        );
+        let st = h.state.outputs_status();
+        assert_eq!(st.followers[0].own_chain, vec!["convolution", "limiter"]);
+        assert!(st.followers[0].chain.is_some());
+        // An edit of chain A: the EQ reaches the follower, the limiter it
+        // overrides does not; A/B stays on the master.
+        let mut edited = cfg.clone();
+        edited.chain.eq = Some(audivane_protocol::EqProfile {
+            preamp_db: -4.0,
+            ..Default::default()
+        });
+        edited.chain.limiter.mode = audivane_protocol::LimiterMode::AutoHeadroom;
+        edited.ab = Some(AbConfig::new(AbB::Patch(serde_json::json!({}))));
+        edited.ab.as_mut().unwrap().chain_b = edited.chain.clone();
+        apply(&mut h, &edited);
+        let own = h.state.followers.config_of(dev).unwrap();
+        assert_eq!(own.chain.eq.as_ref().map(|e| e.preamp_db), Some(-4.0));
+        assert_eq!(
+            own.chain.limiter.mode,
+            audivane_protocol::LimiterMode::Limit
+        );
+        assert_eq!(own.chain.convolution, vec![conv_cfg(&ir)]);
+        assert!(own.ab.is_none());
+        // Without the patch it plays chain A again.
+        let mut plain = edited.clone();
+        plain.ab = None;
+        plain.outputs.followers[0].chain_patch = None;
+        apply(&mut h, &plain);
+        let own = h.state.followers.config_of(dev).unwrap();
+        assert_eq!(own.chain, plain.chain);
+        assert!(h.state.outputs_status().followers[0].own_chain.is_empty());
+        let _ = std::fs::remove_dir_all(ir.parent().unwrap());
+    }
+
+    /// A follower with its own convolution plays it; the master plays
+    /// chain A's (none), from the same config.
+    #[test]
+    fn a_follower_plays_its_own_convolution_while_the_master_plays_a_s() {
+        use audivane_protocol::ipc::FollowerConfig;
+        let ir = temp_ir_path("follower_conv");
+        // Half gain, 100 frames late.
+        let mut taps = vec![0.0; 128];
+        taps[100] = 0.5;
+        write_ir_samples(&ir, 48_000, &taps);
+        let dev = "hw:CARD=USB,DEV=0";
+        let mut cfg = test_cfg();
+        cfg.outputs.followers = vec![FollowerConfig {
+            chain_patch: Some(serde_json::json!({"convolution": [conv_cfg(&ir)]})),
+            ..FollowerConfig::new(dev)
+        }];
+        let plan = Mutex::new(crate::api::RatePlan::default());
+        let own = crate::control::follower_chain::config(&cfg, &cfg.outputs.followers[0]);
+        let mut follower =
+            follower_chain(&plan, &own, 48_000, RateRatio::ONE, SampleFormat::S32).unwrap();
+        let mut master =
+            follower_chain(&plan, &cfg, 48_000, RateRatio::ONE, SampleFormat::S32).unwrap();
+        let run = |c: &mut ActiveChain| {
+            let n = 4096;
+            let mut x = vec![vec![0.0; n]; 2];
+            x[0][0] = 0.5;
+            x[1][0] = 0.5;
+            let mut out = vec![0i32; n * 2];
+            let mut g = audivane_dsp_core::gain::StereoGainRamp::unity(48_000);
+            c.process_in_with_gain(
+                processor::DspIn::planar(&x, n),
+                &mut out,
+                2,
+                n,
+                &mut g,
+                None,
+            );
+            let lat = c.latency_out_frames();
+            let at = |f: usize| f64::from(out[(f + lat) * 2]) / 2_147_483_648.0;
+            (lat, at(0), at(100))
+        };
+        let (m_lat, m0, m100) = run(&mut master);
+        let (f_lat, f0, f100) = run(&mut follower);
+        assert_eq!(m_lat, 0);
+        assert!((m0 - 0.5).abs() < 1e-5 && m100.abs() < 1e-5, "{m0} {m100}");
+        assert!(f_lat > 0, "the convolver's block");
+        assert!(f0.abs() < 1e-5 && (f100 - 0.25).abs() < 1e-5, "{f0} {f100}");
+        let _ = std::fs::remove_dir_all(ir.parent().unwrap());
+    }
+
+    /// A follower's IRs are guarded at each build: a WAV replaced at the
+    /// same path with one over the boost cap is refused when the follower
+    /// rebuilds (a reopen), not played.
+    #[test]
+    fn a_follower_build_guards_the_irs_it_loads() {
+        let ir = temp_ir_path("follower_rebuild_guard");
+        write_ir_samples(&ir, 48_000, &[1.0, 0.0, 0.0, 0.0]);
+        let mut cfg = test_cfg();
+        cfg.chain.convolution = vec![conv_cfg(&ir)];
+        let plan = Mutex::new(crate::api::RatePlan::default());
+        assert!(follower_chain(&plan, &cfg, 48_000, RateRatio::ONE, SampleFormat::S32).is_ok());
+        // Replaced in place: +20 dB.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_ir_samples(&ir, 48_000, &[10.0, 0.0, 0.0, 0.0]);
+        let e = follower_chain(&plan, &cfg, 48_000, RateRatio::ONE, SampleFormat::S32)
+            .err()
+            .expect("a boost over the cap was built");
+        assert!(e.contains("boosts"), "{e}");
+        let _ = std::fs::remove_dir_all(ir.parent().unwrap());
+    }
+
+    /// A follower's own convolution goes through the guards: over the boost
+    /// cap it is refused naming the follower; its warnings carry its
+    /// device.
+    #[test]
+    fn a_follower_s_own_convolution_is_guarded() {
+        use audivane_protocol::ipc::FollowerConfig;
+        let ir = temp_ir_path("follower_guard");
+        // +20 dB flat: over the 12 dB cap.
+        write_ir_samples(&ir, 48_000, &[10.0, 0.0, 0.0, 0.0]);
+        let dev = "hw:CARD=USB,DEV=0";
+        let mut cfg = test_cfg();
+        cfg.outputs.followers = vec![FollowerConfig {
+            chain_patch: Some(serde_json::json!({"convolution": [conv_cfg(&ir)]})),
+            ..FollowerConfig::new(dev)
+        }];
+        let mut cache = IrCache::new();
+        let e = validate_engine_config(&cfg, &mut cache, 48_000).unwrap_err();
+        assert!(
+            e.message.contains("follower hw:CARD=USB,DEV=0"),
+            "{}",
+            e.message
+        );
+        assert!(e.message.contains("boosts"), "{}", e.message);
+        // +6 dB with the limiter off and no headroom: a clip-risk warning,
+        // its device named.
+        write_ir_samples(&ir, 48_000, &[2.0, 0.0, 0.0, 0.0]);
+        let mut cache = IrCache::new();
+        let w = validate_engine_config(&cfg, &mut cache, 48_000).unwrap();
+        assert!(!w.is_empty());
+        assert!(w.iter().all(|w| w.device.as_deref() == Some(dev)), "{w:?}");
+        let _ = std::fs::remove_dir_all(ir.parent().unwrap());
     }
 
     #[test]
@@ -8220,7 +9270,223 @@ mod tests {
             enabled: true,
             ir_path: path.to_path_buf(),
             gain_db: 0.0,
+            matrix: None,
+            calibration: false,
         }
+    }
+
+    /// A mono float WAV of `samples` at `rate`.
+    fn write_ir_samples(path: &std::path::Path, rate: u32, samples: &[f64]) {
+        use hound::{SampleFormat as WavFormat, WavSpec, WavWriter};
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: rate,
+            bits_per_sample: 32,
+            sample_format: WavFormat::Float,
+        };
+        let mut w = WavWriter::create(path, spec).unwrap();
+        for &v in samples {
+            w.write_sample(v as f32).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    /// The impulse response of a biquad (`b`, `a` with `a[0] = 1`), `len`
+    /// taps.
+    fn biquad_taps(b: [f64; 3], a: [f64; 3], len: usize) -> Vec<f64> {
+        let (mut x1, mut x2, mut y1, mut y2) = (0.0, 0.0, 0.0, 0.0);
+        (0..len)
+            .map(|k| {
+                let x = if k == 0 { 1.0 } else { 0.0 };
+                let y = b[0] * x + b[1] * x1 + b[2] * x2 - a[1] * y1 - a[2] * y2;
+                (x2, x1, y2, y1) = (x1, x, y1, y);
+                y
+            })
+            .collect()
+    }
+
+    fn guarded_cfg(convs: Vec<ConvolutionConfig>) -> EngineConfig {
+        let mut cfg = test_cfg();
+        cfg.chain.limiter.mode = audivane_protocol::LimiterMode::AutoHeadroom;
+        cfg.chain.convolution = convs;
+        cfg
+    }
+
+    fn gained(path: &std::path::Path, gain_db: f64) -> ConvolutionConfig {
+        ConvolutionConfig {
+            gain_db,
+            ..conv_cfg(path)
+        }
+    }
+
+    /// Over the boost cap is refused (chain A, A/B side B, a matrix row
+    /// that sums its entries); under it passes.
+    #[test]
+    fn convolution_over_the_boost_cap_is_refused() {
+        let ir = temp_ir_path("conv_cap");
+        write_test_ir(&ir, 48_000);
+        let mut cache = IrCache::new();
+
+        validate_engine_config(&guarded_cfg(vec![gained(&ir, 11.0)]), &mut cache, 48_000).unwrap();
+        let err = validate_engine_config(&guarded_cfg(vec![gained(&ir, 13.0)]), &mut cache, 48_000)
+            .unwrap_err();
+        assert_eq!(err.code, RpcError::INVALID_PARAMS);
+        assert!(
+            err.message.contains("+13.0 dB on L") && err.message.contains("+12.0 dB cap"),
+            "{err}"
+        );
+        // Two items in series add up.
+        assert!(
+            validate_engine_config(
+                &guarded_cfg(vec![gained(&ir, 7.0), gained(&ir, 7.0)]),
+                &mut cache,
+                48_000
+            )
+            .is_err()
+        );
+        // The cap is a setting.
+        let mut raised = guarded_cfg(vec![gained(&ir, 13.0)]);
+        raised.convolution_safety.max_boost_db = 14.0;
+        validate_engine_config(&raised, &mut cache, 48_000).unwrap();
+        raised.convolution_safety.max_boost_db = 30.0;
+        assert!(validate_engine_config(&raised, &mut cache, 48_000).is_err());
+
+        // A/B side B over the cap: refused, naming side B.
+        let mut ab = guarded_cfg(Vec::new());
+        ab.ab = Some(AbConfig {
+            level: LevelMatch::Off,
+            headroom: Default::default(),
+            ..AbConfig::chain(ChainConfig {
+                convolution: vec![gained(&ir, 13.0)],
+                ..ab.chain.clone()
+            })
+        });
+        let err = validate_engine_config(&ab, &mut cache, 48_000).unwrap_err();
+        assert!(err.message.starts_with("A/B side B:"), "{err}");
+        if let Some(b) = ab.ab.as_mut() {
+            b.chain_b.convolution = vec![gained(&ir, 6.0)];
+        }
+        validate_engine_config(&ab, &mut cache, 48_000).unwrap();
+
+        // A matrix row sums its entries: +7 dB from each input into L is
+        // +13 dB there, each entry alone under the cap.
+        let entry = |input, output, gain_db| audivane_protocol::MatrixEntry {
+            input,
+            output,
+            ir_path: ir.clone(),
+            channel: None,
+            gain_db,
+        };
+        let matrix = |entries| ConvolutionConfig {
+            name: None,
+            enabled: true,
+            ir_path: Default::default(),
+            gain_db: 0.0,
+            matrix: Some(entries),
+            calibration: false,
+        };
+        let over = matrix(vec![entry(0, 0, 7.0), entry(1, 0, 7.0), entry(1, 1, 0.0)]);
+        let err = validate_engine_config(&guarded_cfg(vec![over]), &mut cache, 48_000).unwrap_err();
+        assert!(err.message.contains("+13.0 dB on L"), "{err}");
+        let under = matrix(vec![entry(0, 0, 5.0), entry(1, 0, 5.0), entry(1, 1, 0.0)]);
+        validate_engine_config(&guarded_cfg(vec![under]), &mut cache, 48_000).unwrap();
+    }
+
+    /// A high-pass gives no subsonic warning; a bass boost reaching below
+    /// the limit does (and only then); the limiter off with more boost than
+    /// the output headroom warns of clipping.
+    #[test]
+    fn convolution_warnings_subsonic_and_clip_risk() {
+        use audivane_protocol::ipc::ConvWarningKind;
+        let rate = 48_000_u32;
+        let w = |f0: f64| 2.0 * std::f64::consts::PI * f0 / f64::from(rate);
+        let mut cache = IrCache::new();
+
+        // 2nd-order high-pass at 30 Hz.
+        let (c, s) = (w(30.0).cos(), w(30.0).sin());
+        let alpha = s / std::f64::consts::SQRT_2;
+        let a0 = 1.0 + alpha;
+        let hp = biquad_taps(
+            [(1.0 + c) / 2.0 / a0, -(1.0 + c) / a0, (1.0 + c) / 2.0 / a0],
+            [1.0, -2.0 * c / a0, (1.0 - alpha) / a0],
+            1 << 15,
+        );
+        let hp_path = temp_ir_path("conv_hp");
+        write_ir_samples(&hp_path, rate, &hp);
+        let warnings =
+            validate_engine_config(&guarded_cfg(vec![conv_cfg(&hp_path)]), &mut cache, rate)
+                .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // A +6 dB boost that reaches DC (a flat IR at +6 dB) warns on each
+        // row.
+        let flat = temp_ir_path("conv_flat");
+        write_test_ir(&flat, rate);
+        let warnings =
+            validate_engine_config(&guarded_cfg(vec![gained(&flat, 6.0)]), &mut cache, rate)
+                .unwrap();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        let w0 = &warnings[0];
+        assert_eq!(w0.kind, ConvWarningKind::Subsonic);
+        assert_eq!((w0.side, w0.output), (AbSide::A, 0));
+        assert!((w0.gain_db - 6.0).abs() < 0.05, "{w0:?}");
+        assert_eq!(w0.limit_hz, Some(20.0));
+        assert!(
+            w0.message.starts_with("Below 20 Hz: +6.0 dB on L"),
+            "{w0:?}"
+        );
+        // Through the 30 Hz high-pass, the boost no longer reaches below
+        // 20 Hz (+6 dB less about 9 dB at 20 Hz).
+        let boosted_hp = vec![gained(&flat, 6.0), conv_cfg(&hp_path)];
+        let warnings = validate_engine_config(&guarded_cfg(boosted_hp), &mut cache, rate).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // A 50 Hz limit catches the boost above the high-pass.
+        let mut high_limit = guarded_cfg(vec![gained(&flat, 6.0), conv_cfg(&hp_path)]);
+        high_limit.convolution_safety.subsonic_hz = 50.0;
+        let warnings = validate_engine_config(&high_limit, &mut cache, rate).unwrap();
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.kind == ConvWarningKind::Subsonic && w.gain_db > 0.1),
+            "{warnings:?}"
+        );
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+
+        // Limiter off, +6 dB over the 3 dB output headroom: clip risk.
+        let mut off = guarded_cfg(vec![gained(&flat, 6.0)]);
+        off.chain.limiter.mode = audivane_protocol::LimiterMode::Off;
+        off.chain.output.headroom_db = 3.0;
+        let warnings = validate_engine_config(&off, &mut cache, rate).unwrap();
+        let clip: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.kind == ConvWarningKind::ClipRisk)
+            .collect();
+        assert_eq!(clip.len(), 2, "{warnings:?}");
+        assert_eq!(clip[0].headroom_db, Some(off.chain.output.headroom_db));
+        // Within the headroom: no clip risk.
+        off.chain.convolution = vec![gained(&flat, 2.0)];
+        let warnings = validate_engine_config(&off, &mut cache, rate).unwrap();
+        assert!(
+            warnings.iter().all(|w| w.kind != ConvWarningKind::ClipRisk),
+            "{warnings:?}"
+        );
+    }
+
+    /// A config without convolution: no warnings, and the file is unchanged
+    /// (the guards are left out at their defaults).
+    #[test]
+    fn a_config_without_convolution_is_unchanged() {
+        let cfg = test_cfg();
+        let mut cache = IrCache::new();
+        assert!(
+            validate_engine_config(&cfg, &mut cache, 48_000)
+                .unwrap()
+                .is_empty()
+        );
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert!(json.get("convolution_safety").is_none(), "{json}");
+        let back: EngineConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back, cfg);
     }
 
     fn expected_fallback_db() -> f64 {
@@ -8300,6 +9566,7 @@ mod tests {
             rate_min: rates.iter().copied().min().unwrap_or(0),
             rate_max: rates.iter().copied().max().unwrap_or(0),
             formats: vec![SampleFormat::S32],
+            modes: Vec::new(),
         }
     }
 
@@ -9342,7 +10609,7 @@ mod tests {
         assert_eq!(h.state.built_generation, h.state.config_generation);
         assert_eq!(
             h.mirror.ab_status().expect("A/B enabled").current,
-            AbSide::B,
+            Some(AbSide::B),
             "deferred publication must not undo the later B selection"
         );
 
@@ -9371,18 +10638,24 @@ mod tests {
                 enabled: true,
                 ir_path: ir1.clone(),
                 gain_db: -3.0,
+                matrix: None,
+                calibration: false,
             },
             ConvolutionConfig {
                 name: Some("Disabled".into()),
                 enabled: false,
                 ir_path: ir_disabled.clone(),
                 gain_db: -20.0,
+                matrix: None,
+                calibration: false,
             },
             ConvolutionConfig {
                 name: Some("Second".into()),
                 enabled: true,
                 ir_path: ir2.clone(),
                 gain_db: -2.0,
+                matrix: None,
+                calibration: false,
             },
         ];
         assert!(
@@ -9408,6 +10681,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(ir1.parent().unwrap());
         let _ = std::fs::remove_dir_all(ir2.parent().unwrap());
         let _ = std::fs::remove_dir_all(ir_disabled.parent().unwrap());
+    }
+
+    #[test]
+    fn matrix_convolution_sums_inputs_into_one_output() {
+        let ir1 = temp_ir_path("matrix_ir_1");
+        let ir2 = temp_ir_path("matrix_ir_2");
+        write_test_ir(&ir1, 48_000);
+        write_test_ir(&ir2, 48_000);
+
+        let mut h = BuilderProcHarness::new(test_cfg());
+        let mut cfg = test_cfg();
+        let entry = |input, path: &std::path::Path| audivane_protocol::MatrixEntry {
+            input,
+            output: 0,
+            ir_path: path.to_path_buf(),
+            channel: None,
+            gain_db: -6.0,
+        };
+        cfg.chain.convolution = vec![ConvolutionConfig {
+            name: Some("Sub".into()),
+            enabled: true,
+            ir_path: Default::default(),
+            gain_db: 0.0,
+            matrix: Some(vec![entry(0, &ir1), entry(1, &ir2)]),
+            calibration: false,
+        }];
+        assert!(
+            !h.state
+                .apply_config(&cfg, &h.mirror, EngineState::Ready, 48_000, None, None)
+                .unwrap()
+        );
+        audivane_io_pw::EngineAudioProcessor::poll_updates(
+            &mut h.proc,
+            SinkChoice::Dsp,
+            48_000,
+            RateRatio::integer(1),
+            false,
+        );
+        // The same -6 dBFS sine on L and R, each through -6 dB, summed into
+        // the left output: -6 dBFS (one input alone would read -12).
+        let db = h.measure_1khz_peak_db(1);
+        assert!(
+            (db - (-6.0)).abs() < 0.2,
+            "expected -6.0 dBFS from the matrix sum, got {db:.3}"
+        );
+
+        // An entry out of range is refused with the chain's channels named.
+        let mut bad = cfg.clone();
+        bad.chain.convolution[0].matrix.as_mut().unwrap()[1].input = 2;
+        let err = h
+            .state
+            .apply_config(&bad, &h.mirror, EngineState::Ready, 48_000, None, None)
+            .unwrap_err();
+        assert!(err.message.contains("must be below 2"), "{}", err.message);
+
+        let _ = std::fs::remove_dir_all(ir1.parent().unwrap());
+        let _ = std::fs::remove_dir_all(ir2.parent().unwrap());
     }
 
     #[test]
@@ -10679,6 +12009,106 @@ mod tests {
         assert_eq!(status.hardware_db, Some(-30.0));
         assert!(!status.hardware);
         assert_eq!(status.software_db, -30.0);
+    }
+
+    /// On a card without a control, `auto` leaves no hardware level
+    /// behind: `software` afterwards reports none (not the digital level
+    /// `auto` played at).
+    #[test]
+    fn software_after_auto_on_a_card_without_a_mixer_reports_no_hardware_level() {
+        let mixer: MixerFn = Arc::new(|_dev, db, _mute| MixerApplyOutcome::digital(db));
+        let mut cfg = test_cfg();
+        cfg.device = "hw:CARD=DAC,DEV=0".into();
+        cfg.volume.mode = VolumeMode::Auto;
+        cfg.volume.volume_db = -30.0;
+        let mut h = BuilderProcHarness::with_mixer(cfg.clone(), mixer);
+        h.negotiate(48_000, RateRatio::ONE, SinkChoice::Dsp, SampleFormat::S32);
+        assert_eq!(h.mirror.volume_status().hardware_db, None);
+        cfg.volume.mode = VolumeMode::Software;
+        h.state
+            .apply_config(&cfg, &h.mirror, EngineState::Ready, 48_000, None, None)
+            .unwrap();
+        let status = h.mirror.volume_status();
+        assert_eq!(status.hardware_db, None, "no control, no hardware level");
+        assert_eq!(status.software_db, -30.0);
+    }
+
+    /// The followers get the master's level as its DAC plays it: with a
+    /// hardware mixer carrying it, the whole effective volume (their
+    /// equivalent digital gain), the digital part below the card's floor
+    /// included; its balance and its mute, whatever carries them here.
+    #[test]
+    fn the_followers_get_the_master_level_in_every_volume_mode() {
+        let mixer: MixerFn = Arc::new(|_dev, db, mute: Option<bool>| MixerApplyOutcome {
+            hardware_volume: true,
+            hardware_mute: mute.is_some(),
+            volume_db: db.clamp(-64.0, 0.0),
+            min_db: -64.0,
+            max_db: 0.0,
+        });
+        let mut cfg = test_cfg();
+        cfg.device = "hw:CARD=DAC,DEV=0".into();
+        cfg.volume.mode = VolumeMode::Auto;
+        cfg.volume.volume_db = -20.0;
+        let mut h = BuilderProcHarness::with_mixer(cfg.clone(), mixer);
+        h.negotiate(48_000, RateRatio::ONE, SinkChoice::Dsp, SampleFormat::S32);
+        let level = |h: &BuilderProcHarness| {
+            h.state
+                .tee
+                .shared()
+                .master_level
+                .read_if_changed(&mut 0)
+                .unwrap()
+        };
+        let mut apply = |h: &mut BuilderProcHarness, f: &dyn Fn(&mut EngineConfig)| {
+            f(&mut cfg);
+            h.state
+                .apply_config(&cfg, &h.mirror, EngineState::Ready, 48_000, None, None)
+                .unwrap();
+        };
+        // The card carries it all: the master's digital gain is unity.
+        assert_eq!(h.state.shared_volume_target().volume_db, 0.0);
+        assert_eq!((level(&h).volume_db, level(&h).muted), (-20.0, false));
+        // Below the card's floor: the card's −64 dB and the digital rest.
+        apply(&mut h, &|c| c.volume.volume_db = -100.0);
+        assert_eq!(h.state.shared_volume_target().volume_db, -36.0);
+        assert_eq!(level(&h).volume_db, -100.0);
+        // The switch carries the mute here; the followers mute digitally.
+        apply(&mut h, &|c| {
+            c.volume.volume_db = -20.0;
+            c.volume.muted = true;
+            c.volume.balance_db = -3.0;
+        });
+        let l = level(&h);
+        assert!(l.muted && !l.hardware_mute && !l.hardware_volume, "{l:?}");
+        assert_eq!((l.volume_db, l.balance_db), (-20.0, -3.0));
+        // Hybrid: the card at its level, the rest digital.
+        apply(&mut h, &|c| {
+            c.volume.muted = false;
+            c.volume.balance_db = 0.0;
+            c.volume.mode = VolumeMode::Hybrid;
+            c.volume.hardware_db = Some(-10.0);
+            c.volume.volume_db = -25.0;
+        });
+        assert_eq!(h.state.shared_volume_target().volume_db, -15.0);
+        // The card's raise waits for the audio buffered at the old digital
+        // gain: the master plays −20 − 15 dB until then, and so do they.
+        assert_eq!(level(&h).volume_db, -35.0);
+        let later = Instant::now() + Duration::from_secs(10);
+        assert!(!h.state.run_pending_hw(later, &h.mirror, None));
+        assert_eq!(level(&h).volume_db, -25.0);
+        // Software with a fixed card level: the volume shown (the card's
+        // fixed level is not part of it, nor of the followers').
+        apply(&mut h, &|c| {
+            c.volume.mode = VolumeMode::Software;
+            c.volume.hardware_db = Some(-6.0);
+            c.volume.volume_db = -18.0;
+        });
+        assert!(!h.state.run_pending_hw(later, &h.mirror, None));
+        assert_eq!(level(&h).volume_db, -18.0);
+        // The ceiling holds for them too.
+        apply(&mut h, &|c| c.volume.max_volume_db = Some(-30.0));
+        assert_eq!(level(&h).volume_db, -30.0);
     }
 
     #[test]

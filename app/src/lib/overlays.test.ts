@@ -37,7 +37,7 @@ describe("parseOverlayText", () => {
 
   it("reads REW text with tabs, comments and a third (phase) column", () => {
     const text = [
-      "* Measurement: Kali IN-5",
+      "* Measurement: Desk monitor",
       "* Frequency(Hz)\tSPL(dB)\tPhase(degrees)",
       ...rows().map((r, i) => r.replace(" ", "\t") + `\t${i * 2}`),
     ].join("\r\n");
@@ -348,9 +348,9 @@ describe("runtime model", () => {
   });
 
   it("makes names unique", () => {
-    expect(uniqueName("Kali", [])).toBe("Kali");
-    expect(uniqueName("Kali", ["Kali"])).toBe("Kali (2)");
-    expect(uniqueName("Kali", ["Kali", "Kali (2)"])).toBe("Kali (3)");
+    expect(uniqueName("Desk", [])).toBe("Desk");
+    expect(uniqueName("Desk", ["Desk"])).toBe("Desk (2)");
+    expect(uniqueName("Desk", ["Desk", "Desk (2)"])).toBe("Desk (3)");
   });
 
   it("parses a reference frequency", () => {

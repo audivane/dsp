@@ -41,7 +41,7 @@ export interface FineSliderProps {
   onReset?: () => void;
   /** When the slider goes away mid-gesture (a wheel burst still waiting
    *  for its pause, a held drag), commit the gesture's last value instead
-   *  of dropping it, so the owner's draft ends. Off for sliders whose
+   *  of dropping it, so the caller's draft ends. Off for sliders whose
    *  gestures must not outlive them (the top bar's, keyed by connection). */
   commitOnUnmount?: boolean;
   title?: string;

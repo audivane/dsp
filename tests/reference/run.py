@@ -6,6 +6,7 @@ independent implementations written here:
 
   eq_response   EQ magnitude/phase vs scipy sosfreqz of RBJ coefficients
   convolution   FIR convolution vs scipy.signal.fftconvolve
+  matrix        FIR matrix (2->1 sum, 2x2 with cross terms) vs fftconvolve sums
   upsampling    integer-ratio interpolation vs scipy.signal.upfirdn
   bypass        16/24-bit passthrough is bit-identical on disk
   levelmatch    analytic A-weighted offset of a +6 dB profile is -6 dB
@@ -74,7 +75,7 @@ def parse_float_field(text: str, key: str) -> float:
 
 
 def parse_int_field(text: str, key: str) -> int:
-    match = re.search(rf"{re.escape(key)}\s+(\d+)", text)
+    match = re.search(rf"{re.escape(key)}:?\s+(\d+)", text)
     if not match:
         raise AssertionError(f"missing {key!r} in:\n{text}")
     return int(match.group(1))
@@ -294,7 +295,7 @@ def check_convolution(ctx: Ctx) -> None:
     if error > 1e-6:
         raise AssertionError(
             f"convolution error {error:.3e} > 1e-6; reported latency: "
-            f"{proc.stdout.splitlines()[2] if len(proc.stdout.splitlines()) > 2 else '?'}"
+            f"{next((l for l in proc.stdout.splitlines() if l.startswith('latency:')), '?')}"
         )
     # Stereo, one IR per channel.
     rng = np.random.default_rng(99)
@@ -325,6 +326,63 @@ def check_convolution(ctx: Ctx) -> None:
         print(f"    channel {channel}: max |error| = {error:.3e}")
         if error > 1e-6:
             raise AssertionError(f"stereo convolution channel {channel} error {error:.3e} > 1e-6")
+
+
+def check_matrix(ctx: Ctx) -> None:
+    """FIR matrix: out_j = sum_i F_ji * x_i, against numpy sums of fftconvolve."""
+    rng = np.random.default_rng(7)
+    rate = 48_000
+    frames = 6000
+    x = (rng.standard_normal((frames, 2)) * 0.1).astype(np.float32)
+    wavfile.write(ctx.path("mx_in.wav"), rate, x)
+
+    def ir(taps: int, decay: float) -> np.ndarray:
+        return (rng.standard_normal(taps) * np.exp(-np.arange(taps) / decay) * 0.08).astype(
+            np.float32
+        )
+
+    def conv(sig: np.ndarray, h: np.ndarray) -> np.ndarray:
+        return fftconvolve(sig.astype(np.float64), h.astype(np.float64))[:frames]
+
+    def process(out: str, *conv_args: str) -> np.ndarray:
+        args = []
+        for a in conv_args:
+            args += ["--conv", a]
+        ctx.run(
+            "process", "mx_in.wav", out, *args,
+            "--format", "f32", "--dither", "none", "--trim-latency", "--block", "301",
+        )
+        got_rate, got = read_wav_float(ctx.path(out))
+        assert got_rate == rate, f"output rate {got_rate}"
+        assert got.shape == x.shape, f"shape {got.shape}"
+        return got
+
+    def compare(what: str, got: np.ndarray, want: np.ndarray) -> None:
+        error = np.max(np.abs(got - want))
+        print(f"    {what}: max |error| = {error:.3e}")
+        if error > 1e-6:
+            raise AssertionError(f"{what} error {error:.3e} > 1e-6")
+
+    # 2 -> 1: a sub feed from one stereo WAV (channel 0 for L, 1 for R).
+    sub = np.stack([ir(400, 120.0), ir(400, 90.0)], axis=1)
+    wavfile.write(ctx.path("mx_sub.wav"), rate, sub)
+    got = process("mx_sum.wav", "0:0:0=mx_sub.wav", "1:0:1=mx_sub.wav")
+    compare("2->1 sum", got[:, 0], conv(x[:, 0], sub[:, 0]) + conv(x[:, 1], sub[:, 1]))
+    if np.any(got[:, 1] != 0.0):
+        raise AssertionError("the output with no entry is not silent")
+
+    # Full 2x2 with cross terms, then a stereo IR in series.
+    f = {k: ir(200 + 60 * n, 70.0) for n, k in enumerate(["00", "01", "10", "11"])}
+    for k, h in f.items():
+        wavfile.write(ctx.path(f"mx_{k}.wav"), rate, h)
+    after = np.stack([ir(110, 30.0), ir(110, 40.0)], axis=1)
+    wavfile.write(ctx.path("mx_after.wav"), rate, after)
+    # Entry name "ji": from input i to output j.
+    entries = [f"{k[1]}:{k[0]}=mx_{k}.wav" for k in f]
+    got = process("mx_full.wav", *entries, "mx_after.wav")
+    for j in range(2):
+        y = conv(x[:, 0], f[f"{j}0"]) + conv(x[:, 1], f[f"{j}1"])
+        compare(f"2x2 then stereo IR, output {j}", got[:, j], conv(y, after[:, j]))
 
 
 def check_upsampling(ctx: Ctx) -> None:
@@ -457,6 +515,7 @@ def check_levelmatch(ctx: Ctx) -> None:
 CHECKS = [
     ("eq_response", check_eq_response),
     ("convolution", check_convolution),
+    ("matrix", check_matrix),
     ("upsampling", check_upsampling),
     ("bypass", check_bypass),
     ("levelmatch", check_levelmatch),

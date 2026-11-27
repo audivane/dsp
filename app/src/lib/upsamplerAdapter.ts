@@ -142,6 +142,7 @@ export function fromUpsamplerConfig(u: UpsamplerConfig): LegacyUpsampler {
       base.cutoff_mode = "band";
       base.band = {
         passband_end: d.cutoff.passband_end,
+        passband_end_hz: d.cutoff.passband_end_hz,
         stopband_start: d.cutoff.stopband_start,
         attenuation_db: d.cutoff.attenuation_db,
       };

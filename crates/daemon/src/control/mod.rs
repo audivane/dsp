@@ -6,11 +6,16 @@
 
 pub mod ab_measure;
 pub mod ab_side;
+pub mod calibration;
 pub mod config;
+pub mod conv_response;
 pub mod cpu_budget;
 pub mod daemon;
+pub mod device_identity;
+pub mod follower_chain;
 pub mod graph;
 pub mod ipc;
+pub mod measure;
 pub mod mpris;
 pub mod overload;
 pub mod passthrough;

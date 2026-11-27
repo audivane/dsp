@@ -20,8 +20,11 @@
 //! - **Backstop** (`SIGXCPU`): the soft limit is half the hard one
 //!   ([`RTTIME_SOFT_FRACTION`]). The signal reaches the thread that ran
 //!   over, or another one when that thread blocks it, so the handler
-//!   demotes the thread it runs on when that one is real-time, and the
-//!   registered audio thread ([`register_audio_thread`]) by its id. It
+//!   demotes the thread it runs on when that one is real-time, the
+//!   registered audio thread ([`register_audio_thread`]) by its id, and
+//!   every registered helper thread ([`register_helper_thread`]: real-time
+//!   threads that work for the audio thread, such as the channel workers)
+//!   by its id. It
 //!   counts the signal ([`overload_signals`]) and each accepted demotion of
 //!   the audio thread ([`audio_thread_demotions`]); the audio loop then
 //!   makes sure it is demoted ([`demote_current_thread`]) and restores the
@@ -67,6 +70,13 @@ static AUDIO_DEMOTIONS: AtomicU64 = AtomicU64::new(0);
 /// Demotions of the real-time audio thread by the handler that the kernel
 /// refused.
 static AUDIO_DEMOTION_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Most helper threads the handler demotes by id.
+pub const MAX_HELPER_THREADS: usize = 8;
+/// Registered helper threads ([`register_helper_thread`]); 0: a free entry.
+static HELPER_TIDS: [AtomicI32; MAX_HELPER_THREADS] =
+    [const { AtomicI32::new(0) }; MAX_HELPER_THREADS];
+/// Real-time to normal transitions of helper threads made by the handler.
+static HELPER_DEMOTIONS: AtomicU64 = AtomicU64::new(0);
 /// The hard `RLIMIT_RTTIME` set by the last promotion, in microseconds
 /// (0: none), for [`restore_rttime_limits`].
 static RTTIME_HARD_USEC: AtomicU64 = AtomicU64::new(0);
@@ -160,12 +170,13 @@ pub fn demote_thread(tid: i32) -> Demotion {
 }
 
 /// The `SIGXCPU` handler. The thread it runs on is the one that ran over
-/// unless that one blocks the signal, so it demotes the calling thread when
-/// it is real-time and the registered audio thread by its id. It counts
-/// three things apart: the signal, each real-time to normal transition of
-/// the audio thread, and each demotion of it the kernel refused (a signal
-/// that finds the audio thread at normal priority already is neither).
-/// Only system calls and atomics.
+/// unless that one blocks the signal, so it demotes the registered audio
+/// thread and every registered helper by id, then the calling thread when
+/// it is still real-time. It counts four things apart: the signal, each
+/// real-time to normal transition of the audio thread, each demotion of it
+/// the kernel refused (a signal that finds the audio thread at normal
+/// priority already is neither), and each helper's transition. Only system
+/// calls and atomics.
 extern "C" fn on_sigxcpu(_signal: libc::c_int) {
     // SAFETY: errno is thread-local; saved and restored around the calls.
     unsafe {
@@ -173,6 +184,12 @@ extern "C" fn on_sigxcpu(_signal: libc::c_int) {
         let saved = *errno;
         let tid = libc::syscall(libc::SYS_gettid) as i32;
         let audio = AUDIO_TID.load(Ordering::Acquire);
+        for helper in &HELPER_TIDS {
+            let id = helper.load(Ordering::Acquire);
+            if id > 0 && id != audio && demote_thread(id) == Demotion::Demoted {
+                HELPER_DEMOTIONS.fetch_add(1, Ordering::Release);
+            }
+        }
         if audio != tid && is_realtime_raw(0) {
             demote_raw(0);
         }
@@ -239,6 +256,42 @@ pub fn register_audio_thread() -> i32 {
 /// before the thread ends, so a later signal does not demote a reused id).
 pub fn unregister_audio_thread(tid: i32) {
     let _ = AUDIO_TID.compare_exchange(tid, 0, Ordering::AcqRel, Ordering::Relaxed);
+}
+
+/// The registered audio thread's id (0: none).
+pub fn audio_thread_tid() -> i32 {
+    AUDIO_TID.load(Ordering::Acquire)
+}
+
+/// Register the calling thread as a helper of the audio thread: a
+/// real-time thread the `SIGXCPU` handler demotes by id with the audio
+/// thread, whichever thread the signal reaches (an overloaded helper that
+/// blocks it, or that another thread beats to it, would otherwise stay
+/// real-time until the hard limit kills the process). Returns its id, or
+/// `None` when all [`MAX_HELPER_THREADS`] entries are taken.
+pub fn register_helper_thread() -> Option<i32> {
+    let tid = current_tid();
+    HELPER_TIDS
+        .iter()
+        .find(|e| {
+            e.compare_exchange(0, tid, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        })
+        .map(|_| tid)
+}
+
+/// Forget helper `tid` (call before the thread ends, so a later signal does
+/// not demote a reused id).
+pub fn unregister_helper_thread(tid: i32) {
+    for e in &HELPER_TIDS {
+        let _ = e.compare_exchange(tid, 0, Ordering::AcqRel, Ordering::Relaxed);
+    }
+}
+
+/// Real-time to normal transitions of registered helper threads made by
+/// the `SIGXCPU` handler, since the process started.
+pub fn helper_thread_demotions() -> u64 {
+    HELPER_DEMOTIONS.load(Ordering::Acquire)
 }
 
 /// Real-time to normal transitions of the registered audio thread made by

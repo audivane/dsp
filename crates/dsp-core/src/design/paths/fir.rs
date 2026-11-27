@@ -42,6 +42,18 @@ pub(crate) enum Window {
     HannPeriodic,
     /// Not a windowed sinc: the Lanczos kernel with `a` lobes.
     Lanczos { a: usize },
+    /// Not a windowed sinc: an optimal low-pass ([`super::optimal`]) with
+    /// its band edges as fractions of the build grid's lower Nyquist (the
+    /// sinc cutoff's scale), built by the general path only.
+    Optimal {
+        method: super::optimal::Method,
+        pass: f64,
+        stop: f64,
+        /// Retry a length the exchange does not level 2 and 4 taps shorter
+        /// (always, but the automatic search's bracket, which tries other
+        /// lengths first).
+        retry: bool,
+    },
     /// Any other design window and sampling ([`windows::sample`]): the new
     /// combinations. Made by [`Window::other`] only.
     Other(crate::design::Window),
@@ -88,6 +100,7 @@ pub(crate) fn window(w: Window, n: usize) -> Vec<f64> {
         // `Window::other` checked that it is sampled.
         Window::Other(w) => windows::sample(w, n).unwrap_or_else(|| vec![1.0; n]),
         Window::Lanczos { .. } => unreachable!("Lanczos has no window"),
+        Window::Optimal { .. } => unreachable!("an optimal design has no window"),
     }
 }
 
@@ -102,6 +115,7 @@ pub(crate) fn prototype_len(r: &Recipe, n: usize, ratio: usize) -> Vec<f64> {
     let centre = (n / 2) as i64;
     match r.window {
         Window::Lanczos { a } => lanczos(n, centre, a),
+        Window::Optimal { .. } => unreachable!("the general path builds optimal designs"),
         w => {
             // The window buffer becomes the kernel, so the design holds a
             // single full-length copy.

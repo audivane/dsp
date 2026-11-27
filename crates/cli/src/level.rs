@@ -1,4 +1,4 @@
-//! `avdsp levelmatch` — analytic and measured A/B level offsets.
+//! `avdsp levelmatch`: analytic and measured A/B level offsets.
 
 use crate::LevelMatchArgs;
 use crate::wavio;

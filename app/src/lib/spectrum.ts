@@ -62,10 +62,10 @@ export function saveSpectrumPrefs(prefs: SpectrumPrefs): void {
  * partly inside count by their overlap). Averaging power keeps broadband
  * levels where they are and can only lower a narrow peak, never raise it.
  */
-export function smoothFractionalOctave(bins: readonly number[], binsPerOctave: number, fraction: number): number[] {
+export function smoothFractionalOctave(bins: readonly number[], binsPerOctave: number, fraction: number, floorDb = SPEC_DB_MIN): number[] {
   const n = bins.length;
   const width = binsPerOctave / Math.max(1, fraction);
-  if (n === 0 || width <= 1 + 1e-9) return bins.map((v) => (Number.isFinite(v) ? v : SPEC_DB_MIN));
+  if (n === 0 || width <= 1 + 1e-9) return bins.map((v) => (Number.isFinite(v) ? v : floorDb));
   const half = width / 2;
   const reach = Math.ceil(half + 0.5);
   const weights: number[] = [];
@@ -84,7 +84,7 @@ export function smoothFractionalOctave(bins: readonly number[], binsPerOctave: n
       sum += pow[j] * w;
       wsum += w;
     }
-    out[i] = wsum > 0 && sum > 0 ? 10 * Math.log10(sum / wsum) : SPEC_DB_MIN;
+    out[i] = wsum > 0 && sum > 0 ? 10 * Math.log10(sum / wsum) : floorDb;
   }
   return out;
 }
@@ -164,13 +164,14 @@ export function smoothSpectrumBins(
   floorDb = SPEC_DB_MIN,
   attackS = SPEC_ATTACK_S,
   releaseS = SPEC_RELEASE_S,
+  ceilDb = SPEC_DB_MAX,
 ): boolean {
   const n = Math.min(current.length, target.length);
   const dt = Math.max(0, dtSec);
   let active = false;
   for (let i = 0; i < n; i++) {
     const raw = target[i];
-    const tgt = Math.max(floorDb, Math.min(SPEC_DB_MAX, Number.isFinite(raw) ? raw : floorDb));
+    const tgt = Math.max(floorDb, Math.min(ceilDb, Number.isFinite(raw) ? raw : floorDb));
     const cur = current[i];
     const tau = tgt > cur ? attackS : releaseS;
     const alpha = dt <= 0 ? 0 : tau <= 0 ? 1 : 1 - Math.exp(-dt / tau);
@@ -226,13 +227,14 @@ export function updatePeakHoldBins(
   floorDb = SPEC_DB_MIN,
   holdMs = SPEC_PEAK_HOLD_MS,
   fallDbPerS = SPEC_PEAK_FALL_DB_PER_S,
+  ceilDb = SPEC_DB_MAX,
 ): boolean {
   const n = Math.min(peaks.length, holdUntil.length, target.length);
   const dt = Math.max(0, dtSec);
   let active = false;
   for (let i = 0; i < n; i++) {
     const raw = target[i];
-    const tgt = Math.max(floorDb, Math.min(SPEC_DB_MAX, Number.isFinite(raw) ? raw : floorDb));
+    const tgt = Math.max(floorDb, Math.min(ceilDb, Number.isFinite(raw) ? raw : floorDb));
     if (tgt >= peaks[i]) {
       peaks[i] = tgt;
       holdUntil[i] = nowMs + holdMs;
@@ -270,10 +272,13 @@ export function stepSpectrumAnimation(opts: {
   nowMs: number;
   dtSec: number;
   floorDb?: number;
+  /** The highest level a target is taken at (default 0 dBFS). */
+  ceilDb?: number;
   staleMs?: number;
   fadeMs?: number;
 }): SpectrumAnimStep {
   const floorDb = opts.floorDb ?? SPEC_DB_MIN;
+  const ceilDb = opts.ceilDb ?? SPEC_DB_MAX;
   const staleMs = opts.staleMs ?? SPEC_STALE_MS;
   const fadeMs = opts.fadeMs ?? SPEC_STALE_FADE_MS;
   const stale = opts.frameAgeMs > staleMs;
@@ -308,13 +313,13 @@ export function stepSpectrumAnimation(opts: {
 
   let moving = opts.newFrame;
   if (usePre) {
-    if (smoothSpectrumBins(opts.smoothPre, opts.preTarget, dt, floorDb)) moving = true;
+    if (smoothSpectrumBins(opts.smoothPre, opts.preTarget, dt, floorDb, SPEC_ATTACK_S, SPEC_RELEASE_S, ceilDb)) moving = true;
   }
   if (usePost) {
-    if (smoothSpectrumBins(opts.smoothPost, opts.postTarget, dt, floorDb)) moving = true;
+    if (smoothSpectrumBins(opts.smoothPost, opts.postTarget, dt, floorDb, SPEC_ATTACK_S, SPEC_RELEASE_S, ceilDb)) moving = true;
   }
   if (opts.peakHold && primaryTarget.length >= 2) {
-    if (updatePeakHoldBins(opts.peakVals, opts.peakUntil, primaryTarget, opts.nowMs, dt, floorDb)) moving = true;
+    if (updatePeakHoldBins(opts.peakVals, opts.peakUntil, primaryTarget, opts.nowMs, dt, floorDb, SPEC_PEAK_HOLD_MS, SPEC_PEAK_FALL_DB_PER_S, ceilDb)) moving = true;
   }
   // Keep animating while frame is within the stale threshold so stale decay starts promptly at > staleMs.
   return {
@@ -323,4 +328,146 @@ export function stepSpectrumAnimation(opts: {
     peakAlpha: 1,
     clearFrame: false,
   };
+}
+
+/**
+ * One analyser's animation state: the displayed (ballistic) levels of its
+ * two traces and the peak hold, stepped once per drawn frame toward the
+ * latest targets. The PEQ analyser and the Harmonics page's live spectrum
+ * each keep one.
+ */
+export class SpectrumAnimator {
+  pre = new Float64Array(0);
+  post = new Float64Array(0);
+  peak = new Float64Array(0);
+  peakUntil = new Float64Array(0);
+  private lastTickMs = 0;
+  private lastKey: unknown = undefined;
+
+  reset(): void {
+    this.pre = new Float64Array(0);
+    this.post = new Float64Array(0);
+    this.peak = new Float64Array(0);
+    this.peakUntil = new Float64Array(0);
+    this.lastTickMs = 0;
+    this.lastKey = undefined;
+  }
+
+  /** True once a step has run since the last reset (the buffers hold levels). */
+  get started(): boolean {
+    return this.lastKey !== undefined;
+  }
+
+  /**
+   * Advance to `nowMs`. `frameKey` changes with each new frame (its targets),
+   * `frameAtMs` is when that frame arrived. New buffers start at the floor.
+   */
+  step(opts: {
+    frameKey: unknown;
+    frameAtMs: number;
+    nowMs: number;
+    tap: SpectrumTap;
+    peakHold: boolean;
+    preTarget: readonly number[];
+    postTarget: readonly number[];
+    floorDb?: number;
+    ceilDb?: number;
+    staleMs?: number;
+  }): SpectrumAnimStep {
+    const floor = opts.floorDb ?? SPEC_DB_MIN;
+    const peakLen = opts.tap === "pre" ? opts.preTarget.length : opts.postTarget.length;
+    if (this.pre.length !== opts.preTarget.length) this.pre = new Float64Array(opts.preTarget.length).fill(floor);
+    if (this.post.length !== opts.postTarget.length) this.post = new Float64Array(opts.postTarget.length).fill(floor);
+    if (this.peak.length !== peakLen) {
+      this.peak = new Float64Array(peakLen).fill(floor);
+      this.peakUntil = new Float64Array(peakLen).fill(0);
+    }
+    const dt = this.lastTickMs > 0 ? Math.min(0.1, Math.max(0, (opts.nowMs - this.lastTickMs) / 1000)) : 1 / 60;
+    this.lastTickMs = opts.nowMs;
+    const newFrame = opts.frameKey !== this.lastKey;
+    this.lastKey = opts.frameKey;
+    return stepSpectrumAnimation({
+      frameAgeMs: Math.max(0, opts.nowMs - opts.frameAtMs),
+      newFrame,
+      tap: opts.tap,
+      peakHold: opts.peakHold,
+      preTarget: opts.preTarget,
+      postTarget: opts.postTarget,
+      smoothPre: this.pre,
+      smoothPost: this.post,
+      peakVals: this.peak,
+      peakUntil: this.peakUntil,
+      nowMs: opts.nowMs,
+      dtSec: dt,
+      floorDb: opts.floorDb,
+      ceilDb: opts.ceilDb,
+      staleMs: opts.staleMs,
+    });
+  }
+}
+
+/**
+ * The points of a log-binned trace on a plot: bin `i` at its centre frequency,
+ * up to one bin past `xEnd` (where a clip cuts it). The last bin stops short of
+ * the tap's Nyquist (whole bins and a guard); with `topHz` its level carries on
+ * to it, so the trace meets an "above Nyquist" shading, only across a gap under
+ * two bins.
+ */
+export function spectrumCurvePoints(
+  bins: ArrayLike<number>,
+  fMinHz: number,
+  binsPerOctave: number,
+  xOf: (f: number) => number,
+  yOf: (db: number) => number,
+  xEnd: number,
+  topHz?: number,
+): { xs: number[]; ys: number[] } {
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (let i = 0; i < bins.length; i++) {
+    const x = xOf(spectrumBinFreq(i, fMinHz, binsPerOctave));
+    xs.push(x);
+    ys.push(yOf(bins[i]));
+    if (x > xEnd) break;
+  }
+  const last = bins.length - 1;
+  if (topHz !== undefined && xs.length === bins.length && last >= 0) {
+    const fLast = spectrumBinFreq(last, fMinHz, binsPerOctave);
+    if (topHz > fLast && topHz / fLast < Math.pow(2, 2 / binsPerOctave)) {
+      xs.push(xOf(topHz));
+      ys.push(ys[ys.length - 1]);
+    }
+  }
+  return { xs, ys };
+}
+
+/**
+ * A smooth curve through the points onto `ctx`'s path (a monotone cubic: no
+ * overshoot, so the drawing never shows a peak the data does not have).
+ * Starts with a moveTo unless `join`, which continues the path with a lineTo.
+ */
+export function traceMonotone(ctx: Pick<CanvasRenderingContext2D, "moveTo" | "lineTo" | "bezierCurveTo">, xs: readonly number[], ys: readonly number[], join = false): void {
+  const n = Math.min(xs.length, ys.length);
+  if (n === 0) return;
+  const m = monotoneTangents(xs, ys);
+  if (join) ctx.lineTo(xs[0], ys[0]);
+  else ctx.moveTo(xs[0], ys[0]);
+  for (let i = 0; i < n - 1; i++) {
+    const h = (xs[i + 1] - xs[i]) / 3;
+    ctx.bezierCurveTo(xs[i] + h, ys[i] + m[i] * h, xs[i + 1] - h, ys[i + 1] - m[i + 1] * h, xs[i + 1], ys[i + 1]);
+  }
+}
+
+/** The same curve as an SVG path's commands ("M… C…", or "L… C…" with `join`). */
+export function monotonePathD(xs: readonly number[], ys: readonly number[], join = false): string {
+  const n = Math.min(xs.length, ys.length);
+  if (n === 0) return "";
+  const m = monotoneTangents(xs, ys);
+  const f = (v: number) => v.toFixed(1);
+  let d = `${join ? "L" : "M"}${f(xs[0])},${f(ys[0])}`;
+  for (let i = 0; i < n - 1; i++) {
+    const h = (xs[i + 1] - xs[i]) / 3;
+    d += `C${f(xs[i] + h)},${f(ys[i] + m[i] * h)} ${f(xs[i + 1] - h)},${f(ys[i + 1] - m[i + 1] * h)} ${f(xs[i + 1])},${f(ys[i + 1])}`;
+  }
+  return d;
 }

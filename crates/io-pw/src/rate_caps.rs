@@ -479,6 +479,7 @@ mod tests {
                 .rev()
                 .filter(|f| rows.iter().any(|r| r.1.contains(f)))
                 .collect(),
+            modes: Vec::new(),
         }
     }
 
@@ -628,6 +629,7 @@ mod tests {
             rate_min: 48_000,
             rate_max: 48_000,
             formats: vec![SampleFormat::S16],
+            modes: Vec::new(),
         };
         let err = effective_rate_policy(
             &RatePolicy::default(),
@@ -637,11 +639,8 @@ mod tests {
             ALLOWED_RATES,
         )
         .unwrap_err();
-        assert!(err.contains("needs 2 channels; device supports 1"), "{err}");
-        assert!(
-            err.contains("channels 2") && err.contains("channels 1"),
-            "{err}"
-        );
+        assert!(err.contains("is mono (1 channel)"), "{err}");
+        assert!(err.contains("at least 2"), "{err}");
         assert!(err.contains("rate 48000 Hz; formats S16"), "{err}");
         assert!(!err.contains("sample rates"), "{err}");
     }
@@ -658,6 +657,7 @@ mod tests {
             rate_min: 32_000,
             rate_max: 32_000,
             formats: vec![SampleFormat::S16],
+            modes: Vec::new(),
         };
         let err = effective_rate_policy(
             &RatePolicy::default(),

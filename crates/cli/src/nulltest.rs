@@ -1,4 +1,4 @@
-//! `avdsp nulltest` — sample-by-sample comparison of two WAV files.
+//! `avdsp nulltest`: sample-by-sample comparison of two WAV files.
 
 use crate::NullTestArgs;
 use crate::wavio::{self, WavData};

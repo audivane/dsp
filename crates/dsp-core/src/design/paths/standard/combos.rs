@@ -114,19 +114,25 @@ fn cepstral_target(phase: Phase) -> Option<Option<Target>> {
     }
 }
 
-/// What `k` promises at the resolved design `r`.
-fn claim_of(k: &KernelDesign, r: &UpsamplerDesign) -> Result<Option<Claim>, DesignError> {
+/// What `k` promises at the resolved design `r` (`band_rate`: the lower of
+/// the input and output rates, [`crate::design::band_rate`], where a band's
+/// absolute passband end resolves to a fraction).
+fn claim_of(
+    k: &KernelDesign,
+    r: &UpsamplerDesign,
+    band_rate: u32,
+) -> Result<Option<Claim>, DesignError> {
     let Shape::WindowedSinc { length, cutoff, .. } = &k.shape else {
         return Ok(None);
     };
     Ok(match (length, cutoff) {
         (Length::Band, Cutoff::Band(b)) => Some(Claim {
-            pass: b.passband_end,
+            pass: crate::design::band_passband_end(b, band_rate),
             stop: b.stopband_start,
             db: b.attenuation_db,
         }),
         (Length::Auto(FilterErrorBudget::Db(a)), Cutoff::Band(b)) => Some(Claim {
-            pass: b.passband_end,
+            pass: crate::design::band_passband_end(b, band_rate),
             stop: b.stopband_start,
             db: *a,
         }),
@@ -308,7 +314,11 @@ fn plan(k: &KernelDesign, r: &UpsamplerDesign, cx: &BuildContext, exact: bool) -
             _ => budget::reflect_workspace(n),
         },
     };
-    if claim_of(k, r).ok().flatten().is_some() {
+    if claim_of(k, r, crate::design::band_rate(cx.source_rate, cx.ratio))
+        .ok()
+        .flatten()
+        .is_some()
+    {
         workspace = workspace.max(claim::workspace(n * growth));
     }
     let priced = match cepstral_target(k.phase) {
@@ -433,7 +443,7 @@ pub(crate) fn prepare(
     let t = twin(k);
     let (_, mut r) = super::searched(&FilterDesign::Kernel(t.clone()), &t, cx)?;
     budgets(k, r.taps, cx)?;
-    let claim = claim_of(k, &r)?;
+    let claim = claim_of(k, &r, crate::design::band_rate(cx.source_rate, cx.ratio))?;
     let grid = cx.grid();
     let auto = matches!(
         k.shape,
@@ -579,6 +589,7 @@ mod tests {
             band: BandSpec {
                 passband_end: 0.9,
                 stopband_start: 1.0,
+                passband_end_hz: None,
                 attenuation_db: a,
             },
             auto_taps: auto.then_some(FilterErrorBudget::Db(a)),

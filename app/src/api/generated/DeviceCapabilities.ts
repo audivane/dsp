@@ -10,7 +10,11 @@ import type { SampleFormat } from "./SampleFormat";
  */
 export type DeviceCapabilities = { device: string, 
 /**
- * Channel count the probe used.
+ * Channel count the probe used: the one the engine opens the device
+ * at (the smallest it takes of at least 2, or more for
+ * `output_channels` reaching past them). The engine's two channels
+ * land on `output_channels` (default the first two), the others get
+ * exact zeros.
  */
 channels: number, 
 /**

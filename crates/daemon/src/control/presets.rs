@@ -1,12 +1,18 @@
-//! Presets: chain A's signal path, stored by the daemon.
+//! Presets: parts of chain A's signal path, stored by the daemon.
 //!
-//! One JSON file per preset in `presets/` next to `config.json`
+//! One JSON file per preset next to `config.json`
 //! (`$XDG_CONFIG_HOME/audivane-dsp/presets/`, or the directory of a
-//! `--config` override):
+//! `--config` override). Global presets sit in `presets/`, each page's own in
+//! `presets/<part>/` (`presets/eq/`, `presets/upsampling/`, …):
 //!
 //! ```json
-//! { "version": 1, "name": "HD 650", "chain": { "eq": { … }, … } }
+//! { "version": 1, "name": "HD 650", "parts": ["eq", "upsampling"], "chain": { "eq": { … }, "upsampler": { … } } }
+//! { "version": 1, "name": "HD 650", "part": "eq", "chain": { "eq": { … } } }
 //! ```
+//!
+//! A file holds only the chain keys of its parts; a global preset without
+//! `parts` holds every part. The directory decides the page: a file's own
+//! `part` is overridden by it.
 //!
 //! The file name is a safe slug of the name (lowercase ascii, digits, `-`);
 //! the authoritative name is the `name` field, so two names that slug the same
@@ -20,7 +26,7 @@
 
 use crate::control::config::{self, ConfigStore, write_atomic};
 use audivane_protocol::ChainConfig;
-use audivane_protocol::ipc::{Preset, PresetInfo};
+use audivane_protocol::ipc::{Preset, PresetInfo, PresetPart};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -120,15 +126,54 @@ pub fn chain_stats(chain: &ChainConfig) -> (u32, u32) {
     (bands, convolution)
 }
 
-/// A preset directory.
+/// The chain JSON of `preset` reduced to the keys of the parts it holds.
+fn stripped_chain(preset: &Preset) -> io::Result<serde_json::Value> {
+    use serde_json::{Map, Value};
+    let full = serde_json::to_value(&preset.chain)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let Value::Object(full) = full else {
+        return Ok(full);
+    };
+    let mut out = Map::new();
+    for part in preset.covers() {
+        for (key, field) in part.json_paths() {
+            let Some(value) = full.get(*key) else {
+                continue;
+            };
+            match field {
+                None => {
+                    out.insert((*key).to_string(), value.clone());
+                }
+                Some(field) => {
+                    if let Some(inner) = value.get(*field) {
+                        let entry = out
+                            .entry((*key).to_string())
+                            .or_insert_with(|| Value::Object(Map::new()));
+                        if let Value::Object(entry) = entry {
+                            entry.insert((*field).to_string(), inner.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+/// A preset directory: the global presets (`part: None`) or one page's.
 #[derive(Clone, Debug)]
 pub struct PresetStore {
     dir: PathBuf,
+    part: Option<PresetPart>,
 }
 
 impl PresetStore {
+    /// The global presets in `dir`.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            part: None,
+        }
     }
 
     /// `presets/` in the directory that holds `config.json`, so `--config`
@@ -138,8 +183,30 @@ impl PresetStore {
         Self::new(parent.join("presets"))
     }
 
+    /// The store for `part`'s presets (`<dir>/<part>/`), or the global one.
+    /// Call it on the global store.
+    pub fn scoped(&self, part: Option<PresetPart>) -> Self {
+        match part {
+            None => self.clone(),
+            Some(part) => Self {
+                dir: self.dir.join(part.name()),
+                part: Some(part),
+            },
+        }
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Every preset: the global ones, then each part's, each sorted by name.
+    /// Call it on the global store.
+    pub fn list_all(&self) -> Vec<PresetInfo> {
+        let mut all = self.list();
+        for part in PresetPart::ALL {
+            all.extend(self.scoped(Some(part)).list());
+        }
+        all
     }
 
     /// Every readable preset, sorted by name. Unreadable files are logged and
@@ -167,11 +234,18 @@ impl PresetStore {
         let name = normalize_name(&preset.name).map_err(PresetError::InvalidName)?;
         let mut preset = preset.clone();
         preset.name = name.clone();
+        preset.part = self.part;
+        if self.part.is_some() {
+            preset.parts = None;
+        }
         let path = match self.find_path(&name) {
             Some(path) => path,
             None => self.free_path(&name),
         };
-        let mut json = serde_json::to_vec_pretty(&preset)
+        let mut value = serde_json::to_value(&preset)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        value["chain"] = stripped_chain(&preset)?;
+        let mut json = serde_json::to_vec_pretty(&value)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         json.push(b'\n');
         write_atomic(&path, &json)?;
@@ -229,10 +303,33 @@ impl PresetStore {
             match fs::read_to_string(&path)
                 .map_err(|err| format!("cannot read {}: {err}", path.display()))
                 .and_then(|text| {
-                    serde_json::from_str::<Preset>(&text)
-                        .map_err(|err| format!("{} is not a preset: {err}", path.display()))
+                    let mut value: serde_json::Value = serde_json::from_str(&text)
+                        .map_err(|err| format!("{} is not a preset: {err}", path.display()))?;
+                    let migrated = config::migrate_safety_modes(&mut value);
+                    let preset = serde_json::from_value::<Preset>(value.clone())
+                        .map_err(|err| format!("{} is not a preset: {err}", path.display()))?;
+                    if migrated {
+                        // Written back once, best effort (it migrates again
+                        // on the next read otherwise).
+                        let written = serde_json::to_vec_pretty(&value)
+                            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+                            .and_then(|mut json| {
+                                json.push(b'\n');
+                                write_atomic(&path, &json)
+                            });
+                        match written {
+                            Ok(()) => log::info!("preset {} migrated and saved", path.display()),
+                            Err(err) => log::warn!(
+                                "preset {} migrated but not saved ({err})",
+                                path.display()
+                            ),
+                        }
+                    }
+                    Ok(preset)
                 }) {
-                Ok(preset) => {
+                Ok(mut preset) => {
+                    // The directory decides the page.
+                    preset.part = self.part;
                     let info = info_with_mtime(&preset, &path);
                     entries.push((path, preset, info));
                 }
@@ -272,9 +369,22 @@ impl PresetStore {
 }
 
 fn info_for(preset: &Preset, modified_unix: u64) -> PresetInfo {
+    let parts = preset.covers();
     let (bands, convolution) = chain_stats(&preset.chain);
+    let bands = if parts.contains(&PresetPart::Eq) {
+        bands
+    } else {
+        0
+    };
+    let convolution = if parts.contains(&PresetPart::Convolution) {
+        convolution
+    } else {
+        0
+    };
     PresetInfo {
         name: preset.name.clone(),
+        part: preset.part,
+        parts,
         modified_unix,
         bands,
         convolution,
@@ -302,6 +412,9 @@ fn info_with_mtime(preset: &Preset, path: &Path) -> PresetInfo {
 /// is loaded under, so they are checked when it is loaded into the config.
 pub fn validate(preset: &Preset) -> Result<(), String> {
     normalize_name(&preset.name)?;
+    if preset.covers().is_empty() {
+        return Err("a preset must hold at least one part".into());
+    }
     config::validate_chain_at("preset.chain", &preset.chain, &[], 1)
 }
 
@@ -440,6 +553,93 @@ mod tests {
             Err(PresetError::NotFound(_))
         ));
         assert_eq!(store.load("Two").unwrap().chain, chain(2));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A preset saved with a safety-only mode reads as the natural one and
+    /// is written back once.
+    #[test]
+    fn a_preset_with_a_safety_mode_migrates() {
+        let dir = temp_dir("safety-preset");
+        let store = PresetStore::new(dir.join("presets"));
+        fs::create_dir_all(dir.join("presets")).unwrap();
+        let path = dir.join("presets").join("old.json");
+        let old = serde_json::json!({
+            "name": "Old",
+            "chain": {
+                "crossfeed": {"mode": "bs2b_default", "level": "peak_safe"},
+                "harmonics": {"enabled": true, "routing": "series_makeup", "layers": [
+                    {"kind": "chebyshev", "preset": "triode", "levels_db": [-40.0, -58.0, null, null, null, null, null, null]}
+                ]}
+            }
+        });
+        fs::write(&path, old.to_string()).unwrap();
+        let preset = store.load("Old").unwrap();
+        assert_eq!(
+            preset.chain.harmonics.as_ref().unwrap().routing,
+            audivane_protocol::HarmonicsRouting::Series
+        );
+        assert!(preset.chain.crossfeed.is_some());
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("peak_safe") && !written.contains("series_makeup"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn part_presets_live_in_their_own_directory_and_hold_their_part_only() {
+        let dir = temp_dir("parts");
+        let root = PresetStore::new(dir.join("presets"));
+        let eq = root.scoped(Some(PresetPart::Eq));
+        // Even a preset built as global becomes the directory's part.
+        let info = eq.save(&Preset::new("Warm", chain(2))).unwrap();
+        assert_eq!(info.part, Some(PresetPart::Eq));
+        assert_eq!(info.parts, vec![PresetPart::Eq]);
+        let path = dir.join("presets").join("eq").join("warm.json");
+        let file: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(file["part"], "eq");
+        assert!(file.get("parts").is_none());
+        assert_eq!(
+            file["chain"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["eq"]
+        );
+
+        // A global one with two parts: the output part holds the output-side
+        // stages (DC block and the off crossfeed/harmonics are left out).
+        let mut global = Preset::new("Desk", chain(1));
+        global.parts = Some(vec![PresetPart::Output, PresetPart::Eq]);
+        let info = root.save(&global).unwrap();
+        assert_eq!(info.part, None);
+        assert_eq!(info.parts, vec![PresetPart::Eq, PresetPart::Output]);
+        let file: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(dir.join("presets").join("desk.json")).unwrap(),
+        )
+        .unwrap();
+        let mut keys: Vec<&String> = file["chain"].as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["eq", "limiter", "output", "pitch"]);
+
+        // Each store sees its own; `list_all` sees both, globals first.
+        assert_eq!(root.list().len(), 1);
+        assert_eq!(eq.list().len(), 1);
+        let all: Vec<(Option<PresetPart>, String)> = root
+            .list_all()
+            .into_iter()
+            .map(|info| (info.part, info.name))
+            .collect();
+        assert_eq!(
+            all,
+            vec![
+                (None, "Desk".to_string()),
+                (Some(PresetPart::Eq), "Warm".to_string())
+            ]
+        );
+        assert!(root.load("Warm").is_err());
+        assert_eq!(eq.load("Warm").unwrap().chain.eq, chain(2).eq);
         fs::remove_dir_all(&dir).unwrap();
     }
 

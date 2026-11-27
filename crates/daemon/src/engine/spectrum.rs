@@ -16,11 +16,14 @@
 //! A non-RT analysis thread runs two Hann FFTs on each tap: 8192 points
 //! (50% overlap) for every log bin and 32768 points (87.5% overlap) for the
 //! low band, where a 1/24-octave bin is narrower than a few short-FFT bins.
+//! Above 88.2 kHz both run at the rate decimated to 44.1/48 kHz, so they
+//! serve 10 Hz..20 kHz; a third Hann FFT at a higher rate (the tap's, or
+//! 352.8/384 kHz) serves the bins above 20 kHz (`HighPath`).
 //! Each log bin reads interpolated band power (with a sine's peak level where
-//! the bin holds one), so the two resolutions agree and narrow bins never
-//! plateau. Power is averaged on a fixed log grid (20 Hz .. min(20 kHz,
-//! Nyquist) at 24 bins/octave) and a [`Spectrum`] published at roughly the
-//! frame cadence (about 10-20 Hz). Nothing is computed while no client
+//! the bin holds one), so the resolutions agree and narrow bins never
+//! plateau. Power is averaged on a fixed log grid (10 Hz up to the tap's
+//! Nyquist or [`F_MAX_HZ`], at 24 bins/octave) and a [`Spectrum`] published
+//! at roughly the frame cadence (about 10-20 Hz). Nothing is computed while no client
 //! subscribes to [`audivane_protocol::ipc::Topic::Spectrum`]: the RT thread
 //! stops copying and the analyser drains its rings and reports nothing, as
 //! with fewer than one complete frame.
@@ -38,8 +41,23 @@ pub const FFT_SIZE: usize = 8192;
 /// Long FFT for the low band (about 1.5 Hz per FFT bin at 48 kHz).
 pub const LONG_FFT_SIZE: usize = 32_768;
 pub const BINS_PER_OCTAVE: u32 = 24;
-pub const F_MIN_HZ: f64 = 20.0;
-pub const F_MAX_HZ: f64 = 20_000.0;
+/// The grid's bottom edge. Below 20 Hz a log bin is a fifth to two fifths
+/// of a long-FFT bin: it reads the interpolated band power (a sine its peak
+/// level), so the trace stays smooth but a sine there is about 3 Hz wide.
+pub const F_MIN_HZ: f64 = 10.0;
+/// The highest frequency a tap reports: the graph's widest range.
+pub const F_MAX_HZ: f64 = 100_000.0;
+/// Where the analysis is decimated to 44.1/48 kHz, the short and long FFTs
+/// serve the log bins up to this edge (the half-band decimator's passband)
+/// and the high path the bins above.
+const BASE_MAX_HZ: f64 = 20_000.0;
+/// The high path's FFT bins are at most this wide (about 47 Hz: 12 or more
+/// per log bin above 20 kHz).
+const HIGH_BIN_HZ: f64 = 48.0;
+/// Log bins stop this many FFT bins short of the analysed Nyquist: the
+/// Hann FFT's last bins hold the window's mirror image of what lies just
+/// below it, and the Nyquist bin itself double counts.
+const NYQUIST_GUARD_BINS: f64 = 2.0;
 /// Log bins narrower than this many short-FFT bins come from the long FFT.
 const CROSSOVER_BINS: f64 = 4.0;
 /// Ring capacity in frames of the pre tap, at the graph rate (about 85 ms
@@ -69,17 +87,37 @@ const HOP: usize = FFT_SIZE / 2;
 const TICK: Duration = Duration::from_millis(10);
 const DB_FLOOR: f64 = -160.0;
 /// Equivalent noise bandwidth of a periodic Hann window, in FFT bins.
-const HANN_ENBW: f64 = 1.5;
+pub(crate) const HANN_ENBW: f64 = 1.5;
 
-/// Number of log bins for a tap at `rate`: centres from 20 Hz up to
-/// min(20 kHz, Nyquist).
+/// Number of log bins for a tap at `rate`: from 10 Hz, every bin whose upper
+/// edge lies at or below [`spectrum_top_hz`] (none straddles the top).
 pub fn spectrum_bin_count(rate: u32) -> usize {
-    let nyquist = f64::from(rate) / 2.0;
-    let top = nyquist.min(F_MAX_HZ);
-    if top <= F_MIN_HZ {
+    bins_up_to(spectrum_top_hz(rate))
+}
+
+/// The top edge of a tap's log grid at `rate`: [`F_MAX_HZ`], or the Nyquist
+/// of the FFT that serves the top bins less `NYQUIST_GUARD_BINS`.
+pub fn spectrum_top_hz(rate: u32) -> f64 {
+    let rate = rate.max(1);
+    let (top_rate, size) = if decimation_stages(rate) == 0 {
+        (rate, FFT_SIZE)
+    } else {
+        let high = rate >> high_stages(rate);
+        (high, high_fft_size(high))
+    };
+    let bin_hz = f64::from(top_rate) / size as f64;
+    (f64::from(top_rate) / 2.0 - NYQUIST_GUARD_BINS * bin_hz).min(F_MAX_HZ)
+}
+
+/// The number of log bins whose upper edge (half a step above the centre)
+/// lies at or below `edge_hz`; at least one.
+fn bins_up_to(edge_hz: f64) -> usize {
+    let steps = f64::from(BINS_PER_OCTAVE) * (edge_hz / F_MIN_HZ).log2() - 0.5;
+    if steps.is_nan() || steps < 0.0 {
         return 1;
     }
-    ((f64::from(BINS_PER_OCTAVE) * (top / F_MIN_HZ).log2()).floor() as usize) + 1
+    // A hair of slack so an edge exactly on a bin's upper edge keeps it.
+    (steps + 1.0e-9).floor() as usize + 1
 }
 
 /// Centre frequency of log bin `index`: `F_MIN_HZ * 2^(index / 24)`. The bin
@@ -609,28 +647,54 @@ fn hat_cdf(x: f64) -> f64 {
 
 /// How one log bin is read from one FFT resolution.
 #[derive(Clone, Debug)]
-struct LogBand {
+pub(crate) struct LogBand {
     /// Index into the published log grid.
-    index: usize,
+    pub(crate) index: usize,
     /// `(fft bin, weight)`: the integral over the band of the hat function
     /// centred on that FFT bin, in FFT-bin units. Summing `power * weight`
     /// integrates the linearly interpolated power density over the band, so
     /// bands narrower than one FFT bin still vary smoothly with frequency
     /// instead of repeating the same bin.
-    weights: Vec<(usize, f64)>,
+    pub(crate) weights: Vec<(usize, f64)>,
 }
 
-/// Log bins for one FFT size at `rate`. `max_width_hz` keeps only the bands
-/// narrower than that (used to give the long FFT only the low band); `None`
-/// serves every log bin.
-fn log_bands(rate: u32, size: usize, max_width_hz: Option<f64>) -> Vec<LogBand> {
-    let count = spectrum_bin_count(rate);
+/// Log bin `index` spanning `lo_hz..hi_hz`, read from an FFT of `bin_hz`
+/// per bin whose last bin is `max_bin`.
+pub(crate) fn log_band(
+    index: usize,
+    lo_hz: f64,
+    hi_hz: f64,
+    bin_hz: f64,
+    max_bin: usize,
+) -> LogBand {
+    let xa = lo_hz / bin_hz;
+    let xb = (hi_hz / bin_hz).max(xa);
+    let first = (xa.floor() as isize - 1).max(0) as usize;
+    let last = ((xb.ceil() as usize) + 1).min(max_bin);
+    let weights = (first..=last)
+        .filter_map(|k| {
+            let w = hat_cdf(xb - k as f64) - hat_cdf(xa - k as f64);
+            (w > 0.0).then_some((k, w))
+        })
+        .collect();
+    LogBand { index, weights }
+}
+
+/// The log bins `indices` for one FFT size at `rate`. `max_width_hz` keeps
+/// only the bands narrower than that (used to give the long FFT only the
+/// low band); `None` serves every one.
+fn log_bands(
+    rate: u32,
+    size: usize,
+    indices: std::ops::Range<usize>,
+    max_width_hz: Option<f64>,
+) -> Vec<LogBand> {
     let nyquist = f64::from(rate) / 2.0;
     let bin_hz = f64::from(rate) / size as f64;
     let max_bin = size / 2;
     let half = 2.0_f64.powf(0.5 / f64::from(BINS_PER_OCTAVE));
     let mut out = Vec::new();
-    for index in 0..count {
+    for index in indices {
         let centre = spectrum_bin_centre_hz(index);
         let lo_hz = centre / half;
         let hi_hz = (centre * half).min(nyquist);
@@ -639,17 +703,7 @@ fn log_bands(rate: u32, size: usize, max_width_hz: Option<f64>) -> Vec<LogBand> 
         {
             continue;
         }
-        let xa = lo_hz / bin_hz;
-        let xb = (hi_hz / bin_hz).max(xa);
-        let first = (xa.floor() as isize - 1).max(0) as usize;
-        let last = ((xb.ceil() as usize) + 1).min(max_bin);
-        let weights = (first..=last)
-            .filter_map(|k| {
-                let w = hat_cdf(xb - k as f64) - hat_cdf(xa - k as f64);
-                (w > 0.0).then_some((k, w))
-            })
-            .collect();
-        out.push(LogBand { index, weights });
+        out.push(log_band(index, lo_hz, hi_hz, bin_hz, max_bin));
     }
     out
 }
@@ -669,6 +723,8 @@ struct Resolution {
     bands: Vec<LogBand>,
     /// Log-grid index -> entry of `bands`.
     slot_of: Vec<Option<usize>>,
+    /// The FFT bins whose peaks can land in `bands` (the tonal search).
+    peak_bins: std::ops::Range<usize>,
     /// Per entry of `bands`: tonal reading of the current frame.
     tonal: Vec<f64>,
     /// Summed linear power per entry of `bands` since the last report.
@@ -695,6 +751,7 @@ impl Resolution {
             power: vec![0.0; size / 2 + 1],
             bands: Vec::new(),
             slot_of: Vec::new(),
+            peak_bins: 0..0,
             tonal: Vec::new(),
             accum: Vec::new(),
             frames: 0,
@@ -710,6 +767,11 @@ impl Resolution {
         for (slot, band) in bands.iter().enumerate() {
             self.slot_of[band.index] = Some(slot);
         }
+        let bins_of = || bands.iter().flat_map(|b| b.weights.iter().map(|&(k, _)| k));
+        self.peak_bins = match (bins_of().min(), bins_of().max()) {
+            (Some(lo), Some(hi)) => lo.saturating_sub(1)..(hi + 2).min(self.power.len()),
+            _ => 0..0,
+        };
         self.bands = bands;
         self.frames = 0;
     }
@@ -755,30 +817,14 @@ impl Resolution {
     /// noise are rejected by requiring the peak to stand well above the noise
     /// floor outside the Hann main lobe (`±3..=±8` bins).
     fn find_tonal_peaks(&mut self) {
-        self.tonal.fill(0.0);
         let bin_hz = f64::from(self.rate) / self.size as f64;
-        let steps = f64::from(BINS_PER_OCTAVE);
-        for k in 1..self.power.len() - 1 {
-            let Some((delta, level)) = interpolated_peak(&self.power, k) else {
-                continue;
-            };
-            if !is_coherent_tone(&self.power, k, level) {
-                continue;
-            }
-            let freq = (k as f64 + delta) * bin_hz;
-            if freq <= 0.0 {
-                continue;
-            }
-            let index = (steps * (freq / F_MIN_HZ).log2()).round();
-            if index < 0.0 || index >= self.slot_of.len() as f64 {
-                continue;
-            }
-            if let Some(slot) = self.slot_of[index as usize]
-                && level > self.tonal[slot]
-            {
-                self.tonal[slot] = level;
-            }
-        }
+        tonal_peaks_in(
+            &self.power,
+            self.peak_bins.clone(),
+            bin_hz,
+            &self.slot_of,
+            &mut self.tonal,
+        );
     }
 
     /// Write the averaged dB values of this resolution's bands into `out`.
@@ -788,6 +834,52 @@ impl Resolution {
             if let Some(dst) = out.get_mut(band.index) {
                 *dst = to_db(total / frames);
             }
+        }
+    }
+}
+
+/// The tonal readings of [`Resolution::find_tonal_peaks`] from `power`
+/// (`bin_hz` per bin) into `tonal`, one per band (`slot_of` maps a log-grid
+/// index to its band).
+pub(crate) fn tonal_peaks(
+    power: &[f64],
+    bin_hz: f64,
+    slot_of: &[Option<usize>],
+    tonal: &mut [f64],
+) {
+    tonal_peaks_in(power, 0..power.len(), bin_hz, slot_of, tonal);
+}
+
+/// [`tonal_peaks`] for the peaks at the FFT bins `bins` only (those that
+/// can land in a band; the rest would be looked up and dropped).
+fn tonal_peaks_in(
+    power: &[f64],
+    bins: std::ops::Range<usize>,
+    bin_hz: f64,
+    slot_of: &[Option<usize>],
+    tonal: &mut [f64],
+) {
+    tonal.fill(0.0);
+    let steps = f64::from(BINS_PER_OCTAVE);
+    for k in bins.start.max(1)..bins.end.min(power.len().saturating_sub(1)) {
+        let Some((delta, level)) = interpolated_peak(power, k) else {
+            continue;
+        };
+        if !is_coherent_tone(power, k, level) {
+            continue;
+        }
+        let freq = (k as f64 + delta) * bin_hz;
+        if freq <= 0.0 {
+            continue;
+        }
+        let index = (steps * (freq / F_MIN_HZ).log2()).round();
+        if index < 0.0 || index >= slot_of.len() as f64 {
+            continue;
+        }
+        if let Some(slot) = slot_of[index as usize]
+            && level > tonal[slot]
+        {
+            tonal[slot] = level;
         }
     }
 }
@@ -836,7 +928,7 @@ fn is_coherent_tone(power: &[f64], peak: usize, level: f64) -> bool {
 /// reads its power there), so it does not depend on the FFT size and the short
 /// and long resolutions agree. Linear interpolation never exceeds the larger of
 /// its two neighbours, so it cannot invent a peak.
-fn band_power(power: &[f64], band: &LogBand) -> f64 {
+pub(crate) fn band_power(power: &[f64], band: &LogBand) -> f64 {
     band.weights.iter().map(|&(k, w)| power[k] * w).sum::<f64>() / HANN_ENBW
 }
 
@@ -890,7 +982,7 @@ fn to_db(power: f64) -> f32 {
 }
 
 /// Number of `/2` half-band decimation stages before the FFTs so the analysis
-/// rate always lands in the 44.1/48 kHz family while preserving 20 Hz..20 kHz.
+/// rate always lands in the 44.1/48 kHz family while preserving 10 Hz..20 kHz.
 fn decimation_stages(rate: u32) -> usize {
     let mut r = rate;
     let mut stages = 0;
@@ -899,6 +991,37 @@ fn decimation_stages(rate: u32) -> usize {
         stages += 1;
     }
     stages
+}
+
+/// Number of `/2` stages before the high path's FFT: down to 352.8/384 kHz
+/// at most, where [`F_MAX_HZ`] still lies well inside the last stage's
+/// alias-free band. Never more than [`decimation_stages`].
+fn high_stages(rate: u32) -> usize {
+    let mut r = rate;
+    let mut stages = 0;
+    while stages < decimation_stages(rate) && f64::from(r) / 4.0 >= 1.1 * F_MAX_HZ {
+        r /= 2;
+        stages += 1;
+    }
+    stages
+}
+
+/// The high path's FFT size at `rate`: bins at most [`HIGH_BIN_HZ`] wide.
+fn high_fft_size(rate: u32) -> usize {
+    ((f64::from(rate) / HIGH_BIN_HZ).ceil() as usize)
+        .next_power_of_two()
+        .max(256)
+}
+
+/// Half-band length (`k`, see [`HalfBandStage`]) for a stage from `rate_in`
+/// whose passband reaches `pass_hz`: the Kaiser estimate for about 105 dB
+/// over the transition `pass_hz .. rate_in/2 - pass_hz`, with a 20% margin.
+/// Everything in the transition folds above `pass_hz`.
+fn half_band_k(rate_in: f64, pass_hz: f64) -> usize {
+    let transition = (rate_in / 2.0 - 2.0 * pass_hz).max(rate_in * 0.01);
+    let dw = 2.0 * std::f64::consts::PI * transition / rate_in;
+    let taps = 1.2 * (105.0 - 8.0) / (2.285 * dw);
+    (((taps + 1.0) / 4.0).ceil() as usize).max(5)
 }
 
 #[derive(Clone)]
@@ -935,7 +1058,7 @@ impl HalfBandChState {
 
 /// Polyphase symmetric half-band FIR decimator-by-2 (`N = 4*k - 1` taps,
 /// only `k + 1` multiplies per output sample).
-struct HalfBandStage {
+pub(crate) struct HalfBandStage {
     center: f64,
     odd: Vec<f64>,
     ch: Vec<HalfBandChState>,
@@ -944,7 +1067,7 @@ struct HalfBandStage {
 impl HalfBandStage {
     /// Build a Kaiser-windowed half-band decimator for `remaining_stages`
     /// after this stage (`0` = final `88.2k/96k -> 44.1k/48k` stage).
-    fn new(channels: usize, remaining_stages: usize) -> Self {
+    pub(crate) fn new(channels: usize, remaining_stages: usize) -> Self {
         // Kaiser beta = 10.5 gives >105 dB stopband attenuation; passband is
         // flat (<0.0001 dB) up to 20 kHz at every stage.
         let k = match remaining_stages {
@@ -953,6 +1076,11 @@ impl HalfBandStage {
             2 => 6,  // N = 23 taps
             _ => 5,  // N = 19 taps
         };
+        Self::with_k(channels, k)
+    }
+
+    /// A decimator of `4 * k - 1` taps (Kaiser beta 10.5).
+    fn with_k(channels: usize, k: usize) -> Self {
         let n_taps = 4 * k - 1;
         let center_idx = 2 * k - 1;
         let win = audivane_dsp_core::window::kaiser(n_taps, 10.5);
@@ -976,7 +1104,7 @@ impl HalfBandStage {
     }
 
     #[inline]
-    fn push(&mut self, channel: usize, sample: f64) -> Option<f64> {
+    pub(crate) fn push(&mut self, channel: usize, sample: f64) -> Option<f64> {
         let st = &mut self.ch[channel];
         if !st.have_even {
             st.pending_even = sample;
@@ -1004,7 +1132,7 @@ impl HalfBandStage {
         Some(acc)
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         for ch in &mut self.ch {
             ch.reset();
         }
@@ -1020,12 +1148,8 @@ impl CascadedDecimator {
         Self { stages: Vec::new() }
     }
 
-    fn configure(&mut self, channels: usize, num_stages: usize) {
-        self.stages.clear();
-        for s in 0..num_stages {
-            let remaining = num_stages - 1 - s;
-            self.stages.push(HalfBandStage::new(channels, remaining));
-        }
+    fn configure(&mut self, stages: Vec<HalfBandStage>) {
+        self.stages = stages;
     }
 
     fn reset(&mut self) {
@@ -1040,10 +1164,10 @@ impl CascadedDecimator {
     }
 
     #[inline]
-    fn push_frame(&mut self, frame: &[TapSample], out: &mut [f32]) -> bool {
+    fn push_frame(&mut self, frame: &[f32], out: &mut [f32]) -> bool {
         let mut ready = true;
-        for (c, sample) in frame.iter().enumerate() {
-            let mut val = f64::from(sample.value);
+        for (c, &sample) in frame.iter().enumerate() {
+            let mut val = f64::from(sample);
             for stage in &mut self.stages {
                 match stage.push(c, val) {
                     Some(y) => val = y,
@@ -1061,15 +1185,84 @@ impl CascadedDecimator {
     }
 }
 
-/// One tap's rolling frames, the two FFT resolutions and averaged log bins.
+/// The bins above 20 kHz of a tap whose base analysis is decimated: a Hann
+/// FFT of [`high_fft_size`] (no overlap: about 47 a second, each log bin up
+/// there spans a dozen FFT bins or more) at the tap's rate, or at 352.8/384
+/// kHz above that (its own half-band stages, passband to [`F_MAX_HZ`]). Its
+/// decimated frames also feed the base path's remaining stages, so the
+/// stages above 384 kHz run once for both.
+struct HighPath {
+    decimator: CascadedDecimator,
+    frame: Vec<f32>,
+    /// Interleaved rolling buffer of `res.size` frames.
+    buf: Vec<f32>,
+    fill: usize,
+    res: Resolution,
+}
+
+impl HighPath {
+    fn new(channels: usize, rate: u32, bins: usize) -> Self {
+        let stages = high_stages(rate);
+        let mut decimator = CascadedDecimator::new();
+        decimator.configure(
+            (0..stages)
+                .map(|s| {
+                    HalfBandStage::with_k(channels, half_band_k(f64::from(rate >> s), F_MAX_HZ))
+                })
+                .collect(),
+        );
+        let high_rate = rate >> stages;
+        let size = high_fft_size(high_rate);
+        let mut res = Resolution::new(size);
+        res.set_bands(
+            high_rate,
+            bins,
+            log_bands(high_rate, size, bins_up_to(BASE_MAX_HZ)..bins, None),
+        );
+        Self {
+            decimator,
+            frame: vec![0.0; channels],
+            buf: vec![0.0; size * channels],
+            fill: 0,
+            res,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.decimator.reset();
+        self.fill = 0;
+        self.res.reset();
+    }
+
+    /// Take one input frame; true with the decimated frame in `self.frame`
+    /// when one is ready.
+    fn push(&mut self, input: &[f32], channels: usize) -> bool {
+        if self.decimator.is_identity() {
+            self.frame.copy_from_slice(input);
+        } else if !self.decimator.push_frame(input, &mut self.frame) {
+            return false;
+        }
+        let base = self.fill * channels;
+        self.buf[base..base + channels].copy_from_slice(&self.frame);
+        self.fill += 1;
+        if self.fill == self.res.size {
+            self.res.analyze(&self.buf, channels);
+            self.fill = 0;
+        }
+        true
+    }
+}
+
+/// One tap's rolling frames, the FFT resolutions and averaged log bins.
 ///
 /// Rates at or above 88.2 kHz are decimated on the analysis thread by a
 /// cascaded half-band anti-alias filter to the 44.1/48 kHz family, so
-/// resolution and bass calibration stay uniform up to 768 kHz. Every [`HOP`]
-/// decimated frames the short FFT ([`FFT_SIZE`]) analyses the newest frames for
-/// every log bin; once [`LONG_FFT_SIZE`] are buffered the long FFT also
-/// analyses the low band (log bins narrower than [`CROSSOVER_BINS`] short-FFT
-/// bins, below roughly 800 Hz at 48 kHz).
+/// resolution and bass calibration stay uniform up to 768 kHz; the bins above
+/// 20 kHz then come from a [`HighPath`]. Every [`HOP`] decimated frames the
+/// short FFT ([`FFT_SIZE`]) analyses the newest frames for every other log
+/// bin; once [`LONG_FFT_SIZE`] are buffered the long FFT also analyses the
+/// low band (log bins narrower than [`CROSSOVER_BINS`] short-FFT bins, below
+/// roughly 800 Hz at 48 kHz).
 pub(crate) struct TapAnalyzer {
     channels: usize,
     rate: u32,
@@ -1077,12 +1270,14 @@ pub(crate) struct TapAnalyzer {
     epoch: u32,
     bins: usize,
     decimator: CascadedDecimator,
+    in_frame: Vec<f32>,
     decim_frame: Vec<f32>,
     /// Interleaved `LONG_FFT_SIZE`-frame rolling buffer (at `analysis_rate`).
     buf: Vec<f32>,
     fill: usize,
     short: Resolution,
     long: Resolution,
+    high: Option<HighPath>,
 }
 
 impl TapAnalyzer {
@@ -1095,26 +1290,43 @@ impl TapAnalyzer {
             epoch: 0,
             bins: 0,
             decimator: CascadedDecimator::new(),
+            in_frame: vec![0.0; channels],
             decim_frame: vec![0.0; channels],
             buf: vec![0.0; LONG_FFT_SIZE * channels],
             fill: 0,
             short: Resolution::new(FFT_SIZE),
             long: Resolution::new(LONG_FFT_SIZE),
+            high: None,
         }
     }
 
     pub(crate) fn set_rate(&mut self, rate: u32) {
         self.rate = rate.max(1);
         let stages = decimation_stages(self.rate);
+        let high = high_stages(self.rate);
         self.analysis_rate = (self.rate >> stages).max(1);
-        self.decimator.configure(self.channels, stages);
+        // The base stages after the high path's (the same filters as a
+        // cascade from the tap's rate would end with).
+        let base_stages = stages - high;
+        self.decimator.configure(
+            (0..base_stages)
+                .map(|s| HalfBandStage::new(self.channels, base_stages - 1 - s))
+                .collect(),
+        );
         self.bins = spectrum_bin_count(self.rate);
+        let base_bins = if stages == 0 {
+            self.bins
+        } else {
+            bins_up_to(BASE_MAX_HZ).min(self.bins)
+        };
+        self.high = (stages > 0 && base_bins < self.bins)
+            .then(|| HighPath::new(self.channels, self.rate, self.bins));
         let short_bin_hz = f64::from(self.analysis_rate) / FFT_SIZE as f64;
         let (analysis_rate, bins) = (self.analysis_rate, self.bins);
         self.short.set_bands(
             analysis_rate,
             bins,
-            log_bands(analysis_rate, FFT_SIZE, None),
+            log_bands(analysis_rate, FFT_SIZE, 0..base_bins, None),
         );
         self.long.set_bands(
             analysis_rate,
@@ -1122,6 +1334,7 @@ impl TapAnalyzer {
             log_bands(
                 analysis_rate,
                 LONG_FFT_SIZE,
+                0..base_bins,
                 Some(CROSSOVER_BINS * short_bin_hz),
             ),
         );
@@ -1133,6 +1346,9 @@ impl TapAnalyzer {
         self.decimator.reset();
         self.short.reset();
         self.long.reset();
+        if let Some(high) = &mut self.high {
+            high.reset();
+        }
     }
 
     pub(crate) fn frames(&self) -> u64 {
@@ -1157,12 +1373,22 @@ impl TapAnalyzer {
             if self.bins == 0 {
                 continue;
             }
+            for (dst, sample) in self.in_frame.iter_mut().zip(frame) {
+                *dst = sample.value;
+            }
+            let input = match &mut self.high {
+                Some(high) => {
+                    if !high.push(&self.in_frame, channels) {
+                        continue;
+                    }
+                    &high.frame
+                }
+                None => &self.in_frame,
+            };
             let base = self.fill * channels;
             if self.decimator.is_identity() {
-                for (dst, sample) in self.buf[base..base + channels].iter_mut().zip(frame) {
-                    *dst = sample.value;
-                }
-            } else if self.decimator.push_frame(frame, &mut self.decim_frame) {
+                self.buf[base..base + channels].copy_from_slice(input);
+            } else if self.decimator.push_frame(input, &mut self.decim_frame) {
                 self.buf[base..base + channels].copy_from_slice(&self.decim_frame);
             } else {
                 continue;
@@ -1187,6 +1413,12 @@ impl TapAnalyzer {
         self.short.write(&mut out);
         if self.long.frames > 0 {
             self.long.write(&mut out);
+        }
+        if let Some(high) = &mut self.high {
+            if high.res.frames > 0 {
+                high.res.write(&mut out);
+            }
+            high.res.reset();
         }
         self.short.reset();
         self.long.reset();
@@ -1251,16 +1483,151 @@ mod tests {
 
     #[test]
     fn bin_count_matches_the_formula() {
-        assert_eq!(spectrum_bin_count(44_100), 240);
-        assert_eq!(spectrum_bin_count(48_000), 240);
-        assert_eq!(spectrum_bin_count(96_000), 240);
-        // A low rate limits the top to its Nyquist.
-        assert_eq!(spectrum_bin_count(8_000), 184);
-        // 20 Hz .. min(20 kHz, Nyquist), 24 bins/octave.
-        for rate in [8_000u32, 32_000, 44_100, 48_000, 192_000] {
-            let top = (f64::from(rate) / 2.0).min(F_MAX_HZ);
-            let expected = ((24.0 * (top / F_MIN_HZ).log2()).floor() as usize) + 1;
-            assert_eq!(spectrum_bin_count(rate), expected);
+        // Up to each tap's Nyquist (less two FFT bins), at most 100 kHz.
+        assert_eq!(spectrum_bin_count(8_000), 207);
+        assert_eq!(spectrum_bin_count(44_100), 267);
+        assert_eq!(spectrum_bin_count(48_000), 269);
+        assert_eq!(spectrum_bin_count(96_000), 293);
+        assert_eq!(spectrum_bin_count(192_000), 317);
+        for rate in [352_800, 384_000, 768_000, 3_072_000] {
+            assert_eq!(spectrum_bin_count(rate), 319, "rate {rate}");
+        }
+        let half = 2.0_f64.powf(0.5 / f64::from(BINS_PER_OCTAVE));
+        for rate in [
+            8_000u32, 32_000, 44_100, 48_000, 64_000, 88_200, 96_000, 128_000, 176_400, 192_000,
+            352_800, 384_000, 705_600, 768_000, 1_536_000, 3_072_000,
+        ] {
+            let count = spectrum_bin_count(rate);
+            let top = spectrum_top_hz(rate);
+            let limit = (f64::from(rate) / 2.0).min(F_MAX_HZ);
+            assert!(top <= limit && top > 0.99 * limit, "rate {rate}: top {top}");
+            // The last bin ends at or below the top; the next would not.
+            assert!(
+                spectrum_bin_centre_hz(count - 1) * half <= top,
+                "rate {rate}"
+            );
+            assert!(spectrum_bin_centre_hz(count) * half > top, "rate {rate}");
+        }
+    }
+
+    #[test]
+    fn the_high_path_runs_at_most_at_384_khz() {
+        for (rate, high) in [
+            (96_000u32, 96_000u32),
+            (192_000, 192_000),
+            (352_800, 352_800),
+            (384_000, 384_000),
+            (705_600, 352_800),
+            (768_000, 384_000),
+            (1_536_000, 384_000),
+            (3_072_000, 384_000),
+        ] {
+            assert_eq!(rate >> high_stages(rate), high, "rate {rate}");
+            assert!(high_fft_size(high) <= 8192);
+        }
+        assert_eq!(high_stages(48_000), 0);
+    }
+
+    #[test]
+    fn sines_above_20_khz_read_zero_db_up_to_the_top() {
+        for rate in [
+            44_100u32, 48_000, 96_000, 192_000, 384_000, 768_000, 3_072_000,
+        ] {
+            let count = spectrum_bin_count(rate);
+            let frames = (FFT_SIZE * 2 + HOP) << decimation_stages(rate);
+            for freq in [
+                21_000.0, 22_900.0, 30_000.0, 47_000.0, 70_000.0, 95_000.0, 99_000.0,
+            ] {
+                // Only where a whole bin holds it.
+                if bin_of(freq * 1.01) >= count {
+                    continue;
+                }
+                let mut tap = TapAnalyzer::new(2);
+                tap.set_rate(rate);
+                tap.feed(&tagged(sine(frames, rate, freq, 1.0), rate, 1));
+                let bins = tap.finish();
+                assert_eq!(bins.len(), spectrum_bin_count(rate));
+                let (index, peak) = peak_bin(&bins);
+                assert!(
+                    f64::from(peak).abs() <= 0.5,
+                    "rate {rate}: {freq} Hz reads {peak} dB"
+                );
+                assert!(
+                    index.abs_diff(bin_of(freq)) <= 1,
+                    "rate {rate}: {freq} Hz peaks at {:.0} Hz",
+                    spectrum_bin_centre_hz(index)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_high_path_rejects_ultrasonic_images() {
+        // Above 100 kHz nothing may fold into the reported bins.
+        for (rate, freq) in [
+            (768_000u32, 290_000.0),
+            (768_000, 380_000.0),
+            (3_072_000, 1_000_000.0),
+            (3_072_000, 290_000.0),
+        ] {
+            let frames = (FFT_SIZE * 2 + HOP) << decimation_stages(rate);
+            let mut tap = TapAnalyzer::new(2);
+            tap.set_rate(rate);
+            tap.feed(&tagged(sine(frames, rate, freq, 1.0), rate, 1));
+            let bins = tap.finish();
+            let (index, peak) = peak_bin(&bins);
+            assert!(
+                peak <= -95.0,
+                "rate {rate}: {freq} Hz shows {peak} dB at {:.0} Hz",
+                spectrum_bin_centre_hz(index)
+            );
+        }
+    }
+
+    #[test]
+    fn white_noise_reads_its_band_power_up_to_the_top_bin() {
+        // Across the 20 kHz seam and into the last bins (no Nyquist bump or
+        // droop), white noise reads sigma^2 * bandwidth / Nyquist.
+        let half = 2.0_f64.powf(0.5 / f64::from(BINS_PER_OCTAVE));
+        for rate in [44_100u32, 48_000, 96_000, 192_000, 768_000] {
+            let nyquist = f64::from(rate) / 2.0;
+            let rms = 0.1;
+            let mut lin = vec![0.0_f64; spectrum_bin_count(rate)];
+            const TRIALS: u64 = 2;
+            for t in 0..TRIALS {
+                let mut tap = TapAnalyzer::new(2);
+                tap.set_rate(rate);
+                let frames = (FFT_SIZE * 4) << decimation_stages(rate);
+                tap.feed(&tagged(
+                    independent_white_noise(frames, rms, 0x9e37_79b9 + t),
+                    rate,
+                    1,
+                ));
+                for (dst, &db) in lin.iter_mut().zip(&tap.finish()) {
+                    *dst += 10.0_f64.powf(f64::from(db) / 10.0) / TRIALS as f64;
+                }
+            }
+            let n = lin.len();
+            let expected = |i: usize| {
+                let c = spectrum_bin_centre_hz(i);
+                2.0 * rms * rms * (c * half - c / half) / nyquist
+            };
+            for i in bin_of(5_000.0)..n {
+                let (lo, hi) = (i - 3, (i + 3).min(n - 1));
+                let got: f64 = lin[lo..=hi].iter().sum();
+                let want: f64 = (lo..=hi).map(expected).sum();
+                let err = 10.0 * (got / want).log10();
+                assert!(
+                    err.abs() <= 0.6,
+                    "rate {rate}: {:.0} Hz reads {err:+.2} dB off",
+                    spectrum_bin_centre_hz(i)
+                );
+            }
+            let last = 10.0 * (lin[n - 1] / expected(n - 1)).log10();
+            assert!(
+                last.abs() <= 1.0,
+                "rate {rate}: the last bin reads {last:+.2} dB off"
+            );
         }
     }
 
@@ -1512,6 +1879,36 @@ mod tests {
     }
 
     #[test]
+    fn sines_down_to_the_bottom_edge_read_their_level_in_their_bin() {
+        // The grid starts at 10 Hz; below 20 Hz a log bin is a fifth to
+        // two fifths of a long-FFT bin, so a sine's level is its
+        // interpolated peak, in the bin holding its frequency.
+        assert!((spectrum_bin_centre_hz(0) - 10.0).abs() < 1e-12);
+        for rate in [44_100u32, 96_000, 768_000] {
+            let frames = (LONG_FFT_SIZE + HOP * 2) << decimation_stages(rate);
+            for (freq, amplitude_db) in [(10.3, 0.0), (12.0, -6.0), (12.0, -20.0), (17.0, 0.0)] {
+                let amplitude = 10.0_f64.powf(amplitude_db / 20.0);
+                let mut tap = TapAnalyzer::new(2);
+                tap.set_rate(rate);
+                tap.feed(&tagged(sine(frames, rate, freq, amplitude), rate, 1));
+                assert!(tap.long.frames > 0);
+                let bins = tap.finish();
+                let (index, peak) = peak_bin(&bins);
+                assert!(
+                    (f64::from(peak) - amplitude_db).abs() <= 0.5,
+                    "rate {rate}: {freq} Hz at {amplitude_db} dB reads {peak} dB"
+                );
+                assert_eq!(
+                    index,
+                    bin_of(freq),
+                    "rate {rate}: {freq} Hz peaks at {:.2} Hz",
+                    spectrum_bin_centre_hz(index)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn high_rate_sines_stay_calibrated_across_all_rates() {
         for rate in [44_100u32, 48_000, 96_000, 192_000, 384_000, 768_000] {
             let factor = 1usize << decimation_stages(rate);
@@ -1549,7 +1946,7 @@ mod tests {
         ] {
             assert_eq!(decimation_stages(rate), stages);
             assert_eq!(rate >> stages, analysis);
-            assert_eq!(spectrum_bin_count(rate), spectrum_bin_count(analysis));
+            assert_eq!(spectrum_bin_count(rate), bins_up_to(F_MAX_HZ));
         }
         // A sine at the top rate reads full scale at its own bin.
         let rate = audivane_protocol::MAX_OUTPUT_RATE;
@@ -1631,7 +2028,7 @@ mod tests {
     #[test]
     fn pink_noise_is_flat_without_bass_lift_and_matches_across_all_rates() {
         // 1) At 48 kHz, average multiple seeds (representing long-term analyser
-        //    averaging) and verify every 1/24-oct bin from 20 Hz to 18 kHz is flat
+        //    averaging) and verify every 1/24-oct bin from 10 Hz to 18 kHz is flat
         //    within +-0.5 dB with zero bass lift from random noise peaks.
         let rate_48 = 48_000u32;
         let frames_48 = LONG_FFT_SIZE * 8;
@@ -1693,7 +2090,7 @@ mod tests {
                     / (hi - lo + 1) as f64;
                 10.0 * lin.log10()
             };
-            let low = mean_db(20.0, 200.0);
+            let low = mean_db(10.0, 200.0);
             let mid = mean_db(200.0, 2_000.0);
             let high = mean_db(2_000.0, 16_000.0);
             assert!(
@@ -1761,9 +2158,14 @@ mod tests {
 
     #[test]
     #[ignore]
-    fn bench_analyzer_768khz_cpu() {
+    fn bench_analyzer_cpu() {
+        for rate in [48_000u32, 96_000, 192_000, 384_000, 768_000, 3_072_000] {
+            bench_rate(rate);
+        }
+    }
+
+    fn bench_rate(rate: u32) {
         use std::time::Instant;
-        let rate = 768_000u32;
         let secs = 10usize;
         let frames = rate as usize * secs;
         let samples = tagged(sine(frames, rate, 100.0, 0.5), rate, 1);
@@ -1782,7 +2184,7 @@ mod tests {
         let elapsed = t0.elapsed().as_secs_f64();
         let cpu_pct = (elapsed / secs as f64) * 100.0;
         eprintln!(
-            "TapAnalyzer 768 kHz stereo (single tap): {secs}s audio in {elapsed:.4}s => {cpu_pct:.2}% of 1 core (2 taps pre+post ~{:.2}%)",
+            "TapAnalyzer {rate} Hz stereo (single tap): {secs}s audio in {elapsed:.4}s => {cpu_pct:.2}% of 1 core (2 taps pre+post ~{:.2}%)",
             cpu_pct * 2.0
         );
     }

@@ -103,9 +103,11 @@ pub const AUTO_GRID_MAX_FFT: usize = 1 << 23;
 /// points: grid `s` is the `n`-point grid shifted by `s / (r n)`, so
 /// together they are exactly the `r n` points [`protected_error_with`]
 /// uses and the result is the same measurement, not an estimate with a
-/// margin. Every point is a true value of the response, so once the error
-/// exceeds `bound` the remaining grids are skipped (the error can only
-/// grow): a failing kernel usually costs one FFT, a passing one all `r`.
+/// margin. The kernel is real, so grid `r - s` is grid `s` mirrored and
+/// conjugated: one pair of FFTs measures both (`scan_shifted`). Every
+/// point is a true value of the response, so once the error exceeds
+/// `bound` the remaining grids are skipped (the error can only grow): a
+/// failing kernel usually costs one FFT, a passing one `r / 2 + 1` pairs.
 /// The second return is whether the measurement is complete: a skipped one
 /// is a lower bound of the error only (always above `bound`).
 pub fn protected_error_bounded(
@@ -116,29 +118,9 @@ pub fn protected_error_bounded(
     stop: f64,
     bound: f64,
 ) -> (f64, bool) {
-    let len = kernel.len().max(2);
-    if (len * 32).next_power_of_two() <= AUTO_GRID_MAX_FFT {
-        return (
-            protected_error_with(planner, kernel, gain, pass, stop),
-            true,
-        );
-    }
-    let mut m = 16;
-    while m > 1 && (len * m).next_power_of_two() > AUTO_GRID_MAX_FFT {
-        m /= 2;
-    }
-    let n = (len * m).next_power_of_two();
-    let r = 32 / m;
-    let mut error = protected_error_n(planner, kernel, gain, pass, stop, n);
-    for shift in 1..r {
-        if error > bound {
-            return (error, false);
-        }
-        error = error.max(protected_error_shifted(
-            planner, kernel, gain, pass, stop, n, shift, r,
-        ));
-    }
-    (error, true)
+    let (error, complete, _) =
+        protected_error_scan(planner, kernel, gain, pass, stop, bound, &mut |_, _| {});
+    (error, complete)
 }
 
 /// A candidate of the real-grid check measured against the pass `bound`
@@ -162,39 +144,55 @@ fn measure_ranked(
     protected_error_bounded(planner, kernel, gain, pass, stop, f64::INFINITY)
 }
 
-/// [`protected_error_n`] on the `n`-point grid shifted by `shift / (r n)`
-/// (the band-edge points are left to the unshifted grid). The response at
-/// `k / n + d` is the DFT of `h[t] e^(-2 pi i d t)`: with `a = h cos` and
-/// `b = h sin` (both real), it is `A[k] - i B[k]`.
-#[allow(clippy::too_many_arguments)]
-fn protected_error_shifted(
-    planner: &mut RealFftPlanner<f64>,
-    kernel: &[f64],
-    gain: f64,
-    pass: f64,
-    stop: f64,
-    n: usize,
-    shift: usize,
-    r: usize,
-) -> f64 {
-    scan_shifted(
-        planner,
-        kernel,
-        gain,
-        pass,
-        stop,
-        n,
-        shift,
-        r,
-        &mut |_, _| {},
-    )
+/// The buffers of the shifted grids, kept from one grid to the next: the
+/// FFT input, its two outputs and the FFT's scratch.
+struct ShiftedBuffers {
+    time: Vec<f64>,
+    a: Vec<Complex64>,
+    b: Vec<Complex64>,
+    scratch: Vec<Complex64>,
 }
 
-/// [`protected_error_shifted`] with each point given to `sink` (as
-/// [`scan_n`]).
+/// Twiddles per block of [`fill_twiddled`]: each block's first one is
+/// evaluated directly, the rest rotated from it by a table of this size.
+const TWIDDLE_BLOCK: usize = 1024;
+
+/// `time[t] = kernel[t] cos(w t)` (`sine`: `sin(w t)`), zero past the
+/// kernel. `w t` is evaluated at each block's start and rotated by `w j`
+/// within it (`table`, `(sin, cos)(w j)` for `j <` [`TWIDDLE_BLOCK`]), so
+/// every twiddle is two roundings from the exact one.
+fn fill_twiddled(time: &mut [f64], kernel: &[f64], w: f64, table: &[(f64, f64)], sine: bool) {
+    let (head, tail) = time.split_at_mut(kernel.len());
+    tail.fill(0.0);
+    for (b, (out, h)) in head
+        .chunks_mut(TWIDDLE_BLOCK)
+        .zip(kernel.chunks(TWIDDLE_BLOCK))
+        .enumerate()
+    {
+        let (sa, ca) = (w * (b * TWIDDLE_BLOCK) as f64).sin_cos();
+        for ((x, &h), &(sj, cj)) in out.iter_mut().zip(h).zip(table) {
+            let v = if sine {
+                sa.mul_add(cj, ca * sj)
+            } else {
+                ca.mul_add(cj, -(sa * sj))
+            };
+            *x = h * v;
+        }
+    }
+}
+
+/// [`scan_n`] on the `n`-point grid shifted by `shift / (r n)` and, unless
+/// `2 shift = r`, the one shifted by `(r - shift) / (r n)` (the band-edge
+/// points are left to the unshifted grid). The response at `k / n + d` is
+/// the DFT of `h[t] e^(-2 pi i d t)`: with `a = h cos` and `b = h sin`
+/// (both real), it is `A[k] - i B[k]`. The kernel is real, so the response
+/// at `(k - shift / r) / n`, a point of grid `r - shift`, is the conjugate
+/// of the one at `-(k - shift / r) / n`, bin `n - k` of the same DFT:
+/// `conj(A[k]) - i conj(B[k])`.
 #[allow(clippy::too_many_arguments)]
 fn scan_shifted(
-    planner: &mut RealFftPlanner<f64>,
+    fft: &dyn realfft::RealToComplex<f64>,
+    buffers: &mut ShiftedBuffers,
     kernel: &[f64],
     gain: f64,
     pass: f64,
@@ -204,29 +202,28 @@ fn scan_shifted(
     r: usize,
     sink: &mut impl FnMut(f64, f64),
 ) -> f64 {
-    let fft = planner.plan_fft_forward(n);
     let w = 2.0 * PI * shift as f64 / (r * n) as f64;
-    let mut time = fft.make_input_vec();
-    let mut a = fft.make_output_vec();
-    let mut b = fft.make_output_vec();
-    for (part, out) in [(0, &mut a), (1, &mut b)] {
-        time.fill(0.0);
-        for (t, (x, &h)) in time.iter_mut().zip(kernel).enumerate() {
-            let (sin, cos) = (w * t as f64).sin_cos();
-            *x = h * if part == 0 { cos } else { sin };
-        }
-        fft.process(&mut time, out).expect("offline response FFT");
+    let table: Vec<(f64, f64)> = (0..TWIDDLE_BLOCK)
+        .map(|j| (w * j as f64).sin_cos())
+        .collect();
+    let ShiftedBuffers {
+        time,
+        a,
+        b,
+        scratch,
+    } = buffers;
+    for (sine, out) in [(false, &mut *a), (true, &mut *b)] {
+        fill_twiddled(time, kernel, w, &table, sine);
+        fft.process_with_scratch(time, out, scratch)
+            .expect("offline response FFT");
     }
     let offset = shift as f64 / r as f64;
+    let mirror = 2 * shift != r;
     let mut error = 0.0_f64;
-    for (k, (ak, bk)) in a.iter().zip(&b).enumerate() {
-        let f = (k as f64 + offset) / n as f64;
-        if f > 0.5 {
-            break;
-        }
-        // A - iB.
-        let value = Complex64::new(ak.re + bk.im, ak.im - bk.re);
-        let amp = value.norm() / gain;
+    // `|value|` without `hypot`'s overflow care (a kernel's response is
+    // nowhere near the range's ends), several times faster.
+    let mut point = |f: f64, value: Complex64| {
+        let amp = value.norm_sqr().sqrt() / gain;
         if f <= pass {
             error = error.max((amp - 1.0).abs());
             sink(f, (amp - 1.0).abs());
@@ -235,6 +232,20 @@ fn scan_shifted(
             error = error.max(amp);
             sink(f, amp);
         }
+    };
+    for (k, (ak, bk)) in a.iter().zip(b.iter()).enumerate() {
+        let f = (k as f64 + offset) / n as f64;
+        if f <= 0.5 {
+            // A - iB.
+            point(f, Complex64::new(ak.re + bk.im, ak.im - bk.re));
+        }
+        if mirror && k > 0 {
+            // conj(A) - i conj(B).
+            point(
+                (k as f64 - offset) / n as f64,
+                Complex64::new(ak.re - bk.im, -ak.im - bk.re),
+            );
+        }
     }
     error
 }
@@ -242,8 +253,7 @@ fn scan_shifted(
 /// [`protected_error_bounded`] that also gives every grid point of the
 /// protected bands to `sink` as `(frequency, error)`, and returns the grid
 /// spacing (`1 / (32 points per tap, rounded up to a power of two)`)
-/// beside the error and its completeness. The grids and their order are
-/// [`protected_error_bounded`]'s, so the error is the same.
+/// beside the error and its completeness.
 pub(crate) fn protected_error_scan(
     planner: &mut RealFftPlanner<f64>,
     kernel: &[f64],
@@ -267,12 +277,29 @@ pub(crate) fn protected_error_scan(
     let r = 32 / m;
     let step = 1.0 / (r * n) as f64;
     let mut error = scan_n(planner, kernel, gain, pass, stop, n, sink);
-    for shift in 1..r {
+    let fft = planner.plan_fft_forward(n);
+    let mut buffers = None;
+    for shift in 1..=r / 2 {
         if error > bound {
             return (error, false, step);
         }
+        let buffers = buffers.get_or_insert_with(|| ShiftedBuffers {
+            time: fft.make_input_vec(),
+            a: fft.make_output_vec(),
+            b: fft.make_output_vec(),
+            scratch: fft.make_scratch_vec(),
+        });
         error = error.max(scan_shifted(
-            planner, kernel, gain, pass, stop, n, shift, r, sink,
+            fft.as_ref(),
+            buffers,
+            kernel,
+            gain,
+            pass,
+            stop,
+            n,
+            shift,
+            r,
+            sink,
         ));
     }
     (error, true, step)
@@ -399,6 +426,19 @@ impl DesignGrid {
 /// (less aliasing), so the x16 measurement is the conservative one, while a
 /// search on a 160x grid would measure FFTs ten times longer per step.
 pub const AUTO_EXACT_MAX_SCALE: usize = 16;
+
+/// The band design a search starts from (`manual`: the band at the search's
+/// beta depth): [`UpsamplerDesign::try_for_ratio`] with the beta of the band
+/// itself, without the band length's wide-passband margin
+/// ([`crate::resample::band_length_design_for`]), since the search
+/// measures the passband.
+fn searched_band(manual: &ManualConfig, ratio: RateRatio) -> Result<UpsamplerDesign, String> {
+    let mut d = UpsamplerDesign::try_for_ratio(manual, ratio).map_err(|e| e.to_string())?;
+    d.kaiser_beta = band_design_for(manual.window, &manual.band, 1)
+        .map_err(|e| e.to_string())?
+        .kaiser_beta;
+    Ok(d)
+}
 
 /// Cheap feasibility check: the window-formula length estimate at `ratio`,
 /// in taps. Errors when the estimate is past the search limits, so the
@@ -667,7 +707,7 @@ fn derived_design(
     manual.auto_taps = None;
     manual.cutoff_mode = audivane_protocol::CutoffMode::Band;
     manual.band.attenuation_db = a + AUTO_BETA_MARGIN_DB;
-    let d = UpsamplerDesign::try_for_ratio(&manual, ratio).map_err(|e| e.to_string())?;
+    let d = searched_band(&manual, ratio)?;
     Ok((
         UpsamplerDesign {
             taps: grid.taps(k),
@@ -882,7 +922,7 @@ pub fn automatic_design_uncached_for(
     manual.auto_taps = None;
     manual.cutoff_mode = audivane_protocol::CutoffMode::Band;
     manual.band.attenuation_db = a + AUTO_BETA_MARGIN_DB;
-    let mut d = UpsamplerDesign::try_for_ratio(&manual, ratio).map_err(|e| e.to_string())?;
+    let mut d = searched_band(&manual, ratio)?;
     if ratio.is_unity() {
         return Ok(d);
     }

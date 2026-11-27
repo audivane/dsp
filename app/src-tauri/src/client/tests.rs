@@ -125,6 +125,15 @@ fn serve(s: UnixStream, old: bool, stop: Arc<AtomicBool>, topics: Arc<Mutex<Vec<
                     json!({"id": id, "ok": {"fast": true, "taps": taps}})
                 }
             }
+            "set_upsampler" => {
+                // A long build: blocks this connection's handler loop, as
+                // the daemon does.
+                let deadline = Instant::now() + Duration::from_millis(300);
+                while Instant::now() < deadline && !stop.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                json!({"id": id, "ok": null})
+            }
             "subscribe" => {
                 let t: Vec<String> = serde_json::from_value(v["params"]["topics"].clone()).unwrap();
                 topics.lock().unwrap().push(t.clone());
@@ -413,8 +422,62 @@ fn slow_analysis_does_not_delay_control_calls() {
 }
 
 #[test]
+fn a_long_build_does_not_delay_other_calls() {
+    for m in [
+        "set_upsampler",
+        "check_design",
+        "set_config",
+        "load_preset",
+        "set_ab",
+    ] {
+        assert_eq!(timeout_for(m), BUILD_CALL_TIMEOUT, "{m}");
+    }
+    let fake = Fake::start(false);
+    let c = Arc::new(DaemonClient::new(fake.path_fn()));
+    assert_eq!(c.call("status", None).unwrap(), json!("status"));
+    let build = {
+        let c = c.clone();
+        std::thread::spawn(move || c.call("set_upsampler", Some(json!({"target": "off"}))))
+    };
+    std::thread::sleep(Duration::from_millis(40));
+    // The request connection and the check's own one answer at once.
+    let t = Instant::now();
+    assert_eq!(c.call("status", None).unwrap(), json!("status"));
+    assert_eq!(
+        c.call("check_design", Some(json!({}))).unwrap(),
+        json!("check_design")
+    );
+    assert!(
+        t.elapsed() < Duration::from_millis(120),
+        "calls took {:?} behind a build",
+        t.elapsed()
+    );
+    assert_eq!(build.join().unwrap().unwrap(), Value::Null);
+    assert_eq!(fake.conns.load(Ordering::SeqCst), 3);
+
+    // A read on the build's lane is answered after the build.
+    let build = {
+        let c = c.clone();
+        std::thread::spawn(move || c.call("set_upsampler", Some(json!({"target": "off"}))))
+    };
+    std::thread::sleep(Duration::from_millis(40));
+    let t = Instant::now();
+    let after = c
+        .call_request(json!({"method": "get_config", "lane": "upsampler"}))
+        .unwrap();
+    assert_eq!(after, json!("get_config"));
+    assert!(
+        t.elapsed() >= Duration::from_millis(200),
+        "{:?}",
+        t.elapsed()
+    );
+    build.join().unwrap().unwrap();
+    assert_eq!(fake.conns.load(Ordering::SeqCst), 3);
+}
+
+#[test]
 fn newer_analysis_supersedes_pending_one() {
-    assert_eq!(timeout_for("upsampler_response"), Duration::from_secs(120));
+    assert_eq!(timeout_for("upsampler_response"), BUILD_CALL_TIMEOUT);
     let fake = Fake::start(false);
     let c = Arc::new(DaemonClient::new(fake.path_fn()));
 
@@ -562,4 +625,12 @@ fn subscription_toggles_meters_topic() {
     let msgs = got.lock().unwrap().clone();
     assert!(!msgs.iter().any(|m| matches!(m, SubMsg::Down(_))));
     sub.stop();
+}
+
+#[test]
+fn a_daemon_superseded_reply_maps_to_the_client_code() {
+    let reply = json!({"id": 3, "error": {"code": 5, "message": "superseded"}});
+    assert_eq!(outcome(&reply).unwrap_err().code, CallError::SUPERSEDED);
+    let other = json!({"id": 3, "error": {"code": 4, "message": "stale"}});
+    assert_eq!(outcome(&other).unwrap_err().code, 4);
 }

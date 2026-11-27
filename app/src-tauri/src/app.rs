@@ -7,13 +7,12 @@
 //! on-screen volume display). Each has its own store and event channel; the
 //! main one also gets meters and spectrum.
 //!
-//! Each webview is a WebKit web process of its own, so none is kept while
-//! nobody looks at it: closing the main window to the tray destroys it (and
-//! drops the meters and spectrum topics), showing it makes it again from
-//! the app config; the popup and our OSD window are made when first needed
-//! and destroyed [`IDLE_FREE`] after they were last hidden. While the main
-//! window is gone the volume keys and the tray wheel are handled here
-//! (`volume_step`) instead of by its store.
+//! Each webview is its own WebKit web process and is not kept while nobody
+//! looks at it: closing the main window to the tray destroys it (and drops the
+//! meters and spectrum topics), showing it makes it again; the popup and our
+//! OSD window are made when first needed and destroyed [`IDLE_FREE`] after
+//! they were last hidden. While the main window is gone the volume keys and
+//! the tray wheel are handled here (`volume_step`) instead of by its store.
 
 use crate::client::{CallError, DaemonClient, PathFn, SubMsg, Subscription};
 use crate::shortcuts::{self, KeyAction, KeyEvent, KeysState, PortalKeys};
@@ -23,7 +22,8 @@ use crate::ui_settings::{self, OsdMode, TrayClick, UiSettings};
 use crate::wheel::{self, WheelAccumulator};
 use crate::window_life::{Closing, IDLE_FREE, IdleReaper};
 use crate::{
-    autostart, eq, irinfo, overlays, paths, placement, plasma_osd, systemd, tray_text, volume_step,
+    appimage, autostart, eq, irinfo, overlays, paths, placement, plasma_osd, relaunch, systemd,
+    tray_text, volume_step,
 };
 use audivane_protocol::Band;
 use audivane_protocol::ipc::Status;
@@ -65,9 +65,9 @@ enum ShowRequest {
 /// Meter frames for the webview: at most one delivery outstanding.
 ///
 /// `Channel::send` is not acknowledged, so a webview that stops processing
-/// messages (suspended while minimized, say) would let 30 Hz meter frames pile
-/// up. Instead one frame goes out, and the next only once the webview says it
-/// has drawn it (`meters_ack`); frames arriving meanwhile replace each other.
+/// messages (suspended while minimized, say) would let 30 Hz frames pile up.
+/// Instead one frame goes out and the next only once the webview says it has
+/// drawn it (`meters_ack`); frames arriving meanwhile replace each other.
 #[derive(Default)]
 struct MeterMailbox {
     /// The newest frame not yet sent.
@@ -352,6 +352,14 @@ struct Shared {
     closing: Mutex<BTreeMap<String, Closing<ShowRequest>>>,
     /// Which close of the main window its time-out belongs to.
     main_close_gen: AtomicU64,
+    /// A package upgrade replaced the binary but relaunching into it
+    /// failed: the window and the tray ask for a restart.
+    update_pending: AtomicBool,
+    /// A replaced binary is ready, but the main window had the focus: the
+    /// relaunch waits until the user leaves it (`relaunch_when_away`).
+    upgrade_waiting: AtomicBool,
+    /// An upgrade check is running (one at a time).
+    upgrade_checking: AtomicBool,
 }
 
 impl Shared {
@@ -487,41 +495,240 @@ fn app_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Relaunch the app, e.g. after a package upgrade replaced its binary: the
-/// new process runs the installed (new) code. Like `AppHandle::restart`, but
-/// without `--hidden`: the user clicked Restart in a visible window. The
-/// single-instance lock is released (`cleanup_before_exit`) before the new
-/// process starts.
+/// Relaunch the app, e.g. after a package upgrade replaced its binary, so the
+/// new process runs the installed code (the window's Restart, or the tray's
+/// "Restart to finish the update").
 #[tauri::command]
-fn restart_app(app: AppHandle) {
-    let _ = app.save_window_state(StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED);
+fn restart_app(app: AppHandle) -> Result<(), CallError> {
+    let Err(message) = relaunch_now(&app);
+    Err(CallError { code: 2, message })
+}
+
+/// Where an upgrade of the app stands, for the window's notice: "ready"
+/// (it relaunches once the user leaves the window), "failed" (relaunching
+/// failed: restart by hand), or nothing.
+#[tauri::command]
+fn app_update_pending(state: State<'_, AppState>) -> Option<&'static str> {
+    if state.update_pending.load(Ordering::Relaxed) {
+        Some("failed")
+    } else if state.upgrade_waiting.load(Ordering::Relaxed) {
+        Some("ready")
+    } else {
+        None
+    }
+}
+
+/// Running from the AppImage: what its setup offer needs (null otherwise).
+#[tauri::command]
+fn appimage_setup() -> Option<appimage::SetupState> {
+    appimage::appdir(std::env::var_os("APPIMAGE"), std::env::var_os("APPDIR"))?;
+    let home = std::env::var_os("HOME")?;
+    Some(appimage::current_state(std::path::Path::new(&home)))
+}
+
+/// The AppImage's per-user setup (it starts the engine), then a relaunch
+/// into the installed app. Returns only when either failed.
+#[tauri::command]
+async fn appimage_install(app: AppHandle, login_start: bool) -> Result<(), CallError> {
+    let fail = |message: String| CallError { code: 2, message };
+    let appdir = appimage::appdir(std::env::var_os("APPIMAGE"), std::env::var_os("APPDIR"))
+        .ok_or_else(|| fail("This app is not running from an AppImage.".into()))?;
+    let home = std::env::var_os("HOME").ok_or_else(|| fail("HOME is not set.".into()))?;
+    tauri::async_runtime::spawn_blocking(move || appimage::install(&appdir, login_start))
+        .await
+        .map_err(|e| fail(e.to_string()))?
+        .map_err(fail)?;
+    let exe = appimage::installed_app(std::path::Path::new(&home));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let a = app.clone();
+    app.run_on_main_thread(move || {
+        let env: Vec<_> = appimage::APPIMAGE_ENV.iter().map(|k| (*k, None)).collect();
+        let Err(e) = relaunch_into(&a, &exe, &env);
+        let _ = tx.send(e);
+    })
+    .map_err(|e| fail(e.to_string()))?;
+    let message = tauri::async_runtime::spawn_blocking(move || rx.recv())
+        .await
+        .map_err(|e| fail(e.to_string()))?
+        .unwrap_or_else(|_| "the relaunch did not report back".into());
+    Err(fail(format!(
+        "Set up, but the app could not restart into the installed copy ({message}). Close it and open Audivane DSP from the app menu."
+    )))
+}
+
+/// How long the user must have been away from the window (it lost the
+/// focus or was closed to the tray) before a waiting relaunch runs: a
+/// moment's focus change (to the tray popup, a dialog) is not leaving.
+const AWAY_WAIT: Duration = Duration::from_millis(1500);
+
+/// Wait between looks at a replaced binary: a package manager writing it
+/// in place changes its size or time meanwhile; relaunch only once it
+/// holds still.
+const UPGRADE_SETTLE: Duration = Duration::from_secs(3);
+/// The fallback look, for an upgrade that did not restart the engine.
+const UPGRADE_POLL: Duration = Duration::from_secs(600);
+
+/// Relaunching by itself after an upgrade: release builds from a package (not
+/// an AppImage, whose binary sits in its own mount and never changes).
+/// `AUDIVANE_SELF_RELAUNCH=1` turns it on in a debug build.
+fn self_relaunch_enabled() -> bool {
+    std::env::var_os("APPIMAGE").is_none_or(|a| a.is_empty())
+        && (!cfg!(debug_assertions) || std::env::var_os("AUDIVANE_SELF_RELAUNCH").is_some())
+}
+
+/// Look whether a package upgrade replaced this binary (on the engine coming
+/// back, which the post-upgrade scriptlet restarts, and now and then); if so,
+/// relaunch into the new one once it holds still. Never blocks the caller.
+fn check_for_upgrade(app: &AppHandle) {
+    let state = app.state::<AppState>().inner().clone();
+    if !self_relaunch_enabled()
+        || state.update_pending.load(Ordering::Relaxed)
+        || state.upgrade_waiting.load(Ordering::Relaxed)
+        || state.upgrade_checking.swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let ready = upgraded_binary_ready();
+        state.upgrade_checking.store(false, Ordering::SeqCst);
+        if ready {
+            let a = app.clone();
+            let _ = app.run_on_main_thread(move || relaunch_after_upgrade(&a));
+        }
+    });
+}
+
+/// The installed binary is a new, runnable file that kept the same
+/// identity for `UPGRADE_SETTLE` (a few tries while it is still changing).
+fn upgraded_binary_ready() -> bool {
+    let link = std::path::Path::new("/proc/self/exe");
+    let Ok(path) = relaunch::installed_path(link) else {
+        return false;
+    };
+    let Some(mut seen) = relaunch::replacement(link, &path) else {
+        return false;
+    };
+    for _ in 0..5 {
+        std::thread::sleep(UPGRADE_SETTLE);
+        match relaunch::replacement(link, &path) {
+            Some(now) if now == seen => return true,
+            Some(now) => seen = now,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// The main window is shown and has the focus, or the tray popup has it:
+/// the user is working in the app.
+fn user_in_app(app: &AppHandle) -> bool {
     let state = app.state::<AppState>();
-    if let Some(mut s) = state
-        .subscription
+    let main = state.main_focused.load(Ordering::Relaxed)
+        && app
+            .get_webview_window(MAIN)
+            .is_some_and(|w| w.is_visible().unwrap_or(false));
+    main || state.popup_focused.load(Ordering::Relaxed)
+}
+
+/// Relaunch into the replaced binary, unless the user is working in the
+/// window: then the window offers "Restart now" and the relaunch waits
+/// until they leave it (`relaunch_when_away`). Main thread only.
+fn relaunch_after_upgrade(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if user_in_app(app) {
+        if !state.upgrade_waiting.swap(true, Ordering::SeqCst) {
+            log::info!(
+                "the app's binary was replaced (a package upgrade); relaunching once the window loses the focus"
+            );
+            let _ = app.emit_to(MAIN, "update-ready", ());
+        }
+        return;
+    }
+    state.upgrade_waiting.store(false, Ordering::SeqCst);
+    log::info!("the app's binary was replaced (a package upgrade); relaunching into it");
+    let Err(e) = relaunch_now(app);
+    log::warn!("{e}; the app keeps running the old code until it is restarted");
+    let state = app.state::<AppState>();
+    state.update_pending.store(true, Ordering::Relaxed);
+    state
+        .tray
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .take()
+        .update_pending = true;
+    refresh_tray(app);
+    let _ = app.emit_to(MAIN, "update-pending", ());
+}
+
+/// The user may have left the window (it lost the focus, or was closed to
+/// the tray): a waiting relaunch runs if they are still away after
+/// `AWAY_WAIT`. Never blocks the caller.
+fn relaunch_when_away(app: &AppHandle) {
+    if !app
+        .state::<AppState>()
+        .upgrade_waiting
+        .load(Ordering::Relaxed)
     {
-        s.stop();
+        return;
     }
-    state.client.reset();
-    let env = app.env();
-    let exe = tauri::process::current_binary(&env);
-    app.cleanup_before_exit();
-    match exe {
-        Ok(exe) => {
-            let args = env
-                .args_os
-                .iter()
-                .skip(1)
-                .filter(|a| a.to_str() != Some("--hidden"));
-            if let Err(e) = std::process::Command::new(&exe).args(args).spawn() {
-                log::error!("cannot relaunch {}: {e}", exe.display());
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(AWAY_WAIT);
+        let a = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            let st = a.state::<AppState>();
+            if st.upgrade_waiting.load(Ordering::Relaxed) && !user_in_app(&a) {
+                relaunch_after_upgrade(&a);
             }
-        }
-        Err(e) => log::error!("cannot find the app binary to relaunch: {e}"),
-    }
-    std::process::exit(0);
+        });
+    });
+}
+
+/// Replace this process with the installed binary (`exec`: same PID, so the
+/// same session or autostart unit). The old image's tray item and
+/// single-instance name go with its D-Bus connections, which `exec` closes
+/// before the new image starts; the new one waits for the name to be free
+/// (`relaunch::wait_name_free`). Same arguments, with `--hidden` only when no
+/// main window is open; the main view's place goes along. Returns only when
+/// `exec` failed, and then nothing has been torn down. Main thread only.
+fn relaunch_now(app: &AppHandle) -> Result<std::convert::Infallible, String> {
+    let installed = relaunch::installed_path(std::path::Path::new("/proc/self/exe"))
+        .map_err(|e| format!("cannot find the app binary to relaunch: {e}"))?;
+    // From an AppImage: run the AppImage file again, not the binary in its
+    // mount.
+    let exe = autostart::launcher(std::env::var_os("APPIMAGE"), installed);
+    relaunch_into(app, &exe, &[])
+}
+
+/// `relaunch_now` into `exe`, with `env` changed besides (a `None` value
+/// removes the variable).
+fn relaunch_into(
+    app: &AppHandle,
+    exe: &std::path::Path,
+    extra_env: &[(&str, Option<std::ffi::OsString>)],
+) -> Result<std::convert::Infallible, String> {
+    let shown = app
+        .get_webview_window(MAIN)
+        .is_some_and(|w| w.is_visible().unwrap_or(false));
+    let _ = app.save_window_state(StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED);
+    let state = app.state::<AppState>();
+    let view = state
+        .main_view
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let old: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let args = relaunch::relaunch_args(&old, !shown);
+    let reap = relaunch::format_pids(&relaunch::child_pids(std::process::id()));
+    let mut env = vec![
+        (relaunch::ENV_RELAUNCHED, Some("1".into())),
+        (relaunch::ENV_REAP, Some(reap.into())),
+        (relaunch::ENV_MAIN_VIEW, view.map(|v| v.to_string().into())),
+    ];
+    env.extend(extra_env.iter().cloned());
+    log::info!("relaunching {} {args:?}", exe.display());
+    let err = relaunch::exec(exe, &args, &env);
+    Err(format!("cannot relaunch {}: {err}", exe.display()))
 }
 
 #[tauri::command]
@@ -590,18 +797,24 @@ fn update_tray_from(state: &Shared, msg: &SubMsg) -> bool {
     match msg {
         SubMsg::Up => m.up = true,
         SubMsg::Down(_) | SubMsg::Connecting => {
-            *m = TrayModel::default();
+            *m = TrayModel {
+                update_pending: m.update_pending,
+                ..TrayModel::default()
+            };
         }
         SubMsg::Event(v) => match v.get("event").and_then(Value::as_str) {
             Some("status") => {
                 if let Ok(st) = serde_json::from_value::<Status>(v["data"].clone()) {
                     m.line = tray_text::passthrough_line(&st);
                     m.dsp_enabled = st.dsp_enabled;
-                    m.ab = st.ab.filter(|a| a.enabled).map(|a| {
-                        serde_json::to_value(a.current)
+                    // "a", "b", or "blind" while a blind test hides the side.
+                    m.ab = st.ab.filter(|a| a.enabled).map(|a| match a.current {
+                        _ if a.blind => "blind".to_string(),
+                        Some(side) => serde_json::to_value(side)
                             .ok()
                             .and_then(|s| s.as_str().map(str::to_string))
-                            .unwrap_or_default()
+                            .unwrap_or_default(),
+                        None => String::new(),
                     });
                 }
                 if let Some(name) = v["data"]["preset"]["name"].as_str() {
@@ -659,6 +872,13 @@ pub(crate) fn tray_action(app: &AppHandle, id: String, token: Option<String>) {
         "show" => present_main(app, token),
         "popup" => open_popup(app, None, token),
         "quit" => app.exit(0),
+        "restart" => {
+            let a = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                let Err(e) = relaunch_now(&a);
+                log::warn!("{e}");
+            });
+        }
         _ => {
             let state = app.state::<AppState>().inner().clone();
             let app = app.clone();
@@ -1889,6 +2109,29 @@ fn first_run_defaults(app: &AppHandle, settings: &UiSettings) {
 }
 
 pub fn run() {
+    // stderr, which the session journal keeps for a desktop-launched app.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
+    let context = tauri::generate_context!();
+    // Relaunched into a new binary (`relaunch_now`): the old image's
+    // single-instance name may still look taken for a moment, its WebKit
+    // processes are still our children, and its main view's place came along.
+    let relaunched = std::env::var_os(relaunch::ENV_RELAUNCHED).is_some();
+    let relaunched_view: Option<Value> = if relaunched {
+        relaunch::wait_name_free(
+            &format!("{}.SingleInstance", context.config().identifier),
+            Duration::from_secs(3),
+        );
+        relaunch::reap(relaunch::parse_pids(
+            &std::env::var(relaunch::ENV_REAP).unwrap_or_default(),
+        ));
+        std::env::var(relaunch::ENV_MAIN_VIEW)
+            .ok()
+            .and_then(|v| serde_json::from_str(&v).ok())
+    } else {
+        None
+    };
     let path: PathFn = Arc::new(paths::socket_path);
     let settings_path = ui_settings::path().map_err(|e| log::warn!("{e}")).ok();
     // No settings file yet: the app's first run on this account.
@@ -1919,13 +2162,16 @@ pub fn run() {
         hidden_at_start: AtomicBool::new(false),
         tray_respawns: AtomicUsize::new(0),
         tray_respawn_lock: Mutex::new(()),
-        main_view: Mutex::new(None),
+        main_view: Mutex::new(relaunched_view),
         popup_life: Mutex::new(IdleReaper::default()),
         osd_life: Mutex::new(IdleReaper::default()),
         levels: Mutex::new(volume_step::Tracker::default()),
         native_steps: Mutex::new(None),
         closing: Mutex::new(BTreeMap::new()),
         main_close_gen: AtomicU64::new(0),
+        update_pending: AtomicBool::new(false),
+        upgrade_waiting: AtomicBool::new(false),
+        upgrade_checking: AtomicBool::new(false),
     });
     // Until the tray-host watch says otherwise there is no tray: closing
     // the window quits.
@@ -1961,6 +2207,9 @@ pub fn run() {
             restart_engine,
             app_version,
             restart_app,
+            app_update_pending,
+            appimage_setup,
+            appimage_install,
             ir_info,
             overlays_list,
             overlay_save,
@@ -2030,6 +2279,9 @@ pub fn run() {
                 }
                 let mut changed = update_tray_from(&state, &msg);
                 if msg == SubMsg::Up {
+                    // The post-upgrade scriptlet restarts the engine: a
+                    // reconnect is when a new app binary may be in place.
+                    check_for_upgrade(&h);
                     let (st, h2) = (state.clone(), h.clone());
                     std::thread::spawn(move || {
                         refresh_model(&st);
@@ -2052,6 +2304,14 @@ pub fn run() {
                 .subscription
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = Some(sub);
+            // The fallback look for a replaced binary.
+            let h = handle.clone();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(UPGRADE_POLL);
+                    check_for_upgrade(&h);
+                }
+            });
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -2059,7 +2319,10 @@ pub fn run() {
             let state = app.state::<AppState>();
             if let WindowEvent::Destroyed = event {
                 match window.label() {
-                    MAIN => main_gone(app),
+                    MAIN => {
+                        main_gone(app);
+                        relaunch_when_away(app);
+                    }
                     label => helper_gone(app, label),
                 }
                 // A show request made while it was going is made afresh now.
@@ -2069,6 +2332,9 @@ pub fn run() {
             if window.label() == POPUP {
                 if let WindowEvent::Focused(focused) = event {
                     state.popup_focused.store(*focused, Ordering::Relaxed);
+                    if !*focused {
+                        relaunch_when_away(app);
+                    }
                     // Focus loss closes it, like a menu. GTK can report a
                     // short focus-out while mapping; ignore one right after
                     // it opened.
@@ -2110,6 +2376,9 @@ pub fn run() {
             }
             if let WindowEvent::Focused(focused) = event {
                 state.main_focused.store(*focused, Ordering::Relaxed);
+                if !*focused {
+                    relaunch_when_away(app);
+                }
             }
             // Minimizing has no event of its own. On GTK, (de)iconifying sends
             // Moved and Resized, and focus changes with it; read the state then.
@@ -2141,7 +2410,7 @@ pub fn run() {
                 close_main_to_tray(app, window);
             }
         })
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("failed to build the Audivane DSP window");
 
     app.run(|handle, event| {

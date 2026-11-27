@@ -16,7 +16,7 @@
 //! [`PresetError`]s. The runtimes with fixed internal filters live here:
 //!
 //! - [`cascade`]: the x2/x3 stage cascades (the `cascade_*` presets).
-//! - [`interp`]: the `cosine`, `catmull_rom` and `table_sinc` presets.
+//! - [`interp`]: the `nos`, `cosine`, `catmull_rom` and `table_sinc` presets.
 //! - [`block_fft`]: the `block_fft*` presets.
 
 pub mod block_fft;
@@ -138,6 +138,7 @@ mod tests {
             FilterPreset::GaussianLong,
             FilterPreset::CascadeFir,
             FilterPreset::BlockFftLarge,
+            FilterPreset::Nos,
             FilterPreset::CatmullRom,
             FilterPreset::Lanczos32767,
             FilterPreset::FlattopHuge,

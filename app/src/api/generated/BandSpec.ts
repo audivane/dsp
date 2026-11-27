@@ -10,9 +10,24 @@ export type BandSpec = {
 /**
  * End of the passband, as a fraction of the source Nyquist. Up to here
  * the response stays within the stopband's relative error of 0 dB
- * (a Kaiser design ripples by the same amount in both bands).
+ * (a Kaiser design ripples by the same amount in both bands). When
+ * [`Self::passband_end_hz`] is set, this is the fallback at a source
+ * rate where that frequency does not fit the band.
  */
 passband_end: number, 
+/**
+ * End of the passband as an absolute frequency, Hz: converted to a
+ * fraction of the source Nyquist when the design is built, so the band
+ * does not scale with the source rate (Recommended and `craven_apod`
+ * pin 20 kHz this way; the Custom editor's "Hz" unit sets it). Like
+ * the fractions it is of the lower Nyquist, so decimating converts it
+ * at the output rate. Where
+ * the frequency does not fit the band at a source rate (it must end
+ * below the stopband start, at most at the Nyquist, and leave a
+ * transition no wider than the Nyquist), the design uses
+ * [`Self::passband_end`] there instead and the design check notes it.
+ */
+passband_end_hz?: number, 
 /**
  * Start of the stopband, as a fraction of the source Nyquist. 1.0 puts
  * it at the source Nyquist (no imaging); above 1.0 lets images of the

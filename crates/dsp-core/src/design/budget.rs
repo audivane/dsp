@@ -443,6 +443,15 @@ pub fn engine_block(max_block: usize) -> usize {
     }
 }
 
+/// Stages of the FFT polyphase engine for `taps` at the output rate at
+/// integer ratio `ratio`, with chain blocks of `max_block`: 1 is the
+/// uniformly partitioned engine; more, non-uniform partitions
+/// (`crate::nupc::polyphase_plan`).
+pub fn polyphase_stages(taps: usize, ratio: usize, max_block: usize) -> usize {
+    let r = ratio.max(1);
+    crate::nupc::polyphase_plan(engine_block(max_block), r, taps.div_ceil(r)).len()
+}
+
 /// What an `n`-tap kernel's runtime keeps in `cx` (an estimate): the FFT
 /// polyphase engine's partition spectra and per-channel delay lines and
 /// FIFOs, or the rational runtime's coefficient rows and histories.
@@ -452,10 +461,32 @@ pub fn kernel_resident(n: usize, cx: &super::BuildContext) -> u64 {
     let ch = cx.channels as u64;
     if cx.ratio.is_integer() {
         let b = engine_block(cx.max_block);
-        let parts = per_branch.div_ceil(b) as u64;
-        let spectrum = 16 * (b as u64 + 1);
+        let plan = crate::nupc::polyphase_plan(b, l, per_branch);
+        let spectrum = |block: usize| 16 * (block as u64 + 1);
         let fifos = 8 * 4 * (b * l) as u64;
-        parts * l as u64 * spectrum + ch * (parts * spectrum + fifos)
+        if plan.len() == 1 {
+            let parts = per_branch.div_ceil(b) as u64;
+            return parts * l as u64 * spectrum(b) + ch * (parts * spectrum(b) + fifos);
+        }
+        // Stage 0, then per tail stage its spectra and, per channel, its
+        // delay line, input blocks, output double buffer, accumulator and
+        // four-step work buffer.
+        let parts0 = crate::nupc::stage_parts(&plan[0], per_branch).max(1) as u64;
+        let mut shared = parts0 * l as u64 * spectrum(b);
+        let mut own = parts0 * spectrum(b) + fifos;
+        for st in &plan[1..] {
+            let parts = crate::nupc::stage_parts(st, per_branch) as u64;
+            let delay = ((st.offset - 2 * st.block) / st.block) as u64;
+            let blk = st.block as u64;
+            let work = if st.block > crate::nupc::DIRECT_FFT_MAX_BLOCK {
+                16 * blk
+            } else {
+                0
+            };
+            shared += parts * l as u64 * spectrum(st.block);
+            own += (parts + delay + 1) * spectrum(st.block) + 8 * (3 + 2 * l as u64) * blk + work;
+        }
+        shared + ch * own
     } else {
         8 * (l * per_branch) as u64 + ch * 8 * (per_branch + cx.max_block.max(1)) as u64
     }
@@ -486,7 +517,7 @@ pub fn runtime_resident(d: &super::FilterDesign, cx: &super::BuildContext) -> u6
 ///
 /// | Runtime | Work per second and channel |
 /// |---|---|
-/// | integer kernel: FFT polyphase engine, block `b` | `fs/b` blocks of `parts * r * (b+1)` spectral bins and `1 + r` transforms of `2b` points |
+/// | integer kernel: FFT polyphase engine, block `b` | one stage: `fs/b` blocks of `parts * r * (b+1)` spectral bins and `1 + r` transforms of `2b` points; with tail stages, stage 0 so and each tail stage's period at its runtime slicing, priced at the heaviest callback |
 /// | rational kernel: direct polyphase | `out_rate * ceil(grid_taps / L)` dot multiply-adds |
 /// | cascade, FIR stages | per stage the same block model with its short kernel |
 /// | cascade, recursive stages | per stage output sample, `order` serial multiply-adds |
@@ -538,6 +569,27 @@ const TABLE_SINC_PER_OUTPUT: f64 = 127.0 * 1.2;
 /// The FFT polyphase engine's work beside its bins and transforms: the
 /// delay line, the branch interleave, FIFO copies.
 const FFT_ENGINE_OVERHEAD: f64 = 1.15;
+/// A tail stage's four-step transform jobs, each kind over its share of one
+/// real FFT of the stage's size by the job cost model (the model prices a
+/// direct real FFT within 4 % for blocks of 8192 and more). The factors are
+/// measured real/model per kind: forward step A (the strided gather from
+/// the input blocks, the transposed store) 1.5 to 2.7, forward step B 1.15
+/// to 2.05, inverse step B 1.0 to 1.4, inverse step A 1.1 to 1.8. Priced
+/// near the top of each range: the heaviest callback is one of the period's
+/// first base blocks, which run only forward step-A jobs of every stage.
+const FOUR_STEP_FWD_A: f64 = 2.6;
+const FOUR_STEP_FWD_B: f64 = 1.8;
+const FOUR_STEP_INV_B: f64 = 1.3;
+const FOUR_STEP_INV_A: f64 = 1.7;
+/// A tail stage's multiply-accumulate over the benchmark's spectral rate at
+/// the stage's spectra size: it sweeps every partition of one branch a
+/// chunk of bins at a time, about as fast as the uniform engine from
+/// memory and slower in cache (measured 0.9 to 1.5).
+const TAIL_MAC: f64 = 1.25;
+/// The tail stages' heaviest callback window over its price: what the
+/// measured per-callback time still adds (the period start's cold delay
+/// line slot and output swap, cache misses the job prices average out).
+const TAIL_PEAK_MARGIN: f64 = 1.15;
 /// The block FFT's work beside its transforms and bins: windowing, the
 /// split forward transform's twiddle pass, the phase interleave.
 const BLOCK_FFT_OVERHEAD: f64 = 1.8;
@@ -550,10 +602,148 @@ pub fn intermediate_growth(beta: f64) -> f64 {
     (1.45 + (14.0 - beta).max(0.0) * (3.1 - 1.45) / 12.0).clamp(1.45, 3.1)
 }
 
+/// Seconds per second of audio, per channel, of the FFT polyphase engine
+/// ([`crate::resample::Upsampler`]): `taps` at the output rate, ratio `r`,
+/// input block `b`, source rate `fs`, callbacks of `max_block` input
+/// frames. Its partition schedule is the runtime's
+/// (`crate::nupc::polyphase_plan`): one stage is the uniformly
+/// partitioned engine ([`uniform_polyphase_secs`]); with tail stages, the
+/// heaviest callback ([`nupc_polyphase_secs`]).
+fn fft_polyphase_secs(
+    rates: &KernelRates,
+    taps: usize,
+    r: usize,
+    b: usize,
+    fs: f64,
+    max_block: usize,
+) -> f64 {
+    let len = taps.div_ceil(r);
+    let plan = crate::nupc::polyphase_plan(b, r, len);
+    if plan.len() == 1 {
+        return uniform_polyphase_secs(rates, taps, r, b, fs);
+    }
+    nupc_polyphase_secs(rates, &plan, len, r, b, fs, max_block)
+}
+
+/// The FFT polyphase engine on the partition schedule `plan` (more than one
+/// stage), branches of `len` taps: seconds of its heaviest callback over
+/// the callback's duration.
+///
+/// Stage 0 runs whole on every base block of `b` frames: `1 + r` real
+/// transforms of `2b` points and its partitions' bins, as the uniform
+/// engine's. A tail stage's period is sliced over its base blocks exactly
+/// as the runtime slices it (`crate::nupc::Schedule`, by the job cost
+/// model); here each job is priced with this machine's rates instead (a
+/// transform job by its kind at a measured factor over the model's share of
+/// a real FFT of the stage's size, a multiply-accumulate at the spectral
+/// rate of the stage's spectra, which stream from memory when they are
+/// large), so a base block whose jobs the model under-weights is priced as
+/// heavy as it runs. A callback of at most `max_block` frames runs at most
+/// `max_block / b` consecutive base blocks (at least one), starting at any
+/// base block; the heaviest such window of every stage is added up, an
+/// upper bound on the heaviest callback.
+fn nupc_polyphase_secs(
+    rates: &KernelRates,
+    plan: &[crate::nupc::StagePlan],
+    len: usize,
+    r: usize,
+    b: usize,
+    fs: f64,
+    max_block: usize,
+) -> f64 {
+    use crate::nupc::{Job, NS_MAC, Schedule, real_fft_cost, stage_parts};
+    let k = (max_block / b).max(1);
+    let spectra = |parts: usize, block: usize| parts * r * (block + 1) * 16;
+    let parts0 = stage_parts(&plan[0], len).max(1);
+    let head = (1 + r) as f64 * rates.fft_seconds(2 * b)
+        + (parts0 * r * (b + 1)) as f64 / rates.spectral_rate(spectra(parts0, b));
+    let mut peak = k as f64 * head;
+    let mut mean = peak;
+    for st in &plan[1..] {
+        let parts = stage_parts(st, len);
+        if parts == 0 {
+            continue;
+        }
+        let sched = Schedule::new(st.block, r, b);
+        // Seconds per model unit of each job kind: a transform job at its
+        // kind's measured factor over the model's real FFT of this size, a
+        // multiply-accumulate at the spectral rate of the stage's spectra.
+        let fft = rates.fft_seconds(2 * st.block) / real_fft_cost(st.block);
+        let mac = TAIL_MAC / (NS_MAC * rates.spectral_rate(spectra(parts, st.block)));
+        let scale = |job: Job| match job {
+            Job::Mac { .. } => mac,
+            Job::FwdA(_) => fft * FOUR_STEP_FWD_A,
+            Job::FwdB(_) => fft * FOUR_STEP_FWD_B,
+            Job::InvB { .. } => fft * FOUR_STEP_INV_B,
+            Job::InvA { .. } => fft * FOUR_STEP_INV_A,
+            Job::FwdDirect | Job::InvDirect { .. } | Job::Done => fft,
+        };
+        let mut ticks = vec![0.0f64; sched.ticks];
+        sched.for_each_sliced(parts, |tick, job| {
+            ticks[tick] += sched.job_cost(job, parts) * scale(job);
+        });
+        let period: f64 = ticks.iter().sum();
+        mean += period * k as f64 / sched.ticks as f64;
+        peak += TAIL_PEAK_MARGIN * heaviest_window(&ticks, k);
+    }
+    debug_assert!(peak >= mean * (1.0 - 1e-9));
+    let callback = peak.max(mean);
+    callback * fs / (k * b) as f64 * FFT_ENGINE_OVERHEAD + out_overhead(rates, fs * r as f64)
+}
+
+/// Seconds of CPU per second of audio of one partitioned convolver
+/// channel ([`crate::conv::Convolver`]): `taps` at `source_rate`, chain
+/// blocks of `max_block` frames. Priced like the FFT polyphase engine at
+/// one branch, on the convolver's own partition schedule
+/// (`crate::nupc::plan_schedule`): the uniform engine for one stage, the
+/// heaviest callback of its sliced tail stages otherwise. A filter matrix
+/// runs one per present entry.
+pub fn convolution_secs(
+    rates: &KernelRates,
+    taps: usize,
+    source_rate: u32,
+    max_block: usize,
+) -> f64 {
+    let taps = taps.max(1);
+    let b = engine_block(max_block);
+    let fs = f64::from(source_rate);
+    let plan = crate::nupc::plan_schedule(b, taps);
+    if plan.len() == 1 {
+        return uniform_polyphase_secs(rates, taps, 1, b, fs);
+    }
+    nupc_polyphase_secs(rates, &plan, taps, 1, b, fs, max_block)
+}
+
+/// Seconds of CPU per second of audio of `sections` second-order IIR
+/// sections in series on one channel at `source_rate` (the EQ: a serial
+/// recursion, priced as the cascade's recursive stages are).
+pub fn biquad_secs(rates: &KernelRates, sections: usize, source_rate: u32) -> f64 {
+    f64::from(source_rate) * (2 * sections) as f64 * IIR_PER_ORDER / rates.reference_rate()
+}
+
+/// The heaviest sum of `k` consecutive entries of the periodic `ticks`
+/// (one period of a tail stage, base block by base block): every window,
+/// across the period's end too, as calls of any size can start anywhere.
+fn heaviest_window(ticks: &[f64], k: usize) -> f64 {
+    let n = ticks.len();
+    let whole = (k / n) as f64 * ticks.iter().sum::<f64>();
+    let rest = k % n;
+    if rest == 0 {
+        return whole;
+    }
+    let mut sum: f64 = ticks[..rest].iter().sum();
+    let mut best = sum;
+    for start in 1..n {
+        sum += ticks[(start + rest - 1) % n] - ticks[start - 1];
+        best = best.max(sum);
+    }
+    whole + best
+}
+
 /// Seconds per second of audio, per channel, of a uniformly partitioned
 /// polyphase FFT convolution: `taps` at the output rate, ratio `r`, input
 /// block `b`, source rate `fs`.
-fn fft_polyphase_secs(rates: &KernelRates, taps: usize, r: usize, b: usize, fs: f64) -> f64 {
+fn uniform_polyphase_secs(rates: &KernelRates, taps: usize, r: usize, b: usize, fs: f64) -> f64 {
     let blocks = fs / b as f64;
     let parts = taps.div_ceil(r).div_ceil(b).max(1);
     let bins = (b + 1) as f64;
@@ -599,7 +789,7 @@ impl Callback {
         Ok(match *self {
             Self::None => 0.0,
             Self::Polyphase { taps, ratio } => {
-                fft_polyphase_secs(rates, taps, ratio, engine_block(max_block), fs)
+                fft_polyphase_secs(rates, taps, ratio, engine_block(max_block), fs, max_block)
             }
             Self::Rational { grid_taps, ratio } => rational_secs(rates, grid_taps, ratio, fs),
             Self::Cascade { stage, ratio } => {
@@ -620,7 +810,7 @@ impl Callback {
                             .map_err(|e| DesignError::Failed(e.to_string()))?
                             .len();
                         let b = taps.div_ceil(f).next_power_of_two().max(8);
-                        secs += fft_polyphase_secs(rates, taps, f, b, rate);
+                        secs += uniform_polyphase_secs(rates, taps, f, b, rate);
                     }
                     rate *= f as f64;
                 }
@@ -628,10 +818,11 @@ impl Callback {
             }
             Self::Interpolator { method, ratio } => {
                 let out = fs * ratio as f64;
-                if method == super::InterpMethod::TableSinc {
-                    out * TABLE_SINC_PER_OUTPUT / rates.mul_add
-                } else {
-                    out * POLY_PER_OUTPUT / reference
+                match method {
+                    super::InterpMethod::Nos
+                    | super::InterpMethod::Cosine
+                    | super::InterpMethod::CatmullRom => out * POLY_PER_OUTPUT / reference,
+                    super::InterpMethod::TableSinc => out * TABLE_SINC_PER_OUTPUT / rates.mul_add,
                 }
             }
             Self::BlockFft { design, ratio: r } => {
@@ -889,6 +1080,17 @@ impl Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_heaviest_window_wraps_across_the_period() {
+        let t = [1.0, 0.0, 0.0, 5.0];
+        assert_eq!(heaviest_window(&t, 1), 5.0);
+        // [5, 1] across the period's end.
+        assert_eq!(heaviest_window(&t, 2), 6.0);
+        assert_eq!(heaviest_window(&t, 4), 6.0);
+        // A period and a half: one whole period and the best two.
+        assert_eq!(heaviest_window(&t, 6), 12.0);
+    }
     use crate::design::paths::standard::design_of;
     use crate::design::{BuildContext, FilterDesign, Phase, catalogue, feasibility, length, rates};
     use audivane_protocol::{
@@ -1018,14 +1220,19 @@ mod tests {
             return true;
         }
         let grid = crate::design::Grid::new(rate, ratio);
-        let mut t = length::per_input(k, grid.up, rate).unwrap();
-        if grid.decimating {
-            t = length::decimated(t, &k.decimation, &grid);
-        }
-        let n = t * grid.up;
-        let n = match k.phase {
-            Phase::Intermediate { .. } => 4 * n,
-            _ => n,
+        let n = match length::per_input(k, grid.up, rate) {
+            Ok(mut t) => {
+                if grid.decimating {
+                    t = length::decimated(t, &k.decimation, &grid);
+                }
+                let n = t * grid.up;
+                match k.phase {
+                    Phase::Intermediate { .. } => 4 * n,
+                    _ => n,
+                }
+            }
+            // A band length (`craven_apod`): its searched grid length.
+            Err(_) => crate::design::grid_taps(d, rate, ratio).unwrap(),
         };
         check_rational(
             n,

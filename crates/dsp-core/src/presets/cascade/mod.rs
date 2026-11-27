@@ -285,6 +285,31 @@ impl UpsamplerRuntime for FirCascade {
     fn impulse_span_out_frames(&self) -> usize {
         self.span
     }
+
+    // Each channel has its own stages and buffers already.
+    fn split_channels(&mut self) -> Option<Vec<Box<dyn UpsamplerRuntime>>> {
+        let stages = std::mem::take(&mut self.stages);
+        let bufs = std::mem::take(&mut self.bufs);
+        self.channels = 0;
+        Some(
+            stages
+                .into_iter()
+                .zip(bufs)
+                .map(|(st, b)| {
+                    Box::new(FirCascade {
+                        ratio: self.ratio,
+                        channels: 1,
+                        max_block: self.max_block,
+                        mults: self.mults.clone(),
+                        stages: vec![st],
+                        bufs: vec![b],
+                        latency: self.latency,
+                        span: self.span,
+                    }) as Box<dyn UpsamplerRuntime>
+                })
+                .collect(),
+        )
+    }
 }
 
 #[cfg(test)]

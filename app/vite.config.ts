@@ -5,7 +5,8 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
   clearScreen: false,
-  server: { port: 1430, strictPort: true, host: "127.0.0.1" },
+  // The browser mock reads the engine's harmonics presets from crates/protocol.
+  server: { port: 1430, strictPort: true, host: "127.0.0.1", fs: { allow: [".", "../crates/protocol/src"] } },
   preview: { port: 1431, strictPort: true, host: "127.0.0.1" },
   envPrefix: ["VITE_", "TAURI_ENV_"],
   build: {

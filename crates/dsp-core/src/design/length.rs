@@ -26,7 +26,7 @@ pub fn per_input(k: &KernelDesign, up: usize, source_rate: u32) -> Result<usize,
     let bad = |what: &str| Err(DesignError::Unsupported(what.to_string()));
     match &k.shape {
         Shape::Lanczos { lobes } => Ok(2 * lobes + 1),
-        Shape::WindowedSinc { length, .. } => match length {
+        Shape::WindowedSinc { length, .. } | Shape::Optimal { length, .. } => match length {
             Length::Fixed(_) | Length::Band | Length::Auto(_) => {
                 bad("this length rule counts frames or is searched: the standard path only")
             }

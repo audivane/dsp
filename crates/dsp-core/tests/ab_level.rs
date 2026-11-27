@@ -11,8 +11,8 @@ use audivane_dsp_core::db_to_lin;
 use audivane_dsp_core::loudness::{LufsMeter, Weighting};
 use audivane_protocol::ipc::AbHeadroom;
 use audivane_protocol::{
-    Band, ChainConfig, ChannelEq, ConvolutionConfig, CrossfeedConfig, CrossfeedLevel, DitherKind,
-    EqProfile, FilterType, LimiterConfig, LimiterMode, OutputConfig, RateTarget, TiltConfig,
+    Band, ChainConfig, ChannelEq, ConvolutionConfig, CrossfeedConfig, DitherKind, EqProfile,
+    FilterType, LimiterConfig, LimiterMode, OutputConfig, RateTarget, TiltConfig,
 };
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex64;
@@ -42,7 +42,7 @@ fn spec(config: ChainConfig, irs: Option<Vec<Vec<f64>>>) -> ChainSpec {
         sample_rate: FS,
         channels: 2,
         max_block: BLOCK,
-        irs,
+        irs: irs.map(Into::into),
     }
 }
 
@@ -74,6 +74,8 @@ fn with_conv(mut c: ChainConfig) -> ChainConfig {
         enabled: true,
         ir_path: "test.wav".into(),
         gain_db: 0.0,
+        matrix: None,
+        calibration: false,
     }];
     c
 }
@@ -205,7 +207,7 @@ fn analytic_k_offset_matches_offline_lufs() {
     });
     let crossfeed = ChainConfig {
         crossfeed: Some(CrossfeedConfig {
-            level: CrossfeedLevel::PeakSafe,
+            width: 1.5,
             ..CrossfeedConfig::default()
         }),
         ..config()
@@ -225,7 +227,7 @@ fn analytic_k_offset_matches_offline_lufs() {
         ),
         ("tilt -3 dB total", tilt),
         ("10-band headphone EQ", headphone),
-        ("crossfeed bs2b peak-safe", crossfeed),
+        ("crossfeed bs2b, width 1.5", crossfeed),
     ];
     let mut worst: f64 = 0.0;
     for (name, b) in rows {

@@ -62,30 +62,51 @@ pub fn materialize(a: &ChainConfig, b: &AbB) -> Result<ChainConfig, String> {
         }
         AbB::Patch(patch) => {
             check_patch(patch)?;
-            let base = serde_json::to_value(a).map_err(|e| format!("chain A: {e}"))?;
-            let mut merged = base.clone();
-            merge(&mut merged, patch);
-            serde_json::from_value(merged).map_err(|err| {
-                // Name the first top-level key that fails on its own.
-                let key = patch.as_object().and_then(|p| {
-                    p.iter().find_map(|(k, v)| {
-                        let mut one = base.clone();
-                        merge(
-                            &mut one,
-                            &Value::Object(Map::from_iter([(k.clone(), v.clone())])),
-                        );
-                        serde_json::from_value::<ChainConfig>(one)
-                            .is_err()
-                            .then(|| k.clone())
-                    })
-                });
-                match key {
-                    Some(k) => format!("ab.b.patch.{k}: {err}"),
-                    None => format!("ab.b.patch: {err}"),
-                }
-            })
+            apply_patch(a, patch, "ab.b.patch")
         }
     }
+}
+
+/// Chain A with the JSON merge patch `patch` applied, or why it does not
+/// apply, naming `at` and the first top-level key that fails on its own.
+pub fn apply_patch(a: &ChainConfig, patch: &Value, at: &str) -> Result<ChainConfig, String> {
+    let base = serde_json::to_value(a).map_err(|e| format!("chain A: {e}"))?;
+    let mut merged = base.clone();
+    merge(&mut merged, patch);
+    serde_json::from_value(merged).map_err(|err| {
+        let key = patch.as_object().and_then(|p| {
+            p.iter().find_map(|(k, v)| {
+                let mut one = base.clone();
+                merge(
+                    &mut one,
+                    &Value::Object(Map::from_iter([(k.clone(), v.clone())])),
+                );
+                serde_json::from_value::<ChainConfig>(one)
+                    .is_err()
+                    .then(|| k.clone())
+            })
+        });
+        match key {
+            Some(k) => format!("{at}.{k}: {err}"),
+            None => format!("{at}: {err}"),
+        }
+    })
+}
+
+/// The top-level chain fields where `own` differs from chain A (`a`), in
+/// the chain's field order.
+pub fn differing_fields(a: &ChainConfig, own: &ChainConfig) -> Vec<String> {
+    let (Ok(Value::Object(a)), Ok(Value::Object(own))) =
+        (serde_json::to_value(a), serde_json::to_value(own))
+    else {
+        return Vec::new();
+    };
+    let mut keys: Vec<&String> = a.keys().collect();
+    keys.extend(own.keys().filter(|k| !a.contains_key(*k)));
+    keys.into_iter()
+        .filter(|k| a.get(*k) != own.get(*k))
+        .cloned()
+        .collect()
 }
 
 /// A patch is an object that leaves the shared fields alone. A ratio

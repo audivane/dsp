@@ -1,9 +1,12 @@
 // Verify the bundled font subsets against third_party/fonts.json.
 //
-// The app bundles Latin subsets of IBM Plex Sans and Mono. IBM Plex declares
-// the Reserved Font Name "Plex", so the subsets ship renamed: their primary
-// name records carry an Audivane Latin family (Audivane Sans Latin, Audivane
-// Mono Latin) while copyright, license URL, glyphs and metrics are unchanged.
+// The app bundles a Latin subset of Geist (interface text) and Latin subsets
+// of IBM Plex Mono (numbers and values). IBM Plex declares the Reserved Font
+// Name "Plex", so its subsets ship renamed: their primary name records carry
+// Audivane Mono Latin while copyright, license URL, glyphs and metrics are
+// unchanged. Geist has no Reserved Font Name and keeps its own names; its
+// subset is recorded with the upstream file, axis range, code points and
+// command that made it (the `subset` record in the manifest).
 //
 // Decodes each WOFF2 with no third-party dependencies and confirms: the
 // manifest inventory matches the bundled files exactly with its license,
@@ -14,7 +17,9 @@
 // over every stored WOFF2 table except `name` and the head table's
 // checkSumAdjustment that must equal the fingerprint recorded from the
 // original upstream subset (originalContentSha256), so the glyph and metric
-// data are proven identical to the originals. Reproduce an original
+// data are proven identical to the originals. A `subset` family (Geist) has no
+// upstream subset to compare with: its bytes and fingerprint must match the
+// recorded sha256 and contentSha256 of the file made by the recorded command. Reproduce an original
 // fingerprint with `node tools/check-subset-fonts.mjs --fingerprint <file>`.
 //
 // `--update` recomputes contentSha256 from disk; tools/rename-subset-fonts.py
@@ -63,8 +68,10 @@ const REQUIRED_NAME_IDS = [0, 14];
 // `reservedFontNames` (IBM Plex: "Plex") is a renamed modified subset: its
 // primary names must carry the Audivane Latin family and never the reserved
 // name, and its file differs from the upstream subset only in the name table.
-// A family without reserved names (Inter, Instrument Serif) ships the pinned
-// upstream subset unmodified: its bytes must equal the recorded original.
+// A family without reserved names either ships a pinned upstream fontsource
+// subset unmodified (its bytes must equal the recorded original) or, with a
+// `subset` record (Geist), our own subset of the upstream font under its own
+// names.
 //
 // nameID -> validator; a validator returns an error message naming the
 // record's content, or null when the record is intact. Records that are
@@ -239,17 +246,25 @@ function readFamilies(manifest) {
     if (renamed && !(entry.family.includes("Audivane") && entry.family.includes("Latin"))) {
       throw new Error(`${label}: a family with a Reserved Font Name must be renamed to an Audivane Latin family`);
     }
-    if (!renamed && !/^@fontsource\/[a-z0-9-]+@\d+\.\d+\.\d+$/.test(String(entry.source))) {
+    const subset = entry.subset ?? null;
+    if (subset) {
+      if (renamed) throw new Error(`${label}: a family with a Reserved Font Name cannot ship a subset under its own name`);
+      if (!/^@?[a-z0-9/-]+@\d+\.\d+\.\d+$/.test(String(entry.source))) throw new Error(`${label}: source must pin the upstream package version`);
+      if (typeof subset.from !== "string" || !subset.from) throw new Error(`${label}: subset.from must name the upstream file`);
+      if (!hex64.test(String(subset.fromSha256))) throw new Error(`${label}: subset.fromSha256 is not a SHA-256 hex digest`);
+      if (typeof subset.axes !== "string" || !subset.axes) throw new Error(`${label}: subset.axes must record the axis range`);
+      if (typeof subset.unicodes !== "string" || !/^U\+/.test(subset.unicodes)) throw new Error(`${label}: subset.unicodes must list the code points`);
+      if (typeof subset.command !== "string" || !subset.command.includes("pyftsubset")) throw new Error(`${label}: subset.command must record the pyftsubset call`);
+    } else if (!renamed && !/^@fontsource\/[a-z0-9-]+@\d+\.\d+\.\d+$/.test(String(entry.source))) {
       throw new Error(`${label}: an unmodified family must pin its @fontsource package version`);
     }
     for (const reserved of entry.reservedFontNames) {
       if (entry.family.toLowerCase().includes(String(reserved).toLowerCase())) throw new Error(`${label}: family name uses the reserved name ${reserved}`);
     }
-    families.set(entry.family, { ...entry, renamed });
+    families.set(entry.family, { ...entry, renamed, subset });
   }
-  for (const family of ["Audivane Sans Latin", "Audivane Mono Latin"]) {
-    if (!families.get(family)?.renamed) throw new Error(`${FONT_MANIFEST}: missing renamed family ${family}`);
-  }
+  if (!families.get("Audivane Mono Latin")?.renamed) throw new Error(`${FONT_MANIFEST}: missing renamed family Audivane Mono Latin`);
+  if (!families.get("Geist")?.subset) throw new Error(`${FONT_MANIFEST}: missing the Geist subset family`);
   return families;
 }
 
@@ -280,19 +295,23 @@ export async function checkSubsetFonts({ root = ROOT, update = false } = {}) {
     const label = file.path;
     const family = families.get(file.family);
     if (!family) throw new Error(`${label}: family ${file.family} is not listed in the manifest families`);
-    if (!hex64.test(String(file.originalSha256))) throw new Error(`${label}: originalSha256 is not a SHA-256 hex digest`);
     if (!hex64.test(String(file.sha256))) throw new Error(`${label}: sha256 is not a SHA-256 hex digest`);
-    if (!hex64.test(String(file.originalContentSha256))) {
-      throw new Error(`${label}: originalContentSha256 is missing from the manifest`);
+    if (family.subset) {
+      if (file.upstreamFile !== family.subset.from) throw new Error(`${label}: upstreamFile must be the subset source ${family.subset.from}`);
+    } else {
+      if (!hex64.test(String(file.originalSha256))) throw new Error(`${label}: originalSha256 is not a SHA-256 hex digest`);
+      if (!hex64.test(String(file.originalContentSha256))) {
+        throw new Error(`${label}: originalContentSha256 is missing from the manifest`);
+      }
     }
-    if (!family.renamed && !(typeof file.upstreamFile === "string" && file.upstreamFile.startsWith("files/") && file.upstreamFile.endsWith(".woff2"))) {
+    if (!family.renamed && !family.subset && !(typeof file.upstreamFile === "string" && file.upstreamFile.startsWith("files/") && file.upstreamFile.endsWith(".woff2"))) {
       throw new Error(`${label}: upstreamFile must name the file inside ${family.source}`);
     }
     const bytes = readFileSync(path.join(root, file.path));
     const actualSha256 = createHash("sha256").update(bytes).digest("hex");
     if (actualSha256 !== file.sha256) throw new Error(`${label}: file bytes do not match the recorded sha256`);
     if (family.renamed && file.originalSha256 === file.sha256) throw new Error(`${label}: original and renamed hashes are identical; the rename was not applied`);
-    if (!family.renamed && file.originalSha256 !== file.sha256) throw new Error(`${label}: unmodified upstream subset differs from its original bytes`);
+    if (!family.renamed && !family.subset && file.originalSha256 !== file.sha256) throw new Error(`${label}: unmodified upstream subset differs from its original bytes`);
 
     const parsed = parseWoff2(bytes, label);
     const actualFingerprint = contentFingerprint(parsed.tables);
@@ -304,7 +323,7 @@ export async function checkSubsetFonts({ root = ROOT, update = false } = {}) {
     if (actualFingerprint !== file.contentSha256) {
       throw new Error(`${label}: content fingerprint ${actualFingerprint} does not match the recorded contentSha256 ${file.contentSha256}; glyphs, metrics or other non-name font data changed`);
     }
-    if (file.contentSha256 !== file.originalContentSha256) {
+    if (!family.subset && file.contentSha256 !== file.originalContentSha256) {
       throw new Error(`${label}: content fingerprint ${file.contentSha256} does not match the recorded upstream originalContentSha256 ${file.originalContentSha256}; glyphs, metrics or other non-name font data differ from the original subset`);
     }
 
@@ -337,6 +356,7 @@ export async function checkSubsetFonts({ root = ROOT, update = false } = {}) {
       }
     }
 
+    if (family.subset) continue;
     const original = byOriginal.get(file.originalSha256);
     if (original) {
       if (
@@ -393,6 +413,6 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const update = args.includes("--update");
     const summary = await checkSubsetFonts({ update });
     const note = update ? " (contentSha256 re-recorded from disk)" : "";
-    console.log(`[fonts] ${summary.files} bundled subsets in ${summary.families} families match ${FONT_MANIFEST}: hashes, renamed or unmodified upstream names, preserved copyright and OFL records, unchanged glyph/metric data${note}`);
+    console.log(`[fonts] ${summary.files} bundled subsets in ${summary.families} families match ${FONT_MANIFEST}: hashes, renamed or upstream names, preserved copyright and OFL records, recorded glyph/metric data${note}`);
   }
 }

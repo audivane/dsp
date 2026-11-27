@@ -304,6 +304,7 @@ mod tests {
             quantum: 1024,
             latency_ms: 5.0,
             filter_latency_ms: 0.0,
+            conv_latency_ms: 0.0,
             xruns: 0,
             dsp_load: 0.0,
             dsp_active: false,

@@ -4,13 +4,37 @@
 // CPU on the mock's machine). Mock only: the real engine's plan is priced
 // with the machine's measured kernel rates.
 
-import type { DesignPlan, FieldError, FilterDesign, RatePlan, RateRatio, Window } from "./types";
+import type { DesignAdvice, DesignCheck, DesignFix, DesignPlan, FieldError, FilterDesign, Length, RateNote, RateRatio, Window } from "./types";
+import { catalogueDesign } from "./mockCatalogue";
+import { polyphaseSeconds } from "../lib/polyphasePlan";
+import { kaiserAttenuationDb } from "../lib/upsamplerLimits";
+import { bandPassbandEnd, bandPinMisfit, bandRate, type PinnedBand } from "../lib/filterDesign";
 
-type Kernel = Extract<FilterDesign, { kind: "windowed_sinc" | "lanczos" }>;
+export { bandPassbandEnd };
+
+type Kernel = Extract<FilterDesign, { kind: "windowed_sinc" | "lanczos" | "optimal" }>;
 
 const MAX_PER_INPUT = 65535;
 const BAND_RANGE: [number, number] = [55, 225];
 const REFLECT_BETA: [number, number] = [2, 20];
+const NW_RANGE: [number, number] = [1, 10];
+/** `window_model::DPSS_SHORTFALL_DB`: the DPSS model is Kaiser's at β = π·NW, this much shallower. */
+const DPSS_SHORTFALL_DB = 12;
+const REFLECT_MAX_DB = 190;
+const OPTIMAL_MAX_DB = { equiripple: 150, least_squares: 135 } as const;
+const OPTIMAL_MAX_TAPS = { equiripple: 4095, least_squares: 65535 } as const;
+/** `optimal::EQUIRIPPLE_LEVEL_DB`, `LEAST_SQUARES_LEVEL_DB`: the deepest estimated depth of a fixed length. */
+const OPTIMAL_LEVEL_DB = { equiripple: 160, least_squares: 200 } as const;
+
+/** `optimal::estimate_db`: Kaiser's depth estimate of `n` taps over a transition of `df` cycles per sample. */
+const optimalDepthDb = (n: number, df: number) => 7.95 + 14.36 * df * (Math.max(1, n) - 1);
+
+/** `general::optimal_dc_floor_db`: the estimated depth an optimal design's L branches need for their DC gains. */
+function optimalDcFloorDb(k: Extract<Kernel, { kind: "optimal" }>, L: number): number {
+  if (L < 2) return -Infinity;
+  const tol = 10 ** ((k.phase.type === "linear" ? 0.01 : 0.1) / 20) - 1;
+  return k.method === "equiripple" ? 20 * Math.log10((L - 1) / tol) : 20 * Math.log10(1 / tol) + 6;
+}
 
 class Checker {
   errors: FieldError[] = [];
@@ -31,6 +55,16 @@ class Checker {
 }
 
 const reflected = (k: Kernel) => k.phase.type !== "linear" && k.phase.method === "reflect";
+
+/**
+ * `design::band_pin_note`: the check's note at source rate `rate` where the
+ * pin falls back, the band being of the Nyquist at `bandRate`.
+ */
+export function bandPinNote(b: PinnedBand, rate: number, bandRate = rate): string | null {
+  const f = bandPinMisfit(b, bandRate);
+  if (f === null || b.passband_end_hz == null) return null;
+  return `at ${rate} Hz, the passband end ${b.passband_end_hz} Hz (${f.toFixed(3)} of the Nyquist) does not fit below the stopband start (${b.stopband_start}): the passband ends at ${b.passband_end} of the Nyquist (${Math.round((b.passband_end * bandRate) / 2)} Hz) instead`;
+}
 
 function checkWindow(c: Checker, path: string, w: Window, k: Kernel) {
   const p = (f: string) => `${path}.${f}`;
@@ -71,6 +105,25 @@ function checkWindow(c: Checker, path: string, w: Window, k: Kernel) {
       if (standard) c.fail(p("type"), "this window is not on the standard path: use a preset path");
       break;
     }
+    case "dpss":
+      if (w.nw !== null) {
+        c.range(p("nw"), w.nw, NW_RANGE);
+        if (reflect && Number.isFinite(w.nw) && kaiserAttenuationDb(Math.PI * w.nw) - DPSS_SHORTFALL_DB > REFLECT_MAX_DB) {
+          let nw = NW_RANGE[1];
+          for (let lo = NW_RANGE[0], i = 0; i < 60; i++) {
+            const mid = (lo + nw) / 2;
+            if (kaiserAttenuationDb(Math.PI * mid) - DPSS_SHORTFALL_DB > REFLECT_MAX_DB) nw = mid;
+            else lo = mid;
+          }
+          c.fail(p("nw"), `a reflected phase keeps at most ${REFLECT_MAX_DB} dB: NW up to ${nw.toFixed(2)} (got ${w.nw})`);
+        }
+      }
+      if (standard) c.fail(p("type"), "this window is not on the standard path: use a preset path");
+      if (w.sampling !== "symmetric") {
+        c.fail(p("sampling"), "the DPSS window is sampled symmetric only");
+        return;
+      }
+      break;
     case "tukey":
       if (c.finite(p("taper"), w.taper) && !(w.taper > 0 && w.taper <= 1)) c.fail(p("taper"), `must be in (0, 1] (got ${w.taper})`);
       if (k.phase.type !== "linear") c.fail(p("type"), "the Tukey window has no calibrated stopband: linear phase only");
@@ -98,7 +151,7 @@ export function checkAll(d: FilterDesign, maxKernelTaps: number): FieldError[] {
     }
     return c.errors;
   }
-  if (d.kind !== "windowed_sinc" && d.kind !== "lanczos") return c.errors;
+  if (d.kind !== "windowed_sinc" && d.kind !== "lanczos" && d.kind !== "optimal") return c.errors;
   const k = d;
   const path = k.numerics.path;
   const reflect = reflected(k);
@@ -118,6 +171,27 @@ export function checkAll(d: FilterDesign, maxKernelTaps: number): FieldError[] {
     c.count("lobes", k.lobes, 1, MAX_PER_INPUT);
     if (path !== "fir" && path !== "fir_after") c.fail("numerics.path", "the Lanczos kernel is built on the fir paths");
     if (k.preserve_samples) c.fail("preserve_samples", "a Lanczos kernel's zeros are off the input grid");
+    return c.errors;
+  }
+  if (k.kind === "optimal") {
+    const { passband_end: pe, stopband_start: se } = k;
+    if (Number.isFinite(pe) && Number.isFinite(se) && (pe < 0.5 || pe > 1 || se <= pe || se > 1.5)) {
+      c.fail("passband_end", `needs 0.5 <= passband end (${pe}) <= 1 and passband end < stopband start (${se}) <= 1.5`);
+    }
+    const l = k.length;
+    if (l.rule === "fixed") c.count("length.taps", l.taps, 1, maxKernelTaps);
+    else if (l.rule === "per_input") {
+      if (typeof l.taps === "number") c.count("length.taps", l.taps, 1, MAX_PER_INPUT);
+      else {
+        stepsShape(c, "length.taps", l.taps.by_source_rate.map((s) => s[0]));
+        l.taps.by_source_rate.forEach(([, t], i) => c.count(`length.taps[${i}]`, t, 1, MAX_PER_INPUT));
+      }
+    } else if (l.rule === "auto") {
+      if (l.budget !== "match_output") c.range("length.budget", l.budget.db, [55, OPTIMAL_MAX_DB[k.method]]);
+    } else c.fail("length.rule", "an optimal design takes a fixed, per-input or automatic length");
+    if (path !== "fir" && path !== "fir_after") c.fail("numerics.path", "an optimal design is built on the fir paths");
+    if (k.preserve_samples) c.fail("preserve_samples", "an optimal low-pass is not a Nyquist filter: its zeros are off the input grid");
+    if (fb) c.fail("rates.fallback_window", "an optimal design has no window to fall back from");
     return c.errors;
   }
   const w = k.window;
@@ -164,6 +238,12 @@ export function checkAll(d: FilterDesign, maxKernelTaps: number): FieldError[] {
     if (Number.isFinite(pe) && Number.isFinite(se) && (pe < 0.5 || pe > 1 || se <= pe || se > 1.5)) {
       c.fail("cutoff.passband_end", `needs 0.5 <= passband end (${pe}) <= 1 and passband end < stopband start (${se}) <= 1.5`);
     }
+    // An absolute passband end replaces the fraction above; whether it
+    // fits the band is checked once the source rate is known
+    // (`bandPassbandEnd`).
+    if (cut.passband_end_hz != null && !(Number.isFinite(cut.passband_end_hz) && cut.passband_end_hz > 0)) {
+      c.fail("cutoff.passband_end_hz", `must be a frequency above 0 Hz (got ${cut.passband_end_hz})`);
+    }
     if (l.rule !== "auto") {
       c.range("cutoff.attenuation_db", a, BAND_RANGE);
       if (reflect && a > 190) c.fail("cutoff.attenuation_db", `a reflected phase promises at most 190 dB (got ${a})`);
@@ -195,7 +275,21 @@ function kernelTaps(k: Kernel, rate: number, r: RateRatio, autoDb: number): { ta
   let n: number;
   let exact = true;
   if (k.kind === "lanczos") n = (2 * k.lobes + 1) * L;
-  else {
+  else if (k.kind === "optimal") {
+    const l = k.length;
+    if (l.rule === "fixed") n = l.taps * M;
+    else if (l.rule === "per_input") n = stepAt(l.taps, rate) * L;
+    else {
+      // Kaiser's equiripple estimate, a quarter longer for least squares;
+      // from the depth its branches' DC needs when deeper.
+      const budget = l.rule === "auto" && l.budget !== "match_output" ? l.budget.db : Math.min(autoDb, OPTIMAL_MAX_DB[k.method]);
+      const atten = Math.max(budget, optimalDcFloorDb(k, L));
+      const df = Math.max(0.005, k.stopband_start - k.passband_end) / (2 * Math.max(L, M));
+      n = Math.ceil(((atten - 7.95) / (14.36 * df) + 1) * (k.method === "least_squares" ? 1.25 : 1));
+      exact = false;
+    }
+    n = Math.max(3, n % 2 === 0 ? n - 1 : n);
+  } else {
     const l = k.length;
     switch (l.rule) {
       case "fixed":
@@ -212,7 +306,8 @@ function kernelTaps(k: Kernel, rate: number, r: RateRatio, autoDb: number): { ta
       default: {
         const band = k.cutoff.mode === "band" ? k.cutoff : { passband_end: 0.9, stopband_start: 1, attenuation_db: 150 };
         const atten = l.rule === "auto" ? (l.budget === "match_output" ? autoDb : l.budget.db) : band.attenuation_db;
-        const delta = Math.max(0.005, band.stopband_start - band.passband_end);
+        // The band is of the lower Nyquist (`design::band_rate`).
+        const delta = Math.max(0.005, band.stopband_start - bandPassbandEnd(band, bandRate(rate, r)));
         const gauss = k.window.type === "gaussian" ? 2 : 1;
         n = 2 * Math.ceil(((atten - 7.95) / (14.36 * delta)) * gauss) * Math.max(L, M) + 1;
         exact = l.rule === "band";
@@ -232,7 +327,7 @@ export interface MockCheckContext {
   maxKernelTaps: number;
   /** `match_output` as a level in dB. */
   autoDb: number;
-  /** The engine block at a rate (frames). */
+  /** The chain block at a rate (frames). */
   block: (rate: number) => number;
   /** Rational pipelines that can run at once (2, or 4 with A/B). */
   pipelines: number;
@@ -272,15 +367,14 @@ function ratioRule(d: FilterDesign, r: RateRatio): [string, string] | null {
 }
 
 function plan(d: FilterDesign, rate: number, r: RateRatio, ctx: MockCheckContext): DesignPlan {
-  const kernel = d.kind === "windowed_sinc" || d.kind === "lanczos";
+  const kernel = d.kind === "windowed_sinc" || d.kind === "lanczos" || d.kind === "optimal";
   const { taps, exact } = kernel ? kernelTaps(d as Kernel, rate, r, ctx.autoDb) : { taps: 0, exact: true };
   const out = (rate * r.up) / r.down;
   let cpu: number;
   if (!kernel) cpu = (2 * out * (d.kind === "interpolator" && d.method === "table_sinc" ? 127 : 40)) / 5e9;
   else if (r.down === 1) {
-    const b = ctx.block(rate);
-    const parts = Math.max(1, Math.ceil(Math.ceil(taps / r.up) / b));
-    cpu = 2 * (((rate / b) * parts * r.up * (b + 1)) / 0.5e9) * 1.15;
+    const block = ctx.block(rate);
+    cpu = 2 * polyphaseSeconds(taps, r.up, Math.min(1024, block), block, rate);
   } else cpu = (2 * out * Math.ceil(taps / r.up)) / 5e9;
   return {
     grid_up: r.up,
@@ -293,47 +387,286 @@ function plan(d: FilterDesign, rate: number, r: RateRatio, ctx: MockCheckContext
   };
 }
 
-/** `check_design`: the bounds, then the ratio rule, budget and plan at each rate. */
-export function checkDesign(d: FilterDesign, ctx: MockCheckContext): { errors: FieldError[]; plans: RatePlan[] } {
-  const errors = checkAll(d, ctx.maxKernelTaps);
-  if (errors.length > 0) return { errors, plans: [] };
-  const plans: RatePlan[] = [];
-  const seen = new Set<string>();
-  const push = (path: string, message: string) => {
-    const key = `${path}|${message.replace(/^at \d+ Hz \([^)]*\), /, "")}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    errors.push({ path, message });
-  };
-  for (const rate of ctx.rates) {
-    const r = ctx.ratioAt(rate);
-    if (r.up === r.down) continue;
-    const at = `at ${rate} Hz (${ratioText(r)}), `;
-    const rule = ratioRule(d, r);
-    if (rule) {
-      push(rule[0], at + rule[1]);
-      continue;
-    }
-    const p = plan(d, rate, r, ctx);
-    if (p.grid_taps > ctx.maxKernelTaps) {
-      const field = d.kind === "lanczos" ? "design.lobes" : "design.length";
-      push(field, `${at}its kernel would have ${p.grid_taps} taps, more than ${ctx.maxKernelTaps}`);
-      continue;
-    }
-    if (r.down > 1 && p.grid_taps > 0) {
-      const field = d.kind === "lanczos" ? "design.lobes" : "design.length";
-      const macs = ((rate * r.up) / r.down) * Math.ceil(p.grid_taps / r.up) * ctx.pipelines;
-      if (p.grid_taps > RATIONAL_MAX_GRID) {
-        push(field, `${at}the design needs ${p.grid_taps} taps on the ${r.up}x grid, more than ${RATIONAL_MAX_GRID}: count the length per input sample, or use a shorter design`);
-        continue;
-      }
-      if (macs > RATIONAL_MAX_MACS) {
-        push(field, `${at}the kernel needs ${Math.round(macs / 1e6)} M multiply-adds per second with the ${ctx.pipelines} pipelines that can run at once, more than the ${RATIONAL_MAX_MACS / 1e6} M budget: use a shorter design`);
-        continue;
-      }
-    }
-    plans.push({ source_rate: rate, ratio: r, plan: p });
+/** Why `d` does not build from `rate` at `r`, as (path, message), or null. */
+function rateRefusal(d: FilterDesign, rate: number, r: RateRatio, ctx: MockCheckContext): [string, string] | null {
+  const rule = ratioRule(d, r);
+  if (rule) return rule;
+  const p = plan(d, rate, r, ctx);
+  const field = d.kind === "lanczos" ? "design.lobes" : "design.length";
+  if (d.kind === "optimal" && p.grid_taps / (d.phase.type === "intermediate" ? 4 : 1) > OPTIMAL_MAX_TAPS[d.method]) {
+    const [name, instead] = d.method === "equiripple" ? ["an equiripple design is built (its cost grows with the square of the length)", "least squares or a windowed sinc"] : ["a least-squares design is built", "a windowed sinc"];
+    return ["design.length", `${name} up to ${OPTIMAL_MAX_TAPS[d.method]} taps on the grid (this one needs ${p.grid_taps}): use ${instead} for longer kernels`];
   }
-  return { errors, plans };
+  if (d.kind === "optimal" && d.length.rule !== "auto") {
+    const n = p.grid_taps / (d.phase.type === "intermediate" ? 4 : 1);
+    const est = optimalDepthDb(n, (d.stopband_start - d.passband_end) / (2 * Math.max(r.up, r.down)));
+    const level = OPTIMAL_LEVEL_DB[d.method];
+    const floor = optimalDcFloorDb(d, r.up);
+    if (est > level) {
+      return [
+        "design.length",
+        d.method === "equiripple"
+          ? `an equiripple design of ${n} taps over this band at ${ratioText(r)} would be about ${est.toFixed(0)} dB deep, past the ${level} dB f64 levels its ripple to: shorten it, narrow the transition or use an automatic length`
+          : `a least-squares design of ${n} taps over this band at ${ratioText(r)} would be about ${est.toFixed(0)} dB deep, far past its 137 to 153 dB floor, where the solve no longer holds the passband: shorten it or use an automatic length`,
+      ];
+    }
+    if (est < floor) {
+      return [
+        "design.length",
+        d.method === "equiripple"
+          ? `an equiripple design of ${n} taps over this band at ${ratioText(r)} is about ${est.toFixed(0)} dB deep, but its flat stopband adds up in each of the ${r.up} polyphase branches, whose DC gains need about ${floor.toFixed(0)} dB here: lengthen it, widen the transition or use an automatic length`
+          : `a least-squares design of ${n} taps over this band at ${ratioText(r)} is about ${est.toFixed(0)} dB deep, too shallow for the ${r.up} polyphase branches' DC gains (about ${floor.toFixed(0)} dB): lengthen it, widen the transition or use an automatic length`,
+      ];
+    }
+  }
+  if (p.grid_taps > ctx.maxKernelTaps) return [field, `the design does not run at ${ratioText(r)}: its kernel would have ${p.grid_taps} taps, more than ${ctx.maxKernelTaps}; use a lower ratio or a shorter design`];
+  if (r.down > 1 && p.grid_taps > 0) {
+    const macs = ((rate * r.up) / r.down) * Math.ceil(p.grid_taps / r.up) * ctx.pipelines;
+    if (p.grid_taps > RATIONAL_MAX_GRID) return [field, `the ${ratioText(r)} kernel needs ${p.grid_taps} taps, more than ${RATIONAL_MAX_GRID}`];
+    if (macs > RATIONAL_MAX_MACS) return [field, `the ${ratioText(r)} kernel needs ${Math.round(macs / 1e6)} M multiply-adds per second with the ${ctx.pipelines} pipelines that can run at once, more than the ${RATIONAL_MAX_MACS / 1e6} M budget`];
+  }
+  return null;
 }
 
+// ------------------------------------------------------------ plain words
+// The mock's `design::explain`: each refusal classified by trying other
+// lengths, the rates grouped by reason, fixes checked at every rate.
+
+interface Case {
+  rate: number;
+  r: RateRatio;
+  refusal: [string, string] | null;
+}
+
+type Problem = { kind: "short"; need: number } | { kind: "long"; why: string } | { kind: "ratio" } | { kind: "other" };
+
+type Knob = { rule: "fixed"; v: number } | { rule: "per_input"; v: number } | null;
+
+function knob(d: FilterDesign): Knob {
+  if (d.kind !== "windowed_sinc" && d.kind !== "optimal") return null;
+  const l = d.length;
+  if (l.rule === "fixed") return { rule: "fixed", v: l.taps };
+  if (l.rule === "per_input" && typeof l.taps === "number") return { rule: "per_input", v: l.taps };
+  return null;
+}
+
+/** `catalogue::RECOMMENDED`: what a rate the design does not build at plays. */
+const RECOMMENDED_PRESET = "recommended";
+
+function withLength(d: FilterDesign, length: Length): FilterDesign {
+  return { ...d, length } as FilterDesign;
+}
+
+const fixedOf = (d: FilterDesign) => (v: number) => withLength(d, { rule: "fixed", taps: v });
+const perInputOf = (d: FilterDesign) => (v: number) => withLength(d, { rule: "per_input", taps: v });
+
+/** The lengths `make(v)` builds with at a case, as one interval found from `start`; null when none. */
+function interval(c: Case, make: (v: number) => FilterDesign, start: number, min: number, max: number, ctx: MockCheckContext): [number, number] | null {
+  const ok = (v: number) => rateRefusal(make(v), c.rate, c.r, ctx) === null;
+  const s = Math.min(max, Math.max(min, start));
+  let anchor: number | null = ok(s) ? s : null;
+  for (let v = s; anchor === null && v < max; ) if (ok((v = Math.min(max, v * 2)))) anchor = v;
+  for (let v = s; anchor === null && v > min; ) if (ok((v = Math.max(min, Math.floor(v / 2))))) anchor = v;
+  if (anchor === null) return null;
+  let lo = min;
+  if (!ok(min)) {
+    let [bad, good] = [min, anchor];
+    while (good - bad > 1) {
+      const mid = bad + Math.floor((good - bad) / 2);
+      if (ok(mid)) good = mid;
+      else bad = mid;
+    }
+    lo = good;
+  }
+  let hi = max;
+  if (!ok(max)) {
+    let [good, bad] = [anchor, max];
+    while (bad - good > 1) {
+      const mid = good + Math.floor((bad - good) / 2);
+      if (ok(mid)) good = mid;
+      else bad = mid;
+    }
+    hi = good;
+  }
+  return [lo, hi];
+}
+
+function classify(d: FilterDesign, c: Case, ctx: MockCheckContext): Problem {
+  const [path, message] = c.refusal!;
+  if (path === "design.rates" || path === "design.preserve_samples") return { kind: "ratio" };
+  const k = knob(d);
+  const range = k ? interval(c, k.rule === "fixed" ? fixedOf(d) : perInputOf(d), k.v, k.rule === "fixed" ? 3 : 1, k.rule === "fixed" ? ctx.maxKernelTaps : MAX_PER_INPUT, ctx) : null;
+  if (k && range && k.v < range[0]) return { kind: "short", need: range[0] };
+  if (k && range && k.v > range[1]) {
+    const why = message.includes("multiply-adds") || /kernel needs \d+ taps/.test(message)
+      ? "too heavy for a fractional ratio"
+      : message.includes("kernel would have")
+        ? "over the engine's longest kernel"
+        : d.kind === "optimal"
+          ? `too long for ${d.method === "equiripple" ? "an equiripple" : "a least-squares"} design`
+          : "too long";
+    return { kind: "long", why };
+  }
+  return { kind: "other" };
+}
+
+const thousands = (n: number) => n.toLocaleString("en-US");
+const about = (n: number) => {
+  if (n < 100) return n;
+  let step = 1;
+  while (n / step >= 100) step *= 10;
+  return Math.ceil(n / step) * step;
+};
+const rateLabel = (rate: number) => `${Number((rate / 1000).toFixed(3))}k`;
+const ratioLabel = (r: RateRatio) => (r.down === 1 ? `×${r.up}` : `×${r.up}/${r.down}`);
+const joinAnd = (xs: string[]) => (xs.length < 2 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`);
+const joinOr = (xs: string[]) => (xs.length < 2 ? xs.join("") : `${xs.slice(0, -1).join(", ")}, or ${xs[xs.length - 1]}`);
+
+function phrase(p: Problem, at: string, needs: number[]): string {
+  switch (p.kind) {
+    case "short":
+      return `too short ${at} (needs about ${joinAnd([...new Set(needs.map(about))].sort((a, b) => a - b).map(thousands))})`;
+    case "long":
+      return `${p.why} ${at}`;
+    case "ratio":
+      return `not made for the ratio ${at}`;
+    default:
+      return `not buildable ${at}`;
+  }
+}
+
+export interface MockExplanation {
+  message: string;
+  rates: { source_rate: number; ratio: RateRatio; path: string; short: string; detail: string }[];
+  fixes: DesignFix[];
+}
+
+/** `design::explain`: plain words for the cases that do not build, and fixes that build at all of them. */
+export function explain(d: FilterDesign, cases: Case[], applied: boolean, ctx: MockCheckContext): MockExplanation {
+  const failing = cases.filter((c) => c.refusal).map((c) => ({ c, p: classify(d, c, ctx) }));
+  const k = knob(d);
+  const subject = k?.rule === "fixed" ? `${thousands(k.v)} taps` : k?.rule === "per_input" ? `${thousands(k.v)} taps per input sample` : "This design";
+  const unit = k?.rule === "per_input" ? " per input sample" : " taps";
+  const rates = failing.map(({ c, p }) => {
+    let short = phrase(p, "here", p.kind === "short" ? [p.need] : []);
+    if (p.kind === "short") short = short.replace(/\)$/, `${unit})`);
+    return { source_rate: c.rate, ratio: c.r, path: c.refusal![0], short, detail: c.refusal![1] };
+  });
+  const groups = new Map<string, typeof failing>();
+  for (const f of failing) {
+    const key = f.p.kind === "long" ? `long ${f.p.why}` : f.p.kind;
+    groups.set(key, [...(groups.get(key) ?? []), f]);
+  }
+  const parts = [...groups.values()].map((g) =>
+    phrase(g[0].p, `at ${joinAnd(g.map(({ c }) => `${rateLabel(c.rate)} ${ratioLabel(c.r)}`))}`, g.flatMap(({ p }) => (p.kind === "short" ? [p.need] : []))),
+  );
+  const fixes = mockFixes(d, cases, failing.map((f) => f.p), ctx);
+  const todo = fixes.map((f) => f.label[0].toLowerCase() + f.label.slice(1));
+  if (todo.length === 0) {
+    const short = failing.some((f) => f.p.kind === "short");
+    const long = failing.some((f) => f.p.kind === "long");
+    todo.push(short && !long ? "lengthen it" : long && !short ? "shorten it or pick a lighter design" : "change the length");
+  }
+  todo.push(applied ? "allow fewer rates" : "change the rate target");
+  const t = joinOr(todo);
+  return { message: `${subject} is ${joinAnd(parts)}. ${t[0].toUpperCase()}${t.slice(1)}.`, rates, fixes };
+}
+
+function mockFixes(d: FilterDesign, cases: Case[], problems: Problem[], ctx: MockCheckContext): DesignFix[] {
+  const out: DesignFix[] = [];
+  if (d.kind !== "windowed_sinc" && d.kind !== "optimal") return out;
+  const everywhere = (x: FilterDesign) => cases.every((c) => rateRefusal(x, c.rate, c.r, ctx) === null);
+  if (d.length.rule !== "auto" && (d.kind === "optimal" || d.cutoff.mode === "band")) {
+    const auto = withLength(d, { rule: "auto", budget: "match_output" });
+    if (everywhere(auto)) out.push({ label: "Use automatic length", design: auto });
+  }
+  const k = knob(d);
+  const odd = d.kind === "optimal";
+  const up = cases.find((c) => c.refusal)?.r.up ?? 1;
+  const [fixedStart, perStart] = k?.rule === "fixed" ? [k.v, Math.max(1, Math.floor(k.v / up))] : k?.rule === "per_input" ? [k.v * up, k.v] : [1023, 64];
+  const common = (make: (v: number) => FilterDesign, start: number, min: number, max: number) => {
+    let [lo, hi] = [min, max];
+    for (const c of cases) {
+      const iv = interval(c, make, start, min, max, ctx);
+      if (!iv) return null;
+      lo = Math.max(lo, iv[0]);
+      hi = Math.min(hi, iv[1]);
+    }
+    return lo <= hi ? ([lo, hi] as const) : null;
+  };
+  const pick = (cur: number, lo: number, hi: number, wantOdd: boolean) => {
+    const v = Math.min(hi, Math.max(lo, cur));
+    if (!wantOdd || v % 2 === 1) return v;
+    return v < hi ? v + 1 : v > lo ? v - 1 : null;
+  };
+  const fixed = common(fixedOf(d), fixedStart, 3, ctx.maxKernelTaps);
+  const fv = fixed && pick(fixedStart, fixed[0], fixed[1], odd);
+  if (fv && !(k?.rule === "fixed" && k.v === fv) && everywhere(fixedOf(d)(fv))) out.push({ label: `Set ${thousands(fv)} taps`, design: fixedOf(d)(fv) });
+  const per = common(perInputOf(d), perStart, 1, MAX_PER_INPUT);
+  const pv = per && pick(perStart, per[0], per[1], false);
+  if (pv && !(k?.rule === "per_input" && k.v === pv) && everywhere(perInputOf(d)(pv))) {
+    out.push({ label: `Set ${thousands(pv)} taps per input sample`, design: perInputOf(d)(pv) });
+  }
+  const pe = d.kind === "optimal" ? d.passband_end : d.cutoff.mode === "band" && d.cutoff.passband_end_hz == null ? d.cutoff.passband_end : null;
+  if (pe !== null && problems.every((p) => p.kind === "short")) {
+    const set = (x: number): FilterDesign => (d.kind === "optimal" ? { ...d, passband_end: x } : { ...d, cutoff: { ...(d.cutoff as Extract<typeof d.cutoff, { mode: "band" }>), passband_end: x } });
+    if (everywhere(set(pe * 0.5))) {
+      let [good, bad] = [pe * 0.5, pe];
+      for (let i = 0; i < 20; i++) {
+        const mid = (good + bad) / 2;
+        if (everywhere(set(mid))) good = mid;
+        else bad = mid;
+      }
+      const x = Math.floor(good * 1000) / 1000;
+      if (x < pe && everywhere(set(x))) out.push({ label: `Widen the transition: pass to ${x.toFixed(3)}`, design: set(x) });
+    }
+  }
+  return out;
+}
+
+/** Where `d` does not build at the rates of `ctx` (each with a few plain words), when it builds at some. */
+export function designFallbacks(d: FilterDesign, ctx: MockCheckContext): { source_rate: number; reason: string }[] {
+  const check = checkDesign(d, ctx);
+  return check.notes.filter((n) => n.plays).map((n) => ({ source_rate: n.source_rate, reason: n.message }));
+}
+
+/**
+ * `check_design`: the bounds, then each rate's ratio rule and budgets. A
+ * design that builds at none of the rates is refused in plain words; one
+ * that builds at some plays Recommended at the others (`notes`), with the
+ * same advice.
+ */
+export function checkDesign(d: FilterDesign, ctx: MockCheckContext): DesignCheck {
+  const errors = checkAll(d, ctx.maxKernelTaps);
+  if (errors.length > 0) return { errors, plans: [], notes: [] };
+  const cases: Case[] = ctx.rates
+    .map((rate) => ({ rate, r: ctx.ratioAt(rate) }))
+    .filter(({ r }) => r.up !== r.down)
+    .map(({ rate, r }) => ({ rate, r, refusal: rateRefusal(d, rate, r, ctx) }));
+  // A pinned passband end that falls back at a rate the design builds at
+  // (the band is of the lower Nyquist, on every path).
+  const pins: RateNote[] = [];
+  if (d.kind === "windowed_sinc" && d.cutoff.mode === "band") {
+    for (const c of cases) {
+      const note = c.refusal ? null : bandPinNote(d.cutoff, c.rate, bandRate(c.rate, c.r));
+      if (note !== null) pins.push({ source_rate: c.rate, path: "design.cutoff.passband_end_hz", message: note });
+    }
+  }
+  if (!cases.some((c) => c.refusal)) return { errors, plans: cases.map((c) => ({ source_rate: c.rate, ratio: c.r, plan: plan(d, c.rate, c.r, ctx) })), notes: pins };
+  const applied = cases.some((c) => !c.refusal);
+  const x = explain(d, cases, applied, ctx);
+  const advice: DesignAdvice = {
+    message: x.message,
+    applied,
+    details: x.rates.map((r) => ({ source_rate: r.source_rate, ratio: r.ratio, path: r.path, message: r.detail })),
+    fixes: x.fixes,
+  };
+  if (!applied) return { errors: [{ path: x.rates[0]?.path ?? "design", message: x.message }], plans: [], notes: [], advice };
+  const rec = catalogueDesign(RECOMMENDED_PRESET);
+  return {
+    errors,
+    plans: cases.map((c) => ({ source_rate: c.rate, ratio: c.r, plan: plan(c.refusal && rec ? rec : d, c.rate, c.r, ctx) })),
+    notes: [...pins, ...x.rates.map((r) => ({ source_rate: r.source_rate, path: r.path, message: r.short, plays: RECOMMENDED_PRESET }))].sort((a, b) => a.source_rate - b.source_rate),
+    advice,
+  };
+}

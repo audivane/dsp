@@ -31,6 +31,7 @@ fn an_underrun_recovery_does_not_log() {
         device: "hw:Loopback,1,2".into(),
         rate: 48_000,
         channels: 2,
+        channel_map: Vec::new(),
         period_frames: 1024,
         buffer_periods: 2,
         preferred_format: None,

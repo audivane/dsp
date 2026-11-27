@@ -48,7 +48,7 @@ describe("followers", () => {
     s.addFollower(USB);
     await s.whenIdle();
     expect(t.of("set_follower")).toEqual([{ device: USB }]);
-    expect(s.followers()).toEqual([{ device: USB, enabled: true, trim_ms: 0, volume_db: 0 }]);
+    expect(s.followers()).toEqual([{ device: USB, enabled: true, trim_ms: 0, volume_db: 0, follow_volume: false }]);
     expect(s.getState().status?.outputs.followers[0].state).toBe("opening");
 
     s.editFollower(USB, { trim_ms: 1.5 });
@@ -56,6 +56,12 @@ describe("followers", () => {
     await s.whenIdle();
     expect(daemon.config.outputs.followers[0]).toMatchObject({ trim_ms: 1.5, enabled: false });
     expect(s.getState().followerDrafts).toEqual({});
+
+    s.editFollower(USB, { follow_volume: true });
+    await s.whenIdle();
+    expect(t.of("set_follower").at(-1)).toEqual({ device: USB, follow_volume: true });
+    expect(daemon.config.outputs.followers[0]).toMatchObject({ follow_volume: true, trim_ms: 1.5 });
+    expect(s.getState().status?.outputs.followers[0].follow_volume).toBe(true);
 
     s.removeFollower(USB);
     await s.whenIdle();
@@ -130,5 +136,35 @@ describe("followers", () => {
     await s.whenIdle();
     expect(s.getState().varispeedError).toMatch(/at most 1.996 while followers play/);
     expect(daemon.config.varispeed.speed).toBe(1);
+  });
+});
+
+describe("output channels", () => {
+  const IFACE = "hw:CARD=IFACE,DEV=0";
+
+  it("sets the main device's pair with set_device; another device starts from the first two", async () => {
+    const { s, t, daemon } = await setup();
+    await s.setDevice(IFACE);
+    await until(() => daemon.config.device === IFACE);
+    await s.setOutputChannels([2, 3]);
+    await until(() => s.getState().config?.output_channels?.[0] === 2);
+    expect(t.of("set_device").at(-1)).toEqual({ device: IFACE, output_channels: [2, 3] });
+    expect(daemon.config.output_channels).toEqual([2, 3]);
+    // Past the device's 8 channels: refused, nothing changes.
+    await s.setOutputChannels([8, 9]);
+    expect(daemon.config.output_channels).toEqual([2, 3]);
+    await s.setOutputChannels([0, 1]);
+    await until(() => s.getState().config?.output_channels === undefined);
+    await s.setOutputChannels([6, 7]);
+    await s.setDevice(USB);
+    await until(() => daemon.config.device === USB);
+    expect(daemon.config.output_channels).toBeUndefined();
+  });
+
+  it("sets a follower's pair with set_follower", async () => {
+    const { s, t, daemon } = await setup([IFACE]);
+    s.editFollower(IFACE, { output_channels: [4, 5] });
+    await until(() => daemon.config.outputs.followers[0]?.output_channels?.[0] === 4);
+    expect(t.of("set_follower").at(-1)).toEqual({ device: IFACE, output_channels: [4, 5] });
   });
 });

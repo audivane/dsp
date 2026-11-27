@@ -1,6 +1,6 @@
 """Rename bundled subsets without changing glyphs or copyright/license metadata.
 
-Requires fonttools[woff]==4.61.1. Run on the original fontsource Latin subsets of IBM Plex Sans and Mono to
+Requires fonttools[woff]==4.61.1. Run on the original fontsource Latin subsets of IBM Plex Mono to
 reproduce the renamed fonts. Original, renamed
 and name-independent content hashes are recorded in third_party/fonts.json;
 this script writes the file hashes and the upstream content fingerprint
@@ -8,7 +8,7 @@ this script writes the file hashes and the upstream content fingerprint
 `node tools/check-subset-fonts.mjs --update` to record the renamed content
 hash and verify it against the upstream fingerprint. Existing asset filenames
 identify the upstream family, which is recorded per manifest entry as
-`family`; the font's primary names are Audivane Sans/Mono Latin.
+`family`; the font's primary names are Audivane Mono Latin.
 """
 import hashlib
 import json
@@ -57,16 +57,14 @@ def family(path: Path) -> str:
     # against it.
     if "-mono-" in path.name:
         return "Audivane Mono Latin"
-    if "-sans-" in path.name:
-        return "Audivane Sans Latin"
-    raise SystemExit(f"{path}: only IBM Plex Sans and Mono subsets are bundled")
+    raise SystemExit(f"{path}: only IBM Plex Mono subsets are bundled")
 
 
 with tempfile.TemporaryDirectory() as tmp:
     fonts = []
     for directory in DIRECTORIES:
         # Only the IBM Plex subsets carry a Reserved Font Name and are renamed.
-        # Unmodified upstream families (Inter, Instrument Serif) are left as is.
+        # The Geist subset keeps its own names and is left as is.
         for path in sorted((ROOT / directory).glob("ibm-plex-*.woff2")):
             fonts.append((path, TTFont(path, recalcTimestamp=False)))
 
@@ -89,7 +87,6 @@ with tempfile.TemporaryDirectory() as tmp:
                 name = record.toUnicode()
                 name = name.replace("IBM Plex", "Audivane").replace("IBMPlex", "Audivane")
                 # Explicitly identify these as Latin subsets.
-                name = name.replace("Sans", "Sans Latin" if " " in name else "SansLatin")
                 name = name.replace("Mono", "Mono Latin" if " " in name else "MonoLatin")
                 record.string = name.encode(record.getEncoding())
         font.save(path)

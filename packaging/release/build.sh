@@ -44,27 +44,33 @@ stage_end
 # The engine (fat LTO, one codegen unit) and the desktop app (thin LTO, see
 # [profile.release-ui]) build at the same time in separate target dirs, so the
 # engine's single-threaded LTO link overlaps the app's parallel compile.
-stage_start "rust: engine + CLI (release) and app (release-ui) in parallel"
+# The protocol unit tests run alongside, in a third target dir with thin LTO
+# (still opt-level 3): with the engine's fat LTO they took a 90 s link of
+# their own after both builds.
+stage_start "rust: engine + CLI (release), app (release-ui) and protocol tests, in parallel"
 cargo build --release --locked --target-dir "$target/engine" \
   -p audivane-dsp-daemon -p audivane-dsp-cli > "$stage/engine.log" 2>&1 &
 engine=$!
 cargo build --profile release-ui --locked --target-dir "$target/app" \
   -p audivane-dsp-ui --features custom-protocol > "$stage/app.log" 2>&1 &
 app=$!
+tests=
+if [ "${SKIP_TESTS:-0}" != 1 ]; then
+  CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    cargo test --release --locked --target-dir "$target/tests" -p audivane-protocol -q \
+    > "$stage/tests.log" 2>&1 &
+  tests=$!
+fi
 status=0
 wait "$engine" || { status=1; echo "engine build failed:"; tail -40 "$stage/engine.log"; }
 wait "$app" || { status=1; echo "app build failed:"; tail -40 "$stage/app.log"; }
+if [ -n "$tests" ]; then
+  wait "$tests" || { status=1; echo "protocol tests failed:"; tail -60 "$stage/tests.log"; }
+  grep -h '^test result' "$stage/tests.log" | tail -3 || true
+fi
 grep -h 'Finished' "$stage/engine.log" "$stage/app.log" || true
 [ "$status" = 0 ] || exit 1
 stage_end
-
-if [ "${SKIP_TESTS:-0}" != 1 ]; then
-  # In the engine's target dir: the release profile and its dependencies are
-  # already built there (no third target dir).
-  stage_start "protocol unit tests (release)"
-  cargo test --release --locked --target-dir "$target/engine" -p audivane-protocol -q
-  stage_end
-fi
 
 stage_start "stage package tree"
 rm -rf "$stage/root"
@@ -86,10 +92,12 @@ for size in 16 24 32 48 64 128 256 512; do
 done
 install -Dm644 LICENSE "$r/usr/share/licenses/audivane-dsp/LICENSE"
 # Third-party notices: crates and npm packages in the binaries, the bundled
-# fonts (renamed IBM Plex subsets, SIL OFL 1.1) and the target-curve data.
+# fonts (Geist and renamed IBM Plex Mono subsets, SIL OFL 1.1) and the
+# target-curve data.
 lic=$r/usr/share/licenses/audivane-dsp
 install -Dm644 packaging/THIRD_PARTY_LICENSES.txt "$lic/THIRD_PARTY_LICENSES.txt"
-install -Dm644 app/src/assets/fonts/OFL.txt "$lic/OFL-IBM-Plex.txt"
+install -Dm644 app/src/assets/fonts/OFL-IBM-Plex.txt "$lic/OFL-IBM-Plex.txt"
+install -Dm644 app/src/assets/fonts/OFL-Geist.txt "$lic/OFL-Geist.txt"
 install -Dm644 docs/font-licensing.md "$lic/font-licensing.md"
 install -Dm644 app/src/assets/targets/SOURCES.md "$lic/targets-SOURCES.md"
 install -Dm644 app/src/assets/research-targets/SOURCES.md "$lic/research-targets-SOURCES.md"

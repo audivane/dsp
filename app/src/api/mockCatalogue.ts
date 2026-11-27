@@ -133,12 +133,20 @@ const TABLE: Record<FilterPreset, () => FilterDesign> = {
   lanczos65535: () => accept(lanczos(65535), "integer"),
   short_leaky: () => leaky,
   short_leaky_mp: () => phase(leaky, minimum, "exact_pi_inverse_pairwise"),
+  // `catalogue::craven`: a Kaiser band design, flat to 20 kHz at every
+  // source rate (the band's `passband_end_hz`), 150 dB from the Nyquist,
+  // reflected minimum phase.
+  craven_apod: () => ({
+    ...sinc({ type: "kaiser", beta: null, sampling: "symmetric" }, { rule: "band" }, { mode: "band", passband_end: 20000 / 22050, passband_end_hz: 20000, stopband_start: 1, attenuation_db: 150 }),
+    phase: { type: "minimum", method: "reflect" },
+  }),
   cascade_fir: () => ({ kind: "cascade", stage: "fir" }),
   cascade_fir_mp: () => ({ kind: "cascade", stage: "fir_minimum" }),
   cascade_fir_asym: () => ({ kind: "cascade", stage: "fir_asymmetric" }),
   cascade_fft: () => ({ kind: "cascade", stage: "frequency_sampled" }),
   cascade_elliptic: () => ({ kind: "cascade", stage: "elliptic" }),
   cascade_inverse_chebyshev: () => ({ kind: "cascade", stage: "inverse_chebyshev" }),
+  nos: () => ({ kind: "interpolator", method: "nos" }),
   cosine: () => ({ kind: "interpolator", method: "cosine" }),
   catmull_rom: () => ({ kind: "interpolator", method: "catmull_rom" }),
   table_sinc: () => ({ kind: "interpolator", method: "table_sinc" }),
@@ -153,7 +161,9 @@ function recommended(): FilterDesign {
     window: { type: "kaiser", beta: null, sampling: "symmetric" },
     length: { rule: "auto", budget: "match_output" },
     decimation: { length: "keep" },
-    cutoff: { mode: "band", passband_end: 0.908, stopband_start: 1.0, attenuation_db: 150 },
+    // `catalogue::recommended`: 20 kHz at every source rate, 0.908 where it
+    // does not fit.
+    cutoff: { mode: "band", passband_end: 0.908, passband_end_hz: 20000, stopband_start: 1.0, attenuation_db: 150 },
     phase: { type: "linear" },
     preserve_samples: false,
     rates: { accept: "any", fallback_window: null },

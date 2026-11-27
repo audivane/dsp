@@ -55,6 +55,7 @@ if (label === "osd") {
   // (the debounced scroll save may not have gone out yet).
   transport.onShell((e) => {
     if (e.kind === "main-closing") transport.mainCloseReady(currentMainView());
+    if (e.kind === "update-pending") store.markUpdatePending(e.state);
   });
   // Volume keys and the tray wheel: in the app, the app process is their
   // one writer (src-tauri/src/volume_step.rs) and this window only shows

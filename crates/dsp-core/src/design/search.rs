@@ -58,6 +58,11 @@ pub fn start_fraction(w: Option<&Window>) -> f64 {
     }
 }
 
+/// The start of an optimal design's search, over Kaiser's equiripple
+/// estimate (a quarter more for least squares,
+/// `paths::general::optimal_estimate`).
+const OPTIMAL_START: f64 = 0.9;
+
 type Found = Result<usize, DesignError>;
 
 fn cache() -> &'static Mutex<HashMap<String, Found>> {
@@ -118,37 +123,52 @@ fn uncached(k: &KernelDesign, cx: &BuildContext) -> Found {
             "an automatic length needs a band cutoff".into(),
         ));
     };
-    let (Shape::WindowedSinc { length, cutoff, .. }, Some(window)) = (&k.shape, estimate.window)
-    else {
-        return Err(DesignError::Unsupported(
-            "an automatic length needs a windowed sinc".into(),
-        ));
-    };
     let r = grid.design_ratio;
     let t_low_max = (AUTO_MAX_TAPS / r).max(1);
     let est = (estimate.taps()).div_ceil(r).clamp(1, t_low_max);
-
-    // The linear twin on the measuring grid, with the real grid's window
-    // (a fallback applies there, not on the x16 grid).
-    let proxy = r > AUTO_EXACT_MAX_SCALE;
-    let mgrid = if proxy {
-        Grid::new(source_rate, RateRatio::integer(AUTO_EXACT_MAX_SCALE as u32))
-    } else {
-        *grid
-    };
-    let linear = KernelDesign {
-        shape: Shape::WindowedSinc {
-            window,
-            length: length.clone(),
-            cutoff: cutoff.clone(),
-        },
-        phase: Phase::Linear,
-        preserve_samples: false,
-        rates: Rates {
-            fallback_window: None,
-            ..k.rates
-        },
-        ..k.clone()
+    let optimal = matches!(k.shape, Shape::Optimal { .. });
+    // The linear twin, the grid it is measured on and the search's start.
+    let (linear, mgrid, start_fraction) = match (&k.shape, estimate.window) {
+        // An optimal design is measured on its own grid (it is short; the
+        // x16 grid would design a different filter).
+        (Shape::Optimal { .. }, _) => (
+            KernelDesign {
+                phase: Phase::Linear,
+                ..k.clone()
+            },
+            *grid,
+            OPTIMAL_START,
+        ),
+        (Shape::WindowedSinc { length, cutoff, .. }, Some(window)) => {
+            // The linear twin on the measuring grid, with the real grid's
+            // window (a fallback applies there, not on the x16 grid).
+            let proxy = r > AUTO_EXACT_MAX_SCALE;
+            let mgrid = if proxy {
+                Grid::new(source_rate, RateRatio::integer(AUTO_EXACT_MAX_SCALE as u32))
+            } else {
+                *grid
+            };
+            let linear = KernelDesign {
+                shape: Shape::WindowedSinc {
+                    window,
+                    length: length.clone(),
+                    cutoff: cutoff.clone(),
+                },
+                phase: Phase::Linear,
+                preserve_samples: false,
+                rates: Rates {
+                    fallback_window: None,
+                    ..k.rates
+                },
+                ..k.clone()
+            };
+            (linear, mgrid, start_fraction(Some(&window)))
+        }
+        _ => {
+            return Err(DesignError::Unsupported(
+                "an automatic length needs a windowed sinc or an optimal design".into(),
+            ));
+        }
     };
     let mr = mgrid.design_ratio;
     let edge = 2.0 * mr as f64;
@@ -156,6 +176,17 @@ fn uncached(k: &KernelDesign, cx: &BuildContext) -> Found {
     let bound = 10f64.powf(-(claim.db + AUTO_MEASURE_MARGIN_DB) / 20.0);
     let mut planner = RealFftPlanner::<f64>::new();
     let mut steps = 0usize;
+    // An optimal design's branches must also meet the safety gate's DC
+    // tolerance (an equiripple stopband adds up in every branch).
+    let dc_tol = super::safety::dc_tol_db(k.phase);
+    let unreachable = |t: usize| {
+        DesignError::Claim(format!(
+            "an equiripple design does not reach {} dB over this band at {}: the exchange fails \
+             from {t} taps, where f64 no longer levels its ripple: lower the target or use least \
+             squares",
+            claim.db, grid.ratio
+        ))
+    };
     let mut passes = |t_low: usize| -> Result<bool, DesignError> {
         steps += 1;
         if steps > AUTO_MAX_LINEAR_STEPS {
@@ -167,7 +198,23 @@ fn uncached(k: &KernelDesign, cx: &BuildContext) -> Found {
         super::budget::check_candidate(t, false, 0).map_err(DesignError::Failed)?;
         super::budget::check_measurement(t, false).map_err(DesignError::Failed)?;
         let g = general::recipe(&linear, source_rate, &mgrid, Some(t))?;
-        let h = general::kernel(&linear, &g, &mgrid)?;
+        // The bracket designs an optimal length without the exchange's
+        // shorter retries (it tries other lengths itself) below the
+        // estimate; at or past it with them (as the build), and a length
+        // that still fails is out of reach.
+        let mut quick = g;
+        if let super::paths::fir::Window::Optimal { retry, .. } = &mut quick.recipe.window {
+            *retry = t_low >= est;
+        }
+        let h = match general::kernel(&linear, &quick, &mgrid) {
+            Ok(h) => h,
+            Err(DesignError::Failed(_)) if optimal && t_low < est => return Ok(false),
+            Err(DesignError::Failed(_)) if optimal => return Err(unreachable(t)),
+            Err(e) => return Err(e),
+        };
+        if optimal && super::safety::branch_dc_dev_db(&h.taps, mgrid.up) > dc_tol {
+            return Ok(false);
+        }
         let err = protected_error_with(&mut planner, &h.taps, mgrid.up as f64, pass, stop);
         Ok(err <= bound)
     };
@@ -179,7 +226,7 @@ fn uncached(k: &KernelDesign, cx: &BuildContext) -> Found {
             grid.ratio
         ))
     };
-    let start = ((start_fraction(Some(&window)) * est as f64) as usize).clamp(1, t_low_max);
+    let start = ((start_fraction * est as f64) as usize).clamp(1, t_low_max);
     let (mut lo, mut hi);
     if passes(start)? {
         hi = start;
@@ -237,7 +284,8 @@ fn uncached(k: &KernelDesign, cx: &BuildContext) -> Found {
                 super::budget::check_measurement(h.taps.len(), true)
                     .map_err(DesignError::Failed)?;
                 let m = claim::measure(&mut RealFftPlanner::new(), &h.taps, &claim, grid);
-                if m.keeps(&claim) {
+                let dc_ok = !optimal || super::safety::branch_dc_dev_db(&h.taps, grid.up) <= dc_tol;
+                if m.keeps(&claim) && dc_ok {
                     return Ok(t);
                 }
                 last = Some(m);
@@ -246,6 +294,19 @@ fn uncached(k: &KernelDesign, cx: &BuildContext) -> Found {
                 } else {
                     worse += 1;
                 }
+            }
+            // An exchange that fails past the linear search's length: the
+            // phase transform needs more depth than the exchange levels.
+            Err(DesignError::Failed(_)) if optimal => {
+                if general::method(k) != Some(super::PhaseMethod::Cepstral) || !best.is_finite() {
+                    return Err(unreachable(t));
+                }
+                return Err(DesignError::Claim(format!(
+                    "the cepstral phase of this design keeps about {best:.0} dB at {}, not {} dB: \
+                     a longer prototype is past what the equiripple exchange levels ({t} taps): \
+                     use the reflected phase or lower the target",
+                    grid.ratio, claim.db
+                )));
             }
             Err(e @ DesignError::Phase(_)) => {
                 failures += 1;

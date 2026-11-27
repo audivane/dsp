@@ -1,4 +1,4 @@
-//! `avdsp bench` — real-time factor of the full chain, single threaded.
+//! `avdsp bench`: real-time factor of the full chain, single threaded.
 
 use crate::BenchArgs;
 use crate::signal::Rng;
@@ -49,8 +49,10 @@ pub fn run(args: BenchArgs) -> Result<i32> {
             enabled: true,
             ir_path: PathBuf::new(),
             gain_db: 0.0,
+            matrix: None,
+            calibration: false,
         }];
-        irs = Some(vec![synthetic_ir(taps)]);
+        irs = Some(vec![synthetic_ir(taps)].into());
     }
 
     let frames = (args.seconds * f64::from(args.rate)).round() as usize;

@@ -19,6 +19,8 @@ import { HarmonicsView } from "./views/HarmonicsView";
 import { LimiterView } from "./views/LimiterView";
 import { PitchView } from "./views/PitchView";
 import { versionSkew } from "./lib/versions";
+import { assignments, deviceLabel, heldOutputName, heldWas, initialPicks } from "./lib/devices";
+import type { UnresolvedDevice } from "./api/types";
 
 function Toast() {
   const t = useApp((s) => s.toast);
@@ -39,24 +41,34 @@ function UpdateBanner() {
   const engine = useApp((s) => s.status?.version);
   const dismissed = useApp((s) => s.updateDismissed);
   const restarting = useApp((s) => s.restarting);
+  const pending = useApp((s) => s.updatePending);
   const skew = versionSkew(app, engine);
-  if (!skew || dismissed === skew.engine) return null;
-  const outdatedApp = skew.kind === "app-outdated";
+  // The app relaunches itself after an upgrade, once the user leaves this
+  // window ("ready"); it asks for a restart only when that failed, or
+  // while the versions differ.
+  const ready = pending === "ready";
+  const key = ready ? "ready" : skew ? skew.engine : pending ? "pending" : null;
+  if (!key || dismissed === key) return null;
+  const outdatedApp = ready || !skew || skew.kind === "app-outdated";
   return (
     <div className="update-banner" role="status">
       <span className="text">
-        {outdatedApp
-          ? `Audivane DSP was updated to ${skew.engine}. Restart the app to finish.`
-          : `The engine is still running ${skew.engine}; this app is ${skew.app}. Restart the engine to finish the update.`}
+        {ready
+          ? "Audivane DSP was updated. It restarts when you leave this window."
+          : !skew
+            ? "Audivane DSP was updated. Restart the app to finish."
+            : outdatedApp
+              ? `Audivane DSP was updated to ${skew.engine}. Restart the app to finish.`
+              : `The engine is still running ${skew.engine}; this app is ${skew.app}. Restart the engine to finish the update.`}
       </span>
       <button
         className="btn small primary"
         disabled={restarting}
         onClick={() => void (outdatedApp ? store().restartApp() : store().restartEngine())}
       >
-        {restarting ? "Restarting…" : outdatedApp ? "Restart" : "Restart engine"}
+        {restarting ? "Restarting…" : ready ? "Restart now" : outdatedApp ? "Restart" : "Restart engine"}
       </button>
-      <button className="icon-btn" aria-label="Dismiss" title="Not now" onClick={() => store().dismissUpdate()}>
+      <button className="icon-btn" aria-label="Dismiss" title="Not now" onClick={() => store().dismissUpdate(key)}>
         <Close />
       </button>
     </div>
@@ -72,6 +84,8 @@ function EngineErrorBanner() {
   const state = useApp((s) => s.status?.state);
   const error = useApp((s) => s.status?.error);
   const view = useApp((s) => s.view);
+  const held = useApp((s) => s.status?.unresolved_devices);
+  if (held?.length) return <HeldDevicesBanner held={held} />;
   if (state !== "error" || !error) return <UpdateBanner />;
   return (
     <div className="update-banner bad" role="alert">
@@ -81,6 +95,52 @@ function EngineErrorBanner() {
           Choose output
         </button>
       )}
+    </div>
+  );
+}
+
+/**
+ * Identical DACs without serial numbers both moved USB ports: the engine
+ * cannot tell which is which, so it plays nothing on them until the user
+ * says (one pick per held output, sent together so two can swap).
+ */
+function HeldDevicesBanner({ held }: { held: UnresolvedDevice[] }) {
+  const devices = useApp((s) => s.devices);
+  const key = held.map((u) => `${u.output}=${u.candidates.join("+")}`).join(";");
+  const [picked, setPicked] = useState<{ key: string; picks: string[] }>({ key: "", picks: [] });
+  const picks = picked.key === key ? picked.picks : initialPicks(held);
+  const request = assignments(held, picks);
+  return (
+    <div className="update-banner bad held-devices" role="alert">
+      <span className="text">
+        Two identical DACs changed USB ports: pick which is which. Nothing plays on them until then.
+        {held.map((u, i) => (
+          <span key={u.output} className="held-row">
+            <span>
+              {heldOutputName(u, devices)} (was on {heldWas(u)}) is
+            </span>
+            <select
+              aria-label={`Device for ${heldOutputName(u, devices)}`}
+              value={picks[i]}
+              onChange={(e) => setPicked({ key, picks: picks.map((p, j) => (j === i ? e.target.value : p)) })}
+            >
+              {u.candidates.map((c) => (
+                <option key={c} value={c}>
+                  {devices.some((d) => d.id === c) ? deviceLabel(devices.find((d) => d.id === c)!) : c}
+                </option>
+              ))}
+            </select>
+          </span>
+        ))}
+      </span>
+      <button
+        className="btn small primary"
+        disabled={typeof request === "string"}
+        title={typeof request === "string" ? request : "Play each output on the DAC picked for it"}
+        onClick={() => typeof request !== "string" && void store().assignDevices(request)}
+      >
+        Confirm
+      </button>
     </div>
   );
 }
@@ -112,6 +172,19 @@ function useShortcuts() {
         return;
       }
       if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const run = st.getState().blindRun;
+      if (run?.phase === "running") {
+        // A blind run owns the keys: play A, B, X (or 1, 2), answer with F and J.
+        const abx = run.plan.mode === "abx";
+        if (abx ? k === "a" || k === "b" || k === "x" : k === "1" || k === "2") {
+          e.preventDefault();
+          void st.blindPlay(k as "a" | "b" | "x" | "1" | "2");
+        } else if (k === "f" || k === "j") {
+          e.preventDefault();
+          st.blindAnswer(abx ? (k === "f" ? "A" : "B") : k === "f" ? "1" : "2");
+        }
+        return;
+      }
       if (k === "a" || k === "b") {
         if (st.getState().config?.ab) void st.abSelect(k);
       } else if (e.key === "`") {

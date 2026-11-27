@@ -28,6 +28,22 @@ pub struct Coeffs {
 }
 
 impl Coeffs {
+    /// The time constant of the section's slowest pole, frames
+    /// (`-1 / ln r`, `r` its radius): how long its start-up rings. Infinite
+    /// for a pole on or outside the unit circle.
+    pub fn decay_frames(&self) -> f64 {
+        let disc = self.a1 * self.a1 - 4.0 * self.a2;
+        let r = if disc < 0.0 {
+            self.a2.abs().sqrt()
+        } else {
+            let s = disc.sqrt();
+            ((-self.a1 + s) / 2.0)
+                .abs()
+                .max(((-self.a1 - s) / 2.0).abs())
+        };
+        pole_decay(r)
+    }
+
     pub const IDENTITY: Coeffs = Coeffs {
         b0: 1.0,
         b1: 0.0,
@@ -201,8 +217,17 @@ impl BiquadState {
         self.z2 = c.b2 * x - c.a2 * y;
         y
     }
+
+    /// The state for an input `k` times as large (the section is linear).
+    pub(crate) fn scaled(self, k: f64) -> Self {
+        Self {
+            z1: self.z1 * k,
+            z2: self.z2 * k,
+        }
+    }
 }
 
+#[derive(Clone)]
 struct ChannelFilter {
     preamp: f64,
     bands: Vec<Coeffs>,
@@ -213,6 +238,7 @@ impl ChannelFilter {
         global_preamp_db: f64,
         linked_bands: &[Band],
         section: Option<(f64, &[Band])>,
+        tone: &[Band],
         sample_rate: f64,
     ) -> Self {
         let mut preamp = crate::db_to_lin(global_preamp_db);
@@ -232,6 +258,11 @@ impl ChannelFilter {
                     .filter(|c| !c.is_identity()),
             );
         }
+        bands.extend(
+            tone.iter()
+                .map(|b| Coeffs::design(b, sample_rate))
+                .filter(|c| !c.is_identity()),
+        );
         Self { preamp, bands }
     }
 
@@ -241,6 +272,39 @@ impl ChannelFilter {
             h *= c.response(f_hz, sample_rate);
         }
         h
+    }
+}
+
+/// The slowest decay (time constant, frames) of `f`'s bands from `first`
+/// on, and of `tilt`'s sections when `with_tilt`.
+fn channel_decay(f: &ChannelFilter, first: usize, tilt: &TiltFilter, with_tilt: bool) -> f64 {
+    let bands = f.bands.iter().skip(first).map(Coeffs::decay_frames);
+    let tilt = with_tilt.then(|| tilt.decay_frames()).into_iter();
+    bands.chain(tilt).fold(0.0, f64::max)
+}
+
+/// `-1 / ln r` for a pole of radius `r` (0 for `r` 0, infinite from 1).
+pub(crate) fn pole_decay(r: f64) -> f64 {
+    if r <= 0.0 {
+        0.0
+    } else if r >= 1.0 {
+        f64::INFINITY
+    } else {
+        -1.0 / r.ln()
+    }
+}
+
+/// The filter channel `idx` runs (see [`Eq`]).
+fn filter_at<'a>(
+    left: &'a ChannelFilter,
+    right: &'a ChannelFilter,
+    linked: &'a ChannelFilter,
+    idx: usize,
+) -> &'a ChannelFilter {
+    match idx {
+        0 => left,
+        1 => right,
+        _ => linked,
     }
 }
 
@@ -256,6 +320,9 @@ pub struct Eq {
     tilt: TiltFilter,
     sample_rate: f64,
     channels: usize,
+    /// Index of the first channel this EQ runs (0; a part of
+    /// [`Eq::split_channels`] runs one channel of a wider stream).
+    first_channel: usize,
     /// `states[channel][band]`.
     states: Vec<Vec<BiquadState>>,
     /// `tilt_states[channel]`.
@@ -263,6 +330,15 @@ pub struct Eq {
 }
 
 impl Eq {
+    /// Second-order sections the busiest channel runs per sample (its
+    /// bands and the tilt's sections, a first-order shelf counted as one):
+    /// what the stage costs, for CPU admission.
+    pub fn sections(&self) -> usize {
+        self.states.iter().map(Vec::len).max().unwrap_or(0)
+            + self.tilt.shelves.len()
+            + self.tilt.corners.len()
+    }
+
     /// Build the EQ, designing its tilt (one or two sections, if any) at
     /// `sample_rate`. A tilt that cannot be designed is an error.
     pub fn new(profile: &EqProfile, sample_rate: f64, channels: usize) -> Result<Self, String> {
@@ -296,7 +372,10 @@ impl Eq {
         } else {
             &[]
         };
-        let linked = ChannelFilter::from_layers(profile.preamp_db, linked_bands, None, sample_rate);
+        // The tone knobs' shelves run last on every channel (none at 0/0).
+        let tone = profile.tone_bands();
+        let linked =
+            ChannelFilter::from_layers(profile.preamp_db, linked_bands, None, &tone, sample_rate);
         let left_sec = profile
             .left
             .as_ref()
@@ -307,10 +386,20 @@ impl Eq {
             .as_ref()
             .filter(|c| c.enabled)
             .map(|c| (c.preamp_db, c.bands.as_slice()));
-        let left =
-            ChannelFilter::from_layers(profile.preamp_db, linked_bands, left_sec, sample_rate);
-        let right =
-            ChannelFilter::from_layers(profile.preamp_db, linked_bands, right_sec, sample_rate);
+        let left = ChannelFilter::from_layers(
+            profile.preamp_db,
+            linked_bands,
+            left_sec,
+            &tone,
+            sample_rate,
+        );
+        let right = ChannelFilter::from_layers(
+            profile.preamp_db,
+            linked_bands,
+            right_sec,
+            &tone,
+            sample_rate,
+        );
         let states = (0..channels)
             .map(|ch| {
                 let band_count = match ch {
@@ -329,9 +418,124 @@ impl Eq {
             tilt,
             sample_rate,
             channels,
+            first_channel: 0,
             states,
             tilt_states,
         }
+    }
+
+    /// One single-channel EQ per channel, each running its channel exactly
+    /// as this one does (bit for bit), from this one's state. Off the
+    /// real-time thread (it allocates); `self` is left without channels.
+    pub fn split_channels(&mut self) -> Vec<Eq> {
+        let states = std::mem::take(&mut self.states);
+        let tilt_states = std::mem::take(&mut self.tilt_states);
+        self.channels = 0;
+        states
+            .into_iter()
+            .zip(tilt_states)
+            .enumerate()
+            .map(|(c, (st, tilt_st))| Eq {
+                linked: self.linked.clone(),
+                left: self.left.clone(),
+                right: self.right.clone(),
+                tilt: self.tilt.clone(),
+                sample_rate: self.sample_rate,
+                channels: 1,
+                first_channel: self.first_channel + c,
+                states: vec![st],
+                tilt_states: vec![tilt_st],
+            })
+            .collect()
+    }
+
+    /// Carry `from`'s filter state over, channel by channel, for the
+    /// sections that run exactly as `from`'s do: the longest identical
+    /// start of the cascade (the preamp, then each band's coefficients in
+    /// order, then the tilt). A section from the first changed one on
+    /// starts fresh, as in a new EQ: a transposed DF-II state is only valid
+    /// for the coefficients that made it (copied into another section it
+    /// can ring far louder than a fresh start), and a section after a
+    /// changed one hears another input. So the output never moves more
+    /// than a fresh EQ's would. Returns whether every section was taken
+    /// over (the EQ then plays on bit for bit as `from`). Real-time safe.
+    pub fn inherit_state(&mut self, from: &Eq) -> bool {
+        self.inherit_state_decay(from).0
+    }
+
+    /// [`Self::inherit_state`], and the slowest decay of the sections that
+    /// start fresh (their time constant, frames: how long their start-up
+    /// rings; 0 when none does). A shape that does not match takes nothing
+    /// over: every section is fresh. A preamp that changed scales the
+    /// sections' input: their state, scaled by the same ratio, is exactly
+    /// what they would hold had the new preamp played all along, so they
+    /// carry over scaled (the EQ is not whole: the preamp moved).
+    pub fn inherit_state_decay(&mut self, from: &Eq) -> (bool, f64) {
+        if self.channels != from.channels
+            || self.first_channel != from.first_channel
+            || self.states.len() != from.states.len()
+            || self.tilt_states.len() != from.tilt_states.len()
+        {
+            return (false, self.decay_from(0, true));
+        }
+        let tilt_same = self.tilt.same_filter(&from.tilt);
+        let mut all = true;
+        let mut decay = 0.0f64;
+        for ch in 0..self.states.len() {
+            let idx = ch + self.first_channel;
+            let (df, sf) = (
+                filter_at(&self.left, &self.right, &self.linked, idx),
+                filter_at(&from.left, &from.right, &from.linked, idx),
+            );
+            let k = df.preamp / sf.preamp;
+            if df.preamp != sf.preamp {
+                all = false;
+                if !k.is_finite() || k == 0.0 {
+                    decay = decay.max(channel_decay(df, 0, &self.tilt, true));
+                    continue;
+                }
+            }
+            let k = if df.preamp == sf.preamp { 1.0 } else { k };
+            let (dst, src) = (&mut self.states[ch], &from.states[ch]);
+            let mut whole = df.bands.len() == sf.bands.len() && dst.len() == src.len();
+            let mut taken = 0;
+            for (i, (dc, sc)) in df.bands.iter().zip(&sf.bands).enumerate() {
+                if dc != sc || i >= dst.len() || i >= src.len() {
+                    whole = false;
+                    break;
+                }
+                dst[i] = src[i].scaled(k);
+                taken = i + 1;
+            }
+            if whole && df.bands.len() > taken {
+                whole = false;
+            }
+            let (dt, st) = (&mut self.tilt_states[ch], &from.tilt_states[ch]);
+            if whole && tilt_same && dt.same_shape(st) {
+                dt.copy_scaled(st, k);
+            } else {
+                all = false;
+                let tilt_fresh = !(whole && tilt_same);
+                let first = if whole { df.bands.len() } else { taken };
+                decay = decay.max(channel_decay(df, first, &self.tilt, tilt_fresh));
+            }
+        }
+        (all, decay)
+    }
+
+    /// The slowest decay of all its sections (frames): how long a fresh
+    /// one's start-up rings.
+    pub fn decay_frames(&self) -> f64 {
+        self.decay_from(0, true)
+    }
+
+    /// The slowest decay (frames) of every channel's sections from band
+    /// `first` on, the tilt's too when `tilt`.
+    fn decay_from(&self, first: usize, tilt: bool) -> f64 {
+        [&self.left, &self.right, &self.linked]
+            .iter()
+            .map(|f| channel_decay(f, first, &self.tilt, tilt))
+            .fold(0.0, f64::max)
     }
 
     /// Returns `Some(effective_end_hz)` if the tilt's `end_hz` was clamped to
@@ -394,6 +598,17 @@ impl Eq {
         };
         let left = profile.left.as_ref().filter(|c| c.enabled);
         let right = profile.right.as_ref().filter(|c| c.enabled);
+        // The tone shelves count like bands on both channels.
+        let tone = profile.tone_bands();
+        let with_tone = |sec: Option<&audivane_protocol::ChannelEq>| -> Vec<Band> {
+            sec.map_or(&[][..], |c| c.bands.as_slice())
+                .iter()
+                .chain(&tone)
+                .cloned()
+                .collect()
+        };
+        let left_bands = with_tone(left);
+        let right_bands = with_tone(right);
         let tilt = TiltFilter::design_stage(
             profile.tilt.as_ref(),
             profile.tilt_high.as_ref(),
@@ -404,14 +619,14 @@ impl Eq {
         let peak_l = Self::channel_peak_db(
             linked,
             left.map_or(0.0, |c| c.preamp_db),
-            left.map_or(&[][..], |c| c.bands.as_slice()),
+            &left_bands,
             tilt.as_ref(),
             sample_rate,
         );
         let peak_r = Self::channel_peak_db(
             linked,
             right.map_or(0.0, |c| c.preamp_db),
-            right.map_or(&[][..], |c| c.bands.as_slice()),
+            &right_bands,
             tilt.as_ref(),
             sample_rate,
         );
@@ -547,7 +762,7 @@ impl Stage for Eq {
     fn process(&mut self, chans: &mut [&mut [f64]]) {
         let nch = chans.len().min(self.channels);
         for (ch, buf) in chans.iter_mut().enumerate().take(nch) {
-            let filter = match ch {
+            let filter = match ch + self.first_channel {
                 0 => &self.left,
                 1 => &self.right,
                 _ => &self.linked,
@@ -598,6 +813,62 @@ mod tests {
 
     fn to_db(c: Complex64) -> f64 {
         20.0 * c.norm().log10()
+    }
+
+    /// Run `eq` on `n` frames of a 0.35 FS 1 kHz tone (stereo) from frame
+    /// `from`: the largest output sample.
+    fn tone_peak(eq: &mut Eq, from: usize, n: usize) -> f64 {
+        let fs = 48_000.0;
+        let x: Vec<f64> = (from..from + n)
+            .map(|i| 0.35 * (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / fs).sin())
+            .collect();
+        let (mut l, mut r) = (x.clone(), x);
+        eq.process(&mut [&mut l[..], &mut r[..]]);
+        l.iter().chain(&r).fold(0.0f64, |m, v| m.max(v.abs()))
+    }
+
+    /// A moved band starts fresh: its state, made by other coefficients,
+    /// is not copied (a +6 dB peak moved from 1 kHz to 25 Hz under a tone
+    /// rang to several times full scale with it). The output never passes a
+    /// fresh EQ's; unchanged sections before it are taken over, and an
+    /// unchanged EQ is taken over whole, bit for bit.
+    #[test]
+    fn inherit_state_takes_only_the_unchanged_start() {
+        let fs = 48_000.0;
+        let shelf = band(FilterType::LowShelf, 120.0, -3.0, 0.7);
+        let at = |hz: f64| {
+            Eq::from_bands(
+                &[shelf.clone(), band(FilterType::Peaking, hz, 6.0, 1.0)],
+                0.0,
+                fs,
+                2,
+            )
+        };
+        let mut old = at(1000.0);
+        tone_peak(&mut old, 0, 48_000);
+
+        let mut moved = at(25.0);
+        assert!(!moved.inherit_state(&old), "a band moved: not whole");
+        assert_eq!(moved.states[0][0], old.states[0][0], "the shelf taken over");
+        assert_eq!(
+            moved.states[0][1],
+            BiquadState::default(),
+            "the moved peak fresh"
+        );
+        let mut fresh = at(25.0);
+        let (got, cold) = (
+            tone_peak(&mut moved, 48_000, 48_000),
+            tone_peak(&mut fresh, 48_000, 48_000),
+        );
+        assert!(got <= cold * 1.01, "moved {got}, fresh {cold}");
+        assert!(got < 1.0, "{got}");
+
+        let mut same = at(1000.0);
+        assert!(same.inherit_state(&old));
+        assert_eq!(
+            tone_peak(&mut same, 48_000, 4_800).to_bits(),
+            tone_peak(&mut old, 48_000, 4_800).to_bits()
+        );
     }
 
     #[test]
@@ -1011,6 +1282,81 @@ mod tests {
         assert_eq!(d0, a0);
         assert_eq!(d1, a1);
         assert_eq!(d2, a2);
+    }
+
+    #[test]
+    fn flat_tone_is_bit_identical_to_none() {
+        let fs = 48_000.0;
+        let src: Vec<f64> = (0..512).map(|i| (i as f64 * 0.23).sin() * 0.5).collect();
+        let base = EqProfile {
+            preamp_db: -1.5,
+            bands: vec![band(FilterType::Peaking, 1000.0, 4.0, 1.2)],
+            right: Some(audivane_protocol::ChannelEq {
+                bands: vec![band(FilterType::LowShelf, 90.0, 2.0, 0.7)],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let flat = EqProfile {
+            tone: Some(audivane_protocol::ToneConfig::default()),
+            ..base.clone()
+        };
+        let run = |p: &EqProfile| {
+            let mut eq = Eq::new(p, fs, 3).unwrap();
+            let mut ch = [src.clone(), src.clone(), src.clone()];
+            let [a, b, c] = &mut ch;
+            eq.process(&mut [a, b, c]);
+            ch
+        };
+        assert_eq!(run(&flat), run(&base));
+        assert_eq!(
+            Eq::auto_preamp_db(&flat, fs).unwrap(),
+            Eq::auto_preamp_db(&base, fs).unwrap()
+        );
+    }
+
+    #[test]
+    fn tone_adds_two_shelves_on_every_channel() {
+        use audivane_protocol::{
+            TONE_BASS_HZ, TONE_BASS_Q, TONE_TREBLE_HZ, TONE_TREBLE_Q, ToneConfig,
+        };
+        let fs = 48_000.0;
+        let tone = ToneConfig {
+            bass_db: 6.0,
+            treble_db: -3.5,
+        };
+        let profile = EqProfile {
+            linked_enabled: false,
+            left: Some(audivane_protocol::ChannelEq {
+                bands: vec![band(FilterType::Peaking, 1000.0, 2.0, 1.0)],
+                ..Default::default()
+            }),
+            tone: Some(tone),
+            ..Default::default()
+        };
+        let eq = Eq::new(&profile, fs, 3).unwrap();
+        let ls = Coeffs::design(
+            &band(FilterType::LowShelf, TONE_BASS_HZ, 6.0, TONE_BASS_Q),
+            fs,
+        );
+        let hs = Coeffs::design(
+            &band(FilterType::HighShelf, TONE_TREBLE_HZ, -3.5, TONE_TREBLE_Q),
+            fs,
+        );
+        let pk = Coeffs::design(&band(FilterType::Peaking, 1000.0, 2.0, 1.0), fs);
+        for f in [20.0, 140.0, 1000.0, 4900.0, 15_000.0] {
+            let tone_h = ls.response(f, fs) * hs.response(f, fs);
+            let want = [tone_h * pk.response(f, fs), tone_h, tone_h];
+            for (c, w) in want.iter().enumerate() {
+                assert!((eq.response_channel(c, f) - w).norm() < 1e-12, "{c} {f}");
+            }
+        }
+        // Full boost: about +6 dB in the deep bass, flat-ish at 1 kHz.
+        assert!((to_db(eq.response_channel(1, 10.0)) - 6.0).abs() < 0.05);
+        assert!(to_db(eq.response_channel(1, 1000.0)).abs() < 0.3);
+        // The auto preamp counts the boost.
+        let auto = Eq::auto_preamp_db(&profile, fs).unwrap();
+        assert!((auto + 6.0).abs() < 0.05, "{auto}");
     }
 
     #[test]

@@ -1,10 +1,16 @@
 // A plain range slider that commits once: on release, key-up or a pause in
 // the mouse wheel. While it moves it keeps a local draft (reported through
-// `onDraft` so a field next to it can show the moving value).
+// `onDraft` so a field next to it can show the moving value). After a commit
+// it keeps showing the committed value until the edit has landed (the
+// promise `onCommit` returns settles, or `value` reaches it), so a slow edit
+// never shows the old value in between.
 
 import { useEffect, useRef, useState } from "react";
 import { WHEEL_HINT, WHEEL_IDLE_MS, WheelAccumulator, attachSliderWheelGate, wheelDirection } from "./sliderWheel";
 import { stepValue } from "./valueSliderKeys";
+
+/** How long a committed value stays shown when `onCommit` returns no promise and `value` never reaches it, ms. */
+const HOLD_FALLBACK_MS = 3000;
 
 export interface StepRange {
   min: number;
@@ -25,7 +31,7 @@ export function StepSlider({
   id,
 }: {
   value: number;
-  onCommit: (v: number) => void;
+  onCommit: (v: number) => void | Promise<unknown>;
   onDraft?: (v: number | null) => void;
   label: string;
   range: StepRange;
@@ -37,6 +43,9 @@ export function StepSlider({
   id?: string;
 }) {
   const [draft, setDraftState] = useState<number | null>(null);
+  const [held, setHeldState] = useState<number | null>(null);
+  const heldRef = useRef<number | null>(null);
+  const commitSeq = useRef(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const lastRef = useRef<number | null>(null);
   const wheelTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -49,6 +58,30 @@ export function StepSlider({
   };
   const setDraftRef = useRef(setDraft);
   setDraftRef.current = setDraft;
+  const setHeld = (v: number | null) => {
+    heldRef.current = v;
+    setHeldState(v);
+  };
+  /** Commit `v` and show it until that edit has landed (the latest commit only). */
+  const commit = (v: number) => {
+    const my = ++commitSeq.current;
+    setHeld(v);
+    const release = () => {
+      if (commitSeq.current === my) setHeld(null);
+    };
+    const r = now.current.onCommit(v);
+    if (r && typeof (r as Promise<unknown>).then === "function") (r as Promise<unknown>).then(release, release);
+    else setTimeout(release, HOLD_FALLBACK_MS);
+  };
+  const commitRef = useRef(commit);
+  commitRef.current = commit;
+  // The config caught up: show it again.
+  useEffect(() => {
+    if (heldRef.current !== null && value === heldRef.current) {
+      commitSeq.current++;
+      setHeld(null);
+    }
+  }, [value]);
 
   useEffect(() => {
     const el = inputRef.current;
@@ -64,7 +97,7 @@ export function StepSlider({
         return;
       }
       const r = now.current.range;
-      const cur = lastRef.current ?? now.current.value;
+      const cur = lastRef.current ?? heldRef.current ?? now.current.value;
       if (stepValue(dir, cur, r) === cur) {
         wheelAcc.current.reset();
         return;
@@ -82,7 +115,7 @@ export function StepSlider({
         const finalV = lastRef.current;
         lastRef.current = null;
         setDraftRef.current(null);
-        if (finalV !== null && finalV !== now.current.value) now.current.onCommit(finalV);
+        if (finalV !== null && finalV !== (heldRef.current ?? now.current.value)) commitRef.current(finalV);
       }, WHEEL_IDLE_MS);
     };
     el.addEventListener("wheel", onWheel, { passive: false });
@@ -94,12 +127,12 @@ export function StepSlider({
         wheelTimer.current = null;
         const finalV = lastRef.current;
         lastRef.current = null;
-        if (finalV !== null && finalV !== now.current.value) now.current.onCommit(finalV);
+        if (finalV !== null && finalV !== (heldRef.current ?? now.current.value)) void now.current.onCommit(finalV);
       }
     };
   }, []);
 
-  const v = draft ?? value;
+  const v = draft ?? held ?? value;
   const finish = () => {
     if (wheelTimer.current) {
       clearTimeout(wheelTimer.current);
@@ -107,7 +140,7 @@ export function StepSlider({
     }
     const finalV = lastRef.current ?? draft;
     lastRef.current = null;
-    if (finalV !== null && finalV !== value) onCommit(finalV);
+    if (finalV !== null && finalV !== (held ?? value)) commit(finalV);
     if (draft !== null) setDraft(null);
   };
   return (

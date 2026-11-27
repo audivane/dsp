@@ -19,7 +19,8 @@ Security problems: see [SECURITY.md](SECURITY.md) instead of opening an issue.
 1. For anything bigger than a small fix, open an issue first so we can agree
    on the approach.
 2. Keep each pull request focused on one change, and update the docs it
-   affects (`docs/control-plane.md` for protocol changes).
+   affects (`docs/control-plane.md` for protocol changes, plus `npm run
+   gen:types` in `app/`).
 3. Run the checks before you push:
 
    ```sh

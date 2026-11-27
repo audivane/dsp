@@ -6,6 +6,9 @@ import type { Transport } from "./transport";
 export function createTransport(): Transport {
   if (isTauri()) return new TauriTransport();
   const q = new URLSearchParams(typeof location !== "undefined" ? location.search : "");
+  // `?slow_build=<s>`: each set_upsampler designs for that long;
+  // `&build_timeout=<s>`: the app stops waiting for it after that long.
+  const seconds = (k: string) => (q.has(k) ? Math.max(0, Number(q.get(k)) || 0) * 1000 : undefined);
   return new MockTransport(
     new MockDaemon({
       running: q.get("engine") !== "down",
@@ -20,5 +23,6 @@ export function createTransport(): Transport {
       legacyStreamVolume: q.has("legacy_streams"),
       followers: q.get("followers")?.split(",").filter(Boolean),
     }),
+    { build: seconds("slow_build"), buildTimeout: seconds("build_timeout") },
   );
 }

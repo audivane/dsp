@@ -2,7 +2,7 @@
 
 import type { ConvolutionConfig, DesignPlan, EngineConfig, FilterPreset, RateRatio, RateTarget, UpsamplerConfig } from "../api/types";
 import type { IrInfo } from "../api/transport";
-import { convList } from "./chain";
+import { convList, irPaths } from "./chain";
 import { presetSummary } from "./filterPresets";
 import { RECOMMENDED_PRESET, designSummary, planLatencyMs } from "./filterDesign";
 import { RECOMMENDED_LABEL, isRecommendedUpsampler } from "./upsamplerRecommended";
@@ -82,23 +82,25 @@ export function upsamplingSummary(u: UpsamplerConfig, running: { graphRate: numb
 }
 
 /**
- * Added latency of the upsampling filter at a source rate, ms. The engine's
+ * Added latency of the upsampling filter at a source rate, ms: the engine's
  * measurement (`upsampler_response` for that rate) when there is one, else
- * what the design's plan at that rate tells (`check_design`: half the
- * kernel for a linear-phase design of known length). Null when neither can
- * tell (a preset, minimum or intermediate phase before it is measured).
+ * what the design's plan tells (`check_design`: half the kernel for a
+ * linear-phase design of known length, plus the engine's block at `quantum`).
+ * Null when neither can tell (a preset, minimum or intermediate phase before
+ * it is measured).
  */
 export function upsamplingLatencyMs(
   u: UpsamplerConfig,
   rate: number,
   measured: { source_rate: number; output_rate: number; latency_samples: number } | null = null,
   plan: DesignPlan | null = null,
+  quantum?: number,
 ): number | null {
   if (measured && measured.source_rate === rate && measured.output_rate > 0) return (measured.latency_samples / measured.output_rate) * 1000;
   const ratio = resolveRatio(u.target, rate);
   if (ratio === 1) return 0;
   if (u.preset || !u.design || !plan) return null;
-  return planLatencyMs(u.design, plan, rate);
+  return planLatencyMs(u.design, plan, rate, quantum);
 }
 
 export const DITHER_TEXT: Record<string, string> = {
@@ -121,9 +123,15 @@ export function outputSummary(cfg: EngineConfig, negotiated: string | null | und
   return `${fmt} · ${DITHER_TEXT[cfg.chain.output.dither] ?? cfg.chain.output.dither}`;
 }
 
-/** Taps of one IR, if known. */
+/** Taps of one IR (a matrix: its longest entry), if known. */
 export function irTaps(c: ConvolutionConfig, info: Record<string, IrInfo | null>): number | null {
-  return info[c.ir_path]?.frames ?? null;
+  let max: number | null = null;
+  for (const p of irPaths(c)) {
+    const t = info[p]?.frames;
+    if (t === undefined) return null;
+    max = Math.max(max ?? 0, t);
+  }
+  return max;
 }
 
 /** Length of the single combined filter the engine builds from the enabled IRs. */

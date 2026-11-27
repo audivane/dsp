@@ -52,6 +52,7 @@ export function PitchView() {
       <StageHead
         id="pitch-title"
         title="Pitch"
+        part={missing ? undefined : "output"}
         on={on}
         powerTitle={powerTitle}
         onPower={missing ? undefined : () => st.setStageEnabled("pitch", !on)}

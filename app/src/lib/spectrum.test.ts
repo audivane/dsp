@@ -4,7 +4,10 @@ import {
   SPEC_DB_MIN,
   SPEC_STALE_FADE_MS,
   SPEC_STALE_MS,
+  SpectrumAnimator,
   decaySpectrumBins,
+  monotonePathD,
+  spectrumCurvePoints,
   loadSpectrumPrefs,
   monotoneAt,
   monotoneTangents,
@@ -235,5 +238,40 @@ describe("a report without a post spectrum", () => {
       expect(step.clearFrame).toBe(false);
     }
     expect(smoothPre[10]).toBeGreaterThan(SPEC_DB_MIN);
+  });
+});
+
+describe("shared analyser drawing", () => {
+  it("animates toward targets below the PEQ floor, then falls away when stale", () => {
+    const a = new SpectrumAnimator();
+    const target = [-150, -120, -40];
+    let step = a.step({ frameKey: 1, frameAtMs: 0, nowMs: 0, tap: "both", peakHold: false, preTarget: target, postTarget: target, floorDb: -250, ceilDb: 60, staleMs: 1500 });
+    for (let t = 16; t <= 1000; t += 16) step = a.step({ frameKey: 1, frameAtMs: 0, nowMs: t, tap: "both", peakHold: false, preTarget: target, postTarget: target, floorDb: -250, ceilDb: 60, staleMs: 1500 });
+    expect(step.stale).toBe(false);
+    expect(a.post[0]).toBeCloseTo(-150, 0);
+    expect(a.pre[2]).toBeCloseTo(-40, 0);
+    let t = 1000;
+    while (!step.clearFrame && t < 20000) {
+      t += 16;
+      step = a.step({ frameKey: 1, frameAtMs: 0, nowMs: t, tap: "both", peakHold: false, preTarget: target, postTarget: target, floorDb: -250, ceilDb: 60, staleMs: 1500 });
+    }
+    expect(step.clearFrame).toBe(true);
+    expect(t).toBeGreaterThan(1500);
+  });
+
+  it("places bins at their centres and carries the last on to Nyquist", () => {
+    const bins = [0, -10, -20, -30];
+    const { xs, ys } = spectrumCurvePoints(bins, 10, 1, (f) => f, (db) => -db, 1e9, 85);
+    expect(xs).toEqual([10, 20, 40, 80, 85]);
+    expect(ys).toEqual([-0, 10, 20, 30, 30]);
+    // Far from Nyquist: no carry; past the right edge: one bin over.
+    expect(spectrumCurvePoints(bins, 10, 1, (f) => f, (db) => db, 1e9, 400).xs).toHaveLength(4);
+    expect(spectrumCurvePoints(bins, 10, 1, (f) => f, (db) => db, 25).xs).toEqual([10, 20, 40]);
+  });
+
+  it("writes the monotone curve as SVG commands", () => {
+    expect(monotonePathD([0, 10, 20], [5, 5, 0])).toBe("M0.0,5.0C3.3,5.0 6.7,5.0 10.0,5.0C13.3,5.0 16.7,1.7 20.0,0.0");
+    expect(monotonePathD([1], [2], true)).toBe("L1.0,2.0");
+    expect(monotonePathD([], [])).toBe("");
   });
 });

@@ -6,7 +6,11 @@
 
 #![allow(dead_code)] // each test binary uses part of it
 
-use audivane_dsp_core::design::{FilterDesign, catalogue};
+use audivane_dsp_core::design::{
+    Accept, ArithmeticPath, Cutoff, Decimation, FilterDesign, GridCutoff, KernelDesign, Length,
+    Numerics, OddRule, OptimalMethod, Phase, PhaseMethod, Rates, Sampling, Shape, Stepped, Window,
+    catalogue,
+};
 use audivane_dsp_core::presets::FilterPreset;
 use audivane_protocol::{
     ALLOWED_RATES, BandSpec, CutoffMode, DitherKind, FilterErrorBudget, FilterPhase,
@@ -35,7 +39,8 @@ pub const TIER_A_PAIRS: &[(u32, u32)] = &[
     (176_400, 48_000),
 ];
 /// The presets whose kernel depends on the source rate (compact and
-/// constant-time lengths); checked against the builders.
+/// constant-time lengths, and the apodizing band's 20 kHz passband);
+/// checked against the builders.
 pub const RATE_DEPENDENT: &[FilterPreset] = &[
     FilterPreset::GaussianCompact,
     FilterPreset::GaussianHuge,
@@ -43,6 +48,7 @@ pub const RATE_DEPENDENT: &[FilterPreset] = &[
     FilterPreset::FlattopCompact,
     FilterPreset::FlattopHuge,
     FilterPreset::KaiserCompact,
+    FilterPreset::CravenApod,
 ];
 /// Tier A's rational cases that pass with 2 pipelines and are refused with
 /// 4 (picked from tier B's `cost4` rows): (preset, input, output).
@@ -280,7 +286,8 @@ pub fn tier_b() -> Vec<Case> {
 /// view's quick designs, and the design features the presets do not have
 /// (reflected minimum and intermediate phase, band and "stop at Nyquist"
 /// lengths, Gaussian band design, Tukey with kept samples, the even-length
-/// delay conventions).
+/// delay conventions, the DPSS window, the equiripple and least-squares
+/// designs).
 pub fn custom_designs() -> Vec<(&'static str, UpsamplerConfig, &'static [u32])> {
     use audivane_dsp_core::resample::ManualConfig;
     let base = ManualConfig {
@@ -293,6 +300,7 @@ pub fn custom_designs() -> Vec<(&'static str, UpsamplerConfig, &'static [u32])> 
         cutoff_mode: CutoffMode::Band,
         band: BandSpec {
             passband_end: 0.9,
+            passband_end_hz: None,
             stopband_start: 1.0,
             attenuation_db: 150.0,
         },
@@ -390,7 +398,117 @@ pub fn custom_designs() -> Vec<(&'static str, UpsamplerConfig, &'static [u32])> 
             }),
             &[8],
         ),
+        ("dpss_band", designed(dpss_band()), &[4, 16]),
+        (
+            "dpss_nyquist_stop_mp",
+            designed(dpss_nyquist_stop_mp()),
+            &[4, 16],
+        ),
+        (
+            "equiripple_fixed",
+            designed(optimal(
+                OptimalMethod::Equiripple,
+                Length::PerInput(Stepped::Fixed(160)),
+                Phase::Linear,
+            )),
+            &[4, 8],
+        ),
+        (
+            "equiripple_auto_mp",
+            designed(optimal(
+                OptimalMethod::Equiripple,
+                Length::Auto(FilterErrorBudget::Db(120.0)),
+                Phase::Minimum(PhaseMethod::Reflect),
+            )),
+            &[4, 16],
+        ),
+        (
+            "least_squares_auto",
+            designed(optimal(
+                OptimalMethod::LeastSquares,
+                Length::Auto(FilterErrorBudget::Db(120.0)),
+                Phase::Linear,
+            )),
+            &[4, 16],
+        ),
     ]
+}
+
+/// An upsampler config with the design `d`.
+fn designed(d: FilterDesign) -> UpsamplerConfig {
+    UpsamplerConfig {
+        design: Some(audivane_protocol::design::StoredDesign::new(d)),
+        ..UpsamplerConfig::default()
+    }
+}
+
+/// A kernel design on the `fir` path, any ratio, scaled when decimating.
+fn fir_kernel(shape: Shape, phase: Phase) -> FilterDesign {
+    FilterDesign::Kernel(KernelDesign {
+        shape,
+        decimation: Decimation::Scale {
+            odd: OddRule::Down,
+            base_taps: None,
+        },
+        phase,
+        preserve_samples: false,
+        rates: Rates {
+            accept: Accept::Any,
+            fallback_window: None,
+        },
+        numerics: Numerics {
+            path: ArithmeticPath::Fir,
+            grid_cutoff: GridCutoff::Scaled,
+        },
+    })
+}
+
+/// A DPSS band design, its NW from the depth.
+fn dpss_band() -> FilterDesign {
+    fir_kernel(
+        Shape::WindowedSinc {
+            window: Window::Dpss {
+                nw: None,
+                sampling: Sampling::Symmetric,
+            },
+            length: Length::Band,
+            cutoff: Cutoff::Band(BandSpec {
+                passband_end: 0.9,
+                passband_end_hz: None,
+                stopband_start: 1.0,
+                attenuation_db: 140.0,
+            }),
+        },
+        Phase::Linear,
+    )
+}
+
+/// A DPSS stop at Nyquist with the reflected minimum phase.
+fn dpss_nyquist_stop_mp() -> FilterDesign {
+    fir_kernel(
+        Shape::WindowedSinc {
+            window: Window::Dpss {
+                nw: Some(5.0),
+                sampling: Sampling::Symmetric,
+            },
+            length: Length::PerInput(Stepped::Fixed(255)),
+            cutoff: Cutoff::NyquistStop,
+        },
+        Phase::Minimum(PhaseMethod::Reflect),
+    )
+}
+
+/// An optimal design over 0.9 ..= 1.0 of the Nyquist.
+fn optimal(method: OptimalMethod, length: Length, phase: Phase) -> FilterDesign {
+    fir_kernel(
+        Shape::Optimal {
+            method,
+            length,
+            passband_end: 0.9,
+            stopband_start: 1.0,
+        },
+        phase,
+    )
 }
 
 fn custom_design(name: &str) -> Design {

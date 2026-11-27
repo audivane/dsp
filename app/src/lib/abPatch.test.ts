@@ -14,7 +14,8 @@ describe("A/B patch", () => {
     expect(patchError({ upsampler: { preset: "x" } })).toBeNull();
     expect(patchError({ upsampler: { target: "off" } })).toContain("ab.b.patch.upsampler.target");
     expect(patchError({ limiter: {} })).toContain("ab.b.patch.limiter");
-    expect(patchError({ output: {} })).toContain("ab.b.patch.output");
+    expect(patchError({ output: { bits: 16, dither: "tpdf" } })).toBeNull();
+    expect(patchError({ output: { headroom_db: 1 } })).toContain("ab.b.patch.output.headroom_db");
   });
 
   it("names side B", () => {

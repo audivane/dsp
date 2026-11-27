@@ -4,6 +4,7 @@
 //! tested with the rest of the workspace. The Tauri shell (`app`) needs the
 //! `gui` feature and WebKitGTK.
 
+pub mod appimage;
 pub mod autostart;
 pub mod client;
 pub mod dbus_util;
@@ -13,6 +14,7 @@ pub mod overlays;
 pub mod paths;
 pub mod placement;
 pub mod plasma_osd;
+pub mod relaunch;
 pub mod shortcuts;
 pub mod sni_watch;
 pub mod systemd;

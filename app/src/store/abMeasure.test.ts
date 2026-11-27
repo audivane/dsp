@@ -24,7 +24,7 @@ async function setup() {
   stores.push(s);
   s.connect();
   await until(() => s.getState().conn === "up" && !!s.getState().config && !!s.getState().status);
-  daemon.config.chain.crossfeed = { enabled: true, mode: "bs2b_default", cutoff_hz: 700, feed_db: 4.5, level: "matched" };
+  daemon.config.chain.crossfeed = { enabled: true, mode: "bs2b_default", cutoff_hz: 700, feed_db: 4.5, width: 1, width_shape: "flat", width_corner_hz: 700 };
   await s.compareStage("crossfeed");
   await s.whenIdle();
   return { s, daemon };

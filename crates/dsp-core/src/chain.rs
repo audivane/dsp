@@ -11,6 +11,33 @@
 //! entirely and samples go through [`crate::bypass::f32_to_i32`], which is
 //! bit-exact for every input that came from an integer sample of 24 bits or
 //! less.
+//!
+//! # Channel workers
+//!
+//! [`Chain::attach_workers`] (and [`AbChain::attach_workers`]) runs the
+//! per-channel stages on other threads ([`crate::workers`]). The split
+//! point is crossfeed: DC block, pitch (phase-coherent across channels) and
+//! crossfeed stay whole on the audio thread; EQ → convolution → upsampler →
+//! harmonics → output headroom run as one single-channel part per channel,
+//! lane 0 on the audio thread and lane `k` on worker `k - 1`; then the
+//! stages that couple the channels run on the audio thread as before: the
+//! A/B delay, meter, mix and level, volume and balance, the limiter (one
+//! gain for all channels), the quantizer and dither, and the peaks. Every
+//! part is bit for bit its channel of the whole stage (nothing in the
+//! harmonics stage is shared across channels), so the output is the single-threaded chain's
+//! exactly.
+//!
+//! The audio thread waits for the workers until
+//! [`LanePool::deadline`] (two blocks, at least 2 ms). A lane that
+//! misses it is still running, so its state is not the chain's: the chain
+//! plays digital silence, block by block (its frame grid advancing), until
+//! every lane is back, then resets (as [`Chain::reset_to`] at its current
+//! grid position) and plays on. A worker still busy when a block starts
+//! (with a late job) gets no lane: the audio thread runs that lane itself.
+//! A panic on a worker poisons the chain: silence from that block on (its
+//! half-written buffers are never played) until the chain is replaced.
+//! The volume ramp keeps moving through silent blocks, so a mute set during
+//! a stall has taken effect when sound comes back.
 
 use crate::ab_level::{AbGains, AbLevel, AbOffset, ConvTerm, SideTerms};
 use crate::ab_measure::{AbHop, AbHopMeter};
@@ -19,16 +46,21 @@ use crate::conv::Convolver;
 use crate::crossfeed::{Crossfeed, CrossfeedError};
 use crate::dc_block::{DcBlock, DcBlockError};
 use crate::dither::{ClipStats, MAX_CLIP_CHANNELS, Quantizer};
+use crate::fade_bound::FadeBound;
 use crate::gain::StereoGainRamp;
-use crate::harmonics::{Harmonics, HarmonicsError};
+use crate::harmonics::{Harmonics, HarmonicsError, LiveLayer};
 use crate::limiter::Limiter;
 use crate::loudness::Weighting;
+use crate::matrix::{ConvIrs, MatrixConvolver};
 use crate::pitch::PitchShifter;
 use crate::presets::UpsamplerRuntime;
-use crate::{Stage, db_to_lin};
+use crate::workers::{Lane, LanePool, LaneWork};
+use crate::{Complex64, Stage, db_to_lin};
 use audivane_protocol::{ChainConfig, RateRatio, resolve_rate_ratio};
 use std::f64::consts::PI;
 use std::fmt;
+use std::sync::Arc;
+use std::time::Instant;
 
 /// The chain keeps its planar scratch in fixed-size stack arrays of channel
 /// references, so the channel count has to be bounded to stay allocation-free.
@@ -61,6 +93,9 @@ pub enum ChainError {
     IrTooLong { taps: usize, max: usize },
     /// Convolution wants one IR (mono) or one per channel.
     IrCount { irs: usize, channels: usize },
+    /// A filter matrix entry is out of range, repeated, or the matrix is
+    /// empty.
+    Matrix(String),
     /// The upsampler kernel cannot be designed to its tolerances.
     Upsampler(String),
     /// Pitch shifter configuration or initialization failed.
@@ -108,6 +143,7 @@ impl fmt::Display for ChainError {
                 f,
                 "convolution needs 1 (mono) or {channels} impulse responses, got {irs}"
             ),
+            Self::Matrix(e) => write!(f, "convolution: {e}"),
             Self::Upsampler(e) => write!(f, "upsampler: {e}"),
             Self::Pitch(e) => write!(f, "pitch: {e}"),
             Self::DcBlock(e) => write!(f, "{e}"),
@@ -154,11 +190,11 @@ pub struct ChainSpec {
     pub channels: usize,
     /// Largest input frame count per `process` call.
     pub max_block: usize,
-    /// Combined impulse responses already at `sample_rate` and scaled by each
-    /// enabled IR's `gain_db` (loaded/resampled/combined via
-    /// [`crate::conv::combine_irs`] by the caller; dsp-core does no I/O).
-    /// Required when any entry in `config.convolution` is enabled.
-    pub irs: Option<Vec<Vec<f64>>>,
+    /// Combined impulse responses (per channel, or a filter matrix) already
+    /// at `sample_rate` and scaled by every gain (loaded/resampled/combined
+    /// via [`crate::matrix::combine_conv`] by the caller; dsp-core does no
+    /// I/O). Required when any entry in `config.convolution` is enabled.
+    pub irs: Option<ConvIrs>,
 }
 
 /// A `Vec<Vec<f64>>` viewed as `&mut [&mut [f64]]` for the [`Stage`] API,
@@ -192,6 +228,8 @@ macro_rules! make_chans_ref {
 /// convolution → upsampler → harmonics → output headroom, with all scratch.
 struct Pipeline {
     channels: usize,
+    /// Input rate (the workers' deadline is in its blocks).
+    sample_rate: u32,
     ratio: RateRatio,
     /// Input frames processed since construction or reset, modulo
     /// `ratio.down` (the position on the rational frame grid).
@@ -201,8 +239,19 @@ struct Pipeline {
     crossfeed: Option<Crossfeed>,
     eq: Option<Eq>,
     conv: Option<Convolver>,
+    /// The convolution as a filter matrix (instead of `conv`). It couples
+    /// the channels: on a split pipeline it stays whole, with the EQ before
+    /// it, and runs in [`Pipeline::start`].
+    matrix: Option<MatrixConvolver>,
     up: Option<Box<dyn UpsamplerRuntime>>,
     harmonics: Option<Harmonics>,
+    /// The harmonics stage's peak bounds (one per layer in series; empty
+    /// without the stage, [`Harmonics::peak_bounds`]), kept for the A/B
+    /// headroom after [`Pipeline::split`] moved the stage into the lanes.
+    harmonics_peaks: Vec<f64>,
+    /// The live tap of the harmonics stage ([`HarmonicsTap`]); `None`
+    /// without the stage.
+    harm_tap: Option<HarmTap>,
     /// The output headroom gain still to apply after harmonics: 1 when
     /// `output.headroom_db` is 0 or folded into the upsampler's kernel.
     out_gain: f64,
@@ -212,6 +261,434 @@ struct Pipeline {
     upsampled: Vec<Vec<f64>>,
     /// Total delay in output frames.
     latency_out: usize,
+    /// The convolution's own delay, input frames: its IRs' bulk delay
+    /// ([`ConvIrs::bulk_delay`]) plus the convolver's partition block. 0
+    /// without convolution.
+    conv_latency: usize,
+    /// [`Self::latency_out`] plus how long the convolution still rings
+    /// after it (its IR), output frames: what the stream-end flush feeds.
+    tail_out: usize,
+    /// The stages after crossfeed, split into per-channel lanes for the
+    /// channel workers ([`Pipeline::split`]); `eq` to `harmonics` above are
+    /// then `None`.
+    split: Option<SplitTail>,
+    /// The pipeline runs a convolution (whole or in the lanes), and the
+    /// bytes of its state ([`Pipeline::inherit_filter_state`] copies them).
+    has_conv: bool,
+    conv_bytes: usize,
+    /// The convolution's state is all zeros: nothing has run through it
+    /// since construction or the last reset. [`Self::reset_to`] then
+    /// leaves it (clearing a long IR's state takes milliseconds).
+    conv_clean: bool,
+    /// The convolution's fade bound ([`FadeBound`]); `None` without a
+    /// convolution or with one too long to measure (no upstream takeover).
+    fade_bound: Option<Arc<FadeBound>>,
+    /// The EQ's response per channel at the bound's fine points (all ones
+    /// without an EQ; empty without a bound, or with an EQ section too
+    /// narrow for them, [`crate::fade_bound::eq_resolved`]): an edit's
+    /// size at a takeover.
+    up_resp: Vec<Vec<Complex64>>,
+    /// The edit's size per channel and band at a takeover (`channels x
+    /// BANDS`, allocated with the bound).
+    edit_buf: Vec<f64>,
+    /// The last takeover's fade, input frames, and its bound (FS).
+    fade_chosen: Option<(usize, f64)>,
+    /// The last takeover's hold before its ramp, input frames.
+    fade_hold: usize,
+    /// The slowest time constant (input frames) of the stages before the
+    /// convolution that start fresh: all of them until
+    /// [`Self::inherit_filter_state`] takes some over.
+    fresh_decay: f64,
+    /// An upstream edit's outgoing stages, run beside this pipeline's own
+    /// while the fade before the convolution lasts
+    /// ([`Pipeline::take_over_upstream`]).
+    out: Outgoing,
+    /// The outgoing stages' signal during that fade, `channels` x
+    /// `max_block` (allocated with a convolution, empty without one).
+    fade_buf: Vec<Vec<f64>>,
+}
+
+/// The stages before the convolution of the chain an upstream edit
+/// replaced (taken from it, with their state, at the takeover), and the
+/// fade from their output to the new stages' at the convolution's input:
+/// `(1 - g) * old + g * new`, `g` exactly 0 for `hold` input frames (the
+/// new stages' fresh sections settle meanwhile, on the same input), then
+/// a raised cosine over `len`. Inactive outside a fade; the stages stay
+/// until the chain is dropped (off the audio thread).
+#[derive(Default)]
+struct Outgoing {
+    dc_block: Option<DcBlock>,
+    crossfeed: Option<Crossfeed>,
+    /// The whole EQ (a split pipeline without a matrix keeps each
+    /// channel's in its lane: [`ChannelTail::out_eq`]).
+    eq: Option<Eq>,
+    pos: usize,
+    hold: usize,
+    len: usize,
+    active: bool,
+}
+
+/// A block's place in an upstream edit's fade: the frame it starts at,
+/// the hold and the ramp's length ([`Outgoing`]).
+type FadeAt = (usize, usize, usize);
+
+impl Outgoing {
+    /// The fade's place for this block, advanced by `frames`; `None`
+    /// outside a fade.
+    fn advance(&mut self, frames: usize) -> Option<FadeAt> {
+        if !self.active {
+            return None;
+        }
+        let at = (self.pos, self.hold, self.len);
+        self.pos += frames;
+        if self.pos >= self.hold + self.len {
+            self.active = false;
+        }
+        Some(at)
+    }
+}
+
+/// The fade weight of the new stages at frame `i` of a fade: exactly 0
+/// through the hold, then a raised cosine to exactly 1 (from `hold + len`
+/// on).
+fn fade_weight(i: usize, hold: usize, len: usize) -> f64 {
+    if i < hold {
+        0.0
+    } else if i - hold >= len {
+        1.0
+    } else {
+        0.5 - 0.5 * (PI * (i - hold) as f64 / len as f64).cos()
+    }
+}
+
+/// `new = (1 - g) * old + g * new` over a block at `at` in the fade (`g`
+/// exactly 0 at the takeover and through the hold, exactly 1 after).
+fn mix_fade(new: &mut [f64], old: &[f64], at: FadeAt) {
+    let (pos, hold, len) = at;
+    for (i, (n, &o)) in new.iter_mut().zip(old).enumerate() {
+        let g = fade_weight(pos + i, hold, len);
+        *n = (1.0 - g) * o + g * *n;
+    }
+}
+
+/// The whole pipeline's fade before the convolution, for a block: the
+/// outgoing EQ on `fade_buf`, then `planar` faded from it. Nothing
+/// outside a fade.
+fn fade_in(
+    out: &mut Outgoing,
+    fade_buf: &mut [Vec<f64>],
+    planar: &mut [Vec<f64>],
+    channels: usize,
+    frames: usize,
+) {
+    let Some(at) = out.advance(frames) else {
+        return;
+    };
+    if let Some(eq) = &mut out.eq {
+        make_chans!(chans, fade_buf, channels, frames);
+        eq.process(chans);
+    }
+    for (p, b) in planar.iter_mut().zip(fade_buf.iter()).take(channels) {
+        mix_fade(&mut p[..frames], &b[..frames], at);
+    }
+}
+
+/// One channel's stages after crossfeed: EQ → convolution → upsampler →
+/// harmonics → output headroom, each a single-channel part of the
+/// pipeline's own stage ([`Pipeline::split`]), with the channel's buffers.
+struct ChannelTail {
+    eq: Option<Eq>,
+    /// The outgoing EQ of an upstream edit's fade, its input
+    /// (`input`'s length; empty without a convolution) and this block's
+    /// place in the fade (see [`Outgoing`]).
+    out_eq: Option<Eq>,
+    out_input: Vec<f64>,
+    fade: Option<FadeAt>,
+    conv: Option<Convolver>,
+    up: Option<Box<dyn UpsamplerRuntime>>,
+    harmonics: Option<Harmonics>,
+    out_gain: f64,
+    /// Copy the harmonics stage's input and output into `tap_in` and
+    /// `tap_out` this block ([`HarmonicsTap`]).
+    tap: bool,
+    /// This channel's share of the tap's mono sum (its samples over the
+    /// channel count), at the output rate; empty without harmonics.
+    tap_in: Vec<f32>,
+    tap_out: Vec<f32>,
+    /// 1 / channels.
+    tap_scale: f64,
+    /// The channel at the input rate, copied in after crossfeed.
+    input: Vec<f64>,
+    /// The upsampler's output (empty without one).
+    output: Vec<f64>,
+}
+
+impl ChannelTail {
+    /// The same operations, in the same order, as [`Pipeline::finish`]
+    /// runs on this channel without workers.
+    fn process(&mut self, frames: usize, out_frames: usize) {
+        let Self {
+            eq,
+            out_eq,
+            out_input,
+            fade,
+            conv,
+            up,
+            harmonics,
+            out_gain,
+            tap,
+            tap_in,
+            tap_out,
+            tap_scale,
+            input,
+            output,
+        } = self;
+        let x = &mut input[..frames];
+        if let Some(eq) = eq {
+            eq.process(&mut [&mut *x]);
+        }
+        if let Some(at) = *fade {
+            let o = &mut out_input[..frames];
+            if let Some(eq) = out_eq {
+                eq.process(&mut [&mut *o]);
+            }
+            mix_fade(x, o, at);
+        }
+        if let Some(conv) = conv {
+            conv.process(&mut [&mut *x]);
+        }
+        let out: &mut [f64] = if let Some(up) = up {
+            let y = &mut output[..out_frames];
+            up.process(&[&*x], &mut [&mut *y]);
+            y
+        } else {
+            x
+        };
+        if let Some(harm) = harmonics {
+            let tap = *tap && tap_in.len() >= out.len() && tap_out.len() >= out.len();
+            if tap {
+                for (t, &v) in tap_in.iter_mut().zip(out.iter()) {
+                    *t = (v * *tap_scale) as f32;
+                }
+            }
+            harm.process(&mut [&mut *out]);
+            if tap {
+                for (t, &v) in tap_out.iter_mut().zip(out.iter()) {
+                    *t = (v * *tap_scale) as f32;
+                }
+            }
+        }
+        if *out_gain != 1.0 {
+            for v in out.iter_mut() {
+                *v *= *out_gain;
+            }
+        }
+    }
+
+    fn result(&self, out_frames: usize) -> &[f64] {
+        if self.up.is_some() {
+            &self.output[..out_frames]
+        } else {
+            &self.input[..out_frames]
+        }
+    }
+
+    fn reset_to(&mut self, pos: u64, clear_conv: bool) {
+        if let Some(eq) = &mut self.eq {
+            eq.reset();
+        }
+        if let Some(conv) = &mut self.conv.as_mut().filter(|_| clear_conv) {
+            conv.reset();
+        }
+        if let Some(up) = &mut self.up {
+            up.reset_to(pos);
+        }
+        if let Some(harm) = &mut self.harmonics {
+            harm.reset();
+        }
+    }
+}
+
+/// The channels one thread runs in a block.
+struct TailLane {
+    tails: Vec<ChannelTail>,
+    frames: usize,
+    out_frames: usize,
+}
+
+impl LaneWork for TailLane {
+    fn run(&mut self) {
+        for tail in &mut self.tails {
+            tail.process(self.frames, self.out_frames);
+        }
+    }
+}
+
+/// A pipeline's stages after crossfeed, one lane per thread: lane 0 on the
+/// audio thread, lane `k` on worker `k - 1`.
+struct SplitTail {
+    pool: Arc<LanePool>,
+    /// Consecutive channel groups, in channel order.
+    lanes: Vec<Lane<TailLane>>,
+    /// Lanes handed to a worker in this block, as a bit mask.
+    submitted: u64,
+    /// Until when [`Pipeline::finish`] waits for them.
+    deadline: Instant,
+    /// A lane missed its deadline (or was still out at a reset): the
+    /// pipeline is silent until every lane is back, then reset.
+    stalled: bool,
+    /// Blocks of this pipeline a late worker made silent.
+    late: u64,
+}
+
+impl SplitTail {
+    /// Every lane is back from its worker.
+    fn all_idle(&self) -> bool {
+        self.lanes.iter().all(Lane::is_idle)
+    }
+
+    fn poisoned(&self) -> bool {
+        self.lanes.iter().any(Lane::is_poisoned)
+    }
+}
+
+/// The most sag/bias layers a [`HarmonicsTap`] reports (every layer a
+/// stage can hold).
+pub const HARMONICS_TAP_LAYERS: usize = audivane_protocol::HARMONICS_MAX_LAYERS;
+
+/// A pipeline's live tap of its harmonics stage, all allocated at build.
+struct HarmTap {
+    /// Copy this block's samples ([`Chain::set_harmonics_tap`]).
+    on: bool,
+    /// Frames copied in the last block (0: nothing this block).
+    frames: usize,
+    /// The mono sum (channel mean) of the stage's input and output.
+    input: Vec<f32>,
+    output: Vec<f32>,
+    /// The stage's input on channels 0 and 1 (channel 0 twice in mono).
+    input0: Vec<f32>,
+    input1: Vec<f32>,
+    channels: usize,
+    /// [`Harmonics::linear_gain`].
+    linear_gain: f64,
+    /// The even terms' DC blocker state at the block's end, channels 0 and
+    /// 1 ([`Harmonics::live_dc`]).
+    dc: Option<[f64; 2]>,
+    layers: [LiveLayer; HARMONICS_TAP_LAYERS],
+    n_layers: usize,
+}
+
+/// `len` zeros, written (not a lazily mapped `calloc`), so the audio
+/// thread's first writes never page-fault. Off the audio thread.
+pub fn touched_vec<T: Copy + Default>(len: usize) -> Vec<T> {
+    let mut v: Vec<T> = Vec::with_capacity(len);
+    // Keeps the allocation and the fill apart (no fused `calloc`).
+    std::hint::black_box(v.as_mut_ptr());
+    v.resize(len, T::default());
+    std::hint::black_box(&mut v);
+    v
+}
+
+impl HarmTap {
+    fn new(len: usize, linear_gain: f64, channels: usize) -> Self {
+        Self {
+            on: false,
+            frames: 0,
+            input: touched_vec(len),
+            output: touched_vec(len),
+            input0: touched_vec(len),
+            input1: touched_vec(len),
+            channels,
+            linear_gain,
+            dc: None,
+            layers: [LiveLayer::default(); HARMONICS_TAP_LAYERS],
+            n_layers: 0,
+        }
+    }
+
+    fn view(&self, side: u8) -> Option<HarmonicsTap<'_>> {
+        (self.on && self.frames > 0).then(|| HarmonicsTap {
+            input: &self.input[..self.frames],
+            output: &self.output[..self.frames],
+            input0: &self.input0[..self.frames],
+            input1: &self.input1[..self.frames],
+            channels: self.channels,
+            side,
+            linear_gain: self.linear_gain,
+            dc: self.dc,
+            layers: &self.layers[..self.n_layers],
+        })
+    }
+}
+
+/// The last block of a chain's harmonics stage, for the live view
+/// ([`Chain::harmonics_tap`]): the mono sum (mean of the channels) of what
+/// went into the stage and what came out, at the output rate, before the
+/// output headroom and everything after it. The stage has no delay, so
+/// `input[i]` and `output[i]` are the same instant.
+#[derive(Clone, Copy, Debug)]
+pub struct HarmonicsTap<'a> {
+    pub input: &'a [f32],
+    pub output: &'a [f32],
+    /// The stage's input on channels 0 and 1 (channel 0 twice in mono),
+    /// for evaluating its curve per channel.
+    pub input0: &'a [f32],
+    pub input1: &'a [f32],
+    /// The chain's channel count (the mono sum is over all of them).
+    pub channels: usize,
+    /// The side it comes from: 0 = A (a single chain), 1 = B.
+    pub side: u8,
+    /// The stage's even-term DC blocker state after the block's last frame
+    /// on channels 0 and 1 ([`Harmonics::live_dc`]; `None` in series or
+    /// with the blocker off).
+    pub dc: Option<[f64; 2]>,
+    /// The stage's linear part, [`Harmonics::linear_gain`].
+    pub linear_gain: f64,
+    /// Each sag/bias layer's state at the end of the block.
+    pub layers: &'a [LiveLayer],
+}
+
+/// `dst[i]` = the mean of `chans[..channels][i]`, as `f32`.
+#[inline]
+fn mono_into(dst: &mut [f32], chans: &[Vec<f64>], channels: usize, frames: usize) {
+    let scale = 1.0 / channels.max(1) as f64;
+    for (i, d) in dst[..frames].iter_mut().enumerate() {
+        let sum: f64 = chans[..channels].iter().map(|c| c[i]).sum();
+        *d = (sum * scale) as f32;
+    }
+}
+
+impl Pipeline {
+    fn set_harmonics_tap(&mut self, on: bool) {
+        if let Some(t) = &mut self.harm_tap {
+            t.on = on;
+            if !on {
+                t.frames = 0;
+            }
+        }
+    }
+
+    /// Mark the tap empty (a block that does not reach the stage).
+    fn clear_harmonics_tap(&mut self) {
+        if let Some(t) = &mut self.harm_tap {
+            t.frames = 0;
+        }
+    }
+
+    /// Blocks a late worker made silent on its pool (0 without workers).
+    fn late_blocks(&self) -> u64 {
+        self.split.as_ref().map_or(0, |s| s.late)
+    }
+}
+
+/// What a pipeline can do with the next block ([`Pipeline::ready`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Readiness {
+    Ready,
+    /// Back from a stall: reset the chain, then run the block.
+    Recovered,
+    /// Play silence (still stalled, or poisoned by a panic).
+    Silent,
 }
 
 impl Pipeline {
@@ -220,7 +697,7 @@ impl Pipeline {
         sample_rate: u32,
         channels: usize,
         max_block: usize,
-        irs: Option<Vec<Vec<f64>>>,
+        irs: Option<ConvIrs>,
         ratio: RateRatio,
     ) -> Result<Self, ChainError> {
         let sr = f64::from(sample_rate);
@@ -259,27 +736,83 @@ impl Pipeline {
             .transpose()
             .map_err(ChainError::Eq)?;
 
-        let conv = if config.convolution.iter().any(|c| c.enabled) {
-            let irs = irs.ok_or(ChainError::MissingIr)?;
-            if irs.is_empty() || irs.iter().any(|ir| ir.is_empty()) {
-                return Err(ChainError::EmptyIr);
-            }
-            if irs.len() != 1 && irs.len() != channels {
-                return Err(ChainError::IrCount {
-                    irs: irs.len(),
-                    channels,
-                });
-            }
-            let max_len = irs.iter().map(Vec::len).max().unwrap_or(0);
-            if max_len > crate::conv::MAX_COMBINED_IR_TAPS {
-                return Err(ChainError::IrTooLong {
-                    taps: max_len,
-                    max: crate::conv::MAX_COMBINED_IR_TAPS,
-                });
-            }
-            Some(Convolver::new(&irs, channels, max_block))
+        // How an upstream edit's fade at the convolution's input can pass
+        // both settings' (measured here, off the audio thread, cached), and
+        // the EQ's response it is weighed by at a takeover.
+        let conv_on = config.convolution.iter().any(|c| c.enabled);
+        let fade_bound = irs
+            .as_ref()
+            .filter(|_| conv_on)
+            .and_then(|irs| FadeBound::of(irs, channels, sample_rate));
+        let resolved = config
+            .eq
+            .as_ref()
+            .is_none_or(crate::fade_bound::eq_resolved);
+        let up_resp = if fade_bound.is_some() && resolved {
+            let freqs = crate::fade_bound::fine_grid(sample_rate);
+            (0..channels)
+                .map(|ch| {
+                    freqs
+                        .iter()
+                        .map(|&f| {
+                            eq.as_ref()
+                                .map_or(Complex64::new(1.0, 0.0), |e| e.response_channel(ch, f))
+                        })
+                        .collect()
+                })
+                .collect()
         } else {
-            None
+            Vec::new()
+        };
+
+        let mut conv_bulk = 0;
+        let (conv, matrix) = if conv_on {
+            let irs = irs.ok_or(ChainError::MissingIr)?;
+            conv_bulk = irs.bulk_delay();
+            match irs {
+                ConvIrs::Channels(irs) => {
+                    if irs.is_empty() || irs.iter().any(|ir| ir.is_empty()) {
+                        return Err(ChainError::EmptyIr);
+                    }
+                    if irs.len() != 1 && irs.len() != channels {
+                        return Err(ChainError::IrCount {
+                            irs: irs.len(),
+                            channels,
+                        });
+                    }
+                    let max_len = irs.iter().map(Vec::len).max().unwrap_or(0);
+                    if max_len > crate::conv::MAX_COMBINED_IR_TAPS {
+                        return Err(ChainError::IrTooLong {
+                            taps: max_len,
+                            max: crate::conv::MAX_COMBINED_IR_TAPS,
+                        });
+                    }
+                    (Some(Convolver::new(&irs, channels, max_block)), None)
+                }
+                ConvIrs::Matrix(m) => {
+                    if m.channels() != channels {
+                        return Err(ChainError::Matrix(format!(
+                            "a {0}x{0} filter matrix on {channels} channels",
+                            m.channels()
+                        )));
+                    }
+                    if m.entries().next().is_none() {
+                        return Err(ChainError::Matrix("a filter matrix has no entries".into()));
+                    }
+                    if m.entries().any(|(_, _, ir)| ir.is_empty()) {
+                        return Err(ChainError::EmptyIr);
+                    }
+                    if m.max_len() > crate::conv::MAX_COMBINED_IR_TAPS {
+                        return Err(ChainError::IrTooLong {
+                            taps: m.max_len(),
+                            max: crate::conv::MAX_COMBINED_IR_TAPS,
+                        });
+                    }
+                    (None, Some(MatrixConvolver::new(&m, max_block)))
+                }
+            }
+        } else {
+            (None, None)
         };
 
         // The output headroom goes last, after harmonics (non-linear, its
@@ -329,19 +862,38 @@ impl Pipeline {
         let input_rate_latency = dc_block.as_ref().map_or(0, Stage::latency_frames)
             + pitch.as_ref().map_or(0, Stage::latency_frames)
             + crossfeed.as_ref().map_or(0, Stage::latency_frames)
-            + conv.as_ref().map_or(0, Stage::latency_frames);
+            + conv.as_ref().map_or(0, Stage::latency_frames)
+            + matrix.as_ref().map_or(0, Stage::latency_frames);
+        let conv_latency = if conv.is_some() || matrix.is_some() {
+            conv.as_ref().map_or(0, Stage::latency_frames)
+                + matrix.as_ref().map_or(0, Stage::latency_frames)
+                + conv_bulk
+        } else {
+            0
+        };
         let up_latency = up.as_ref().map_or(0.0, |u| u.latency_out_exact());
         let harmonics_latency = harmonics.as_ref().map_or(0, Stage::latency_frames);
         let latency_exact =
             input_rate_latency as f64 * ratio.as_f64() + up_latency + harmonics_latency as f64;
+        let ir_tail = conv.as_ref().map_or(0, Convolver::ir_tail_frames)
+            + matrix.as_ref().map_or(0, MatrixConvolver::ir_tail_frames);
+        let tail_exact = latency_exact + ir_tail as f64 * ratio.as_f64();
         let upsampled = if up.is_some() {
             vec![vec![0.0; ratio.max_frames_out(max_block)]; channels]
         } else {
             Vec::new()
         };
 
+        let has_conv = conv.is_some() || matrix.is_some();
+        let fresh_decay = eq
+            .as_ref()
+            .map_or(0.0, Eq::decay_frames)
+            .max(dc_block.as_ref().map_or(0.0, DcBlock::decay_frames));
+        let conv_bytes = conv.as_ref().map_or(0, Convolver::state_bytes)
+            + matrix.as_ref().map_or(0, MatrixConvolver::state_bytes);
         Ok(Self {
             channels,
+            sample_rate,
             ratio,
             pos: 0,
             dc_block,
@@ -349,13 +901,182 @@ impl Pipeline {
             crossfeed,
             eq,
             conv,
+            matrix,
             up,
+            harmonics_peaks: harmonics
+                .as_ref()
+                .map_or_else(Vec::new, Harmonics::peak_bounds),
+            harm_tap: harmonics.as_ref().map(|h| {
+                let len = if ratio.is_unity() {
+                    max_block
+                } else {
+                    ratio.max_frames_out(max_block)
+                };
+                HarmTap::new(len, h.linear_gain(), channels)
+            }),
             harmonics,
             out_gain,
             planar: vec![vec![0.0; max_block]; channels],
             upsampled,
             latency_out: (latency_exact + 0.5).floor() as usize,
+            conv_latency,
+            tail_out: tail_exact.ceil() as usize,
+            split: None,
+            has_conv,
+            conv_bytes,
+            conv_clean: true,
+            edit_buf: if up_resp.is_empty() {
+                Vec::new()
+            } else {
+                vec![0.0; channels * crate::fade_bound::BANDS]
+            },
+            fade_bound,
+            up_resp,
+            fade_chosen: None,
+            fade_hold: 0,
+            fresh_decay,
+            out: Outgoing::default(),
+            // Written first on the audio thread, in a fade: touched now.
+            fade_buf: if has_conv {
+                (0..channels).map(|_| touched_vec(max_block)).collect()
+            } else {
+                Vec::new()
+            },
         })
+    }
+
+    /// Move the stages after crossfeed (EQ, convolution, upsampler,
+    /// harmonics, output headroom) into per-channel lanes run by `pool`'s
+    /// workers and the audio thread ([`Chain::attach_workers`]). The stages
+    /// before them (DC block, pitch, crossfeed) stay whole: pitch and
+    /// crossfeed couple the channels, and so does a filter matrix (it and
+    /// the EQ then stay whole too). False, with nothing changed, when
+    /// there is one channel, no worker, nothing after crossfeed, or an
+    /// upsampler that cannot split.
+    fn split(&mut self, pool: &Arc<LanePool>) -> bool {
+        let channels = self.channels;
+        let lanes = channels.min(pool.workers() + 1).min(64);
+        // A filter matrix couples the channels: it and the EQ before it
+        // stay whole and run in `start`, the lanes take the rest.
+        let whole_eq = self.matrix.is_some();
+        let has_tail = (self.eq.is_some() && !whole_eq)
+            || self.conv.is_some()
+            || self.up.is_some()
+            || self.harmonics.is_some()
+            || self.out_gain != 1.0;
+        if self.split.is_some() || lanes < 2 || !has_tail {
+            return false;
+        }
+        let mut ups = match &mut self.up {
+            Some(up) => match up.split_channels() {
+                Some(parts) => {
+                    assert_eq!(parts.len(), channels, "upsampler split per channel");
+                    parts.into_iter().map(Some).collect()
+                }
+                None => return false,
+            },
+            None => Vec::new(),
+        };
+        self.up = None;
+        let mut eqs = if whole_eq {
+            None
+        } else {
+            self.eq.take().map(|mut e| e.split_channels().into_iter())
+        };
+        let mut convs = self.conv.take().map(|mut c| c.split_channels().into_iter());
+        let mut harms = self
+            .harmonics
+            .take()
+            .map(|mut h| h.split_channels().into_iter());
+        let mut tails = Vec::with_capacity(channels);
+        for c in 0..channels {
+            tails.push(ChannelTail {
+                eq: eqs.as_mut().and_then(Iterator::next),
+                out_eq: None,
+                out_input: if self.has_conv {
+                    touched_vec(self.planar[c].len())
+                } else {
+                    Vec::new()
+                },
+                fade: None,
+                conv: convs.as_mut().and_then(Iterator::next),
+                up: ups.get_mut(c).and_then(Option::take),
+                harmonics: harms.as_mut().and_then(Iterator::next),
+                out_gain: self.out_gain,
+                tap: false,
+                tap_in: self
+                    .harm_tap
+                    .as_ref()
+                    .map_or_else(Vec::new, |t| touched_vec(t.input.len())),
+                tap_out: self
+                    .harm_tap
+                    .as_ref()
+                    .map_or_else(Vec::new, |t| touched_vec(t.output.len())),
+                tap_scale: 1.0 / channels as f64,
+                input: vec![0.0; self.planar[c].len()],
+                output: self
+                    .upsampled
+                    .get(c)
+                    .map_or_else(Vec::new, |u| vec![0.0; u.len()]),
+            });
+        }
+        let mut tails = tails.into_iter();
+        let lanes = (0..lanes)
+            .map(|k| {
+                let n = (k + 1) * channels / lanes - k * channels / lanes;
+                Lane::new(TailLane {
+                    tails: tails.by_ref().take(n).collect(),
+                    frames: 0,
+                    out_frames: 0,
+                })
+            })
+            .collect();
+        self.split = Some(SplitTail {
+            pool: Arc::clone(pool),
+            lanes,
+            submitted: 0,
+            deadline: Instant::now(),
+            stalled: false,
+            late: 0,
+        });
+        true
+    }
+
+    /// The lanes of this pipeline whose workers are idle now, as a bit mask
+    /// (bit `k` for lane `k`). A lane whose worker is still busy (with a late
+    /// job) runs on the audio thread instead.
+    fn idle_lanes(&self) -> u64 {
+        self.split.as_ref().map_or(0, |s| {
+            (1..s.lanes.len())
+                .filter(|&k| s.pool.is_idle(k - 1))
+                .fold(0, |m, k| m | 1 << k)
+        })
+    }
+
+    /// Whether the next block can run: always without workers.
+    fn ready(&self) -> Readiness {
+        let Some(split) = &self.split else {
+            return Readiness::Ready;
+        };
+        // Idle first: a lane's return publishes its poison flag, so a late
+        // lane that panicked is seen poisoned the moment it is seen back.
+        let idle = split.all_idle();
+        if idle && split.poisoned() {
+            Readiness::Silent
+        } else if !split.stalled {
+            Readiness::Ready
+        } else if idle {
+            Readiness::Recovered
+        } else {
+            Readiness::Silent
+        }
+    }
+
+    /// Advance the frame grid over a block without running it (silence).
+    fn skip(&mut self, frames: usize) -> usize {
+        let out_frames = self.output_frames(frames);
+        self.pos = (self.pos + frames as u64) % u64::from(self.ratio.down);
+        out_frames
     }
 
     /// Output frames the next `process(frames)` produces.
@@ -386,30 +1107,52 @@ impl Pipeline {
             conv,
             upsampler,
             harmonics_gain: db_to_lin(harmonics_db),
+            harmonics_peaks: &self.harmonics_peaks,
         }
     }
 
-    /// Run the f64 stages on the first `frames` samples of `planar`.
-    /// Returns the output-rate buffer (upsampled, or `planar` when ratio 1)
-    /// and its length, [`Self::output_frames`]`(frames)` per channel.
-    fn process(&mut self, frames: usize) -> (&mut [Vec<f64>], usize) {
+    /// The first part of a block: the stages before the split point (DC
+    /// block, pitch, crossfeed) on the first `frames` samples of `planar`
+    /// and, on a split pipeline, the lanes in `idle` handed to their
+    /// workers. Returns the block's output frames, [`Self::output_frames`]
+    /// `(frames)`; [`Self::finish`] runs the rest.
+    fn start(&mut self, frames: usize, idle: u64) -> usize {
         let out_frames = self.output_frames(frames);
+        self.conv_clean = false;
         self.pos = (self.pos + frames as u64) % u64::from(self.ratio.down);
         let Self {
             dc_block,
             pitch,
             crossfeed,
             eq,
-            conv,
-            up,
-            harmonics,
-            out_gain,
+            matrix,
             planar,
-            upsampled,
             channels,
+            split,
+            sample_rate,
+            harm_tap,
+            out,
+            fade_buf,
             ..
         } = self;
+        if let Some(t) = harm_tap.as_mut() {
+            t.frames = 0;
+        }
 
+        // An upstream edit's fade: the outgoing stages on the same input.
+        if out.active {
+            for (b, p) in fade_buf.iter_mut().zip(planar.iter()).take(*channels) {
+                b[..frames].copy_from_slice(&p[..frames]);
+            }
+            if let Some(dc) = &mut out.dc_block {
+                make_chans!(chans, fade_buf, *channels, frames);
+                dc.process(chans);
+            }
+            if let Some(cf) = &mut out.crossfeed {
+                make_chans!(chans, fade_buf, *channels, frames);
+                cf.process(chans);
+            }
+        }
         if let Some(dc) = dc_block {
             make_chans!(chans, planar, *channels, frames);
             dc.process(chans);
@@ -422,13 +1165,178 @@ impl Pipeline {
             make_chans!(chans, planar, *channels, frames);
             cf.process(chans);
         }
+        // A split pipeline keeps a filter matrix (and the EQ before it)
+        // whole, here; unsplit, both run in `finish`.
+        if split.is_some() && matrix.is_some() {
+            if let Some(eq) = eq {
+                make_chans!(chans, planar, *channels, frames);
+                eq.process(chans);
+            }
+            fade_in(out, fade_buf, planar, *channels, frames);
+            if let Some(m) = matrix {
+                make_chans!(chans, planar, *channels, frames);
+                m.process(chans);
+            }
+        }
+        if let Some(split) = split {
+            split.submitted = 0;
+            // Without a matrix the fade runs in the lanes, after each
+            // channel's EQ (the outgoing branch's signal goes with it).
+            let fade = if matrix.is_none() {
+                out.advance(frames)
+            } else {
+                None
+            };
+            let mut c = 0;
+            for (k, lane) in split.lanes.iter_mut().enumerate() {
+                let job = lane.get_mut().expect("a ready pipeline holds every lane");
+                let tap = harm_tap.as_ref().is_some_and(|t| t.on);
+                for tail in &mut job.tails {
+                    tail.input[..frames].copy_from_slice(&planar[c][..frames]);
+                    tail.fade = fade.filter(|_| tail.out_input.len() >= frames);
+                    if tail.fade.is_some() {
+                        tail.out_input[..frames].copy_from_slice(&fade_buf[c][..frames]);
+                    }
+                    tail.tap = tap;
+                    c += 1;
+                }
+                job.frames = frames;
+                job.out_frames = out_frames;
+                if k > 0 && idle & (1 << k) != 0 && split.pool.submit(k - 1, lane) {
+                    split.submitted |= 1 << k;
+                }
+            }
+            split.deadline = split.pool.deadline(Instant::now(), frames, *sample_rate);
+        }
+        out_frames
+    }
+
+    /// The rest of a block [`Self::start`] began: the stages after
+    /// crossfeed. Returns the output-rate buffer (upsampled, or `planar`
+    /// when ratio 1) and its length. On a split pipeline: this thread's
+    /// lanes (and any whose worker was busy), the wait for the others and
+    /// the copy of every channel's result; `None` when a worker missed the
+    /// deadline (the pipeline is then stalled) or a lane is poisoned.
+    fn finish(&mut self, frames: usize, out_frames: usize) -> Option<(&mut [Vec<f64>], usize)> {
+        let Self {
+            out,
+            fade_buf,
+            eq,
+            conv,
+            matrix,
+            up,
+            harmonics,
+            out_gain,
+            planar,
+            upsampled,
+            channels,
+            split,
+            harm_tap,
+            ..
+        } = self;
+
+        if let Some(split) = split {
+            for (k, lane) in split.lanes.iter_mut().enumerate() {
+                if split.submitted & (1 << k) == 0 {
+                    if k > 0 {
+                        split.pool.note_inline();
+                    }
+                    lane.run_here();
+                }
+            }
+            let deadline = split.deadline;
+            let pool = &split.pool;
+            let back = split.lanes.iter().enumerate().all(|(k, lane)| {
+                if k == 0 {
+                    lane.is_idle()
+                } else {
+                    pool.wait(k - 1, lane, deadline)
+                }
+            });
+            if !back {
+                split.stalled = true;
+                split.pool.note_late();
+                split.late += 1;
+                return None;
+            }
+            // A lane that panicked in this block (or before) holds stale or
+            // half-written buffers: never copied, the block is silence (and
+            // so is every later one, see `ready`).
+            if split.poisoned() {
+                return None;
+            }
+            let out = if upsampled.is_empty() {
+                &mut planar[..*channels]
+            } else {
+                &mut upsampled[..*channels]
+            };
+            let mut c = 0;
+            let mut tap = harm_tap
+                .as_mut()
+                .filter(|t| t.on && t.input.len() >= out_frames);
+            if let Some(t) = tap.as_deref_mut() {
+                t.input[..out_frames].fill(0.0);
+                t.output[..out_frames].fill(0.0);
+                t.n_layers = 0;
+                t.dc = None;
+            }
+            for lane in &mut split.lanes {
+                let job = lane.get_mut().expect("every lane is back");
+                for tail in &job.tails {
+                    out[c][..out_frames].copy_from_slice(tail.result(out_frames));
+                    if let Some(t) = tap.as_deref_mut()
+                        && let Some(h) = &tail.harmonics
+                        && tail.tap_in.len() >= out_frames
+                    {
+                        for (m, &v) in t.input[..out_frames].iter_mut().zip(&tail.tap_in) {
+                            *m += v;
+                        }
+                        // Channels 0 and 1 alone (the share times the
+                        // count: exact for one and two channels).
+                        let n = t.channels as f32;
+                        if c == 0 {
+                            for (d, &v) in t.input0[..out_frames].iter_mut().zip(&tail.tap_in) {
+                                *d = v * n;
+                            }
+                        }
+                        if c == 1 || (c == 0 && t.channels == 1) {
+                            for (d, &v) in t.input1[..out_frames].iter_mut().zip(&tail.tap_in) {
+                                *d = v * n;
+                            }
+                        }
+                        for (m, &v) in t.output[..out_frames].iter_mut().zip(&tail.tap_out) {
+                            *m += v;
+                        }
+                        h.live_layers_into(&mut t.layers, &mut t.n_layers);
+                        if c == 0 {
+                            t.dc = h.live_dc(0).map(|z| [z, z]);
+                        } else if c == 1
+                            && let (Some(d), Some(z)) = (t.dc.as_mut(), h.live_dc(0))
+                        {
+                            d[1] = z;
+                        }
+                    }
+                    c += 1;
+                }
+            }
+            if let Some(t) = tap {
+                t.frames = out_frames;
+            }
+            return Some((out, out_frames));
+        }
+
         if let Some(eq) = eq {
             make_chans!(chans, planar, *channels, frames);
             eq.process(chans);
         }
+        fade_in(out, fade_buf, planar, *channels, frames);
         if let Some(conv) = conv {
             make_chans!(chans, planar, *channels, frames);
             conv.process(chans);
+        }
+        if let Some(m) = matrix {
+            make_chans!(chans, planar, *channels, frames);
+            m.process(chans);
         }
 
         let out = if let Some(up) = up {
@@ -445,8 +1353,35 @@ impl Pipeline {
             &mut planar[..*channels]
         };
         if let Some(harm) = harmonics {
+            let tap = harm_tap
+                .as_mut()
+                .filter(|t| t.on && t.input.len() >= out_frames);
+            let mut tap = tap;
+            if let Some(t) = tap.as_deref_mut() {
+                mono_into(&mut t.input, out, *channels, out_frames);
+                let second = if *channels > 1 { 1 } else { 0 };
+                for (d, &v) in t.input0[..out_frames].iter_mut().zip(&out[0][..out_frames]) {
+                    *d = v as f32;
+                }
+                for (d, &v) in t.input1[..out_frames]
+                    .iter_mut()
+                    .zip(&out[second][..out_frames])
+                {
+                    *d = v as f32;
+                }
+            }
             make_chans!(chans, out, *channels, out_frames);
             harm.process(chans);
+            if let Some(t) = tap {
+                mono_into(&mut t.output, out, *channels, out_frames);
+                t.n_layers = harm.live_layers(&mut t.layers);
+                let second = if *channels > 1 { 1 } else { 0 };
+                t.dc = harm
+                    .live_dc(0)
+                    .zip(harm.live_dc(second))
+                    .map(|(a, b)| [a, b]);
+                t.frames = out_frames;
+            }
         }
         if *out_gain != 1.0 {
             for chan in out.iter_mut() {
@@ -455,11 +1390,316 @@ impl Pipeline {
                 }
             }
         }
-        (out, out_frames)
+        Some((out, out_frames))
     }
 
-    /// Clear all state and continue the rational frame grid at `pos`.
+    /// [`Chain::inherit_filter_state`] on this pipeline: unchanged stages
+    /// before the convolution take `from`'s state ([`Eq::inherit_state`]).
+    /// The convolution takes `from`'s only when its input is then the same
+    /// signal (every stage before it taken over whole, no pitch shifter) and
+    /// `copy` allows it: a fresh or edited stage before it starts with a
+    /// transient a long IR would carry past the crossfade. Returns whether
+    /// the convolution was handed over (true without one). Real-time safe.
+    fn inherit_filter_state(&mut self, from: &mut Pipeline, copy: bool) -> bool {
+        if self.channels != from.channels {
+            return !self.has_conv;
+        }
+        let mut same_input = self.pitch.is_none() && from.pitch.is_none();
+        let mut decay = 0.0f64;
+        let dc_kept = match (&mut self.dc_block, &from.dc_block) {
+            (None, None) => true,
+            (Some(d), Some(s)) => d.inherit_state(s),
+            _ => false,
+        };
+        if !dc_kept {
+            decay = self.dc_block.as_ref().map_or(0.0, DcBlock::decay_frames);
+        }
+        same_input &= dc_kept;
+        same_input &= match (&mut self.crossfeed, &from.crossfeed) {
+            (None, None) => true,
+            (Some(d), Some(s)) => d.inherit_state(s),
+            _ => false,
+        };
+        let mut eq_decay = |d: &mut Option<Eq>, s: &Option<Eq>| match (d, s) {
+            (None, None) => true,
+            (Some(d), Some(s)) => {
+                let (whole, t) = d.inherit_state_decay(s);
+                decay = decay.max(t);
+                whole
+            }
+            (Some(d), None) => {
+                decay = decay.max(d.decay_frames());
+                false
+            }
+            (None, Some(_)) => false,
+        };
+        same_input &= eq_decay(&mut self.eq, &from.eq);
+        // The lanes' EQs (a split pipeline without a matrix), only from
+        // lanes no worker holds (a stalled one is still running: its state
+        // is not the chain's).
+        let lanes_fit = match (&mut self.split, &mut from.split) {
+            (None, None) => true,
+            (Some(d), Some(s)) => {
+                let fits = !s.stalled
+                    && d.lanes.len() == s.lanes.len()
+                    && d.lanes.iter().all(Lane::is_idle)
+                    && s.lanes.iter().all(Lane::is_idle);
+                if fits {
+                    for (dl, sl) in d.lanes.iter_mut().zip(s.lanes.iter_mut()) {
+                        let (Some(dw), Some(sw)) = (dl.get_mut(), sl.get_mut()) else {
+                            return !self.has_conv;
+                        };
+                        same_input &= dw.tails.len() == sw.tails.len();
+                        for (dt, st) in dw.tails.iter_mut().zip(&sw.tails) {
+                            same_input &= eq_decay(&mut dt.eq, &st.eq);
+                        }
+                    }
+                }
+                fits
+            }
+            _ => false,
+        };
+        // What starts fresh, and how slowly it settles (lanes not taken
+        // over: everything, as built).
+        if lanes_fit {
+            self.fresh_decay = decay;
+        }
+        if !self.has_conv {
+            return true;
+        }
+        if !(same_input && lanes_fit && copy) {
+            return false;
+        }
+        self.conv_clean = false;
+        let mut ok = true;
+        if let Some(d) = &mut self.matrix {
+            ok &= from.matrix.as_ref().is_some_and(|s| d.inherit_state(s));
+        }
+        if let Some(d) = &mut self.conv {
+            ok &= from.conv.as_ref().is_some_and(|s| d.inherit_state(s));
+        }
+        if let (Some(d), Some(s)) = (&mut self.split, &mut from.split) {
+            for (dl, sl) in d.lanes.iter_mut().zip(s.lanes.iter_mut()) {
+                let (Some(dw), Some(sw)) = (dl.get_mut(), sl.get_mut()) else {
+                    return false;
+                };
+                for (dt, st) in dw.tails.iter_mut().zip(&sw.tails) {
+                    if let Some(d) = &mut dt.conv {
+                        ok &= st.conv.as_ref().is_some_and(|s| d.inherit_state(s));
+                    }
+                }
+            }
+        }
+        ok
+    }
+
+    /// Whether [`Self::take_over_upstream`] can take `from` over: the same
+    /// convolution (filter and buffers) and the same stages after it, on
+    /// the same grid, split the same way (every lane back, none stalled),
+    /// no pitch shifter, `from` not in a fade itself.
+    fn can_take_over(&mut self, from: &mut Pipeline) -> bool {
+        let same_conv = match (&self.conv, &from.conv) {
+            (None, None) => true,
+            (Some(d), Some(s)) => d.can_inherit(s),
+            _ => false,
+        } && match (&self.matrix, &from.matrix) {
+            (None, None) => true,
+            (Some(d), Some(s)) => d.same_filter(s),
+            _ => false,
+        };
+        let same_tail = |d: &ChannelTail, s: &ChannelTail| {
+            d.up.is_some() == s.up.is_some()
+                && d.harmonics.is_some() == s.harmonics.is_some()
+                && d.out_input.len() == s.out_input.len()
+                && match (&d.conv, &s.conv) {
+                    (None, None) => true,
+                    (Some(d), Some(s)) => d.can_inherit(s),
+                    _ => false,
+                }
+        };
+        let same_split = match (&self.split, &from.split) {
+            (None, None) => true,
+            (Some(d), Some(s)) => {
+                !s.stalled
+                    && !d.stalled
+                    && d.lanes.len() == s.lanes.len()
+                    && d.all_idle()
+                    && s.all_idle()
+                    && !d.poisoned()
+                    && !s.poisoned()
+            }
+            _ => false,
+        };
+        self.has_conv
+            && from.has_conv
+            && self.channels == from.channels
+            && self.ratio == from.ratio
+            && self.pos == from.pos
+            && self.latency_out == from.latency_out
+            && self.tail_out == from.tail_out
+            && self.out_gain == from.out_gain
+            && self.pitch.is_none()
+            && from.pitch.is_none()
+            && !from.out.active
+            && self.fade_buf.len() == self.channels
+            && self.up.is_some() == from.up.is_some()
+            && self.harmonics.is_some() == from.harmonics.is_some()
+            && same_conv
+            && same_split
+            && self
+                .split
+                .as_mut()
+                .zip(from.split.as_mut())
+                .is_none_or(|(d, s)| {
+                    // Idle (checked above): no worker holds either.
+                    d.lanes.iter_mut().zip(s.lanes.iter_mut()).all(|(dl, sl)| {
+                        dl.get_mut().zip(sl.get_mut()).is_some_and(|(dw, sw)| {
+                            dw.tails.len() == sw.tails.len()
+                                && dw.tails.iter().zip(&sw.tails).all(|(d, s)| same_tail(d, s))
+                        })
+                    })
+                })
+    }
+
+    /// [`Chain::take_over_upstream`] on this pipeline. The fade's weight
+    /// stays exactly 0 for a hold of [`SETTLE_TIME_CONSTANTS`] time constants
+    /// of the slowest fresh section (to -60 dB of its start-up: the fresh
+    /// sections run on the live input meanwhile, unheard), then the edit
+    /// fades in over `fade_min`, or as long as the IR's [`FadeBound`] asks
+    /// (no hold or fade when nothing before the convolution changed). False,
+    /// with nothing of `from` changed, when it cannot
+    /// ([`Self::can_take_over`]), the hold passes `settle_max` or no measured
+    /// fade keeps the bound. Real-time safe: moves, fixed copies and the
+    /// bound's fixed sums.
+    fn take_over_upstream(
+        &mut self,
+        from: &mut Pipeline,
+        fade_min: usize,
+        settle_max: usize,
+    ) -> bool {
+        if !self.can_take_over(from) {
+            return false;
+        }
+        // The stages before the convolution: what runs unchanged carries
+        // its state over; what changed starts fresh and fades in.
+        let mut same = true;
+        let mut decay = 0.0f64;
+        let dc_kept = match (&mut self.dc_block, &from.dc_block) {
+            (None, None) => true,
+            (Some(d), Some(s)) => d.inherit_state(s),
+            _ => false,
+        };
+        if !dc_kept {
+            same = false;
+            decay = decay.max(self.dc_block.as_ref().map_or(0.0, DcBlock::decay_frames));
+        }
+        // Crossfeed's poles sit hundreds of hertz up: a hold of the
+        // shortest fade covers a fresh one.
+        let cf_kept = match (&mut self.crossfeed, &from.crossfeed) {
+            (None, None) => true,
+            (Some(d), Some(s)) => d.inherit_state(s),
+            _ => false,
+        };
+        same &= cf_kept;
+        if !cf_kept {
+            decay = decay.max(fade_min as f64 / SETTLE_TIME_CONSTANTS);
+        }
+        let mut eq_step = |d: &mut Option<Eq>, s: &Option<Eq>| match (d, s) {
+            (None, None) => {}
+            (Some(d), Some(s)) => {
+                let (whole, t) = d.inherit_state_decay(s);
+                same &= whole;
+                decay = decay.max(t);
+            }
+            (Some(d), None) => {
+                same = false;
+                decay = decay.max(d.decay_frames());
+            }
+            (None, Some(_)) => same = false,
+        };
+        eq_step(&mut self.eq, &from.eq);
+        if let (Some(d), Some(s)) = (&mut self.split, &mut from.split) {
+            for (dl, sl) in d.lanes.iter_mut().zip(s.lanes.iter_mut()) {
+                let (Some(dw), Some(sw)) = (dl.get_mut(), sl.get_mut()) else {
+                    unreachable!("idle lanes (can_take_over)");
+                };
+                for (dt, st) in dw.tails.iter_mut().zip(&sw.tails) {
+                    eq_step(&mut dt.eq, &st.eq);
+                }
+            }
+        }
+        // The hold: the fresh sections settle (to -60 dB) on the same
+        // input before the ramp, so the new stages play what they would
+        // had they run all along when they are faded in. Longer than
+        // `settle_max`, or a section that does not decay: no takeover
+        // (the edit warms a new chain up; nothing of `from` changed so
+        // far). The ramp: the shortest fade, or what the IR's bound asks.
+        let hold = (SETTLE_TIME_CONSTANTS * decay).ceil();
+        if !same && (hold.is_nan() || hold > settle_max as f64) {
+            return false;
+        }
+        let hold = hold as usize;
+        let mut len = fade_min.max(1);
+        let mut chosen = None;
+        if !same {
+            let Some(bound) = self.fade_bound.as_deref() else {
+                return false;
+            };
+            // Either EQ not kept at the fine points (a section too narrow
+            // for them): refused.
+            let (new, old) = (&self.up_resp, &from.up_resp);
+            if new.len() != self.channels || old.len() != self.channels {
+                return false;
+            }
+            // A changed DC block or crossfeed: their part taken at twice
+            // full scale (no response kept for them).
+            let flat = if dc_kept && cf_kept { 0.0 } else { 2.0 };
+            crate::fade_bound::edit_size(old, new, flat, &mut self.edit_buf);
+            let Some((l, t)) = bound.fade_len(&self.edit_buf) else {
+                return false;
+            };
+            len = len.max(l);
+            chosen = Some(t);
+        }
+        // The convolution and every stage after it: `from`'s.
+        std::mem::swap(&mut self.conv_clean, &mut from.conv_clean);
+        std::mem::swap(&mut self.conv, &mut from.conv);
+        std::mem::swap(&mut self.matrix, &mut from.matrix);
+        std::mem::swap(&mut self.up, &mut from.up);
+        std::mem::swap(&mut self.harmonics, &mut from.harmonics);
+        // `from`'s stages before it: the fade's outgoing ones.
+        std::mem::swap(&mut self.out.dc_block, &mut from.dc_block);
+        std::mem::swap(&mut self.out.crossfeed, &mut from.crossfeed);
+        std::mem::swap(&mut self.out.eq, &mut from.eq);
+        if let (Some(d), Some(s)) = (&mut self.split, &mut from.split) {
+            for (dl, sl) in d.lanes.iter_mut().zip(s.lanes.iter_mut()) {
+                let (Some(dw), Some(sw)) = (dl.get_mut(), sl.get_mut()) else {
+                    unreachable!("idle lanes (can_take_over)");
+                };
+                for (dt, st) in dw.tails.iter_mut().zip(sw.tails.iter_mut()) {
+                    std::mem::swap(&mut dt.conv, &mut st.conv);
+                    std::mem::swap(&mut dt.up, &mut st.up);
+                    std::mem::swap(&mut dt.harmonics, &mut st.harmonics);
+                    std::mem::swap(&mut dt.out_eq, &mut st.eq);
+                }
+            }
+        }
+        self.out.len = len;
+        self.out.hold = hold;
+        self.out.pos = 0;
+        self.out.active = !same;
+        self.fade_chosen = chosen.map(|t| (self.out.len, t));
+        self.fade_hold = if same { 0 } else { hold };
+        true
+    }
+
+    /// Clear all state and continue the rational frame grid at `pos`. A
+    /// clean convolution ([`Self::conv_clean`]) is left as it is: a new
+    /// chain that joins a running one off its grid costs no clear.
     fn reset_to(&mut self, pos: u64) {
+        // A fade in flight ends: the new stages play from here.
+        self.out.active = false;
+        let clear_conv = !std::mem::replace(&mut self.conv_clean, true);
         if let Some(dc) = &mut self.dc_block {
             dc.reset();
         }
@@ -472,8 +1712,13 @@ impl Pipeline {
         if let Some(eq) = &mut self.eq {
             eq.reset();
         }
-        if let Some(conv) = &mut self.conv {
-            conv.reset();
+        if clear_conv {
+            if let Some(conv) = &mut self.conv {
+                conv.reset();
+            }
+            if let Some(m) = &mut self.matrix {
+                m.reset();
+            }
         }
         self.pos = pos % u64::from(self.ratio.down);
         if let Some(up) = &mut self.up {
@@ -482,7 +1727,48 @@ impl Pipeline {
         if let Some(harm) = &mut self.harmonics {
             harm.reset();
         }
+        if let Some(split) = &mut self.split {
+            let pos = self.pos;
+            let mut out = false;
+            for lane in &mut split.lanes {
+                match lane.get_mut() {
+                    Some(job) => job
+                        .tails
+                        .iter_mut()
+                        .for_each(|t| t.reset_to(pos, clear_conv)),
+                    // Still with a worker (a stall): reset once it is back.
+                    None => out = true,
+                }
+            }
+            split.stalled = out;
+            // Its convolver was not cleared: not clean, so the reset when
+            // it is back clears it (else it would replay what it had).
+            if out {
+                self.conv_clean = false;
+            }
+        }
     }
+}
+
+/// A block of digital silence (a stalled or poisoned split pipeline,
+/// [`Chain::attach_workers`]): `out_frames` frames of zeros out and into
+/// `tap`, no statistics. The volume ramp still moves through it, so a mute
+/// (or any change) set meanwhile is as far along when sound comes back as
+/// if the block had played.
+fn silence(
+    out: &mut [i32],
+    out_frames: usize,
+    channels: usize,
+    tap: Option<&mut [f32]>,
+    gain: &mut StereoGainRamp,
+) -> ClipStats {
+    gain.advance(out_frames);
+    out[..out_frames * channels].fill(0);
+    if let Some(tap) = tap {
+        let n = (out_frames * channels).min(tap.len());
+        tap[..n].fill(0.0);
+    }
+    ClipStats::default()
 }
 
 /// Per-channel peak |x| of the first `frames` samples of planar buffers.
@@ -768,6 +2054,25 @@ impl Chain {
         Self::try_new(spec).unwrap_or_else(|e| panic!("chain: {e}"))
     }
 
+    /// Whether the chain runs a harmonics stage (one that is active).
+    pub fn has_harmonics(&self) -> bool {
+        self.pipeline.harm_tap.is_some()
+    }
+
+    /// Copy the harmonics stage's input and output from the next block on
+    /// ([`Self::harmonics_tap`]); off by default. Real-time safe: a flag
+    /// (the buffers are allocated at build); off, a block costs nothing.
+    pub fn set_harmonics_tap(&mut self, on: bool) {
+        self.pipeline.set_harmonics_tap(on);
+    }
+
+    /// The last block's tap ([`HarmonicsTap`]): `None` when the tap is off,
+    /// there is no harmonics stage, or the last block did not run the stage
+    /// (silence after a stall, an empty block).
+    pub fn harmonics_tap(&self) -> Option<HarmonicsTap<'_>> {
+        self.pipeline.harm_tap.as_ref().and_then(|t| t.view(0))
+    }
+
     pub fn try_new(spec: ChainSpec) -> Result<Self, ChainError> {
         Self::try_new_with_seed(spec, DEFAULT_SEED)
     }
@@ -916,6 +2221,194 @@ impl Chain {
         }
     }
 
+    /// The convolution's own delay, input (graph-rate) frames: its IRs'
+    /// bulk delay plus the convolver's partition block. 0 without
+    /// convolution or on the passthrough path.
+    pub fn conv_latency_frames(&self) -> usize {
+        if self.passthrough {
+            0
+        } else {
+            self.pipeline.conv_latency
+        }
+    }
+
+    /// Output frames the chain still plays after its last input frame:
+    /// [`Self::latency_out_frames`] plus a convolution IR's length (its
+    /// output rings that long after its delay). The stream-end flush.
+    pub fn tail_out_frames(&self) -> usize {
+        if self.passthrough {
+            0
+        } else {
+            self.pipeline.tail_out + self.limiter.as_ref().map_or(0, Stage::latency_frames)
+        }
+    }
+
+    /// Carry the playing chain's filter state over to this one, which is
+    /// about to warm up next to it for a swap. The stages before the
+    /// convolution take what runs exactly as in `from` (unchanged DC
+    /// block and crossfeed, each EQ channel's unchanged start; a changed
+    /// section starts fresh, as in a new chain). The convolution, when its
+    /// filter and its input are the same (every stage before it taken
+    /// over whole) and its state is at most `max_copy_bytes`, takes `from`'s
+    /// input history, pending output and place in its sliced work: this
+    /// chain then plays on as `from` does, the IR's whole ring included.
+    /// Otherwise it starts fresh and needs [`Self::conv_ring_frames`] of
+    /// warm-up. Returns whether the convolution was handed over (true
+    /// without one). Real-time safe: copies into this chain's own buffers,
+    /// at most `max_copy_bytes` for the convolution.
+    pub fn inherit_filter_state(&mut self, from: &mut Chain, max_copy_bytes: usize) -> bool {
+        if self.passthrough {
+            return true;
+        }
+        if from.passthrough {
+            return !self.pipeline.has_conv;
+        }
+        let copy = self.pipeline.conv_bytes <= max_copy_bytes;
+        self.pipeline.inherit_filter_state(&mut from.pipeline, copy)
+    }
+
+    /// Take over `from`, the playing chain, for an edit of the stages
+    /// before its convolution only (EQ, crossfeed, DC block): when the
+    /// convolution and everything after it are the same (filter, upsampler,
+    /// harmonics, limiter, output; no pitch shift), this chain takes
+    /// `from`'s convolution, upsampler, harmonics, limiter and quantizer
+    /// with their state (moved, nothing copied) and `from`'s stages before
+    /// the convolution as the outgoing side of a fade at its input
+    /// (held at the old side until the sections that start fresh settle,
+    /// [`SETTLE_TIME_CONSTANTS`] time constants of the slowest, up to
+    /// [`UPSTREAM_SETTLE_MAX_MS`]; then [`UPSTREAM_FADE_MIN_MS`] at least,
+    /// or as long as the IR's [`FadeBound`] asks for this edit, up to
+    /// [`UPSTREAM_FADE_BOUND_MAX_MS`]). It plays on `from`'s output
+    /// (without an upsampler or harmonics, whose filters reach ahead of
+    /// their reported latency, its first `hold + latency + 1` output frames
+    /// are `from`'s next, sample for sample; with one, the fade can show a
+    /// little earlier: no frame count is promised), so it replaces `from`
+    /// at once, no warm-up. Each tap of the IR hears the fade at its own
+    /// delay, so it is close to a crossfade of the two chains' outputs only
+    /// as the bound allows: an edit whose bound stays over
+    /// [`crate::fade_bound::FADE_TRANSIENT_MAX`] at the longest fade is not
+    /// taken over. `from` is left with stages of no use (drop it off the
+    /// audio thread). False, with nothing of `from` changed, when it cannot.
+    /// Real-time safe.
+    pub fn take_over_upstream(&mut self, from: &mut Chain) -> bool {
+        let (c, f) = (&self.config, &from.config);
+        let same_after = !self.passthrough
+            && !from.passthrough
+            && self.channels == from.channels
+            && self.sample_rate == from.sample_rate
+            && self.max_block == from.max_block
+            && self.ratio == from.ratio
+            && c.convolution == f.convolution
+            && c.upsampler == f.upsampler
+            && c.harmonics == f.harmonics
+            && c.limiter == f.limiter
+            && c.output == f.output
+            && !c.pitch.is_active()
+            && !f.pitch.is_active()
+            && self.limiter.is_some() == from.limiter.is_some();
+        if !same_after {
+            return false;
+        }
+        let ms = |ms: f64| (f64::from(self.sample_rate) * ms / 1000.0).round() as usize;
+        let (min, max) = (ms(UPSTREAM_FADE_MIN_MS), ms(UPSTREAM_SETTLE_MAX_MS));
+        if !self
+            .pipeline
+            .take_over_upstream(&mut from.pipeline, min, max)
+        {
+            return false;
+        }
+        std::mem::swap(&mut self.limiter, &mut from.limiter);
+        std::mem::swap(&mut self.quantizer, &mut from.quantizer);
+        true
+    }
+
+    /// The last upstream takeover's fade ([`Self::take_over_upstream`]):
+    /// its length (input frames) and the bound on how far it can take the
+    /// output past both settings' ([`FadeBound`], FS); `None` when nothing
+    /// before the convolution changed.
+    pub fn upstream_fade(&self) -> Option<(usize, f64)> {
+        self.pipeline.fade_chosen
+    }
+
+    /// How long the stages before the convolution that start fresh take to
+    /// settle ([`SETTLE_TIME_CONSTANTS`] of the slowest), output frames:
+    /// what a chain warming up with a convolution waits for beside its
+    /// ring (0 without a convolution). After
+    /// [`Self::inherit_filter_state`], the sections it did not take over;
+    /// before, all of them.
+    pub fn settle_out_frames(&self) -> f64 {
+        if !self.pipeline.has_conv {
+            return 0.0;
+        }
+        (SETTLE_TIME_CONSTANTS * self.pipeline.fresh_decay * self.ratio.as_f64()).ceil()
+    }
+
+    /// The last upstream takeover's hold before its ramp, input frames: its
+    /// fresh EQ sections' settling time (0 when nothing changed).
+    pub fn upstream_hold(&self) -> usize {
+        self.pipeline.fade_hold
+    }
+
+    /// An upstream edit's fade ([`Self::take_over_upstream`]) is running.
+    /// Another takeover waits for its end: it would fade from one side
+    /// of a mix.
+    pub fn upstream_fading(&self) -> bool {
+        self.pipeline.out.active
+    }
+
+    /// [`Self::inherit_filter_state`] from an A/B pair's side A (A/B
+    /// switched off keeps chain A).
+    pub fn inherit_filter_state_from_ab(
+        &mut self,
+        from: &mut AbChain,
+        max_copy_bytes: usize,
+    ) -> bool {
+        if self.passthrough {
+            return true;
+        }
+        let copy = self.pipeline.conv_bytes <= max_copy_bytes;
+        self.pipeline.inherit_filter_state(&mut from.a, copy)
+    }
+
+    /// Bytes of convolution state [`Self::inherit_filter_state`] would copy.
+    pub fn conv_state_bytes(&self) -> usize {
+        self.pipeline.conv_bytes
+    }
+
+    /// Output frames the convolution rings past the chain's latency (its
+    /// IR, [`Self::tail_out_frames`] less [`Self::latency_out_frames`]): how
+    /// long a fresh convolver takes to play its full response.
+    pub fn conv_ring_frames(&self) -> usize {
+        self.tail_out_frames()
+            .saturating_sub(self.latency_out_frames())
+    }
+
+    /// Run the per-channel stages after crossfeed on `pool`'s workers (see
+    /// the module docs, "Channel workers"). Off the audio thread (it
+    /// allocates), before the chain's first block. Returns whether the
+    /// chain now uses workers: not with one channel, on the passthrough
+    /// path, without a worker, without a stage after crossfeed, or with an
+    /// upsampler that cannot split; it then runs exactly as before.
+    pub fn attach_workers(&mut self, pool: &Arc<LanePool>) -> bool {
+        !self.passthrough && self.pipeline.split(pool)
+    }
+
+    /// The chain runs its per-channel stages on workers.
+    pub fn uses_workers(&self) -> bool {
+        self.pipeline.split.is_some()
+    }
+
+    /// Blocks of this chain a late worker made silent (its own, not the
+    /// pool's other chains'); 0 without workers.
+    pub fn worker_late_blocks(&self) -> u64 {
+        self.pipeline.late_blocks()
+    }
+
+    /// The word the final quantizer writes, bits.
+    pub fn output_bits(&self) -> u32 {
+        self.quantizer.bits()
+    }
+
     /// True when the chain runs the bit-exact bypass path.
     ///
     /// The bypass is exactly transparent for inputs that originated as
@@ -1003,6 +2496,7 @@ impl Chain {
             "output buffer too small: {} samples for {out_frames} output frames x {channels}",
             out.len(),
         );
+        self.pipeline.clear_harmonics_tap();
         if frames == 0 {
             return ClipStats::default();
         }
@@ -1025,6 +2519,14 @@ impl Chain {
             return ClipStats::default();
         }
 
+        match self.pipeline.ready() {
+            Readiness::Ready => {}
+            Readiness::Recovered => self.reset_to(self.pipeline.pos),
+            Readiness::Silent => {
+                let out_frames = self.pipeline.skip(frames);
+                return silence(out, out_frames, channels, tap, gain);
+            }
+        }
         let Self {
             pipeline,
             quantizer,
@@ -1032,7 +2534,11 @@ impl Chain {
             ..
         } = self;
         input.load(&mut pipeline.planar, frames, channels);
-        let (chans, out_frames) = pipeline.process(frames);
+        let idle = pipeline.idle_lanes();
+        let out_frames = pipeline.start(frames, idle);
+        let Some((chans, out_frames)) = pipeline.finish(frames, out_frames) else {
+            return silence(out, out_frames, channels, tap, gain);
+        };
         let chain_peaks = planar_peaks(chans, out_frames);
         let volume_before = gain.current();
         gain.process_planar(chans, out_frames);
@@ -1080,6 +2586,20 @@ impl Chain {
         self.quantizer.reset();
     }
 }
+
+/// The shortest fade of an upstream edit at the convolution's input
+/// ([`Chain::take_over_upstream`]), ms: the chain swap's crossfade.
+pub const UPSTREAM_FADE_MIN_MS: f64 = 10.0;
+/// The longest hold before an upstream edit's ramp, ms: its fresh EQ
+/// sections' settling time ([`SETTLE_TIME_CONSTANTS`] of the slowest), a
+/// few seconds for a high-Q bell in the deep bass (20 Hz, Q 30: 3.3 s).
+/// One that takes longer warms a new chain up instead.
+pub const UPSTREAM_SETTLE_MAX_MS: f64 = 5_000.0;
+/// Time constants a fresh section settles in, to -60 dB (`ln 1000`).
+pub const SETTLE_TIME_CONSTANTS: f64 = 6.908;
+/// The longest the IR's fade bound may ask for, ms (a large edit on an IR
+/// with long ringing: it starts at once and is in within half a second).
+pub const UPSTREAM_FADE_BOUND_MAX_MS: f64 = 500.0;
 
 /// Deterministic default dither seed. The daemon should use [`Chain::with_seed`]
 /// (or set the seed explicitly) if it wants fresh noise per session; tests use
@@ -1190,7 +2710,11 @@ pub struct AbChain {
     meter: AbHopMeter,
     fade: Fade,
     current: Side,
+    /// The live harmonics view is on ([`Self::set_harmonics_tap`]).
+    tap_on: bool,
     latency_out: usize,
+    /// [`Chain::tail_out_frames`] for the pair: the longer side's tail.
+    tail_out: usize,
 }
 
 impl AbChain {
@@ -1243,7 +2767,7 @@ impl AbChain {
             analytic || matches!(level.headroom, audivane_protocol::ipc::AbHeadroom::Auto);
         let conv_term = |spec: &ChainSpec| match &spec.irs {
             Some(irs) if wants_terms && spec.config.convolution.iter().any(|c| c.enabled) => {
-                ConvTerm::of_irs(irs, sr)
+                ConvTerm::of_conv(irs, sr)
             }
             _ => ConvTerm::Gain(1.0),
         };
@@ -1284,6 +2808,9 @@ impl AbChain {
         let mix = vec![vec![0.0; max_out]; channels];
         let limiter = build_limiter(&a.config, a.sample_rate, channels, ratio_a)?;
         let latency_out = latency_out + limiter.as_ref().map_or(0, Stage::latency_frames);
+        // Each side's tail behind the shared alignment delay.
+        let tail_out = (pipeline_a.tail_out + (latency_out - pipeline_a.latency_out))
+            .max(pipeline_b.tail_out + (latency_out - pipeline_b.latency_out));
 
         // The upsampler enters the level terms only where the two designs
         // differ; the same design on both sides cancels.
@@ -1364,8 +2891,102 @@ impl AbChain {
             meter: AbHopMeter::new(f64::from(output_rate), channels),
             fade: Fade::new(0.0),
             current: Side::A,
+            tap_on: false,
             latency_out,
+            tail_out,
         })
+    }
+
+    /// [`Chain::attach_workers`] for both sides (one block hands out both
+    /// sides' lanes, then waits). Returns whether either side uses them.
+    pub fn attach_workers(&mut self, pool: &Arc<LanePool>) -> bool {
+        let a = self.a.split(pool);
+        let b = self.b.split(pool);
+        a || b
+    }
+
+    /// [`Chain::inherit_filter_state`] for a pair: each side from the
+    /// playing pair's same side, both sides' convolution state together at
+    /// most `max_copy_bytes`. Real-time safe.
+    pub fn inherit_filter_state(&mut self, from: &mut AbChain, max_copy_bytes: usize) -> bool {
+        let copy = self.conv_state_bytes() <= max_copy_bytes;
+        let a = self.a.inherit_filter_state(&mut from.a, copy);
+        let b = self.b.inherit_filter_state(&mut from.b, copy);
+        a && b
+    }
+
+    /// [`Chain::inherit_filter_state`] from a single chain (A/B switched
+    /// on): side A from it; side B, new, warms up from zero.
+    pub fn inherit_filter_state_from_single(
+        &mut self,
+        from: &mut Chain,
+        max_copy_bytes: usize,
+    ) -> bool {
+        let a = if from.passthrough {
+            !self.a.has_conv
+        } else {
+            let copy = self.a.conv_bytes <= max_copy_bytes;
+            self.a.inherit_filter_state(&mut from.pipeline, copy)
+        };
+        a && !self.b.has_conv
+    }
+
+    /// Bytes of convolution state [`Self::inherit_filter_state`] would copy
+    /// (both sides).
+    pub fn conv_state_bytes(&self) -> usize {
+        self.a.conv_bytes + self.b.conv_bytes
+    }
+
+    /// [`Chain::conv_ring_frames`] for the pair: the longer side's.
+    pub fn conv_ring_frames(&self) -> usize {
+        self.tail_out.saturating_sub(self.latency_out)
+    }
+
+    /// Either side runs its per-channel stages on workers.
+    pub fn uses_workers(&self) -> bool {
+        self.a.split.is_some() || self.b.split.is_some()
+    }
+
+    /// [`Chain::worker_late_blocks`] of both sides together.
+    pub fn worker_late_blocks(&self) -> u64 {
+        self.a.late_blocks() + self.b.late_blocks()
+    }
+
+    /// The word A's quantizer writes, bits.
+    pub fn output_bits(&self) -> u32 {
+        self.quantizer.bits()
+    }
+
+    /// [`Chain::has_harmonics`] of the side playing ([`Self::current`]).
+    pub fn has_harmonics(&self) -> bool {
+        match self.current {
+            Side::A => self.a.harm_tap.is_some(),
+            Side::B => self.b.harm_tap.is_some(),
+        }
+    }
+
+    /// [`Chain::set_harmonics_tap`]: the live view follows the side
+    /// playing; each block taps only the side [`Self::current`] names when
+    /// it starts (one side per block, so a switch never mixes them).
+    pub fn set_harmonics_tap(&mut self, on: bool) {
+        self.tap_on = on;
+        self.route_harmonics_tap();
+    }
+
+    fn route_harmonics_tap(&mut self) {
+        let on = self.tap_on;
+        self.a.set_harmonics_tap(on && self.current == Side::A);
+        self.b.set_harmonics_tap(on && self.current == Side::B);
+    }
+
+    /// [`Chain::harmonics_tap`] of the side the last block tapped
+    /// ([`HarmonicsTap::side`] says which).
+    pub fn harmonics_tap(&self) -> Option<HarmonicsTap<'_>> {
+        self.a
+            .harm_tap
+            .as_ref()
+            .and_then(|t| t.view(0))
+            .or_else(|| self.b.harm_tap.as_ref().and_then(|t| t.view(1)))
     }
 
     /// True when B has its own quantizer (its bits or dither differ from
@@ -1480,6 +3101,20 @@ impl AbChain {
         self.latency_out
     }
 
+    /// [`Chain::conv_latency_frames`] of the side playing (the one being
+    /// switched to while a crossfade runs).
+    pub fn conv_latency_frames(&self) -> usize {
+        match self.current {
+            Side::A => self.a.conv_latency,
+            Side::B => self.b.conv_latency,
+        }
+    }
+
+    /// [`Chain::tail_out_frames`] for the pair (the longer side's).
+    pub fn tail_out_frames(&self) -> usize {
+        self.tail_out
+    }
+
     /// The side being switched to (immediately after `select`, before the
     /// crossfade has finished).
     pub fn current(&self) -> Side {
@@ -1561,8 +3196,21 @@ impl AbChain {
             "output buffer too small: {} samples for {out_frames} output frames x {channels}",
             out.len()
         );
+        self.a.clear_harmonics_tap();
+        self.b.clear_harmonics_tap();
+        self.route_harmonics_tap();
         if frames == 0 {
             return ClipStats::default();
+        }
+
+        let (ready_a, ready_b) = (self.a.ready(), self.b.ready());
+        if ready_a == Readiness::Silent || ready_b == Readiness::Silent {
+            self.a.skip(frames);
+            self.b.skip(frames);
+            return silence(out, out_frames, channels, tap, gain);
+        }
+        if ready_a == Readiness::Recovered || ready_b == Readiness::Recovered {
+            self.reset_to(self.a.pos);
         }
 
         let Self {
@@ -1590,8 +3238,16 @@ impl AbChain {
 
         input.load(&mut a.planar, frames, channels);
         input.load(&mut b.planar, frames, channels);
-        let (a_buf, _) = a.process(frames);
-        let (b_buf, _) = b.process(frames);
+        // Both sides' lanes go out before either side's own lane runs; the
+        // workers are checked once, before A's take them.
+        let idle = a.idle_lanes() | b.idle_lanes();
+        a.start(frames, idle);
+        b.start(frames, idle);
+        let a_out = a.finish(frames, out_frames);
+        let b_out = b.finish(frames, out_frames);
+        let (Some((a_buf, _)), Some((b_buf, _))) = (a_out, b_out) else {
+            return silence(out, out_frames, channels, tap, gain);
+        };
         delay_a.process(a_buf, out_frames);
         delay_b.process(b_buf, out_frames);
         // Both sides as they leave their chains, aligned, before the gains.
@@ -1806,12 +3462,25 @@ impl AbChain {
             c.convolution
                 .iter()
                 .filter(|conv| conv.enabled)
-                .map(|conv| db_to_lin(conv.gain_db))
+                .map(crate::ab_level::config_conv_gain)
                 .product()
+        };
+        // The harmonics stage's peak bounds for an `auto` headroom (built at
+        // the input rate: only tilt makes them depend on the rate).
+        let harmonics_peaks = |c: &ChainConfig| -> Result<Vec<f64>, String> {
+            match c.harmonics.as_ref().filter(|h| h.is_active()) {
+                Some(h) if matches!(level.headroom, audivane_protocol::ipc::AbHeadroom::Auto) => {
+                    Harmonics::try_new(h, sr, 1)
+                        .map(|st| st.peak_bounds())
+                        .map_err(|e| e.to_string())
+                }
+                _ => Ok(Vec::new()),
+            }
         };
         let (dc_a, dc_b) = (dc(a)?, dc(b)?);
         let (xf_a, xf_b) = (crossfeed(a)?, crossfeed(b)?);
         let (eq_a, eq_b) = (eq(a)?, eq(b)?);
+        let (peaks_a, peaks_b) = (harmonics_peaks(a)?, harmonics_peaks(b)?);
         let ta = SideTerms {
             sample_rate: sr,
             dc: dc_a.as_ref(),
@@ -1821,6 +3490,7 @@ impl AbChain {
             conv: ConvTerm::Gain(conv_gain(a)),
             upsampler: None,
             harmonics_gain: harmonics_gain(a)?,
+            harmonics_peaks: &peaks_a,
         };
         let tb = SideTerms {
             sample_rate: sr,
@@ -1831,6 +3501,7 @@ impl AbChain {
             conv: ConvTerm::Gain(conv_gain(b)),
             upsampler: None,
             harmonics_gain: harmonics_gain(b)?,
+            harmonics_peaks: &peaks_b,
         };
         let offset_db = match level.offset {
             AbOffset::Analytic(w) => crate::ab_level::analytic_offset_db(&ta, &tb, w),
@@ -2315,7 +3986,6 @@ mod tests {
     fn output_headroom_applies_at_every_ratio_and_after_harmonics() {
         let harmonics = Some(audivane_protocol::HarmonicsConfig {
             enabled: true,
-            character: audivane_protocol::HarmonicsCharacter::Triode,
             ..Default::default()
         });
         let x4 = crate::resample::ManualConfig {
@@ -2430,6 +4100,8 @@ mod tests {
                 enabled: true,
                 ir_path: "ir.wav".into(),
                 gain_db: 0.0,
+                matrix: None,
+                calibration: false,
             }],
             ..ChainConfig::neutral()
         };
@@ -2695,6 +4367,113 @@ mod tests {
         }
     }
 
+    /// The stream-end tail counts a convolution IR's whole ring after the
+    /// chain's delay: an impulse's last non-zero output frame is exactly
+    /// `tail_out_frames` after it, on one chain and on an A/B pair whose
+    /// other side has no IR.
+    /// The convolution's own delay is its IR's peak plus the convolver's
+    /// block, at the input rate: the same whatever the upsampler, and 0
+    /// without convolution.
+    #[test]
+    fn the_convolution_latency_is_its_own_and_ignores_the_upsampler() {
+        let conv = vec![audivane_protocol::ConvolutionConfig {
+            name: None,
+            enabled: true,
+            ir_path: "room.wav".into(),
+            gain_db: 0.0,
+            matrix: None,
+            calibration: false,
+        }];
+        let mut ir = vec![1e-3; 1000];
+        ir[600] = -0.5;
+        let up = |taps| {
+            crate::resample::ManualConfig {
+                target: RateTarget::Ratio(4),
+                taps,
+                ..Default::default()
+            }
+            .into_upsampler_config()
+            .unwrap()
+        };
+        let build = |convolution: Vec<audivane_protocol::ConvolutionConfig>, upsampler| {
+            let with = !convolution.is_empty();
+            let mut sp = spec(
+                ChainConfig {
+                    convolution,
+                    upsampler,
+                    output: quiet_output(),
+                    ..ChainConfig::neutral()
+                },
+                1,
+                256,
+            );
+            if with {
+                sp.irs = Some(vec![ir.clone()].into());
+            }
+            Chain::new(sp)
+        };
+        // At x1 the chain's whole delay is the convolver's block.
+        let x1 = build(conv.clone(), ChainConfig::neutral().upsampler);
+        let block = x1.latency_out_frames();
+        assert!(block > 0);
+        assert_eq!(x1.conv_latency_frames(), 600 + block);
+        let short = build(conv.clone(), up(1024));
+        let long = build(conv.clone(), up(8192));
+        assert_ne!(short.latency_out_frames(), long.latency_out_frames());
+        assert_eq!(short.conv_latency_frames(), 600 + block);
+        assert_eq!(long.conv_latency_frames(), 600 + block);
+        assert_eq!(build(Vec::new(), up(1024)).conv_latency_frames(), 0);
+        assert_eq!(
+            build(Vec::new(), ChainConfig::neutral().upsampler).conv_latency_frames(),
+            0
+        );
+    }
+
+    #[test]
+    fn the_tail_counts_the_convolution_ir() {
+        let config = ChainConfig {
+            convolution: vec![audivane_protocol::ConvolutionConfig {
+                name: None,
+                enabled: true,
+                ir_path: "room.wav".into(),
+                gain_db: 0.0,
+                matrix: None,
+                calibration: false,
+            }],
+            output: quiet_output(),
+            ..ChainConfig::neutral()
+        };
+        // A room-like IR: its peak well into it, a low tail to the end.
+        let mut ir = vec![1e-3; 1000];
+        ir[600] = 0.5;
+        let with_ir = || {
+            let mut sp = spec(config.clone(), 1, 256);
+            sp.irs = Some(vec![ir.clone()].into());
+            sp
+        };
+        let mut chain = Chain::new(with_ir());
+        assert_eq!(chain.tail_out_frames(), chain.latency_out_frames() + 999);
+        let mut input = vec![0.0f32; 256 * 12];
+        input[0] = 0.5;
+        let mut out = vec![0i32; input.len()];
+        for (i, o) in input.chunks(256).zip(out.chunks_mut(256)) {
+            chain.process_f32(i, o);
+        }
+        let last = out.iter().rposition(|&s| s != 0).unwrap();
+        assert_eq!(last, chain.tail_out_frames());
+
+        let plain = ChainConfig {
+            output: quiet_output(),
+            ..ChainConfig::neutral()
+        };
+        let level = AbLevel {
+            offset: AbOffset::Analytic(Weighting::K),
+            headroom: audivane_protocol::ipc::AbHeadroom::Auto,
+        };
+        let ab = AbChain::new(spec(plain, 1, 256), with_ir(), level).unwrap();
+        assert_eq!(ab.tail_out_frames(), chain.tail_out_frames());
+    }
+
     /// A = B with different latencies (a delta IR through the block convolver
     /// on A only). Aligned, the mix during a fade equals A: a null below
     /// -300 dB.
@@ -2706,6 +4485,8 @@ mod tests {
                 enabled: true,
                 ir_path: "delta.wav".into(),
                 gain_db: 0.0,
+                matrix: None,
+                calibration: false,
             }],
             output: quiet_output(),
             ..ChainConfig::default()
@@ -2717,7 +4498,7 @@ mod tests {
         };
         let pair = |fade: bool| {
             let mut spec_a = spec(a.clone(), 2, 256);
-            spec_a.irs = Some(vec![vec![1.0]]);
+            spec_a.irs = Some(vec![vec![1.0]].into());
             let level = AbLevel {
                 offset: AbOffset::Analytic(Weighting::K),
                 headroom: audivane_protocol::ipc::AbHeadroom::Auto,
@@ -2832,17 +4613,37 @@ mod tests {
 
     #[test]
     fn analytic_offset_includes_harmonics_gain() {
-        use audivane_protocol::{HarmonicsCharacter, HarmonicsConfig};
+        use audivane_protocol::{
+            ChebyshevLayer, HARMONICS_DEFAULT_SIGNS, HarmonicsConfig, HarmonicsLayer,
+        };
         let off = ChainConfig::neutral();
         let harm = |h2_db, h3_db, h4_db, h5_db| ChainConfig {
             harmonics: Some(HarmonicsConfig {
+                system: None,
                 enabled: true,
-                character: HarmonicsCharacter::Custom,
-                h2_db,
-                h3_db,
-                h4_db,
-                h5_db,
-                ..Default::default()
+                layers: vec![HarmonicsLayer::Chebyshev(ChebyshevLayer {
+                    enabled: true,
+                    preset: None,
+                    levels_db: [
+                        Some(h2_db),
+                        Some(h3_db),
+                        h4_db,
+                        h5_db,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ],
+                    signs: HARMONICS_DEFAULT_SIGNS,
+                    invert_even: false,
+                    drive_db: 0.0,
+                    amount: 1.0,
+                    tilt: None,
+                    sag: None,
+                    bias: None,
+                })],
+                dc_block: true,
+                routing: Default::default(),
             }),
             ..ChainConfig::neutral()
         };
@@ -2850,14 +4651,15 @@ mod tests {
         for (cfg, lo, hi) in [
             (
                 ChainConfig {
-                    harmonics: Some(Default::default()),
+                    harmonics: Some(HarmonicsConfig::from_preset("triode").unwrap()),
                     ..ChainConfig::neutral()
                 },
                 -0.3,
                 0.1,
             ),
-            (harm(-20.0, -120.0, None, None), -2.0, -0.8),
-            (harm(-20.0, -20.0, Some(-20.0), Some(-20.0)), 0.5, 3.0),
+            // No trim: an H2 curve adds a little energy, never takes any.
+            (harm(-20.0, -120.0, None, None), 0.0, 0.2),
+            (harm(-20.0, -20.0, Some(-20.0), Some(-20.0)), 3.0, 5.0),
         ] {
             let change = Harmonics::loudness_change_db(cfg.harmonics.as_ref().unwrap()).unwrap();
             eprintln!("{:?}: {change:.3} dB", cfg.harmonics);
@@ -2869,55 +4671,43 @@ mod tests {
 
     #[test]
     fn analytic_offset_includes_crossfeed_level() {
-        use audivane_protocol::{CrossfeedConfig, CrossfeedLevel};
-        let xf = |level| ChainConfig {
+        use audivane_protocol::CrossfeedConfig;
+        let xf = |width| ChainConfig {
             crossfeed: Some(CrossfeedConfig {
-                level,
+                width,
                 ..Default::default()
             }),
             ..ChainConfig::neutral()
         };
         let off = ChainConfig::neutral();
-        let safe = xf(CrossfeedLevel::PeakSafe);
-        let matched = xf(CrossfeedLevel::Matched);
+        let matched = xf(1.0);
+        let wide = xf(1.5);
         for rate in [44_100, 96_000] {
             let fs = f64::from(rate);
             let stage =
                 |c: &ChainConfig| Crossfeed::try_new(c.crossfeed.as_ref().unwrap(), fs, 2).unwrap();
-            // Off vs peak-safe: B is quieter by the stage's loudness change on
-            // the reference (-4.27 dB for bs2b default at 44.1 kHz), so B is
-            // raised by that much.
-            let expected = -stage(&safe).loudness_change_db(crate::crossfeed::MATCHED_CORRELATION);
-            let offset = AbChain::analytic_offset_db(&off, &safe, rate, Weighting::A).unwrap();
+            // Off vs matched: same loudness by construction.
+            let offset = AbChain::analytic_offset_db(&off, &matched, rate, Weighting::A).unwrap();
+            assert!(offset.abs() < 1e-6, "{rate}: {offset}");
+            // The width is never compensated: wider is louder, and B is
+            // lowered by the stage's loudness change.
+            let expected = -stage(&wide).loudness_change_db(crate::crossfeed::MATCHED_CORRELATION);
+            let offset = AbChain::analytic_offset_db(&off, &wide, rate, Weighting::A).unwrap();
             assert!(
                 (offset - expected).abs() < 1e-6,
                 "{rate}: {offset} vs {expected}"
             );
-            assert!(offset > 4.0 && offset < 4.6, "{rate}: {offset}");
-            // Off vs matched: same loudness by construction.
-            let offset = AbChain::analytic_offset_db(&off, &matched, rate, Weighting::A).unwrap();
-            assert!(offset.abs() < 1e-6, "{rate}: {offset}");
-            // Matched vs peak-safe: the difference of the two levels.
-            let offset = AbChain::analytic_offset_db(&matched, &safe, rate, Weighting::A).unwrap();
-            let diff = stage(&matched).level_db() - stage(&safe).level_db();
-            assert!((offset - diff).abs() < 1e-6, "{rate}: {offset} vs {diff}");
+            assert!(offset < -0.1, "{rate}: {offset}");
             // Symmetric, and a disabled stage counts as off.
-            let back = AbChain::analytic_offset_db(&safe, &off, rate, Weighting::A).unwrap();
+            let back = AbChain::analytic_offset_db(&wide, &off, rate, Weighting::A).unwrap();
             assert!((back + expected).abs() < 1e-6);
-            let mut disabled = safe.clone();
+            let mut disabled = wide.clone();
             disabled.crossfeed.as_mut().unwrap().enabled = false;
             assert_eq!(
                 AbChain::analytic_offset_db(&off, &disabled, rate, Weighting::A).unwrap(),
                 0.0
             );
         }
-        let at_44 = AbChain::analytic_offset_db(&off, &safe, 44_100, Weighting::A).unwrap();
-        assert!((at_44 - 4.27).abs() < 0.01, "{at_44}");
-        let at_96 = AbChain::analytic_offset_db(&off, &safe, 96_000, Weighting::A).unwrap();
-        assert!(
-            (at_96 - at_44).abs() > 0.05,
-            "the rate must change the design"
-        );
     }
 
     #[test]
@@ -2974,18 +4764,24 @@ mod tests {
                     enabled: true,
                     ir_path: "a.wav".into(),
                     gain_db: 2.0,
+                    matrix: None,
+                    calibration: false,
                 },
                 audivane_protocol::ConvolutionConfig {
                     name: None,
                     enabled: false,
                     ir_path: "disabled.wav".into(),
                     gain_db: 20.0,
+                    matrix: None,
+                    calibration: false,
                 },
                 audivane_protocol::ConvolutionConfig {
                     name: None,
                     enabled: true,
                     ir_path: "b.wav".into(),
                     gain_db: 1.0,
+                    matrix: None,
+                    calibration: false,
                 },
             ],
             ..ChainConfig::neutral()
@@ -3277,8 +5073,8 @@ mod tests {
     #[test]
     fn every_stage_runs_at_a_rational_ratio_resets_and_adds_its_latency() {
         use audivane_protocol::{
-            CrossfeedConfig, CrossfeedMode, HarmonicsCharacter, HarmonicsConfig, LimiterConfig,
-            LimiterMode, PitchConfig,
+            CrossfeedConfig, CrossfeedMode, HarmonicsConfig, LimiterConfig, LimiterMode,
+            PitchConfig,
         };
         let ratio = RateRatio::from_rates(44_100, 48_000);
         let bare = rational_spec(RateTarget::Rate(48_000), 44_100, 32, 256);
@@ -3295,7 +5091,6 @@ mod tests {
         });
         full.config.harmonics = Some(HarmonicsConfig {
             enabled: true,
-            character: HarmonicsCharacter::Triode,
             ..Default::default()
         });
         full.config.limiter = LimiterConfig {
@@ -3479,37 +5274,6 @@ mod tests {
     }
 
     #[test]
-    fn crossfeed_in_chain_does_not_clip_antiphase_steps() {
-        // Full-scale L=-1/R=+1, then flipped: the unscaled crossfeed peaks at
-        // ~1.68 here; the peak-safe level must keep it below full scale.
-        let cfg = ChainConfig {
-            crossfeed: Some(audivane_protocol::CrossfeedConfig {
-                level: audivane_protocol::CrossfeedLevel::PeakSafe,
-                ..Default::default()
-            }),
-            output: quiet_output(),
-            ..ChainConfig::neutral()
-        };
-        let mut chain = Chain::try_new(spec(cfg, 2, 256)).unwrap();
-        let mut input = vec![0.0f32; 512 * 2];
-        for i in 0..512 {
-            let v = if i < 256 { -1.0 } else { 1.0 };
-            input[i * 2] = v;
-            input[i * 2 + 1] = -v;
-        }
-        let mut out = vec![0i32; 256 * 2];
-        let mut clipped = 0;
-        let mut peak = 0.0_f64;
-        for block in input.chunks(256 * 2) {
-            let stats = chain.process_f32(block, &mut out);
-            clipped += stats.clipped;
-            peak = peak.max(stats.peak);
-        }
-        assert_eq!(clipped, 0, "peak {peak}");
-        assert!(peak <= 1.0 && peak > 0.9, "peak {peak}");
-    }
-
-    #[test]
     fn matched_crossfeed_overs_are_left_to_the_limiter() {
         // The same worst case at the default matched level goes over full
         // scale and clips at the quantizer without the limiter (nothing else
@@ -3542,12 +5306,160 @@ mod tests {
         assert_eq!(run(audivane_protocol::LimiterMode::Limit), 0);
     }
 
+    /// The level (dB) of the 1 kHz fundamental of the left output for a
+    /// −20 dBFS 1 kHz sine on both channels through `config` (48 kHz, no
+    /// output headroom, no limiter), relative to the input: the second
+    /// half of one second, by correlation (harmonics and DC left out).
+    fn sine_level_db(config: ChainConfig) -> f64 {
+        let config = ChainConfig {
+            output: quiet_output(),
+            limiter: audivane_protocol::LimiterConfig {
+                mode: audivane_protocol::LimiterMode::Off,
+                ..Default::default()
+            },
+            ..config
+        };
+        let rate = 48_000.0;
+        let amp = crate::db_to_lin(-20.0);
+        let n = 48_000;
+        let block = 480;
+        let mut chain = Chain::try_new(spec(config, 2, block)).unwrap();
+        let lat = chain.latency_out_frames();
+        let mut left = Vec::with_capacity(n);
+        let mut out = vec![0i32; block * 2];
+        for b in 0..n / block {
+            let input: Vec<f32> = (0..block)
+                .flat_map(|i| {
+                    let t = (b * block + i) as f64 / rate;
+                    let v = (amp * (2.0 * PI * 1_000.0 * t).sin()) as f32;
+                    [v, v]
+                })
+                .collect();
+            chain.process_f32(&input, &mut out);
+            left.extend(out.chunks(2).map(|f| f64::from(f[0]) / 2_147_483_648.0));
+        }
+        let (mut re, mut im) = (0.0, 0.0);
+        let from = n / 2;
+        for (i, &y) in left.iter().enumerate().skip(from) {
+            let t = (i - lat) as f64 / rate;
+            re += y * (2.0 * PI * 1_000.0 * t).sin();
+            im += y * (2.0 * PI * 1_000.0 * t).cos();
+        }
+        let a = 2.0 * (re * re + im * im).sqrt() / (n - from) as f64;
+        crate::lin_to_db(a / amp)
+    }
+
+    /// Turning a stage on at its defaults never turns the music down for
+    /// safety: a −20 dBFS sine comes out at the stage's own response, the
+    /// limiter and the output headroom being the only protection.
+    #[test]
+    fn stages_at_their_defaults_play_a_quiet_sine_at_their_own_response() {
+        let rate = 48_000.0;
+        let neutral = ChainConfig::neutral();
+        let off = sine_level_db(neutral.clone());
+        assert!(off.abs() < 1e-6, "{off}");
+
+        let dc = sine_level_db(ChainConfig {
+            dc_block: Some(audivane_protocol::DcBlockConfig::default()),
+            ..neutral.clone()
+        });
+        assert!(dc.abs() < 0.01, "DC block: {dc:+.4} dB");
+
+        let xf_cfg = audivane_protocol::CrossfeedConfig::default();
+        let xf = Crossfeed::try_new(&xf_cfg, rate, 2).unwrap();
+        let want = crate::lin_to_db(xf.mono_response(1_000.0).norm());
+        let got = sine_level_db(ChainConfig {
+            crossfeed: Some(xf_cfg),
+            ..neutral.clone()
+        });
+        assert!(
+            (got - want).abs() < 0.01,
+            "crossfeed: {got:+.4} vs {want:+.4} dB"
+        );
+        // It goes over full scale for worst-case signals: nothing cut it.
+        assert!(xf.peak_gain_db() > 1.0, "{}", xf.peak_gain_db());
+
+        let eq = sine_level_db(ChainConfig {
+            eq: Some(EqProfile::default()),
+            ..neutral.clone()
+        });
+        assert!(eq.abs() < 1e-6, "EQ: {eq:+.6} dB");
+
+        for h in [
+            audivane_protocol::HarmonicsConfig::default(),
+            audivane_protocol::HarmonicsConfig::from_preset("tape_master").unwrap(),
+            audivane_protocol::HarmonicsConfig::from_preset("pentode").unwrap(),
+        ] {
+            let stage = Harmonics::try_new(&h, rate, 1).unwrap();
+            let want = stage.small_signal_gain_db();
+            let got = sine_level_db(ChainConfig {
+                harmonics: Some(h.clone()),
+                ..neutral.clone()
+            });
+            assert!(
+                (got - want).abs() < 0.1,
+                "harmonics {:?}: {got:+.3} vs small-signal {want:+.3} dB (peak gain {:+.2} dB)",
+                h.layers[0].preset(),
+                stage.peak_gain_db()
+            );
+        }
+    }
+
+    /// A harmonics stage that goes over full scale on loud music: the
+    /// overs clip at the quantizer with the limiter off and are caught with
+    /// it on (either mode).
+    #[test]
+    fn harmonics_overs_are_left_to_the_limiter() {
+        use audivane_protocol::{
+            ChebyshevLayer, HarmonicSign, HarmonicsConfig, HarmonicsLayer, LimiterMode,
+        };
+        let mut h = HarmonicsConfig::default();
+        let HarmonicsLayer::Chebyshev(l) = &mut h.layers[0] else {
+            unreachable!("the default layer is a Chebyshev curve")
+        };
+        *l = ChebyshevLayer {
+            preset: None,
+            levels_db: [Some(-20.0); 8],
+            signs: [HarmonicSign::Positive; 8],
+            ..l.clone()
+        };
+        let gain = Harmonics::try_new(&h, 48_000.0, 1).unwrap().peak_gain_db();
+        assert!(gain > 1.0, "{gain}");
+        let run = |mode: LimiterMode| {
+            let cfg = ChainConfig {
+                harmonics: Some(h.clone()),
+                limiter: audivane_protocol::LimiterConfig {
+                    mode,
+                    ..Default::default()
+                },
+                output: quiet_output(),
+                ..ChainConfig::neutral()
+            };
+            let mut chain = Chain::try_new(spec(cfg, 2, 256)).unwrap();
+            let mut out = vec![0i32; 256 * 2];
+            let mut clipped = 0;
+            for b in 0..200 {
+                let input: Vec<f32> = (0..256)
+                    .flat_map(|i| {
+                        let t = (b * 256 + i) as f64 / 48_000.0;
+                        let v = (0.99 * (2.0 * PI * 100.0 * t).sin()) as f32;
+                        [v, v]
+                    })
+                    .collect();
+                clipped += chain.process_f32(&input, &mut out).clipped;
+            }
+            clipped
+        };
+        assert!(run(LimiterMode::Off) > 0);
+        assert_eq!(run(LimiterMode::Limit), 0);
+        assert_eq!(run(LimiterMode::AutoHeadroom), 0);
+    }
+
     #[test]
     fn harmonics_in_chain_runs_after_upsampler_and_breaks_passthrough() {
         let cfg = ChainConfig {
             harmonics: Some(audivane_protocol::HarmonicsConfig {
                 enabled: true,
-                character: audivane_protocol::HarmonicsCharacter::Triode,
                 ..Default::default()
             }),
             ..ChainConfig::neutral()

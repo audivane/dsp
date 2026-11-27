@@ -1,20 +1,20 @@
-/* Skins: Midnight (default dark), Graphite, Light. "System" resolves to
-   Midnight or Light at runtime (src/theme.ts). Same blue accent everywhere.
-   Light is warm paper, shared with the website and the ABX app. */
+/* Skins: Graphite (default dark), Midnight, Light. "System" resolves to
+   Graphite or Light at runtime (src/theme.ts). Same blue accent everywhere.
+   Light is neutral white, shared with the website and the ABX app. */
 :root {
-  --bg: #f5f3ee; --panel: #fffdf9; --panel-2: #f0ece4; --raised: #fffdf9;
-  --line: #e3ddd1; --line-strong: #cbc2b2;
-  --fg: #1d1b16; --muted: #5f5a50; --faint: #8a8478;
+  --bg: #ffffff; --panel: #ffffff; --panel-2: #f6f6f7; --raised: #ffffff;
+  --line: #dcdde1; --line-strong: #c4c6cc;
+  --fg: #141417; --muted: #55575d; --faint: #7d8088;
   --accent: #2563eb; --accent-soft: rgba(37, 99, 235, .12); --accent-fg: #ffffff;
-  --graph-bg: #fbf9f5; --grid: rgba(29, 27, 22, .07); --grid-strong: rgba(29, 27, 22, .22);
-  --spec-fill: rgba(29, 27, 22, .08); --spec-stroke: rgba(29, 27, 22, .26); --spec-pre: rgba(95, 90, 80, .42); --spec-peak: rgba(29, 27, 22, .42);
+  --graph-bg: #fafafb; --grid: rgba(20, 20, 23, .07); --grid-strong: rgba(20, 20, 23, .22);
+  --spec-fill: rgba(20, 20, 23, .08); --spec-stroke: rgba(20, 20, 23, .26); --spec-pre: rgba(85, 87, 93, .42); --spec-peak: rgba(20, 20, 23, .42);
   --ch-l: #2563eb; --ch-r: #d9622b;
   --ok: #17915a; --ok-soft: rgba(23, 145, 90, .12);
   --warn: #b7791f; --warn-soft: rgba(183, 121, 31, .14);
   --bad: #d13438; --bad-soft: rgba(209, 52, 56, .12);
-  --shadow: 0 10px 30px rgba(40, 30, 15, .1);
+  --shadow: 0 10px 30px rgba(20, 20, 23, .1);
   --handle-ink: #0b1020;
-  --font: "Audivane Sans Latin", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font: "Geist", system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: "Audivane Mono Latin", ui-monospace, "SFMono-Regular", Menlo, monospace;
   color-scheme: light;
 }
@@ -47,16 +47,16 @@
   color-scheme: dark;
 }
 :root[data-skin="light"] {
-  --bg: #f5f3ee; --panel: #fffdf9; --panel-2: #f0ece4; --raised: #fffdf9;
-  --line: #e3ddd1; --line-strong: #cbc2b2;
-  --fg: #1d1b16; --muted: #5f5a50; --faint: #8a8478;
+  --bg: #ffffff; --panel: #ffffff; --panel-2: #f6f6f7; --raised: #ffffff;
+  --line: #dcdde1; --line-strong: #c4c6cc;
+  --fg: #141417; --muted: #55575d; --faint: #7d8088;
   --accent: #2563eb; --accent-soft: rgba(37, 99, 235, .12); --accent-fg: #ffffff;
-  --graph-bg: #fbf9f5; --grid: rgba(29, 27, 22, .07); --grid-strong: rgba(29, 27, 22, .22);
-  --spec-fill: rgba(29, 27, 22, .08); --spec-stroke: rgba(29, 27, 22, .26); --spec-pre: rgba(95, 90, 80, .42); --spec-peak: rgba(29, 27, 22, .42);
+  --graph-bg: #fafafb; --grid: rgba(20, 20, 23, .07); --grid-strong: rgba(20, 20, 23, .22);
+  --spec-fill: rgba(20, 20, 23, .08); --spec-stroke: rgba(20, 20, 23, .26); --spec-pre: rgba(85, 87, 93, .42); --spec-peak: rgba(20, 20, 23, .42);
   --ch-l: #2563eb; --ch-r: #d9622b;
   --ok: #17915a; --ok-soft: rgba(23, 145, 90, .12);
   --warn: #b7791f; --warn-soft: rgba(183, 121, 31, .14);
   --bad: #d13438; --bad-soft: rgba(209, 52, 56, .12);
-  --shadow: 0 10px 30px rgba(40, 30, 15, .1);
+  --shadow: 0 10px 30px rgba(20, 20, 23, .1);
   color-scheme: light;
 }

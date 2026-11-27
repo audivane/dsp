@@ -561,6 +561,65 @@ impl LufsMeter {
     }
 }
 
+// ---------------------------------------------------------------- stage loudness
+
+/// Rate of the stage loudness simulation ([`stage_loudness_change`]).
+pub(crate) const STAGE_LOUDNESS_RATE: f64 = 48_000.0;
+/// Its reference: pink noise at a loud master's RMS, peaks near full scale.
+const STAGE_LOUDNESS_RMS_DB: f64 = -14.0;
+/// Seconds of reference, and the settling time left out of the measurement.
+const STAGE_LOUDNESS_SECONDS: f64 = 4.5;
+const STAGE_LOUDNESS_SKIP_SECONDS: f64 = 0.5;
+
+/// [`stage_loudness_change`] of `stage` (built at [`STAGE_LOUDNESS_RATE`],
+/// one channel) for the reference. Off the audio thread: it allocates.
+#[cfg(test)]
+pub(crate) fn stage_loudness_change_db(stage: &mut dyn crate::Stage) -> f64 {
+    let input = stage_loudness_reference();
+    let mut output = input.clone();
+    stage.process(&mut [output.as_mut_slice()]);
+    stage_loudness_change(&input, &output)
+}
+
+/// Loudness change of a non-linear stage on music, dB: the BS.1770
+/// (K-weighted) loudness of the stage's `output` for the reference `input`
+/// ([`stage_loudness_reference`], one channel at [`STAGE_LOUDNESS_RATE`])
+/// minus the input's, after 0.5 s of settling. 0 when not finite.
+pub(crate) fn stage_loudness_change(input: &[f64], output: &[f64]) -> f64 {
+    let skip = (STAGE_LOUDNESS_SKIP_SECONDS * STAGE_LOUDNESS_RATE) as usize;
+    let lufs = |x: &[f64]| {
+        let mut meter = LufsMeter::new(STAGE_LOUDNESS_RATE, 1);
+        meter.push(&[&x[skip..]]);
+        meter.integrated_lufs()
+    };
+    let change = lufs(output) - lufs(input);
+    if change.is_finite() { change } else { 0.0 }
+}
+
+/// Deterministic pink noise (xorshift white through Paul Kellett's economy
+/// filter) at [`STAGE_LOUDNESS_RMS_DB`].
+pub(crate) fn stage_loudness_reference() -> Vec<f64> {
+    let n = (STAGE_LOUDNESS_SECONDS * STAGE_LOUDNESS_RATE) as usize;
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    let (mut b0, mut b1, mut b2) = (0.0, 0.0, 0.0);
+    let mut x: Vec<f64> = (0..n)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let w = (seed >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0;
+            b0 = 0.99765 * b0 + w * 0.099_046_0;
+            b1 = 0.96300 * b1 + w * 0.296_516_4;
+            b2 = 0.57000 * b2 + w * 1.052_691_3;
+            b0 + b1 + b2 + w * 0.1848
+        })
+        .collect();
+    let rms = (x.iter().map(|v| v * v).sum::<f64>() / n as f64).sqrt();
+    let g = crate::db_to_lin(STAGE_LOUDNESS_RMS_DB) / rms;
+    x.iter_mut().for_each(|v| *v *= g);
+    x
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

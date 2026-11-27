@@ -36,20 +36,20 @@ describe("overlays in the store", () => {
   it("loads the overlay files on connect", async () => {
     const { s } = await setup();
     const names = s.getState().overlays.map((o) => o.name);
-    expect(names).toContain("Kali IN-5 (mock room)");
+    expect(names).toContain("Desk monitor (mock room)");
     expect(names).toContain("Harman over-ear 2018");
     expect(s.getState().overlays.find((o) => o.kind === "measurement")?.predicted).toBe(true);
   });
 
   it("imports a measurement, names it after the file and stores it", async () => {
     const { s, daemon } = await setup();
-    s.importOverlay(curve(), "Kali left seat.csv", "measurement");
-    await until(() => s.getState().overlays.some((o) => o.name === "Kali left seat"));
-    const o = s.getState().overlays.find((x) => x.name === "Kali left seat")!;
+    s.importOverlay(curve(), "Desk left seat.csv", "measurement");
+    await until(() => s.getState().overlays.some((o) => o.name === "Desk left seat"));
+    const o = s.getState().overlays.find((x) => x.name === "Desk left seat")!;
     expect(o.kind).toBe("measurement");
     expect(o.data.points).toHaveLength(12);
-    await until(() => daemon.overlays.has("Kali left seat"));
-    const stored = daemon.overlays.get("Kali left seat") as OverlayData;
+    await until(() => daemon.overlays.has("Desk left seat"));
+    const stored = daemon.overlays.get("Desk left seat") as OverlayData;
     expect(stored.kind).toBe("measurement");
     expect(stored.view?.colour).toBe(o.colour);
   });

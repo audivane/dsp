@@ -11,7 +11,10 @@ import { ResizeHandle } from "../components/ResizeHandle";
 import { BandStrip } from "./BandStrip";
 import { EqGraph } from "./EqGraph";
 import { SpectrumControls } from "./SpectrumLayer";
+import { RangePresets } from "../components/RangePresets";
 import { TiltPanel } from "./TiltPanel";
+import { TonePanel } from "./TonePanel";
+import { PresetControl } from "../components/PresetMenu";
 
 const SECTIONS: { id: EqSection; label: string; title: string }[] = [
   { id: "linked", label: "L+R", title: "Shared EQ applied to both channels" },
@@ -82,6 +85,7 @@ export function EqView() {
   const mode = useApp((s) => s.eqMode);
   const sel = useApp((s) => s.selectedBand);
   const canUndo = useApp((s) => s.canUndo);
+  const range = useApp((s) => s.eqRange);
   const canRedo = useApp((s) => s.canRedo);
   const caps = useApp((s) => s.caps);
   const rate = useApp((s) => s.status?.graph_rate ?? s.config?.rate.default_rate ?? 48000);
@@ -209,7 +213,9 @@ export function EqView() {
           </button>
         )}
         <div className="spacer" />
+        <RangePresets x={range} onX={(r) => st.setEqRange(r)} className="eq-range" />
         <CompareButton stage="eq" />
+        <PresetControl part="eq" />
         <SpectrumControls />
         <button className="icon-btn" aria-label="Undo" title="Undo (Ctrl+Z)" disabled={!canUndo} onClick={() => st.undo()}>
           <Undo />
@@ -273,6 +279,7 @@ export function EqView() {
           measure={() => eqStageRef.current?.getBoundingClientRect().height ?? measuredHeight}
         />
       </div>
+      {eq && <TonePanel />}
       {eq && <TiltPanel />}
       {eq && <BandStrip bands={set.bands} selected={sel} disabled={false} />}
     </section>

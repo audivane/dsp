@@ -11,7 +11,7 @@ import { SINK_LABEL, sinkOptions } from "../lib/routing";
 import { directRateNote, directResamples } from "../lib/deviceCaps";
 
 function fmtStream(s: StreamInfo) {
-  return [s.rate ? fmtRateShort(s.rate) : null, s.format?.replace(/LE$|BE$/, ""), s.channels ? `${s.channels}ch` : null].filter(Boolean).join(" · ") || "—";
+  return [s.rate ? fmtRateShort(s.rate) : null, s.format?.replace(/LE$|BE$/, ""), s.channels ? `${s.channels}ch` : null].filter(Boolean).join(" · ") || "-";
 }
 
 const STREAM_TAPER = volumeTaper(VOLUME_MIN_DB, VOLUME_MAX_DB);

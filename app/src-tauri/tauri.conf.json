@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Audivane DSP",
   "mainBinaryName": "audivane-dsp-ui",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "identifier": "com.audivane.dsp",
   "build": {
     "frontendDist": "../dist",
@@ -34,7 +34,7 @@
     "targets": ["deb", "rpm", "appimage"],
     "category": "Audio",
     "shortDescription": "Control the Audivane DSP engine",
-    "longDescription": "Parametric EQ, convolution, upsampling, A/B compare and bit-perfect routing for the Audivane DSP engine.",
+    "longDescription": "Upsampling, harmonics, parametric EQ, convolution, blind A/B tests and bit-perfect routing for the Audivane DSP engine.",
     "copyright": "Triet",
     "license": "AGPL-3.0-only",
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.png"]

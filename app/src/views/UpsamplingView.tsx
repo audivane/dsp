@@ -27,6 +27,7 @@ import {
   type ViewRange,
 } from "../lib/plotView";
 import { cutoffTips, fmtHzStat, fmtRipple, nextWindowToFetch, responsePlotTop, windowRequestFor } from "../lib/upsamplerPlot";
+import { fallbackNowNote, perRateNote } from "../lib/filterDesign";
 import { chosenPreviewRate, dacRates, deviceLandingNote, deviceResampleNote, landsLowerNote, isUnmeasuredRatio, viewSourceRate } from "../lib/upsamplerRate";
 import { convertedRates, previewRates } from "../lib/rates";
 import { buildEnvelope, fmtAmplitude, fmtSampleOffset, impulseFrame, rangeMinMax, type Envelope } from "../lib/impulsePlot";
@@ -35,6 +36,7 @@ import { cssVar } from "../theme";
 import { FilterControls, RateControls, type RateLive } from "./UpsamplingControls";
 import { FilterCompare } from "./FilterCompare";
 import { ZoomPlot, type BoxAxis, type DragMode, type PlotGeom } from "./ZoomPlot";
+import { PresetControl } from "../components/PresetMenu";
 
 function fmtNyquistKhz(hz: number): string {
   const k = hz / 1000;
@@ -253,6 +255,9 @@ export function UpsamplingView() {
   const effectiveDefaultRate = useApp((s) => s.status?.effective_default_rate ?? null);
   const statusRateRatio = useApp((s) => s.status?.rate_ratio ?? null);
   const statusOutputRate = useApp((s) => s.status?.output_rate ?? null);
+  const perRate = perRateNote(useApp((s) => s.status?.upsampler_rates));
+  const fallbackNow = useApp((s) => s.status?.upsampler_fallback_now ?? null);
+  const fallbackNowText = fallbackNowNote(fallbackNow);
   const deviceCaps = useApp((s) => s.status?.device_caps ?? null);
   const deviceRates = useMemo(() => (deviceCaps ? deviceCaps.rates.filter((c) => c.formats.length > 0).map((c) => c.rate) : null), [deviceCaps]);
   // What the engine can open the DAC at with the configured formats.
@@ -266,6 +271,7 @@ export function UpsamplingView() {
   // The engine's fallback after a DSP overload (the saved setting is kept).
   const overload = useApp((s) => s.status?.overload ?? null);
   const allowedRates = useApp((s) => s.config?.rate.allowed_rates);
+  const quantum = useApp((s) => s.config?.quantum);
   const rates = useMemo(() => previewRates(effectiveRates, allowedRates), [effectiveRates, allowedRates]);
   const heldRate = useRef<number | null>(null);
   const playingRate = viewSourceRate({ state: statusState, graphRate: rawGraphRate, effectiveDefaultRate, held: heldRate.current, rates });
@@ -412,7 +418,7 @@ export function UpsamplingView() {
         : statusRateRatio
           ? `the engine runs ${rateRatioText(statusRateRatio)} now`
           : "the engine has not reported what it runs yet";
-  const latMs = r ? upsamplingLatencyMs(measuredU ?? u, r.source_rate, r, r.plan ?? null) : null;
+  const latMs = r ? upsamplingLatencyMs(measuredU ?? u, r.source_rate, r, r.plan ?? null, quantum) : null;
   const tips = cutoffTips(sourceRate, r && r.source_rate === sourceRate ? r : null, u.design?.kind === "windowed_sinc" ? u.design.cutoff.mode : undefined);
   const knownSourceRate = chosenRate ?? (statusState === "playing" && rawGraphRate && rawGraphRate > 0 ? rawGraphRate : recentPlayingRate);
   const readoutSourceRate = knownSourceRate ?? playingRate;
@@ -451,6 +457,11 @@ export function UpsamplingView() {
         </button>
         <h1 id="ups-title">Upsampling</h1>
         <span className={"tag" + (off ? "" : " on")}>{off ? "Off" : "On"}</span>
+        {!off && fallbackNow?.fallback && (
+          <span className="tag mod" title={fallbackNowText ?? undefined}>
+            {fallbackNow.fallback.action === "recommended" ? "Recommended" : "Fallback"} at {fmtRateShort(fallbackNow.source_rate)}
+          </span>
+        )}
         <span className="preview-at">
           <span className="preview-label" id="ups-preview-label" title="The source rate the readouts and plots below are shown for. Only a view: it changes nothing in the engine.">
             Preview at
@@ -479,7 +490,14 @@ export function UpsamplingView() {
         )}
         <span className="spacer" />
         {u && <FilterCompare u={u} />}
+        <PresetControl part="upsampling" />
       </div>
+
+      {!off && fallbackNowText && !overload && (
+        <div className="notice warn ups-overload" role="status" title="The rate playing now plays a fallback; the other rates play your filter. Your settings are kept as they are.">
+          <span>{fallbackNowText}</span>
+        </div>
+      )}
 
       {overload && (
         <div
@@ -512,6 +530,12 @@ export function UpsamplingView() {
           <button type="button" className="btn small" onClick={() => setRetryTick((n) => n + 1)}>
             Retry
           </button>
+        </div>
+      )}
+
+      {perRate && !off && (
+        <div className="notice ups-device-note" role="status" title="The engine admits a filter that fits the source rate playing and builds a lighter one, before it opens, at the rates over the CPU budget (or where it overloaded). Back at a rate it fits, this filter runs again.">
+          <span>{perRate}</span>
         </div>
       )}
 
@@ -682,7 +706,7 @@ export function UpsamplingView() {
                   const i = Math.max(0, Math.min(n - 1, Math.round(x + r.impulse_peak)));
                   const off = i - r.impulse_peak;
                   const a = n > 0 ? r.impulse[i] : null;
-                  return { x: off, y: a, text: `${fmtSampleOffset(off)} samples   ${a === null ? "—" : fmtAmplitude(a, g.view.y1 - g.view.y0)}` };
+                  return { x: off, y: a, text: `${fmtSampleOffset(off)} samples   ${a === null ? "-" : fmtAmplitude(a, g.view.y1 - g.view.y0)}` };
                 }}
               />
               <ResizeHandle
@@ -710,19 +734,25 @@ export function UpsamplingView() {
             </div>
             <div className="fact" title="From here to the output Nyquist the response stays at or below the stopband attenuation">
               <div className="k">Stopband from</div>
-              <div className="v">{ratioOff ? "—" : `${fmtHzStat(r.stopband_start_hz, 1)} Hz`}</div>
+              <div className="v">{ratioOff ? "-" : `${fmtHzStat(r.stopband_start_hz, 1)} Hz`}</div>
             </div>
             <div className="fact" title="Worst level from the stopband start to the output Nyquist">
               <div className="k">Stopband atten.</div>
-              <div className="v">{ratioOff ? "—" : `${r.stopband_atten_db.toFixed(1)} dB`}</div>
+              <div className="v">{ratioOff ? "-" : `${r.stopband_atten_db.toFixed(1)} dB`}</div>
             </div>
             <div className="fact" title={`${liveShown ? "Measured" : savedShown ? "Saved setting" : "Target preview"}: ${fmtInt(r.latency_samples)} samples at ${fmtRate(r.output_rate)}`}>
               <div className="k">Latency</div>
-              <div className="v">{latMs === null ? "—" : fmtMs(latMs)}</div>
+              <div className="v">{latMs === null ? "-" : fmtMs(latMs)}</div>
             </div>
           </div>
 
           <p className="ups-caption">Measured by feeding a full-scale unit impulse through the engine&apos;s own upsampler filter.</p>
+          {r.design?.kind === "block_fft" && (
+            <p className="ups-caption">
+              Block FFT is not time-invariant: these curves are its response at one block position (an impulse at the start of a block), so they show how much it changes across a block, not
+              how a steady tone images. A steady tone&apos;s images come out far lower.
+            </p>
+          )}
         </>
       )}
       {err && isUnmeasuredRatio(err) && (

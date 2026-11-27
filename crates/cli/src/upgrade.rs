@@ -323,6 +323,19 @@ fn detect_installed(exe: &Path) -> Result<Option<Installed>> {
     Ok(None)
 }
 
+/// The AppImage's per-user install (`~/.local/lib/audivane-dsp/`, see
+/// packaging/appimage/), or the AppImage itself: updated by a new AppImage.
+fn from_appimage(exe: &Path) -> bool {
+    std::env::var_os("APPIMAGE").is_some_and(|a| !a.is_empty())
+        || exe
+            .parent()
+            .is_some_and(|d| d.ends_with(".local/lib/audivane-dsp"))
+}
+
+const APPIMAGE_HINT: &str = "this avdsp comes from the AppImage, which `avdsp upgrade` does not \
+     update: download the new AppImage from https://github.com/audivane/dsp/releases and open it \
+     (it updates the user install and restarts the engine)";
+
 // ---------------------------------------------------------------- releases
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -692,7 +705,9 @@ pub fn run(args: UpgradeArgs) -> Result<i32> {
     }
 
     if args.check {
-        if installed.is_none() {
+        if installed.is_none() && from_appimage(&exe) {
+            println!("note: {APPIMAGE_HINT}");
+        } else if installed.is_none() {
             println!(
                 "note: this avdsp ({}) is not from a package, so `avdsp upgrade` cannot update it",
                 exe.display()
@@ -703,6 +718,9 @@ pub fn run(args: UpgradeArgs) -> Result<i32> {
     let Some(action) = action else {
         return Ok(0);
     };
+    if installed.is_none() && from_appimage(&exe) {
+        bail!("{APPIMAGE_HINT}");
+    }
     let Some(installed) = installed else {
         bail!(
             "this avdsp ({}) was not installed from a package (a source build?), so \
@@ -822,8 +840,8 @@ pub fn run(args: UpgradeArgs) -> Result<i32> {
 
     if ui_running() {
         println!(
-            "The Audivane DSP app is open: click \"Restart\" in its update banner \
-             (or close and reopen it) to load the new version."
+            "The Audivane DSP app restarts itself into the new version in a few \
+             seconds (if it cannot, it offers a \"Restart\" in its window and tray)."
         );
     }
     Ok(code)
@@ -945,6 +963,18 @@ mod tests {
         assert_eq!(upstream_version("0.9.1"), "0.9.1");
         assert_eq!(upstream_version("0.10.0-rc.1-1"), "0.10.0-rc.1");
         assert_eq!(upstream_version("0.10.0-rc.1"), "0.10.0-rc.1");
+    }
+
+    #[test]
+    fn a_user_install_is_the_appimages() {
+        if std::env::var_os("APPIMAGE").is_some() {
+            return;
+        }
+        assert!(from_appimage(Path::new(
+            "/home/u/.local/lib/audivane-dsp/avdsp"
+        )));
+        assert!(!from_appimage(Path::new("/usr/bin/avdsp")));
+        assert!(!from_appimage(Path::new("/home/u/.cargo/bin/avdsp")));
     }
 
     #[test]

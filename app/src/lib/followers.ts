@@ -15,7 +15,17 @@ export const FOLLOWER_MIN_DB = -120;
 export const FOLLOWED_MAX_SPEED = 1.996;
 
 /** One editable follower field set (`set_follower`'s optional fields). */
-export type FollowerPatch = Partial<Pick<FollowerConfig, "enabled" | "trim_ms" | "volume_db">>;
+export type FollowerPatch = Partial<Pick<FollowerConfig, "enabled" | "trim_ms" | "volume_db" | "output_channels" | "follow_volume">>;
+
+/**
+ * Whether the follower follows the main volume (main volume changes move it
+ * too, on top of its own level); null when the engine predates
+ * `follow_volume` (its followers keep their own level, and the toggle is not
+ * offered).
+ */
+export function followsVolume(config: FollowerConfig): boolean | null {
+  return typeof config.follow_volume === "boolean" ? config.follow_volume : null;
+}
 
 /** Whether a configured device string names this list entry (the engine compares the strings). */
 function isDevice(d: DeviceInfo, id: string): boolean {
@@ -48,6 +58,12 @@ export function followerOn(device: string, followers: readonly FollowerConfig[])
 export interface FollowerRow {
   config: FollowerConfig;
   status: FollowerStatus | null;
+  /**
+   * The level its volume slider shows: a draft while one is pending, else
+   * the level it plays at (`level_db`: following, the main volume's changes
+   * move it), else its `volume_db`.
+   */
+  level: number;
 }
 
 export function followerRows(
@@ -55,10 +71,13 @@ export function followerRows(
   status: readonly FollowerStatus[] | undefined,
   drafts: Readonly<Record<string, FollowerPatch>> = {},
 ): FollowerRow[] {
-  return followers.map((f) => ({
-    config: { ...f, ...(drafts[f.device] ?? {}) },
-    status: status?.find((s) => s.device === f.device) ?? null,
-  }));
+  return followers.map((f) => {
+    const draft = drafts[f.device] ?? {};
+    const st = status?.find((s) => s.device === f.device) ?? null;
+    const config = { ...f, ...draft };
+    const playing = config.follow_volume && typeof st?.level_db === "number" && Number.isFinite(st.level_db) ? st.level_db : config.volume_db;
+    return { config, status: st, level: draft.volume_db ?? playing };
+  });
 }
 
 export type ChipTone = "ok" | "warn" | "bad" | "idle";
@@ -102,16 +121,62 @@ export function followerChip(s: FollowerStatus | null): FollowerChip {
   }
 }
 
-/** The short detail line under a follower: clock, offset, counters. Null before it plays. */
-export function followerDetail(s: FollowerStatus | null): string | null {
+/**
+ * A follower's time from the player to its DAC, ms, on the same basis as the
+ * main device's end-to-end latency (`status.latency_ms`): in sync it plays
+ * that much later than the main device as its delay plus `offset_ms`. Null
+ * while it is not in sync or the main latency is unknown.
+ */
+export function followerEndToEndMs(s: FollowerStatus | null, mainLatencyMs: number | null | undefined): number | null {
+  if (!s || !mainLatencyMs || mainLatencyMs <= 0) return null;
+  if (s.state !== "locked" && s.state !== "muted" && s.state !== "unaligned") return null;
+  return mainLatencyMs + s.trim_ms + s.offset_ms;
+}
+
+/** The tooltip of a follower's detail line: what its latency figure means, and its own path. */
+export function followerLatencyTitle(s: FollowerStatus | null, mainLatencyMs: number | null | undefined): string | undefined {
+  if (!s || followerEndToEndMs(s, mainLatencyMs) === null) return undefined;
+  const path = s.latency_ms > 0 ? ` Its own path, from where it picks the source up to its DAC: ${fmtMs(s.latency_ms, 1)} ms.` : "";
+  return `From the player to this DAC, the same measure as the main device's latency in the status bar (that plus this device's delay${s.offset_ms > 0 ? " and how late it is" : ""}).${path}`;
+}
+
+/** The short detail line under a follower: clock, offset, latency, counters. Null before it plays. */
+export function followerDetail(s: FollowerStatus | null, mainLatencyMs?: number | null): string | null {
   if (!s || s.state === "off" || s.state === "opening" || s.state === "lost") return s?.state === "lost" && s.error ? s.error : null;
   const parts = [`clock ${fmtPpm(s.ppm)} ppm`];
   if (s.offset_ms > 0) parts.push(`${fmtMs(s.offset_ms, 1)} ms late`);
-  if (s.latency_ms > 0) parts.push(`${fmtMs(s.latency_ms, 1)} ms path`);
+  const e2e = followerEndToEndMs(s, mainLatencyMs);
+  if (e2e !== null) parts.push(`${fmtMs(e2e, 1)} ms latency`);
   if (s.device_rate > 0) parts.push(`${(s.device_rate / 1000).toLocaleString("en-US", { maximumFractionDigits: 1 })} kHz`);
   parts.push(`${s.xruns} ${s.xruns === 1 ? "xrun" : "xruns"}`);
   if (s.skips > 0) parts.push(`${s.skips} ${s.skips === 1 ? "skip" : "skips"}`);
   return parts.join(" · ");
+}
+
+/** The chain fields a follower's own chain changes, in words. */
+const CHAIN_FIELD: Record<string, string> = {
+  convolution: "convolution",
+  eq: "EQ",
+  upsampler: "upsampler",
+  limiter: "limiter",
+  output: "output",
+  crossfeed: "crossfeed",
+  harmonics: "harmonics",
+  dc_block: "DC blocker",
+  pitch: "pitch",
+};
+
+/**
+ * "Own chain: convolution differs" when the follower plays its own chain
+ * (a `chain_patch` over chain A), null when it plays chain A. The status
+ * names what differs; before it reports, the patch's own fields stand in.
+ */
+export function ownChainLabel(config: FollowerConfig, s: FollowerStatus | null): string | null {
+  if (!config.chain_patch) return null;
+  const fields = s?.own_chain ?? Object.keys(config.chain_patch);
+  if (fields.length === 0) return "Own chain: same as the main chain";
+  const names = fields.map((f) => CHAIN_FIELD[f] ?? f.replace(/_/g, " "));
+  return `Own chain: ${names.join(", ")} ${names.length === 1 ? "differs" : "differ"}`;
 }
 
 function fmtMs(v: number, digits: number): string {

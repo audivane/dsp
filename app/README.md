@@ -32,7 +32,7 @@ imports), devices and volume validation. URL switches: `?engine=down` (engine-no
 screen; Start engine "starts" it), `?split` (L/R split EQ), `?apps`
 (Selected-apps routing), `?overlays=demo` (adds a built-in target next to the
 simulated room measurement the mock always has), `?digital` (a DAC without a
-hardware mixer: digital volume), `?device=V3` (a 48 kHz / S16-only USB speaker, so rates, formats, ratio and dither are capped), `?device=USB` (a hi-res DAC
+hardware mixer: digital volume), `?device=SPK` (a 48 kHz / S16-only USB speaker, so rates, formats, ratio and dither are capped), `?device=USB48` (a 48 kHz-only DAC, for the engine bypass resampler), `?device=IFACE` (an 8-channel interface, for the output pair), `?device=USB` (a hi-res DAC
 that also plays 1.4112 / 1.536 / 2.8224 / 3.072 MHz in S32, for ×32 and ×64), `?legacy_ratio` (an engine from before fractional rates: no
 `rate_ratio`, integer rate targets only), `?legacy_streams` (an engine
 without `set_stream_volume`: stream volumes disabled), `?followers=USB,SPK`
@@ -102,13 +102,15 @@ $R bash -lc "cd $W/app && CARGO_TARGET_DIR=$W/target/arch npx tauri build --no-b
 
 ## How it talks to the daemon
 
-- **Requests:** one socket connection shared by all calls, with ids and
+- Requests: one socket connection shared by all calls, with ids and
   pipelining (`client.rs`). The webview calls `daemon_call({method, params?})`;
   presence of `params` is kept (`set_eq` with `null` clears the EQ). Lost
   connections are reopened on the next call.
-- **Events:** a second connection sends `subscribe` for `meters, status,
-  streams, now_playing, config, presets`; a daemon that refuses the newer
-  topics gets the original four. It reconnects with backoff (0.25 → 3 s) and
+- Events: a second connection sends `subscribe` for `meters, status,
+  streams, now_playing, config, presets` and `devices`; a daemon that
+  refuses the newer topics gets the original four (`ALL_TOPICS` vs
+  `BASE_TOPICS` in `client.rs`). `spectrum` is subscribed separately when a
+  plot asks for it. It reconnects with backoff (0.25 → 3 s) and
   reports connecting / up / down. Events go to the webview over a
   `tauri::ipc::Channel`; the latest of each (except meters) is replayed when
   the webview reloads. Meters (30 Hz) are the one exception to "everything is
@@ -119,16 +121,16 @@ $R bash -lc "cd $W/app && CARGO_TARGET_DIR=$W/target/arch npx tauri build --no-b
   acknowledges each frame on its next animation frame (`meters_ack`); frames
   arriving meanwhile replace each other, so a suspended webview cannot build
   a backlog. Status, streams, config and preset events are never dropped.
-- **Socket path:** `$AUDIVANE_DSP_SOCKET`, else `$XDG_RUNTIME_DIR/audivane-dsp.sock`,
+- Socket path: `$AUDIVANE_DSP_SOCKET`, else `$XDG_RUNTIME_DIR/audivane-dsp.sock`,
   else `/tmp/audivane-dsp-<uid>.sock` (same order as the daemon).
-- **Start engine:** `StartUnit("audivane-dsp.service", "replace")` on the
+- Start engine: `StartUnit("audivane-dsp.service", "replace")` on the
   systemd user manager over the session bus (`zbus`).
-- **The daemon is the authority.** The UI renders what the daemon echoes: after
+- The daemon is the authority. The UI renders what the daemon echoes: after
   a change it re-reads `get_config` (and also follows `config` events). The only
   local copies are short-lived drafts that keep an EQ drag or a volume drag
   smooth; they are sent at most ~25 times a second and the final value always
   goes out on release.
-- **One change at a time.** Every change the UI makes goes through one queue
+- One change at a time. Every change the UI makes goes through one queue
   (`lib/queue.ts`) and runs only after the previous one has finished and its
   config has been re-read. A change is an intent (`config → config'`), applied
   when its turn comes to the config read with `get_config` right then, not to
@@ -139,23 +141,23 @@ $R bash -lc "cd $W/app && CARGO_TARGET_DIR=$W/target/arch npx tauri build --no-b
   `set_device`, `set_stream_volume`) are used wherever they exist; only the volume settings go
   through `set_config`. Live
   drags keep at most one send waiting, which always carries the newest value.
-- **Live check:** `examples/probe.rs --exercise IR1.wav IR2.wav` runs every
+- Live check: `examples/probe.rs --exercise IR1.wav IR2.wav` runs every
   call the UI makes against a running daemon (use a test daemon with its own
   `--socket`/`--config`) and checks replies and `config`/`presets` events.
-- **Older engines:** optional calls (`list_presets`, `list_devices`, `set_volume`,
+- Older engines: optional calls (`list_presets`, `list_devices`, `set_volume`,
   `right`/IR-chain support) degrade gracefully: missing support disables that
   control with a plain explanation instead of failing.
 
 ### Mappings worth knowing
 
-- **Effect stages** (DC block, pitch, crossfeed, harmonics, limiter) each
+- Effect stages (DC block, pitch, stereo image, harmonics, limiter) each
   have a sidebar tab and a view (`views/DcBlockView.tsx` …), and are edited
   with their targeted call through `AppStore.editStage`: a draft while a
   slider moves (~25 sends a second at most, the final value always goes
   out), the daemon's echo replaces it, and a refusal is shown next to the
   controls (`InlineError`). Their power buttons keep settings: `enabled:
-  false` for DC block, pitch, crossfeed and harmonics; the limiter's mode is
-  remembered locally like the upsampling ratio, and its Off mode goes
+  false` for DC block, pitch, the stereo image and harmonics; the limiter's
+  mode is remembered locally like the upsampling ratio, and its Off mode goes
   through the same path, so either control brings the mode back (auto
   headroom when none is remembered). When the daemon's clip count rises
   while the limiter is off, `clipNoLimiter` shows a warning with "Turn on
@@ -170,17 +172,50 @@ $R bash -lc "cd $W/app && CARGO_TARGET_DIR=$W/target/arch npx tauri build --no-b
   (`AppStore.setPitchPageEnabled`: a `set_pitch` and a `set_varispeed`, only
   for the ones that change). It shows on when either is on, in the view and
   the sidebar, and reaching 0 cents or 1× keeps it on ("On · no shift").
-  Varispeed runs even at 1×, so on is not bit-perfect. The
+  Varispeed runs even at 1×, so on is not bit-perfect. Its panel
+  (`views/VarispeedPanel.tsx`) takes a speed, a ramp and **Keep pitch**
+  (`keep_pitch`: tempo only, about 135 ms more delay and more CPU, up to
+  96 kHz; an older engine says so and leaves it off). The
   shared maths the views show (crossfeed level and response, THD, tilt
   target, dither guidance) is in `lib/effects.ts` and `lib/tilt.ts`.
-- **Tilt** is part of the EQ (`EqProfile.tilt`, `set_eq`): `lib/eqmath.ts`
+- Harmonics page (`views/HarmonicsView.tsx`, with `HarmonicsExplain`,
+  `HarmonicsLivePanel` and `HarmonicsSpectrumPlot`): a stage is a list of
+  layers (Chebyshev curve, flux, tape hysteresis) added in parallel or run
+  in series. The Layers panel offers the built-in systems on top
+  (`harmonics_systems`: whole stages; loading one asks before replacing the
+  layers), then each layer's preset (`harmonics_presets`), its parameters
+  and an explainer behind each control (`HarmonicsExplain`). Readouts come
+  from `harmonics_readout` (harmonics against level and frequency,
+  THD/GedLee, `under_load` with sag/bias), the
+  distortion spectrum from `harmonics_spectrum` (optionally each layer or,
+  in series, the chain after each layer), and the live analysis from
+  `harmonics_live`, polled at 4 Hz while the page is open: the music's
+  spectrum and the added content, the level change, the per-order split and
+  the history. "Follow music" (`lib/harmonicsFollow.ts`) takes a test
+  sine's level and frequency (the music's spectral centre) from the live
+  frames. A layer that differs from its
+  preset is marked, with a reset back to it; `lib/effects.ts` holds the
+  ranges and the series maths.
+- Room calibration (`views/ConvolutionView.tsx`): its own line above
+  the impulse-response list (label, devices, warnings) with Load
+  (`bundle_load`), Unload (`bundle_unload`) and a level per part
+  (`bundle_gain`, back to the bundle's with the reset); the daemon keeps the
+  tagged item and `store.convolution()` leaves it out of the editable
+  list.
+- Output channels (`components/OutputPairPicker.tsx`): the master's
+  channel pair on the Device page and each follower's in its card
+  (`set_device` / `set_follower` with `output_channels`).
+- Tone (`views/TonePanel.tsx`, in the EQ page): the bass and treble
+  knobs, part of `EqProfile.tone` (±6 dB), included in the auto preamp, the
+  EQ curve and undo like the tilt.
+- Tilt is part of the EQ (`EqProfile.tilt`, `set_eq`): `lib/eqmath.ts`
   adds its target response to every channel, so the curve and the auto
   preamp include it. Both are estimates from the ideal target, and the view
   says so (the engine's design is within 0.1 dB of it away from the
   corners, 0.16 dB inside them). The sliders are bounded by the current
   band (both the ±6 dB/oct and ±24 dB limits hold), and switching between
   slope and total keeps full precision.
-- **Volume settings** (mode, DAC level, ceiling, desktop slider, guard) use
+- Volume settings (mode, DAC level, ceiling, desktop slider, guard) use
   `get_config` + `set_config`, with the level, balance and mute left out of
   the payload (the top bar's guarded writes own them). Each box checks the
   engine's bounds (`lib/volumeSettings.ts`) and shows the reason beside it
@@ -188,7 +223,7 @@ $R bash -lc "cd $W/app && CARGO_TARGET_DIR=$W/target/arch npx tauri build --no-b
   update notice instead. "No rise limit (only the cap)" sends
   `max_rise_db_per_s: 0` and disables the rate box; turning it off restores
   the last non-zero rate (remembered locally, else 6 dB/s).
-- **Stream volumes** in Routing are dB sliders (0 dB = 100 %, down to
+- Stream volumes in Routing are dB sliders (0 dB = 100 %, down to
   −120 dB) with a mute button, one per stream, written with
   `set_stream_volume` (store `setStreamLevel`): an optimistic draft while
   dragging, throttled to ~25 sends a second per stream, the engine's answer
@@ -200,14 +235,17 @@ $R bash -lc "cd $W/app && CARGO_TARGET_DIR=$W/target/arch npx tauri build --no-b
   disabled, and an engine without the call (its streams carry no
   `volume_db`, or the call is an unknown method) disables the sliders with
   an "update the engine" tooltip.
-- **A/B quick compare** (`lib/abCompare.ts`, `views/AbView.tsx`). Each
+- A/B quick compare (`lib/abCompare.ts`, `views/AbView.tsx`). Each
   stage header has a `CompareButton` (`components/StageParts.tsx`) that
   builds side B as a merge patch on chain A, like `avdsp ctl ab stage`
   (the stage off when A runs it, on when A has it set up but off; EQ "on"
   uses the EQ remembered when it was switched off), and sends `set_ab`
   keeping the level and headroom settings. The same patch again is "Stop
   compare" (`set_ab null`). The Upsampling view's `FilterCompare` sends
-  `{"upsampler": {"preset", "design": null}}` like `ab filter`. The top
+  `{"upsampler": {"preset", "design": null}}` like `ab filter`. The Output
+  page's **Compare B** sends `output.bits`/`output.dither` as the patch
+  (`AppStore.compareOutput`): the engine's output compare, one quantizer per
+  side (a hard cut at the middle of the crossfade). The top
   bar names B and the backquote flips (`AppStore.abFlip`). The A/B view
   shows `status.ab`'s offset, gains, headroom and overs; latency is
   `status.filter_latency_ms` (the pair is aligned to the slower side). An
@@ -222,38 +260,56 @@ $R bash -lc "cd $W/app && CARGO_TARGET_DIR=$W/target/arch npx tauri build --no-b
   plain words. The mock simulates a run (about 8 s of music per second),
   a track change (`daemon.simulateTrackChange()`) and a silent side B
   (`?measure=silent`).
-- **Also play on** (Device page, `views/FollowersPanel.tsx`) lists the
+- Blind tests (`views/BlindTest.tsx`, `lib/abBlind.ts`): ABX, blind
+  A/B identification and preference runs on whatever plays through the
+  engine. The app owns the run (1 to 100 trials, feedback at the end or per
+  trial): it draws the hidden sides against a committed secret
+  (`lib/abx/commitment.ts`), switches with `ab_select`, scores with
+  `lib/abx/statistics.ts` (p-value, confidence interval, the trials needed)
+  and sets the engine's blind mask (`ab_blind`, not persisted) so no other
+  client shows the side. The run copies out as `audivane-blind-1` JSON
+  (answers, commitment and secret), to keep or check later.
+- Also play on (Device page, `views/FollowersPanel.tsx`) lists the
   multi-device followers (`config.outputs.followers`, up to 3) with their
   `status.outputs` state as a chip (opening, locking, in sync, muted, N ms
   late, lost) and a detail line (clock ppm, lateness, path latency, rate,
-  xruns, skips). Add, remove, enable, delay (trim) and volume each send one
+  xruns, skips). Add, remove, enable, delay (trim), volume, **Follow main
+  volume** (`follow_volume`) and the follower's output pair each send one
   `set_follower` (store `addFollower` / `removeFollower` /
   `editFollower`, drafts and throttling like the stages); a refusal shows
-  under that follower, or under the add row. Choosing a follower's device
+  under that follower, or under the add row. A follower playing its own
+  chain says which fields (`own_chain`). Choosing a follower's device
   as the main device sends nothing: the Device page says why and offers
   "Remove it and switch" (`moveDeviceToFollower`). The candidate list and
   the wording live in `lib/followers.ts`. An engine without `outputs` in
   its config shows an update note.
 
-- **Bypass** = `set_dsp_enabled { enabled: false }`. With DSP off the engine
+- Bypass = `set_dsp_enabled { enabled: false }`. With DSP off the engine
   sends every stream through its bit-exact path (no EQ, convolution,
   upsampling or dither) and keeps all stage settings; routing is not touched.
   This is the simplest faithful mapping: moving streams to the Direct sink as
   well would change routing the user chose.
-- **Stage power buttons:** the protocol has no "EQ off" or "upsampling off"
+- Stage power buttons: the protocol has no "EQ off" or "upsampling off"
   flag that keeps settings. EQ off sends `set_eq(null)` and upsampling off sets
   the target to `off`; the previous EQ / ratio is remembered in the UI's local
   storage and restored when the stage is turned on. Convolution off turns
   every IR's `enabled` off and remembers which ones were on.
-- **Auto preamp** (default on) writes `preamp_db` = dsp-core's automatic
+- Auto preamp (default on) writes `preamp_db` = dsp-core's automatic
   preamp for the current bands with every EQ edit. Click "auto" to set it by hand.
-- **Undo/redo** covers EQ edits (one step per drag or wheel gesture). Loading
+- Undo/redo covers EQ edits (one step per drag or wheel gesture). Loading
   a preset clears it.
-- **Import** in the EQ header replaces the EQ with a ParametricEQ.txt (parsed
+- Import in the EQ header replaces the EQ with a ParametricEQ.txt (parsed
   in TS). The preset menu's Import sends it to the daemon as a new preset
   (`import_apo`) and loads it. An imported preset is EQ only, so loading it
   can turn convolution and upsampling off; the toast says so. Copy as ParametricEQ.txt writes `Channel: L/R`
   sections for a split EQ.
+- Presets per page (`components/PresetMenu.tsx`, `lib/presetParts.ts`):
+  every page's header carries its own menu (`PresetControl part`), which
+  saves and loads that page's part only (`PresetPart`: `eq`, `convolution`,
+  `stereo`, `harmonics`, `upsampling`, `output`; the output-side pages share
+  one). "New (blank)" is `blank_preset`; a global preset saved with every
+  part ticked holds them all. The active name and its `modified` flag come
+  from `status.preset` / `status.part_presets`.
 
 ## EQ graph overlays
 
@@ -297,7 +353,7 @@ plus the **predicted** measurement + current EQ in a stronger stroke.
 
 ## Upsampling view
 
-- **Rate:** Off, Multiply (common ratios up to ×32 and ×64, plus any whole
+- Rate: Off, Multiply (common ratios up to ×32 and ×64, plus any whole
   ×1…×64), Highest (common caps up to 1.5M and 3M, plus any 44.1…3072 kHz;
   the same rate family, or "Best for DAC" = `max_rate_any`) or Fixed rate
   (`{rate}`, fractional or downsampling). The ×32 / ×64 and 1.5M / 3M
@@ -313,16 +369,16 @@ plus the **predicted** measurement + current EQ in a stronger stroke.
   requires; the taps field also takes `2^20`, `64k` and `1M` (k = 1024). A rate a running
   custom design does not fit is not sent: the view asks `check_design`
   with that target first and shows the engine's reasons instead.
-- **Older engines:** a status without `rate_ratio` (before fractional
+- Older engines: a status without `rate_ratio` (before fractional
   rates) is read as an integer ratio at the transport boundary
   (`api/legacy.ts`), and `caps.rationalRates` turns Fixed rate and Best for
   DAC off with an update note.
-- **Recommended** (`lib/upsamplerRecommended.ts`) is the first card in
+- Recommended (`lib/upsamplerRecommended.ts`) is the first card in
   Preset: one `set_upsampler` with `target {max_rate: 768000}`, `preset:
   "recommended"`. It replaces the kept custom design. The
   card and the sidebar ("Recommended · …") follow the config when it runs
   that name on that target; a custom copy of it is a custom design.
-- **Preset / Custom:** Preset sets `UpsamplerConfig.preset`; Custom runs
+- Preset / Custom: Preset sets `UpsamplerConfig.preset`; Custom runs
   the last custom design again (the store remembers it), or, with none,
   plays a copy of the running preset as "Edit as custom" does. Preset
   returns to the last preset. `lib/filterPresets.ts` splits
@@ -339,14 +395,14 @@ plus the **predicted** measurement + current EQ in a stronger stroke.
   One that fails the check or that the engine refuses (a long design at a
   fractional rate) becomes a draft (`upsDraft`, "Not applied", Discard
   changes) and what played before, a preset too, keeps playing.
-- **Edit as custom** (on the preset detail line and under the Recommended
+- Edit as custom (on the preset detail line and under the Recommended
   card) asks `resolve_design` for the preset's exact `FilterDesign`
   (`based_on` set) and plays it as the custom design (the same sound). The
   Custom view then reads "Same as X" (with "Use
   the preset", which runs the name) or "Modified from X" (with "Revert to
   preset"), comparing the design with the expansion by value
   (`lib/filterDesign.ts::sameDesign`).
-- **Custom** (`views/CustomDesign.tsx`, logic in `lib/filterDesign.ts`)
+- Custom (`views/CustomDesign.tsx`, logic in `lib/filterDesign.ts`)
   edits a `FilterDesign`: Start from (Recommended, Music, Low latency, any
   preset), the type (windowed sinc, Lanczos, cascade, interpolator, block
   FFT), then for a windowed sinc the window and its parameter (Kaiser β or
@@ -368,11 +424,11 @@ plus the **predicted** measurement + current EQ in a stronger stroke.
   and CPU per allowed source rate, with the latency of a linear design. An
   edit that passes the check is sent at once; one that does not stays a
   draft ("Not applied", Discard changes) and is not sent. The plots measure
-  what runs (`upsampler_response`), as before.
+  what runs (`upsampler_response`).
   The upsampler has no headroom of its own: the fixed cut
   (`output.headroom_db`) is on the Limiter view, with a slider and a
   number field; it works with the limiter off too.
-- **CPU limits:** a design this computer cannot run in real time is
+- CPU limits: a design this computer cannot run in real time is
   refused by the engine ("Too heavy for this CPU at 768 kHz: ..."), shown
   under the controls like any refusal. When the engine falls back after an
   overload (`Status.overload`: upsampler off, the last setting that ran,
@@ -382,11 +438,11 @@ plus the **predicted** measurement + current EQ in a stronger stroke.
   saved ones, and the plots are labelled "Saved setting" (not "Playing
   now"). The mock models both
   (`lib/cpuBudget.ts`, `MockDaemon.simulateOverload`).
-- **Unavailable options** stay in the tab order (`aria-disabled`), name
+- Unavailable options stay in the tab order (`aria-disabled`), name
   their reason through `aria-describedby` and show it in a bubble while
   focused (`components/Why.tsx`), in segmented controls, family cards,
   checkboxes and the Start-from buttons.
-- **What the plots show:** at the rate playing now they measure what the
+- What the plots show: at the rate playing now they measure what the
   engine runs (the target rewritten to the landing in status, so a capped
   ratio shows as it plays) and say "Playing now"; at another preview rate,
   or with the engine stopped, they are labelled "Target preview".
@@ -449,11 +505,14 @@ protocol over D-Bus, `src-tauri/src/tray.rs` with `ksni`), not an
 appindicator icon, so it gets left clicks, the wheel and, on Wayland, the
 click's activation token.
 
-- **Left click** opens the volume popup, or the menu as before (Device →
-  Tray and volume keys → Tray icon click). **Right click** always opens the
-  menu: Show window, Volume…, the passthrough line, Bypass (= DSP off),
+- Left click opens the volume popup, or the menu when Device → Tray and
+  volume keys → Tray icon click is set to Menu. **Right click** always opens
+  the menu: Show window, Volume…, the passthrough line, Bypass (= DSP off),
   Listen to A / B, Preset submenu, Routing (System-wide / Selected apps),
-  Quit. **Middle click** shows the window. **The wheel** over the icon
+  Quit. A blind test replaces the two side items with a disabled "A/B:
+  blind"; a binary replaced by an upgrade whose relaunch failed puts
+  "Restart to finish the update" on top (the tooltip says so too), and the
+  app keeps the old code until it is restarted. **Middle click** shows the window. **The wheel** over the icon
   steps the volume like the volume keys: deltas add up and each full notch
   (120 units) is one step, so a touchpad's small deltas do not each count
   as a step. Hosts disagree on the sign (Plasma: positive is wheel-up;
@@ -465,8 +524,8 @@ click's activation token.
   service and keeps running either way. A second launch shows the window
   (single instance). The main window's size and position are remembered
   (window-state plugin).
-- **Nothing runs for a window nobody sees.** Every webview is a WebKit web
-  process of its own (the main one about 300 MB with meters running), and
+- Nothing runs for a window nobody sees. Every webview is a WebKit web
+  process of its own (the main one about 160 MB with meters running), and
   WebKit keeps a destroyed view's process unless told otherwise. So
   closing to the tray destroys the main window and ends its web process
   (`webkit_web_view_terminate_web_process`), drops the daemon's `meters`
@@ -495,7 +554,7 @@ click's activation token.
   (`Exec=<the app> --hidden`, where the app is the AppImage file itself
   when it runs from one, never the binary in its temporary mount); nothing
   outside the home folder.
-- **Is there a tray?** The app follows the StatusNotifier watcher
+- Is there a tray? The app follows the StatusNotifier watcher
   (`sni_watch.rs`: its owner and `IsStatusNotifierHostRegistered`), not
   just its own item. Close-to-tray is on only while a host is registered
   and our item is up; when the watcher or the host goes away (a panel
@@ -504,10 +563,10 @@ click's activation token.
   waiting for a late watcher and registers when one appears. Started with
   `--hidden` and no tray after about 3 s, the window is shown. A second
   launch shows the window, and opens it again if it was closed.
-- **XEmbed-only panels** (the old system tray protocol, without
-  StatusNotifier support) show no icon: the app no longer links
-  libayatana-appindicator, which used to fall back to XEmbed. There the
-  window simply closes and quits like on a desktop without a tray.
+- XEmbed-only panels (the old system tray protocol, without
+  StatusNotifier support) show no icon: the app links no appindicator
+  library, so there is no XEmbed fallback. There the window closes and quits
+  like on a desktop without a tray.
 - The tray item, the watch on the tray host, the portal session and
   Plasma's OSD all talk D-Bus on their own threads with about 2 s bounds;
   startup and quit never wait on D-Bus on the UI thread. Without a session
@@ -522,7 +581,7 @@ Three webviews load the same frontend and pick their view by window label
 window; meters and spectrum go to the main window only), and each is a
 WebKit web process of its own, made only while needed (see above).
 
-- **Popup** (`views/TrayPopup.tsx`, 320×184, undecorated, always on top):
+- Popup (`views/TrayPopup.tsx`, 320×184, undecorated, always on top):
   the level in dB (double-click to type), a slider with the top bar's taper
   and keys, mute, HW/DIG, the passthrough badge, what is playing, the
   ceiling, and Open Audivane DSP. It runs a *secondary* `AppStore` (no
@@ -531,7 +590,7 @@ WebKit web process of its own, made only while needed (see above).
   ceiling and the guard apply as there. Escape, a click elsewhere (focus
   loss) or another click on the icon closes it. On X11 it opens next to
   the icon (`placement.rs`); Wayland compositors place it themselves.
-- **Volume keys** (off by default): volume up, down and mute as global
+- Volume keys (off by default): volume up, down and mute as global
   shortcuts through the GlobalShortcuts portal (`shortcuts.rs`; KDE asks to
   confirm and lists the keys it assigned), else on X11 by grabbing the keys
   (Tauri's global-shortcut plugin). Without either, or when the user says
@@ -555,7 +614,7 @@ WebKit web process of its own, made only while needed (see above).
   digital level; a replaced engine (`STALE_INSTANCE`) drops the press.
   `cargo run -p audivane-dsp-ui --example shortcuts_probe` tries the portal
   without the GUI.
-- **On-screen display** (~1.2 s): after a volume key or the tray wheel
+- On-screen display (~1.2 s): after a volume key or the tray wheel
   (default), after any level change (the desktop, the CLI, a guard step;
   not while an Audivane window has the focus), or never. On KDE Plasma it
   is Plasma's own OSD (`org.kde.plasmashell` `/org/kde/osdService`,
@@ -575,6 +634,7 @@ WebKit web process of its own, made only while needed (see above).
 
 ## Fonts
 
-Renamed IBM Plex Sans and Mono Latin subsets (`woff2`) are bundled in
-`src/assets/fonts` under the SIL Open Font License 1.1 (`OFL.txt`; see
+A Latin subset of Geist (interface text) and renamed IBM Plex Mono Latin
+subsets (numbers and values) are bundled as `woff2` in `src/assets/fonts`
+under the SIL Open Font License 1.1 (`OFL-Geist.txt`, `OFL-IBM-Plex.txt`; see
 [font licensing](../docs/font-licensing.md)). Nothing is loaded from the network.

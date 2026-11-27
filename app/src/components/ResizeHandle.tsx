@@ -16,11 +16,14 @@ export interface ResizeHandleProps {
   onReset: () => void;
   /** Measure the plot container height at drag/keyboard start when value is null. */
   measure?: () => number;
+  /** "y" (default): drag up/down to set a height. "x": drag left/right to set
+   *  a width (a column split); Arrow Left/Right step it. */
+  axis?: "x" | "y";
 }
 
 interface DragState {
   pointerId: number;
-  startY: number;
+  start: number;
   startHeight: number;
   latestHeight: number;
   moved: boolean;
@@ -38,7 +41,9 @@ export function ResizeHandle({
   onStep,
   onReset,
   measure,
+  axis = "y",
 }: ResizeHandleProps) {
+  const pos = (e: { clientX: number; clientY: number }) => (axis === "x" ? e.clientX : e.clientY);
   const dragRef = useRef<DragState | null>(null);
   const rafRef = useRef<number>(0);
   const [dragging, setDragging] = useState(false);
@@ -64,7 +69,7 @@ export function ResizeHandle({
     const startHeight = value ?? callbacksRef.current.measure?.() ?? measured ?? min;
     dragRef.current = {
       pointerId: e.pointerId,
-      startY: e.clientY,
+      start: pos(e),
       startHeight,
       latestHeight: clampPlotHeight(startHeight, min, max),
       moved: false,
@@ -76,7 +81,7 @@ export function ResizeHandle({
   const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     const d = dragRef.current;
     if (!d || d.pointerId !== e.pointerId) return;
-    const dy = e.clientY - d.startY;
+    const dy = pos(e) - d.start;
     if (dy !== 0) d.moved = true;
     d.latestHeight = clampPlotHeight(d.startHeight + dy, min, max);
     if (!rafRef.current) {
@@ -112,10 +117,12 @@ export function ResizeHandle({
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     const step = e.shiftKey ? 100 : 20;
-    if (e.key === "ArrowDown") {
+    const grow = axis === "x" ? "ArrowRight" : "ArrowDown";
+    const shrink = axis === "x" ? "ArrowLeft" : "ArrowUp";
+    if (e.key === grow) {
       e.preventDefault();
       callbacksRef.current.onStep(step, callbacksRef.current.measure?.() ?? measured);
-    } else if (e.key === "ArrowUp") {
+    } else if (e.key === shrink) {
       e.preventDefault();
       callbacksRef.current.onStep(-step, callbacksRef.current.measure?.() ?? measured);
     }
@@ -123,15 +130,15 @@ export function ResizeHandle({
 
   return (
     <div
-      className={"resize-handle" + (dragging ? " dragging" : "") + (className ? ` ${className}` : "")}
+      className={"resize-handle" + (axis === "x" ? " x" : "") + (dragging ? " dragging" : "") + (className ? ` ${className}` : "")}
       role="separator"
-      aria-orientation="horizontal"
+      aria-orientation={axis === "x" ? "vertical" : "horizontal"}
       aria-label={label}
       aria-valuemin={min}
       aria-valuemax={max}
       aria-valuenow={currentForAria}
       tabIndex={0}
-      title="Drag to resize height · double-click to reset · Arrow keys adjust"
+      title={`Drag to resize ${axis === "x" ? "width" : "height"} · double-click to reset · Arrow keys adjust`}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={finishDrag}

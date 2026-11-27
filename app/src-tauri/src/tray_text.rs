@@ -1,6 +1,6 @@
 //! Short plain-word lines for the tray menu (mirrors app/src/lib/passthrough.ts).
 
-use audivane_protocol::ipc::{PassthroughBreak, Status};
+use audivane_protocol::ipc::{OverloadAction, PassthroughBreak, Status};
 
 pub fn passthrough_line(status: &Status) -> String {
     let p = &status.passthrough;
@@ -15,7 +15,10 @@ pub fn passthrough_line(status: &Status) -> String {
         )
     });
     if chosen {
-        return format!("DSP active · {rate}");
+        return match fallback_now(status) {
+            Some(what) => format!("DSP active · {rate} · plays {what}"),
+            None => format!("DSP active · {rate}"),
+        };
     }
     let only_idle = p
         .broken_because
@@ -25,6 +28,17 @@ pub fn passthrough_line(status: &Status) -> String {
         return "Nothing playing".to_string();
     }
     format!("Not bit-perfect · {rate}")
+}
+
+/// What the rate playing now plays in place of the chosen filter
+/// (`status.upsampler_fallback_now`), in a word or two.
+fn fallback_now(status: &Status) -> Option<&'static str> {
+    let f = status.upsampler_fallback_now.as_ref()?.fallback.as_ref()?;
+    Some(match f.action {
+        OverloadAction::Recommended => "Recommended",
+        OverloadAction::Reverted => "the last filter that ran",
+        _ => "a lighter filter",
+    })
 }
 
 fn format_rate(r: u32) -> String {
@@ -64,6 +78,17 @@ mod tests {
         assert_eq!(
             passthrough_line(&status(vec![PassthroughBreak::NotPlaying])),
             "Nothing playing"
+        );
+        let mut s = status(vec![PassthroughBreak::DspActive]);
+        s.upsampler_fallback_now = serde_json::from_value(serde_json::json!({
+            "source_rate": 44100, "output_rate": 352800, "load": 0.1,
+            "fallback": {"action": "recommended", "cause": "design", "load": 0.1,
+                         "reason": "too short here"},
+        }))
+        .unwrap();
+        assert_eq!(
+            passthrough_line(&s),
+            "DSP active · 44.1 kHz · plays Recommended"
         );
     }
 }

@@ -11,11 +11,19 @@
 //! is read as all, with a warning. Unknown directives (Device:,
 //! Include: …) are skipped with a warning.
 //!
+//! The tone knobs (`EqProfile::tone`) export as two shelves at the end of
+//! the linked filters; a file whose linked filters end with exactly those
+//! shelves (same type, corner and Q, a 0.5 dB step within ±6 dB) imports
+//! them back as the tone.
+//!
 //! Beyond the documented subset, `BW <octaves>` and `S <slope>` are accepted
 //! in place of `Q`, because Equalizer APO itself writes those.  They are
 //! converted to the equivalent Q at import time; export always writes Q.
 
-use audivane_protocol::{Band, ChannelEq, EqProfile, FilterType};
+use audivane_protocol::{
+    Band, ChannelEq, EqProfile, FilterType, TONE_BASS_HZ, TONE_BASS_Q, TONE_MAX_DB, TONE_TREBLE_HZ,
+    TONE_TREBLE_Q, ToneConfig,
+};
 use std::fmt::Write as _;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,6 +121,7 @@ pub fn parse(text: &str) -> Result<Parsed, ParseError> {
     let [(preamp_db, bands), left, right] = sides;
     profile.preamp_db = preamp_db;
     profile.bands = bands;
+    profile.tone = take_tone(&mut profile.bands);
     let side = |(preamp_db, bands): (f64, Vec<Band>)| ChannelEq {
         enabled: true,
         preamp_db,
@@ -123,6 +132,37 @@ pub fn parse(text: &str) -> Result<Parsed, ParseError> {
         profile.right = Some(side(right));
     }
     Ok(Parsed { profile, warnings })
+}
+
+/// Whether `band` is the tone shelf of `kind` (corner and Q exact, gain a
+/// non-zero 0.5 dB step within the knob's range).
+fn is_tone_shelf(band: &Band, kind: FilterType, hz: f64, q: f64) -> bool {
+    band.enabled
+        && band.kind == kind
+        && band.freq_hz == hz
+        && band.q == q
+        && band.gain_db != 0.0
+        && band.gain_db.abs() <= TONE_MAX_DB
+        && (band.gain_db * 2.0).fract() == 0.0
+}
+
+/// Pull the tone shelves (bass then treble, either one alone) off the end of
+/// the linked filters, as [`to_apo_string`] writes them.
+fn take_tone(bands: &mut Vec<Band>) -> Option<ToneConfig> {
+    let mut tone = ToneConfig::default();
+    if let Some(b) = bands.last()
+        && is_tone_shelf(b, FilterType::HighShelf, TONE_TREBLE_HZ, TONE_TREBLE_Q)
+    {
+        tone.treble_db = b.gain_db;
+        bands.pop();
+    }
+    if let Some(b) = bands.last()
+        && is_tone_shelf(b, FilterType::LowShelf, TONE_BASS_HZ, TONE_BASS_Q)
+    {
+        tone.bass_db = b.gain_db;
+        bands.pop();
+    }
+    tone.is_active().then_some(tone)
 }
 
 fn parse_preamp(rest: &str, line: usize) -> Result<f64, ParseError> {
@@ -282,7 +322,12 @@ pub fn to_apo_string(profile: &EqProfile) -> String {
     let mut out = String::new();
     // Writing to a String cannot fail.
     let _ = writeln!(out, "Preamp: {} dB", profile.preamp_db);
-    write_bands(&mut out, &profile.bands);
+    write_bands(&mut out, &profile.bands, 1);
+    let tone = profile.tone_bands();
+    if !tone.is_empty() {
+        let _ = writeln!(out, "# Tone (bass and treble knobs)");
+        write_bands(&mut out, &tone, profile.bands.len() + 1);
+    }
     let mut per_channel = false;
     for (name, c) in [("L", &profile.left), ("R", &profile.right)] {
         let Some(c) = c else { continue };
@@ -294,7 +339,7 @@ pub fn to_apo_string(profile: &EqProfile) -> String {
         if c.preamp_db != 0.0 {
             let _ = writeln!(out, "Preamp: {} dB", c.preamp_db);
         }
-        write_bands(&mut out, &c.bands);
+        write_bands(&mut out, &c.bands, 1);
     }
     if per_channel {
         let _ = writeln!(out, "Channel: all");
@@ -302,12 +347,12 @@ pub fn to_apo_string(profile: &EqProfile) -> String {
     out
 }
 
-fn write_bands(out: &mut String, bands: &[Band]) {
+fn write_bands(out: &mut String, bands: &[Band], first: usize) {
     for (i, band) in bands.iter().enumerate() {
         let _ = write!(
             out,
             "Filter {}: {} {} Fc {} Hz",
-            i + 1,
+            i + first,
             if band.enabled { "ON" } else { "OFF" },
             type_name(band.kind),
             band.freq_hz
@@ -374,6 +419,33 @@ Channel: all
         assert_eq!(p.left.as_ref().unwrap().preamp_db, -1.0);
         assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
         assert_eq!(parse(&to_apo_string(p)).unwrap().profile, *p);
+    }
+
+    #[test]
+    fn tone_exports_as_two_shelves_and_imports_back() {
+        let mut p = parse(AUTOEQ).unwrap().profile;
+        p.tone = Some(ToneConfig {
+            bass_db: 3.5,
+            treble_db: -2.0,
+        });
+        let text = to_apo_string(&p);
+        assert!(
+            text.contains("Filter 8: ON LS Fc 140 Hz Gain 3.5 dB Q 0.48"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Filter 9: ON HS Fc 4900 Hz Gain -2 dB Q 0.49"),
+            "{text}"
+        );
+        assert_eq!(parse(&text).unwrap().profile, p);
+        // Treble alone; and a shelf that only looks close stays a band.
+        p.tone = Some(ToneConfig {
+            bass_db: 0.0,
+            treble_db: 6.0,
+        });
+        assert_eq!(parse(&to_apo_string(&p)).unwrap().profile, p);
+        let near = parse("Filter 1: ON LSC Fc 140 Hz Gain 3.3 dB Q 0.48\n").unwrap();
+        assert_eq!((near.profile.tone, near.profile.bands.len()), (None, 1));
     }
 
     #[test]

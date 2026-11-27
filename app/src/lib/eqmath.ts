@@ -5,6 +5,7 @@
 
 import type { Band, EqProfile, FilterType } from "../api/types";
 import { effectiveEndHz, tiltSections, tiltStageDb, tiltStageOn } from "./tilt";
+import { toneBands } from "./tone";
 
 export interface Coeffs {
   b0: number;
@@ -125,6 +126,8 @@ function channelLayers(eq: EqProfile, ch: number): { sectionPreampDb: number; ba
     sectionPreampDb = extra.preamp_db;
     bands.push(...extra.bands);
   }
+  // The tone knobs' shelves run last on every channel (as dsp-core).
+  bands.push(...toneBands(eq.tone));
   return { sectionPreampDb, bands, tilt: eq };
 }
 
@@ -260,4 +263,29 @@ export function profilePeakGainDb(eq: EqProfile, fs: number): number {
     if (r[i] > maxDb) maxDb = r[i];
   }
   return maxDb;
+}
+
+/**
+ * Where a new band goes when nobody picked a frequency: the geometric middle
+ * of the widest gap (in octaves) between the existing bands, with 20 Hz and
+ * 20 kHz as the outer edges, so new bands don't pile up on one spot. 1 kHz
+ * when there are no bands.
+ */
+export function freeBandFreq(bands: readonly Band[], lo = 20, hi = 20000): number {
+  const fs = bands
+    .map((b) => b.freq_hz)
+    .filter((f) => Number.isFinite(f) && f > 0)
+    .map((f) => Math.min(hi, Math.max(lo, f)));
+  if (fs.length === 0) return 1000;
+  const edges = [lo, ...fs.sort((a, b) => a - b), hi];
+  let best = 0;
+  let at = 1000;
+  for (let i = 1; i < edges.length; i++) {
+    const width = Math.log2(edges[i] / edges[i - 1]);
+    if (width > best + 1e-9) {
+      best = width;
+      at = Math.sqrt(edges[i] * edges[i - 1]);
+    }
+  }
+  return at < 100 ? Math.round(at * 10) / 10 : Math.round(at);
 }

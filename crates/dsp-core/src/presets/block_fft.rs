@@ -20,23 +20,16 @@
 //!   the previous block's third quarter and this block's second quarter.
 //!
 //! B is 16 384 (`block_fft_large`: 2^20 / R, so the output transform is
-//! always 2^20 points). Power-of-two ratios only. The history starts as
-//! zeros and the block grid starts at the first input sample.
+//! always 2^20 points). Power-of-two ratios only. The response is not
+//! time-invariant: it depends on where a sample falls on the block grid.
 //!
-//! The result is not time-invariant: the response depends on where a sample
-//! falls on the block grid.
+//! Input and output FIFOs make every `process` call emit exactly `n_in *
+//! ratio` frames. A completed block is computed during the next hop (one
+//! extra hop of output latency), in steps: a call of `n_in` frames runs at
+//! most `ceil(T * n_in / hop)` of the block's T steps.
 //!
-//! # Real-time shape
-//!
-//! Input and output FIFOs make every `process` call emit exactly
-//! `n_in * ratio` frames. A completed block is computed during the next hop
-//! (one extra hop of output latency), in small steps: a call of `n_in`
-//! frames runs at most `ceil(T * n_in / hop)` of the block's T steps, so
-//! small calls (an engine period of a few hundred frames) carry a small
-//! slice and a call of a whole hop or more runs that many whole blocks.
-//!
-//! The long inverse transform is split by output phase. With L = min(B,
-//! 2^15) and Q = R·B / L, output sample `m = Q n + q` is
+//! The long inverse transform is split by output phase, with L = min(B,
+//! 2^15) and Q = R·B / L: output sample `m = Q n + q` is
 //!
 //! `y[Q n + q] = (1/B) (X_0 + 2 Re sum_b V_q[b] e^{2 pi i b n / L})`,
 //! `V_q[b] = sum_{k = b mod L, 1 <= k <= B/2} X_k e^{2 pi i k q / (R B)}`,
@@ -112,6 +105,7 @@ pub fn build(
 
 /// `e^{2 pi i j / N}` from a quarter-period table (exact symmetry for the
 /// other quadrants). `N` is a power of two, at least 4.
+#[derive(Clone)]
 struct Twiddles {
     quarter: Vec<Complex64>,
     mask: usize,
@@ -148,6 +142,7 @@ impl Twiddles {
 }
 
 /// Per-channel stream state.
+#[derive(Clone)]
 struct Channel {
     /// Input ring of 2B samples. The block being filled starts `fill`
     /// samples before the write position; the block in flight is the B
@@ -167,6 +162,7 @@ struct Channel {
 }
 
 /// The block FFT interpolator (see the module docs).
+#[derive(Clone)]
 pub struct BlockFft {
     ratio: usize,
     b: usize,
@@ -579,6 +575,26 @@ impl UpsamplerRuntime for BlockFft {
 
     fn scale_output(&mut self, gain: f64) {
         self.scale = gain * self.ratio as f64 / (self.ratio * self.b) as f64;
+    }
+
+    // Every channel runs the same steps on its own data; only the pacing of
+    // a block in flight is shared, so a split waits for none to be.
+    fn split_channels(&mut self) -> Option<Vec<Box<dyn UpsamplerRuntime>>> {
+        if self.job {
+            return None;
+        }
+        let chans = std::mem::take(&mut self.chans);
+        Some(
+            chans
+                .into_iter()
+                .map(|ch| {
+                    Box::new(BlockFft {
+                        chans: vec![ch],
+                        ..self.clone()
+                    }) as Box<dyn UpsamplerRuntime>
+                })
+                .collect(),
+        )
     }
 
     fn impulse_span_out_frames(&self) -> usize {

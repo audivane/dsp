@@ -5,6 +5,6 @@
  */
 export type PresetState = { name: string, 
 /**
- * Chain A differs from the saved preset's chain.
+ * Chain A differs from the saved preset on a part it holds.
  */
 modified: boolean, };

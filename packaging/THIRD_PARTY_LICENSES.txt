@@ -3,8 +3,9 @@ Audivane DSP: third-party software notices
 Audivane DSP is licensed under the GNU Affero General Public License v3.0 only.
 Its binaries (audivane-dsp, avdsp, audivane-dsp-ui) include the third-party
 software listed below, each under its own license. The fonts and target-curve
-data bundled in the app have their own notices: OFL-IBM-Plex.txt,
-font-licensing.md and the targets SOURCES.md files installed beside this file.
+data bundled in the app have their own notices: OFL-Geist.txt,
+OFL-IBM-Plex.txt, font-licensing.md and the targets SOURCES.md files installed
+beside this file.
 
 The source code of every package is available from crates.io or npmjs.com at
 the version listed, and from the repository shown; this includes the Source
@@ -17,635 +18,635 @@ app/package-lock.json. 315 packages, 191 distinct license texts.
 PACKAGES
 ==============================================================================
 
-c++    signalsmith-linear vendored  —  MIT
+c++    signalsmith-linear vendored  |  MIT
        https://github.com/Signalsmith-Audio/linear
-c++    signalsmith-stretch 1.3.1  —  MIT
+c++    signalsmith-stretch 1.3.1  |  MIT
        https://github.com/Signalsmith-Audio/signalsmith-stretch
-crate  adler2 2.0.1  —  0BSD OR MIT OR Apache-2.0
+crate  adler2 2.0.1  |  0BSD OR MIT OR Apache-2.0
        https://github.com/oyvindln/adler2
-crate  aho-corasick 1.1.5  —  Unlicense OR MIT
+crate  aho-corasick 1.1.5  |  Unlicense OR MIT
        https://github.com/BurntSushi/aho-corasick
-crate  alloc-no-stdlib 3.0.0  —  BSD-3-Clause
+crate  alloc-no-stdlib 3.0.0  |  BSD-3-Clause
        https://github.com/dropbox/rust-alloc-no-stdlib
-crate  alloc-stdlib 0.3.0  —  BSD-3-Clause
+crate  alloc-stdlib 0.3.0  |  BSD-3-Clause
        https://github.com/dropbox/rust-alloc-no-stdlib
-crate  alsa 0.12.1  —  Apache-2.0/MIT
+crate  alsa 0.12.1  |  Apache-2.0/MIT
        https://github.com/diwic/alsa-rs
-crate  alsa-sys 0.6.1  —  MIT
+crate  alsa-sys 0.6.1  |  MIT
        https://github.com/diwic/alsa-sys
-crate  anstream 1.0.0  —  MIT OR Apache-2.0
+crate  anstream 1.0.0  |  MIT OR Apache-2.0
        https://github.com/rust-cli/anstyle.git
-crate  anstyle 1.0.14  —  MIT OR Apache-2.0
+crate  anstyle 1.0.14  |  MIT OR Apache-2.0
        https://github.com/rust-cli/anstyle.git
-crate  anstyle-parse 1.0.0  —  MIT OR Apache-2.0
+crate  anstyle-parse 1.0.0  |  MIT OR Apache-2.0
        https://github.com/rust-cli/anstyle.git
-crate  anstyle-query 1.1.5  —  MIT OR Apache-2.0
+crate  anstyle-query 1.1.5  |  MIT OR Apache-2.0
        https://github.com/rust-cli/anstyle.git
-crate  anyhow 1.0.104  —  MIT OR Apache-2.0
+crate  anyhow 1.0.104  |  MIT OR Apache-2.0
        https://github.com/dtolnay/anyhow
-crate  arboard 3.7.0  —  MIT OR Apache-2.0
+crate  arboard 3.7.0  |  MIT OR Apache-2.0
        https://github.com/1Password/arboard
-crate  arc-swap 1.9.5  —  MIT OR Apache-2.0
+crate  arc-swap 1.9.5  |  MIT OR Apache-2.0
        https://github.com/vorner/arc-swap
-crate  async-broadcast 0.7.2  —  MIT OR Apache-2.0
+crate  async-broadcast 0.7.2  |  MIT OR Apache-2.0
        https://github.com/smol-rs/async-broadcast
-crate  async-channel 2.5.0  —  Apache-2.0 OR MIT
+crate  async-channel 2.5.0  |  Apache-2.0 OR MIT
        https://github.com/smol-rs/async-channel
-crate  async-executor 1.14.1  —  Apache-2.0 OR MIT
+crate  async-executor 1.14.1  |  Apache-2.0 OR MIT
        https://github.com/smol-rs/async-executor
-crate  async-io 2.6.0  —  Apache-2.0 OR MIT
+crate  async-io 2.6.0  |  Apache-2.0 OR MIT
        https://github.com/smol-rs/async-io
-crate  async-lock 3.5.0  —  Apache-2.0 OR MIT
+crate  async-lock 3.5.0  |  Apache-2.0 OR MIT
        https://github.com/smol-rs/async-lock
-crate  async-process 2.5.0  —  Apache-2.0 OR MIT
+crate  async-process 2.5.0  |  Apache-2.0 OR MIT
        https://github.com/smol-rs/async-process
-crate  async-signal 0.2.14  —  Apache-2.0 OR MIT
+crate  async-signal 0.2.14  |  Apache-2.0 OR MIT
        https://github.com/smol-rs/async-signal
-crate  async-task 4.7.1  —  Apache-2.0 OR MIT
+crate  async-task 4.7.1  |  Apache-2.0 OR MIT
        https://github.com/smol-rs/async-task
-crate  atk 0.18.2  —  MIT
+crate  atk 0.18.2  |  MIT
        https://github.com/gtk-rs/gtk3-rs
-crate  atk-sys 0.18.2  —  MIT
+crate  atk-sys 0.18.2  |  MIT
        https://github.com/gtk-rs/gtk3-rs
-crate  atomic-waker 1.1.2  —  Apache-2.0 OR MIT
+crate  atomic-waker 1.1.2  |  Apache-2.0 OR MIT
        https://github.com/smol-rs/atomic-waker
-crate  base64 0.23.1  —  MIT OR Apache-2.0
+crate  base64 0.23.1  |  MIT OR Apache-2.0
        https://github.com/marshallpierce/rust-base64
-crate  bit-set 0.8.0  —  Apache-2.0 OR MIT
+crate  bit-set 0.8.0  |  Apache-2.0 OR MIT
        https://github.com/contain-rs/bit-set
-crate  bit-vec 0.8.0  —  Apache-2.0 OR MIT
+crate  bit-vec 0.8.0  |  Apache-2.0 OR MIT
        https://github.com/contain-rs/bit-vec
-crate  bitflags 1.3.2  —  MIT/Apache-2.0
+crate  bitflags 1.3.2  |  MIT/Apache-2.0
        https://github.com/bitflags/bitflags
-crate  bitflags 2.13.2  —  MIT OR Apache-2.0
+crate  bitflags 2.13.2  |  MIT OR Apache-2.0
        https://github.com/bitflags/bitflags
-crate  block-buffer 0.10.4  —  MIT OR Apache-2.0
+crate  block-buffer 0.10.4  |  MIT OR Apache-2.0
        https://github.com/RustCrypto/utils
-crate  blocking 1.7.0  —  Apache-2.0 OR MIT
+crate  blocking 1.7.0  |  Apache-2.0 OR MIT
        https://github.com/smol-rs/blocking
-crate  brotli 9.1.1  —  BSD-3-Clause AND MIT
+crate  brotli 9.1.1  |  BSD-3-Clause AND MIT
        https://github.com/dropbox/rust-brotli
-crate  brotli-decompressor 6.3.1  —  BSD-3-Clause/MIT
+crate  brotli-decompressor 6.3.1  |  BSD-3-Clause/MIT
        https://github.com/dropbox/rust-brotli-decompressor
-crate  bytemuck 1.25.2  —  Zlib OR Apache-2.0 OR MIT
+crate  bytemuck 1.25.2  |  Zlib OR Apache-2.0 OR MIT
        https://github.com/Lokathor/bytemuck
-crate  byteorder-lite 0.1.0  —  Unlicense OR MIT
+crate  byteorder-lite 0.1.0  |  Unlicense OR MIT
        https://github.com/image-rs/byteorder-lite
-crate  bytes 1.12.1  —  MIT
+crate  bytes 1.12.1  |  MIT
        https://github.com/tokio-rs/bytes
-crate  cairo-rs 0.18.5  —  MIT
+crate  cairo-rs 0.18.5  |  MIT
        https://github.com/gtk-rs/gtk-rs-core
-crate  cairo-sys-rs 0.18.2  —  MIT
+crate  cairo-sys-rs 0.18.2  |  MIT
        https://github.com/gtk-rs/gtk-rs-core
-crate  camino 1.2.6  —  MIT OR Apache-2.0
+crate  camino 1.2.6  |  MIT OR Apache-2.0
        https://github.com/camino-rs/camino
-crate  cargo_metadata 0.19.2  —  MIT
+crate  cargo_metadata 0.19.2  |  MIT
        https://github.com/oli-obk/cargo_metadata
-crate  cargo-platform 0.1.9  —  MIT OR Apache-2.0
+crate  cargo-platform 0.1.9  |  MIT OR Apache-2.0
        https://github.com/rust-lang/cargo
-crate  cfb 0.14.0  —  MIT
+crate  cfb 0.14.0  |  MIT
        https://github.com/mdsteele/rust-cfb
-crate  cfg-if 1.0.5  —  MIT OR Apache-2.0
+crate  cfg-if 1.0.5  |  MIT OR Apache-2.0
        https://github.com/rust-lang/cfg-if
-crate  clap 4.6.7  —  MIT OR Apache-2.0
+crate  clap 4.6.7  |  MIT OR Apache-2.0
        https://github.com/clap-rs/clap
-crate  clap_builder 4.6.7  —  MIT OR Apache-2.0
+crate  clap_builder 4.6.7  |  MIT OR Apache-2.0
        https://github.com/clap-rs/clap
-crate  clap_lex 1.1.1  —  MIT OR Apache-2.0
+crate  clap_lex 1.1.1  |  MIT OR Apache-2.0
        https://github.com/clap-rs/clap
-crate  colorchoice 1.0.5  —  MIT OR Apache-2.0
+crate  colorchoice 1.0.5  |  MIT OR Apache-2.0
        https://github.com/rust-cli/anstyle.git
-crate  concurrent-queue 2.5.0  —  Apache-2.0 OR MIT
+crate  concurrent-queue 2.5.0  |  Apache-2.0 OR MIT
        https://github.com/smol-rs/concurrent-queue
-crate  cookie 0.18.2  —  MIT OR Apache-2.0
+crate  cookie 0.18.2  |  MIT OR Apache-2.0
        https://github.com/SergioBenitez/cookie-rs
-crate  cookie-factory 0.3.3  —  MIT
+crate  cookie-factory 0.3.3  |  MIT
        https://github.com/rust-bakery/cookie-factory
-crate  cpufeatures 0.2.17  —  MIT OR Apache-2.0
+crate  cpufeatures 0.2.17  |  MIT OR Apache-2.0
        https://github.com/RustCrypto/utils
-crate  crc32fast 1.5.5  —  MIT OR Apache-2.0
+crate  crc32fast 1.5.5  |  MIT OR Apache-2.0
        https://github.com/srijs/rust-crc32fast
-crate  crossbeam-channel 0.5.17  —  MIT OR Apache-2.0
+crate  crossbeam-channel 0.5.17  |  MIT OR Apache-2.0
        https://github.com/crossbeam-rs/crossbeam
-crate  crossbeam-queue 0.3.14  —  MIT OR Apache-2.0
+crate  crossbeam-queue 0.3.14  |  MIT OR Apache-2.0
        https://github.com/crossbeam-rs/crossbeam
-crate  crossbeam-utils 0.8.23  —  MIT OR Apache-2.0
+crate  crossbeam-utils 0.8.23  |  MIT OR Apache-2.0
        https://github.com/crossbeam-rs/crossbeam
-crate  crypto-common 0.1.7  —  MIT OR Apache-2.0
+crate  crypto-common 0.1.7  |  MIT OR Apache-2.0
        https://github.com/RustCrypto/traits
-crate  cssparser 0.37.0  —  MPL-2.0
+crate  cssparser 0.37.0  |  MPL-2.0
        https://github.com/servo/rust-cssparser
-crate  ctor 1.0.13  —  Apache-2.0 OR MIT
+crate  ctor 1.0.13  |  Apache-2.0 OR MIT
        https://github.com/mmastrac/linktime
-crate  dbus 0.9.12  —  Apache-2.0/MIT
+crate  dbus 0.9.12  |  Apache-2.0/MIT
        https://github.com/diwic/dbus-rs
-crate  deranged 0.5.9  —  MIT OR Apache-2.0
+crate  deranged 0.5.9  |  MIT OR Apache-2.0
        https://github.com/jhpratt/deranged
-crate  derive_more 2.1.1  —  MIT
+crate  derive_more 2.1.1  |  MIT
        https://github.com/JelteF/derive_more
-crate  digest 0.10.7  —  MIT OR Apache-2.0
+crate  digest 0.10.7  |  MIT OR Apache-2.0
        https://github.com/RustCrypto/traits
-crate  dirs 7.0.0  —  MIT OR Apache-2.0
+crate  dirs 7.0.0  |  MIT OR Apache-2.0
        https://codeberg.org/dirs/dirs-rs
-crate  dirs-sys 0.5.0  —  MIT OR Apache-2.0
+crate  dirs-sys 0.5.0  |  MIT OR Apache-2.0
        https://github.com/dirs-dev/dirs-sys-rs
-crate  dlopen2 0.8.2  —  MIT
+crate  dlopen2 0.8.2  |  MIT
        https://github.com/OpenByteDev/dlopen2
-crate  dom_query 0.28.0  —  MIT
+crate  dom_query 0.28.0  |  MIT
        https://github.com/niklak/dom_query
-crate  downcast-rs 1.2.1  —  MIT/Apache-2.0
+crate  downcast-rs 1.2.1  |  MIT/Apache-2.0
        https://github.com/marcianx/downcast-rs
-crate  dpi 0.1.2  —  Apache-2.0 AND MIT
+crate  dpi 0.1.2  |  Apache-2.0 AND MIT
        https://github.com/rust-windowing/winit
-crate  dtoa 1.0.11  —  MIT OR Apache-2.0
+crate  dtoa 1.0.11  |  MIT OR Apache-2.0
        https://github.com/dtolnay/dtoa
-crate  dtoa-short 0.3.5  —  MPL-2.0
+crate  dtoa-short 0.3.5  |  MPL-2.0
        https://github.com/upsuper/dtoa-short
-crate  dunce 1.0.5  —  CC0-1.0 OR MIT-0 OR Apache-2.0
+crate  dunce 1.0.5  |  CC0-1.0 OR MIT-0 OR Apache-2.0
        https://gitlab.com/kornelski/dunce
-crate  dyn-clone 1.0.20  —  MIT OR Apache-2.0
+crate  dyn-clone 1.0.20  |  MIT OR Apache-2.0
        https://github.com/dtolnay/dyn-clone
-crate  endi 1.1.1  —  MIT
+crate  endi 1.1.1  |  MIT
        https://github.com/zeenix/endi
-crate  enumflags2 0.7.12  —  MIT OR Apache-2.0
+crate  enumflags2 0.7.12  |  MIT OR Apache-2.0
        https://github.com/meithecatte/enumflags2
-crate  env_filter 2.0.0  —  MIT OR Apache-2.0
+crate  env_filter 2.0.0  |  MIT OR Apache-2.0
        https://github.com/rust-cli/env_logger
-crate  env_logger 0.11.11  —  MIT OR Apache-2.0
+crate  env_logger 0.11.11  |  MIT OR Apache-2.0
        https://github.com/rust-cli/env_logger
-crate  equivalent 1.0.3  —  Apache-2.0 OR MIT
+crate  equivalent 1.0.3  |  Apache-2.0 OR MIT
        https://github.com/indexmap-rs/equivalent
-crate  erased-serde 0.4.11  —  MIT OR Apache-2.0
+crate  erased-serde 0.4.11  |  MIT OR Apache-2.0
        https://github.com/dtolnay/erased-serde
-crate  errno 0.3.15  —  MIT OR Apache-2.0
+crate  errno 0.3.15  |  MIT OR Apache-2.0
        https://github.com/lambda-fairy/rust-errno
-crate  event-listener 5.4.2  —  Apache-2.0 OR MIT
+crate  event-listener 5.4.2  |  Apache-2.0 OR MIT
        https://github.com/smol-rs/event-listener
-crate  event-listener-strategy 0.5.4  —  Apache-2.0 OR MIT
+crate  event-listener-strategy 0.5.4  |  Apache-2.0 OR MIT
        https://github.com/smol-rs/event-listener-strategy
-crate  fastrand 2.5.0  —  Apache-2.0 OR MIT
+crate  fastrand 2.5.0  |  Apache-2.0 OR MIT
        https://github.com/smol-rs/fastrand
-crate  fdeflate 0.3.7  —  MIT OR Apache-2.0
+crate  fdeflate 0.3.7  |  MIT OR Apache-2.0
        https://github.com/image-rs/fdeflate
-crate  field-offset 0.3.6  —  MIT OR Apache-2.0
+crate  field-offset 0.3.6  |  MIT OR Apache-2.0
        https://github.com/Diggsey/rust-field-offset
-crate  fixedbitset 0.5.9  —  MIT OR Apache-2.0
+crate  fixedbitset 0.5.9  |  MIT OR Apache-2.0
        https://github.com/petgraph/fixedbitset
-crate  flate2 1.1.11  —  MIT OR Apache-2.0
+crate  flate2 1.1.11  |  MIT OR Apache-2.0
        https://github.com/rust-lang/flate2-rs
-crate  fnv 1.0.7  —  Apache-2.0 / MIT
+crate  fnv 1.0.7  |  Apache-2.0 / MIT
        https://github.com/servo/rust-fnv
-crate  foldhash 0.1.5  —  Zlib
+crate  foldhash 0.1.5  |  Zlib
        https://github.com/orlp/foldhash
-crate  foldhash 0.2.0  —  Zlib
+crate  foldhash 0.2.0  |  Zlib
        https://github.com/orlp/foldhash
-crate  form_urlencoded 1.2.2  —  MIT OR Apache-2.0
+crate  form_urlencoded 1.2.2  |  MIT OR Apache-2.0
        https://github.com/servo/rust-url
-crate  futures-channel 0.3.34  —  MIT OR Apache-2.0
+crate  futures-channel 0.3.34  |  MIT OR Apache-2.0
        https://github.com/rust-lang/futures-rs
-crate  futures-core 0.3.34  —  MIT OR Apache-2.0
+crate  futures-core 0.3.34  |  MIT OR Apache-2.0
        https://github.com/rust-lang/futures-rs
-crate  futures-executor 0.3.34  —  MIT OR Apache-2.0
+crate  futures-executor 0.3.34  |  MIT OR Apache-2.0
        https://github.com/rust-lang/futures-rs
-crate  futures-io 0.3.34  —  MIT OR Apache-2.0
+crate  futures-io 0.3.34  |  MIT OR Apache-2.0
        https://github.com/rust-lang/futures-rs
-crate  futures-lite 2.6.1  —  Apache-2.0 OR MIT
+crate  futures-lite 2.6.1  |  Apache-2.0 OR MIT
        https://github.com/smol-rs/futures-lite
-crate  futures-task 0.3.34  —  MIT OR Apache-2.0
+crate  futures-task 0.3.34  |  MIT OR Apache-2.0
        https://github.com/rust-lang/futures-rs
-crate  futures-util 0.3.34  —  MIT OR Apache-2.0
+crate  futures-util 0.3.34  |  MIT OR Apache-2.0
        https://github.com/rust-lang/futures-rs
-crate  gdk 0.18.2  —  MIT
+crate  gdk 0.18.2  |  MIT
        https://github.com/gtk-rs/gtk3-rs
-crate  gdk-pixbuf 0.18.5  —  MIT
+crate  gdk-pixbuf 0.18.5  |  MIT
        https://github.com/gtk-rs/gtk-rs-core
-crate  gdk-pixbuf-sys 0.18.0  —  MIT
+crate  gdk-pixbuf-sys 0.18.0  |  MIT
        https://github.com/gtk-rs/gtk-rs-core
-crate  gdk-sys 0.18.2  —  MIT
+crate  gdk-sys 0.18.2  |  MIT
        https://github.com/gtk-rs/gtk3-rs
-crate  gdkwayland-sys 0.18.2  —  MIT
+crate  gdkwayland-sys 0.18.2  |  MIT
        https://github.com/gtk-rs/gtk3-rs
-crate  gdkx11 0.18.2  —  MIT
+crate  gdkx11 0.18.2  |  MIT
        https://github.com/gtk-rs/gtk3-rs
-crate  gdkx11-sys 0.18.2  —  MIT
+crate  gdkx11-sys 0.18.2  |  MIT
        https://github.com/gtk-rs/gtk3-rs
-crate  generic-array 0.14.7  —  MIT
+crate  generic-array 0.14.7  |  MIT
        https://github.com/fizyk20/generic-array.git
-crate  gethostname 1.1.0  —  Apache-2.0
+crate  gethostname 1.1.0  |  Apache-2.0
        https://codeberg.org/swsnr/gethostname.rs.git
-crate  getrandom 0.3.4  —  MIT OR Apache-2.0
+crate  getrandom 0.3.4  |  MIT OR Apache-2.0
        https://github.com/rust-random/getrandom
-crate  getrandom 0.4.3  —  MIT OR Apache-2.0
+crate  getrandom 0.4.3  |  MIT OR Apache-2.0
        https://github.com/rust-random/getrandom
-crate  gio 0.18.4  —  MIT
+crate  gio 0.18.4  |  MIT
        https://github.com/gtk-rs/gtk-rs-core
-crate  gio-sys 0.18.1  —  MIT
+crate  gio-sys 0.18.1  |  MIT
        https://github.com/gtk-rs/gtk-rs-core
-crate  glib 0.18.5  —  MIT
+crate  glib 0.18.5  |  MIT
        https://github.com/gtk-rs/gtk-rs-core
-crate  glib-sys 0.18.1  —  MIT
+crate  glib-sys 0.18.1  |  MIT
        https://github.com/gtk-rs/gtk-rs-core
-crate  glob 0.3.4  —  MIT OR Apache-2.0
+crate  glob 0.3.4  |  MIT OR Apache-2.0
        https://github.com/rust-lang/glob
-crate  global-hotkey 0.8.0  —  Apache-2.0 OR MIT
+crate  global-hotkey 0.8.0  |  Apache-2.0 OR MIT
        https://github.com/tauri-apps/global-hotkey
-crate  gobject-sys 0.18.0  —  MIT
+crate  gobject-sys 0.18.0  |  MIT
        https://github.com/gtk-rs/gtk-rs-core
-crate  gtk 0.18.2  —  MIT
+crate  gtk 0.18.2  |  MIT
        https://github.com/gtk-rs/gtk3-rs
-crate  gtk-sys 0.18.2  —  MIT
+crate  gtk-sys 0.18.2  |  MIT
        https://github.com/gtk-rs/gtk3-rs
-crate  hashbrown 0.12.3  —  MIT OR Apache-2.0
+crate  hashbrown 0.12.3  |  MIT OR Apache-2.0
        https://github.com/rust-lang/hashbrown
-crate  hashbrown 0.15.5  —  MIT OR Apache-2.0
+crate  hashbrown 0.15.5  |  MIT OR Apache-2.0
        https://github.com/rust-lang/hashbrown
-crate  hashbrown 0.17.1  —  MIT OR Apache-2.0
+crate  hashbrown 0.17.1  |  MIT OR Apache-2.0
        https://github.com/rust-lang/hashbrown
-crate  heck 0.5.0  —  MIT OR Apache-2.0
+crate  heck 0.5.0  |  MIT OR Apache-2.0
        https://github.com/withoutboats/heck
-crate  hex 0.4.3  —  MIT OR Apache-2.0
+crate  hex 0.4.3  |  MIT OR Apache-2.0
        https://github.com/KokaKiwi/rust-hex
-crate  hound 3.5.1  —  Apache-2.0
+crate  hound 3.5.1  |  Apache-2.0
        https://github.com/ruuda/hound
-crate  html5ever 0.39.0  —  MIT OR Apache-2.0
+crate  html5ever 0.39.0  |  MIT OR Apache-2.0
        https://github.com/servo/html5ever
-crate  http 1.5.0  —  MIT OR Apache-2.0
+crate  http 1.5.0  |  MIT OR Apache-2.0
        https://github.com/hyperium/http
-crate  icu_collections 2.4.0  —  Unicode-3.0
+crate  icu_collections 2.4.0  |  Unicode-3.0
        https://github.com/unicode-org/icu4x
-crate  icu_locale_core 2.4.0  —  Unicode-3.0
+crate  icu_locale_core 2.4.0  |  Unicode-3.0
        https://github.com/unicode-org/icu4x
-crate  icu_normalizer 2.4.0  —  Unicode-3.0
+crate  icu_normalizer 2.4.0  |  Unicode-3.0
        https://github.com/unicode-org/icu4x
-crate  icu_normalizer_data 2.4.0  —  Unicode-3.0
+crate  icu_normalizer_data 2.4.0  |  Unicode-3.0
        https://github.com/unicode-org/icu4x
-crate  icu_properties 2.4.0  —  Unicode-3.0
+crate  icu_properties 2.4.0  |  Unicode-3.0
        https://github.com/unicode-org/icu4x
-crate  icu_properties_data 2.4.0  —  Unicode-3.0
+crate  icu_properties_data 2.4.0  |  Unicode-3.0
        https://github.com/unicode-org/icu4x
-crate  icu_provider 2.4.0  —  Unicode-3.0
+crate  icu_provider 2.4.0  |  Unicode-3.0
        https://github.com/unicode-org/icu4x
-crate  idna 1.1.0  —  MIT OR Apache-2.0
+crate  idna 1.1.0  |  MIT OR Apache-2.0
        https://github.com/servo/rust-url/
-crate  idna_adapter 1.2.2  —  Apache-2.0 OR MIT
+crate  idna_adapter 1.2.2  |  Apache-2.0 OR MIT
        https://github.com/hsivonen/idna_adapter
-crate  image 0.25.10  —  MIT OR Apache-2.0
+crate  image 0.25.10  |  MIT OR Apache-2.0
        https://github.com/image-rs/image
-crate  indexmap 1.9.3  —  Apache-2.0 OR MIT
+crate  indexmap 1.9.3  |  Apache-2.0 OR MIT
        https://github.com/bluss/indexmap
-crate  indexmap 2.14.2  —  Apache-2.0 OR MIT
+crate  indexmap 2.14.2  |  Apache-2.0 OR MIT
        https://github.com/indexmap-rs/indexmap
-crate  infer 0.22.0  —  MIT
+crate  infer 0.22.0  |  MIT
        https://github.com/bojand/infer
-crate  is_terminal_polyfill 1.70.2  —  MIT OR Apache-2.0
+crate  is_terminal_polyfill 1.70.2  |  MIT OR Apache-2.0
        https://github.com/polyfill-rs/is_terminal_polyfill
-crate  itoa 1.0.19  —  MIT OR Apache-2.0
+crate  itoa 1.0.19  |  MIT OR Apache-2.0
        https://github.com/dtolnay/itoa
-crate  javascriptcore-rs 1.1.2  —  MIT
+crate  javascriptcore-rs 1.1.2  |  MIT
        https://github.com/tauri-apps/javascriptcore-rs
-crate  javascriptcore-rs-sys 1.1.1  —  MIT
+crate  javascriptcore-rs-sys 1.1.1  |  MIT
        https://github.com/tauri-apps/javascriptcore-rs
-crate  jiff 0.2.43  —  Unlicense OR MIT
+crate  jiff 0.2.43  |  Unlicense OR MIT
        https://github.com/BurntSushi/jiff
-crate  jiff-core 0.1.5  —  Unlicense OR MIT
+crate  jiff-core 0.1.5  |  Unlicense OR MIT
        https://github.com/BurntSushi/jiff
-crate  json-patch 4.2.0  —  MIT/Apache-2.0
+crate  json-patch 4.2.0  |  MIT/Apache-2.0
        https://github.com/idubrov/json-patch
-crate  jsonptr 0.7.1  —  MIT OR Apache-2.0
+crate  jsonptr 0.7.1  |  MIT OR Apache-2.0
        https://github.com/chanced/jsonptr
-crate  keyboard-types 0.7.0  —  MIT OR Apache-2.0
+crate  keyboard-types 0.7.0  |  MIT OR Apache-2.0
        https://github.com/pyfisch/keyboard-types
-crate  keyboard-types 0.8.3  —  MIT OR Apache-2.0
+crate  keyboard-types 0.8.3  |  MIT OR Apache-2.0
        https://github.com/rust-windowing/keyboard-types
-crate  ksni 0.3.7  —  Unlicense
+crate  ksni 0.3.7  |  Unlicense
        https://github.com/iovxw/ksni
-crate  libc 0.2.191  —  MIT OR Apache-2.0
+crate  libc 0.2.191  |  MIT OR Apache-2.0
        https://github.com/rust-lang/libc
-crate  libdbus-sys 0.2.7  —  Apache-2.0/MIT
+crate  libdbus-sys 0.2.7  |  Apache-2.0/MIT
        https://github.com/diwic/dbus-rs
-crate  libspa 0.10.1  —  MIT
+crate  libspa 0.10.1  |  MIT
        https://gitlab.freedesktop.org/pipewire/pipewire-rs
-crate  libspa-sys 0.10.1  —  MIT
+crate  libspa-sys 0.10.1  |  MIT
        https://gitlab.freedesktop.org/pipewire/pipewire-rs
-crate  linux-raw-sys 0.12.1  —  Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+crate  linux-raw-sys 0.12.1  |  Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
        https://github.com/sunfishcode/linux-raw-sys
-crate  litemap 0.8.3  —  Unicode-3.0
+crate  litemap 0.8.3  |  Unicode-3.0
        https://github.com/unicode-org/icu4x
-crate  lock_api 0.4.14  —  MIT OR Apache-2.0
+crate  lock_api 0.4.14  |  MIT OR Apache-2.0
        https://github.com/Amanieu/parking_lot
-crate  log 0.4.35  —  MIT OR Apache-2.0
+crate  log 0.4.35  |  MIT OR Apache-2.0
        https://github.com/rust-lang/log
-crate  markup5ever 0.39.0  —  MIT OR Apache-2.0
+crate  markup5ever 0.39.0  |  MIT OR Apache-2.0
        https://github.com/servo/html5ever
-crate  memchr 2.8.3  —  Unlicense OR MIT
+crate  memchr 2.8.3  |  Unlicense OR MIT
        https://github.com/BurntSushi/memchr
-crate  memoffset 0.9.1  —  MIT
+crate  memoffset 0.9.1  |  MIT
        https://github.com/Gilnaa/memoffset
-crate  mime 0.3.18  —  MIT OR Apache-2.0
+crate  mime 0.3.18  |  MIT OR Apache-2.0
        https://github.com/hyperium/mime
-crate  miniz_oxide 0.8.9  —  MIT OR Zlib OR Apache-2.0
+crate  miniz_oxide 0.8.9  |  MIT OR Zlib OR Apache-2.0
        https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide
-crate  miniz_oxide 0.9.1  —  MIT OR Zlib OR Apache-2.0
+crate  miniz_oxide 0.9.1  |  MIT OR Zlib OR Apache-2.0
        https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide
-crate  mio 1.2.4  —  MIT
+crate  mio 1.2.4  |  MIT
        https://github.com/tokio-rs/mio
-crate  moxcms 0.8.1  —  BSD-3-Clause OR Apache-2.0
+crate  moxcms 0.8.1  |  BSD-3-Clause OR Apache-2.0
        https://github.com/awxkee/moxcms.git
-crate  muda 0.20.0  —  Apache-2.0 OR MIT
+crate  muda 0.20.0  |  Apache-2.0 OR MIT
        https://github.com/tauri-apps/muda
-crate  new_debug_unreachable 1.0.6  —  MIT
+crate  new_debug_unreachable 1.0.6  |  MIT
        https://github.com/mbrubeck/rust-debug-unreachable
-crate  nom 8.0.0  —  MIT
+crate  nom 8.0.0  |  MIT
        https://github.com/rust-bakery/nom
-crate  num-complex 0.4.6  —  MIT OR Apache-2.0
+crate  num-complex 0.4.6  |  MIT OR Apache-2.0
        https://github.com/rust-num/num-complex
-crate  num-conv 0.2.2  —  MIT OR Apache-2.0
+crate  num-conv 0.2.2  |  MIT OR Apache-2.0
        https://github.com/jhpratt/num-conv
-crate  num-integer 0.1.47  —  MIT OR Apache-2.0
+crate  num-integer 0.1.47  |  MIT OR Apache-2.0
        https://github.com/rust-num/num-integer
-crate  num-traits 0.2.19  —  MIT OR Apache-2.0
+crate  num-traits 0.2.19  |  MIT OR Apache-2.0
        https://github.com/rust-num/num-traits
-crate  once_cell 1.21.4  —  MIT OR Apache-2.0
+crate  once_cell 1.21.4  |  MIT OR Apache-2.0
        https://github.com/matklad/once_cell
-crate  option-ext 0.2.0  —  MPL-2.0
+crate  option-ext 0.2.0  |  MPL-2.0
        https://github.com/soc/option-ext.git
-crate  ordered-stream 0.2.0  —  MIT OR Apache-2.0
+crate  ordered-stream 0.2.0  |  MIT OR Apache-2.0
        https://github.com/danieldg/ordered-stream
-crate  os_pipe 1.2.3  —  MIT
+crate  os_pipe 1.2.3  |  MIT
        https://github.com/oconnor663/os_pipe.rs
-crate  pango 0.18.3  —  MIT
+crate  pango 0.18.3  |  MIT
        https://github.com/gtk-rs/gtk-rs-core
-crate  pango-sys 0.18.0  —  MIT
+crate  pango-sys 0.18.0  |  MIT
        https://github.com/gtk-rs/gtk-rs-core
-crate  parking 2.2.1  —  Apache-2.0 OR MIT
+crate  parking 2.2.1  |  Apache-2.0 OR MIT
        https://github.com/smol-rs/parking
-crate  parking_lot 0.12.5  —  MIT OR Apache-2.0
+crate  parking_lot 0.12.5  |  MIT OR Apache-2.0
        https://github.com/Amanieu/parking_lot
-crate  parking_lot_core 0.9.12  —  MIT OR Apache-2.0
+crate  parking_lot_core 0.9.12  |  MIT OR Apache-2.0
        https://github.com/Amanieu/parking_lot
-crate  percent-encoding 2.3.2  —  MIT OR Apache-2.0
+crate  percent-encoding 2.3.2  |  MIT OR Apache-2.0
        https://github.com/servo/rust-url/
-crate  petgraph 0.8.3  —  MIT OR Apache-2.0
+crate  petgraph 0.8.3  |  MIT OR Apache-2.0
        https://github.com/petgraph/petgraph
-crate  phf 0.13.1  —  MIT
+crate  phf 0.13.1  |  MIT
        https://github.com/rust-phf/rust-phf
-crate  phf_shared 0.13.1  —  MIT
+crate  phf_shared 0.13.1  |  MIT
        https://github.com/rust-phf/rust-phf
-crate  pin-project-lite 0.2.17  —  Apache-2.0 OR MIT
+crate  pin-project-lite 0.2.17  |  Apache-2.0 OR MIT
        https://github.com/taiki-e/pin-project-lite
-crate  piper 0.2.5  —  MIT OR Apache-2.0
+crate  piper 0.2.5  |  MIT OR Apache-2.0
        https://github.com/smol-rs/piper
-crate  pipewire 0.10.1  —  MIT
+crate  pipewire 0.10.1  |  MIT
        https://gitlab.freedesktop.org/pipewire/pipewire-rs
-crate  pipewire-sys 0.10.1  —  MIT
+crate  pipewire-sys 0.10.1  |  MIT
        https://gitlab.freedesktop.org/pipewire/pipewire-rs
-crate  plist 1.10.3  —  MIT
+crate  plist 1.10.3  |  MIT
        https://github.com/ebarnard/rust-plist/
-crate  png 0.18.1  —  MIT OR Apache-2.0
+crate  png 0.18.1  |  MIT OR Apache-2.0
        https://github.com/image-rs/image-png
-crate  polling 3.11.0  —  Apache-2.0 OR MIT
+crate  polling 3.11.0  |  Apache-2.0 OR MIT
        https://github.com/smol-rs/polling
-crate  potential_utf 0.1.6  —  Unicode-3.0
+crate  potential_utf 0.1.6  |  Unicode-3.0
        https://github.com/unicode-org/icu4x
-crate  powerfmt 0.2.1  —  MIT OR Apache-2.0
+crate  powerfmt 0.2.1  |  MIT OR Apache-2.0
        https://github.com/jhpratt/powerfmt
-crate  precomputed-hash 0.1.1  —  MIT
+crate  precomputed-hash 0.1.1  |  MIT
        https://github.com/emilio/precomputed-hash
-crate  primal-check 0.3.4  —  MIT OR Apache-2.0
+crate  primal-check 0.3.4  |  MIT OR Apache-2.0
        https://github.com/huonw/primal
-crate  proc-macro2 1.0.107  —  MIT OR Apache-2.0
+crate  proc-macro2 1.0.107  |  MIT OR Apache-2.0
        https://github.com/dtolnay/proc-macro2
-crate  pxfm 0.1.30  —  BSD-3-Clause OR Apache-2.0
+crate  pxfm 0.1.30  |  BSD-3-Clause OR Apache-2.0
        https://github.com/awxkee/pxfm
-crate  quick-xml 0.42.0  —  MIT
+crate  quick-xml 0.42.0  |  MIT
        https://github.com/tafia/quick-xml
-crate  quote 1.0.47  —  MIT OR Apache-2.0
+crate  quote 1.0.47  |  MIT OR Apache-2.0
        https://github.com/dtolnay/quote
-crate  raw-window-handle 0.6.2  —  MIT OR Apache-2.0 OR Zlib
+crate  raw-window-handle 0.6.2  |  MIT OR Apache-2.0 OR Zlib
        https://github.com/rust-windowing/raw-window-handle
-crate  realfft 3.5.1  —  MIT
+crate  realfft 3.5.1  |  MIT
        https://github.com/HEnquist/realfft
-crate  regex 1.13.1  —  MIT OR Apache-2.0
+crate  regex 1.13.1  |  MIT OR Apache-2.0
        https://github.com/rust-lang/regex
-crate  regex-automata 0.4.18  —  MIT OR Apache-2.0
+crate  regex-automata 0.4.18  |  MIT OR Apache-2.0
        https://github.com/rust-lang/regex
-crate  regex-syntax 0.8.11  —  MIT OR Apache-2.0
+crate  regex-syntax 0.8.11  |  MIT OR Apache-2.0
        https://github.com/rust-lang/regex
-crate  rfd 0.17.2  —  MIT
+crate  rfd 0.17.2  |  MIT
        https://github.com/PolyMeilex/rfd
-crate  rtrb 0.4.1  —  MIT OR Apache-2.0
+crate  rtrb 0.4.1  |  MIT OR Apache-2.0
        https://github.com/mgeier/rtrb
-crate  rustc-hash 2.1.3  —  Apache-2.0 OR MIT
+crate  rustc-hash 2.1.3  |  Apache-2.0 OR MIT
        https://github.com/rust-lang/rustc-hash
-crate  rustfft 6.4.1  —  MIT OR Apache-2.0
+crate  rustfft 6.4.1  |  MIT OR Apache-2.0
        https://github.com/ejmahler/RustFFT
-crate  rustix 1.1.6  —  Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+crate  rustix 1.1.6  |  Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
        https://github.com/bytecodealliance/rustix
-crate  same-file 1.0.6  —  Unlicense/MIT
+crate  same-file 1.0.6  |  Unlicense/MIT
        https://github.com/BurntSushi/same-file
-crate  schemars 0.8.22  —  MIT
+crate  schemars 0.8.22  |  MIT
        https://github.com/GREsau/schemars
-crate  scopeguard 1.2.0  —  MIT OR Apache-2.0
+crate  scopeguard 1.2.0  |  MIT OR Apache-2.0
        https://github.com/bluss/scopeguard
-crate  selectors 0.38.0  —  MPL-2.0
+crate  selectors 0.38.0  |  MPL-2.0
        https://github.com/servo/stylo
-crate  semver 1.0.28  —  MIT OR Apache-2.0
+crate  semver 1.0.28  |  MIT OR Apache-2.0
        https://github.com/dtolnay/semver
-crate  serde 1.0.229  —  MIT OR Apache-2.0
+crate  serde 1.0.229  |  MIT OR Apache-2.0
        https://github.com/serde-rs/serde
-crate  serde_core 1.0.229  —  MIT OR Apache-2.0
+crate  serde_core 1.0.229  |  MIT OR Apache-2.0
        https://github.com/serde-rs/serde
-crate  serde_json 1.0.154  —  MIT OR Apache-2.0
+crate  serde_json 1.0.154  |  MIT OR Apache-2.0
        https://github.com/serde-rs/json
-crate  serde_spanned 1.1.3  —  MIT OR Apache-2.0
+crate  serde_spanned 1.1.3  |  MIT OR Apache-2.0
        https://github.com/toml-rs/toml
-crate  serde_with 3.24.0  —  MIT OR Apache-2.0
+crate  serde_with 3.24.0  |  MIT OR Apache-2.0
        https://github.com/jonasbb/serde_with/
-crate  serde-untagged 0.1.9  —  MIT OR Apache-2.0
+crate  serde-untagged 0.1.9  |  MIT OR Apache-2.0
        https://github.com/dtolnay/serde-untagged
-crate  serialize-to-javascript 0.1.2  —  MIT OR Apache-2.0
+crate  serialize-to-javascript 0.1.2  |  MIT OR Apache-2.0
        https://github.com/chippers/serialize-to-javascript
-crate  servo_arc 0.4.3  —  MIT OR Apache-2.0
+crate  servo_arc 0.4.3  |  MIT OR Apache-2.0
        https://github.com/servo/stylo
-crate  sha2 0.10.9  —  MIT OR Apache-2.0
+crate  sha2 0.10.9  |  MIT OR Apache-2.0
        https://github.com/RustCrypto/hashes
-crate  signal-hook-registry 1.4.8  —  MIT OR Apache-2.0
+crate  signal-hook-registry 1.4.8  |  MIT OR Apache-2.0
        https://github.com/vorner/signal-hook
-crate  simd-adler32 0.3.10  —  MIT
+crate  simd-adler32 0.3.10  |  MIT
        https://github.com/mcountryman/simd-adler32
-crate  siphasher 1.0.4  —  MIT OR Apache-2.0
+crate  siphasher 1.0.4  |  MIT OR Apache-2.0
        https://github.com/jedisct1/rust-siphash
-crate  slab 0.4.12  —  MIT
+crate  slab 0.4.12  |  MIT
        https://github.com/tokio-rs/slab
-crate  smallvec 1.16.5  —  MIT OR Apache-2.0
+crate  smallvec 1.16.5  |  MIT OR Apache-2.0
        https://github.com/servo/rust-smallvec
-crate  socket2 0.6.5  —  MIT OR Apache-2.0
+crate  socket2 0.6.5  |  MIT OR Apache-2.0
        https://github.com/rust-lang/socket2
-crate  soup3 0.5.0  —  MIT
+crate  soup3 0.5.0  |  MIT
        https://gitlab.gnome.org/World/Rust/soup3-rs
-crate  soup3-sys 0.5.0  —  MIT
+crate  soup3-sys 0.5.0  |  MIT
        https://gitlab.gnome.org/World/Rust/soup3-rs
-crate  stable_deref_trait 1.2.1  —  MIT OR Apache-2.0
+crate  stable_deref_trait 1.2.1  |  MIT OR Apache-2.0
        https://github.com/storyyeller/stable_deref_trait
-crate  strength_reduce 0.2.4  —  MIT OR Apache-2.0
+crate  strength_reduce 0.2.4  |  MIT OR Apache-2.0
        http://github.com/ejmahler/strength_reduce
-crate  string_cache 0.9.0  —  MIT OR Apache-2.0
+crate  string_cache 0.9.0  |  MIT OR Apache-2.0
        https://github.com/servo/string-cache
-crate  strsim 0.11.1  —  MIT
+crate  strsim 0.11.1  |  MIT
        https://github.com/rapidfuzz/strsim-rs
-crate  syn 3.0.10  —  MIT OR Apache-2.0
+crate  syn 3.0.10  |  MIT OR Apache-2.0
        https://github.com/dtolnay/syn
-crate  tao 0.37.2  —  Apache-2.0
+crate  tao 0.37.2  |  Apache-2.0
        https://github.com/tauri-apps/tao
-crate  task-local 0.1.1  —  MIT OR Apache-2.0
+crate  task-local 0.1.1  |  MIT OR Apache-2.0
        https://github.com/BugenZhao/task-local
-crate  tauri 2.12.5  —  Apache-2.0 OR MIT
+crate  tauri 2.12.5  |  Apache-2.0 OR MIT
        https://github.com/tauri-apps/tauri
-crate  tauri-plugin-clipboard-manager 2.5.0  —  Apache-2.0 OR MIT
+crate  tauri-plugin-clipboard-manager 2.5.0  |  Apache-2.0 OR MIT
        https://github.com/tauri-apps/plugins-workspace
-crate  tauri-plugin-dialog 2.8.4  —  Apache-2.0 OR MIT
+crate  tauri-plugin-dialog 2.8.4  |  Apache-2.0 OR MIT
        https://github.com/tauri-apps/plugins-workspace
-crate  tauri-plugin-fs 2.7.1  —  Apache-2.0 OR MIT
+crate  tauri-plugin-fs 2.7.1  |  Apache-2.0 OR MIT
        https://github.com/tauri-apps/plugins-workspace
-crate  tauri-plugin-global-shortcut 2.4.1  —  Apache-2.0 OR MIT
+crate  tauri-plugin-global-shortcut 2.4.1  |  Apache-2.0 OR MIT
        https://github.com/tauri-apps/plugins-workspace
-crate  tauri-plugin-single-instance 2.5.5  —  Apache-2.0 OR MIT
+crate  tauri-plugin-single-instance 2.5.5  |  Apache-2.0 OR MIT
        https://github.com/tauri-apps/plugins-workspace
-crate  tauri-plugin-window-state 2.5.0  —  Apache-2.0 OR MIT
+crate  tauri-plugin-window-state 2.5.0  |  Apache-2.0 OR MIT
        https://github.com/tauri-apps/plugins-workspace
-crate  tauri-runtime 2.12.2  —  Apache-2.0 OR MIT
+crate  tauri-runtime 2.12.2  |  Apache-2.0 OR MIT
        https://github.com/tauri-apps/tauri
-crate  tauri-runtime-wry 2.12.3  —  Apache-2.0 OR MIT
+crate  tauri-runtime-wry 2.12.3  |  Apache-2.0 OR MIT
        https://github.com/tauri-apps/tauri
-crate  tauri-utils 2.10.2  —  Apache-2.0 OR MIT
+crate  tauri-utils 2.10.2  |  Apache-2.0 OR MIT
        https://github.com/tauri-apps/tauri
-crate  tempfile 3.27.0  —  MIT OR Apache-2.0
+crate  tempfile 3.27.0  |  MIT OR Apache-2.0
        https://github.com/Stebalien/tempfile
-crate  tendril 0.5.1  —  MIT OR Apache-2.0
+crate  tendril 0.5.1  |  MIT OR Apache-2.0
        https://github.com/servo/html5ever
-crate  thiserror 1.0.69  —  MIT OR Apache-2.0
+crate  thiserror 1.0.69  |  MIT OR Apache-2.0
        https://github.com/dtolnay/thiserror
-crate  thiserror 2.0.21  —  MIT OR Apache-2.0
+crate  thiserror 2.0.21  |  MIT OR Apache-2.0
        https://github.com/dtolnay/thiserror
-crate  time 0.3.55  —  MIT OR Apache-2.0
+crate  time 0.3.55  |  MIT OR Apache-2.0
        https://github.com/time-rs/time
-crate  time-core 0.1.9  —  MIT OR Apache-2.0
+crate  time-core 0.1.9  |  MIT OR Apache-2.0
        https://github.com/time-rs/time
-crate  tinystr 0.8.5  —  Unicode-3.0
+crate  tinystr 0.8.5  |  Unicode-3.0
        https://github.com/unicode-org/icu4x
-crate  tokio 1.54.1  —  MIT
+crate  tokio 1.54.1  |  MIT
        https://github.com/tokio-rs/tokio
-crate  toml 1.2.1+spec-1.1.0  —  MIT OR Apache-2.0
+crate  toml 1.2.1+spec-1.1.0  |  MIT OR Apache-2.0
        https://github.com/toml-rs/toml
-crate  toml_datetime 1.1.3+spec-1.1.0  —  MIT OR Apache-2.0
+crate  toml_datetime 1.1.3+spec-1.1.0  |  MIT OR Apache-2.0
        https://github.com/toml-rs/toml
-crate  toml_parser 1.1.5+spec-1.1.0  —  MIT OR Apache-2.0
+crate  toml_parser 1.1.5+spec-1.1.0  |  MIT OR Apache-2.0
        https://github.com/toml-rs/toml
-crate  toml_writer 1.2.0+spec-1.1.0  —  MIT OR Apache-2.0
+crate  toml_writer 1.2.0+spec-1.1.0  |  MIT OR Apache-2.0
        https://github.com/toml-rs/toml
-crate  tracing 0.1.44  —  MIT
+crate  tracing 0.1.44  |  MIT
        https://github.com/tokio-rs/tracing
-crate  tracing-core 0.1.36  —  MIT
+crate  tracing-core 0.1.36  |  MIT
        https://github.com/tokio-rs/tracing
-crate  transpose 0.2.3  —  MIT OR Apache-2.0
+crate  transpose 0.2.3  |  MIT OR Apache-2.0
        https://github.com/ejmahler/transpose
-crate  tree_magic_mini 3.2.2  —  MIT
+crate  tree_magic_mini 3.2.2  |  MIT
        https://github.com/mbrubeck/tree_magic/
-crate  typeid 1.0.3  —  MIT OR Apache-2.0
+crate  typeid 1.0.3  |  MIT OR Apache-2.0
        https://github.com/dtolnay/typeid
-crate  typenum 1.20.1  —  MIT OR Apache-2.0
+crate  typenum 1.20.1  |  MIT OR Apache-2.0
        https://github.com/paholg/typenum
-crate  unicode-ident 1.0.27  —  (MIT OR Apache-2.0) AND Unicode-3.0
+crate  unicode-ident 1.0.27  |  (MIT OR Apache-2.0) AND Unicode-3.0
        https://github.com/dtolnay/unicode-ident
-crate  unicode-segmentation 1.13.3  —  MIT OR Apache-2.0
+crate  unicode-segmentation 1.13.3  |  MIT OR Apache-2.0
        https://github.com/unicode-rs/unicode-segmentation
-crate  url 2.5.8  —  MIT OR Apache-2.0
+crate  url 2.5.8  |  MIT OR Apache-2.0
        https://github.com/servo/rust-url
-crate  urlpattern 0.6.0  —  MIT
+crate  urlpattern 0.6.0  |  MIT
        https://github.com/denoland/rust-urlpattern
-crate  utf_types 1.0.0  —  Apache-2.0 OR MIT
+crate  utf_types 1.0.0  |  Apache-2.0 OR MIT
        https://github.com/hsivonen/utf_types
-crate  utf8_iter 1.1.0  —  Apache-2.0 OR MIT
+crate  utf8_iter 1.1.0  |  Apache-2.0 OR MIT
        https://github.com/hsivonen/utf8_iter
-crate  utf8parse 0.2.2  —  Apache-2.0 OR MIT
+crate  utf8parse 0.2.2  |  Apache-2.0 OR MIT
        https://github.com/alacritty/vte
-crate  uuid 1.29.2  —  Apache-2.0 OR MIT
+crate  uuid 1.29.2  |  Apache-2.0 OR MIT
        https://github.com/uuid-rs/uuid
-crate  walkdir 2.5.0  —  Unlicense/MIT
+crate  walkdir 2.5.0  |  Unlicense/MIT
        https://github.com/BurntSushi/walkdir
-crate  wayland-backend 0.3.17  —  MIT
+crate  wayland-backend 0.3.17  |  MIT
        https://github.com/smithay/wayland-rs
-crate  wayland-client 0.31.15  —  MIT
+crate  wayland-client 0.31.15  |  MIT
        https://github.com/smithay/wayland-rs
-crate  wayland-protocols 0.32.13  —  MIT
+crate  wayland-protocols 0.32.13  |  MIT
        https://github.com/smithay/wayland-rs
-crate  wayland-protocols-wlr 0.3.12  —  MIT
+crate  wayland-protocols-wlr 0.3.12  |  MIT
        https://github.com/smithay/wayland-rs
-crate  wayland-sys 0.31.11  —  MIT
+crate  wayland-sys 0.31.11  |  MIT
        https://github.com/smithay/wayland-rs
-crate  web_atoms 0.2.6  —  MIT OR Apache-2.0
+crate  web_atoms 0.2.6  |  MIT OR Apache-2.0
        https://github.com/servo/html5ever
-crate  web-time 1.1.0  —  MIT OR Apache-2.0
+crate  web-time 1.1.0  |  MIT OR Apache-2.0
        https://github.com/daxpedda/web-time
-crate  webkit2gtk 2.0.2  —  MIT
+crate  webkit2gtk 2.0.2  |  MIT
        https://github.com/tauri-apps/webkit2gtk-rs
-crate  webkit2gtk-sys 2.0.2  —  MIT
+crate  webkit2gtk-sys 2.0.2  |  MIT
        https://github.com/tauri-apps/webkit2gtk-rs
-crate  winnow 1.0.5  —  MIT
+crate  winnow 1.0.5  |  MIT
        https://github.com/winnow-rs/winnow
-crate  wl-clipboard-rs 0.9.5  —  MIT OR Apache-2.0
+crate  wl-clipboard-rs 0.9.5  |  MIT OR Apache-2.0
        https://github.com/YaLTeR/wl-clipboard-rs
-crate  writeable 0.6.4  —  Unicode-3.0
+crate  writeable 0.6.4  |  Unicode-3.0
        https://github.com/unicode-org/icu4x
-crate  wry 0.57.2  —  Apache-2.0 OR MIT
+crate  wry 0.57.2  |  Apache-2.0 OR MIT
        https://github.com/tauri-apps/wry
-crate  x11 2.21.0  —  MIT
+crate  x11 2.21.0  |  MIT
        https://github.com/AltF02/x11-rs.git
-crate  x11-dl 2.21.0  —  MIT
+crate  x11-dl 2.21.0  |  MIT
        https://github.com/AltF02/x11-rs.git
-crate  x11rb 0.13.2  —  MIT OR Apache-2.0
+crate  x11rb 0.13.2  |  MIT OR Apache-2.0
        https://github.com/psychon/x11rb
-crate  x11rb-protocol 0.13.2  —  MIT OR Apache-2.0
+crate  x11rb-protocol 0.13.2  |  MIT OR Apache-2.0
        https://github.com/psychon/x11rb
-crate  xkeysym 0.2.1  —  MIT OR Apache-2.0 OR Zlib
+crate  xkeysym 0.2.1  |  MIT OR Apache-2.0 OR Zlib
        https://github.com/notgull/xkeysym
-crate  yoke 0.8.4  —  Unicode-3.0
+crate  yoke 0.8.4  |  Unicode-3.0
        https://github.com/unicode-org/icu4x
-crate  zbus 5.19.0  —  MIT
+crate  zbus 5.19.0  |  MIT
        https://github.com/z-galaxy/zbus/
-crate  zbus 6.2.1  —  MIT
+crate  zbus 6.2.1  |  MIT
        https://github.com/z-galaxy/zbus/
-crate  zbus_names 4.3.5  —  MIT
+crate  zbus_names 4.3.5  |  MIT
        https://github.com/z-galaxy/zbus/
-crate  zbus_utils 6.1.0  —  MIT
+crate  zbus_utils 6.1.0  |  MIT
        https://github.com/z-galaxy/zbus/
-crate  zcheapstr 1.2.0  —  MIT
+crate  zcheapstr 1.2.0  |  MIT
        https://github.com/z-galaxy/zcheapstr/
-crate  zerofrom 0.1.8  —  Unicode-3.0
+crate  zerofrom 0.1.8  |  Unicode-3.0
        https://github.com/unicode-org/icu4x
-crate  zerotrie 0.2.5  —  Unicode-3.0
+crate  zerotrie 0.2.5  |  Unicode-3.0
        https://github.com/unicode-org/icu4x
-crate  zerovec 0.11.9  —  Unicode-3.0
+crate  zerovec 0.11.9  |  Unicode-3.0
        https://github.com/unicode-org/icu4x
-crate  zmij 1.0.23  —  MIT
+crate  zmij 1.0.23  |  MIT
        https://github.com/dtolnay/zmij
-crate  zruntime 0.2.2  —  MIT
+crate  zruntime 0.2.2  |  MIT
        https://github.com/z-galaxy/zruntime
-crate  zvariant 5.15.1  —  MIT
+crate  zvariant 5.15.1  |  MIT
        https://github.com/z-galaxy/zbus/
-crate  zvariant_utils 4.2.0  —  MIT
+crate  zvariant_utils 4.2.0  |  MIT
        https://github.com/z-galaxy/zbus/
-npm    @tauri-apps/api 2.12.4  —  Apache-2.0 OR MIT
+npm    @tauri-apps/api 2.12.4  |  Apache-2.0 OR MIT
        https://github.com/tauri-apps/tauri.git
-npm    @tauri-apps/plugin-clipboard-manager 2.5.0  —  MIT OR Apache-2.0
+npm    @tauri-apps/plugin-clipboard-manager 2.5.0  |  MIT OR Apache-2.0
        https://github.com/tauri-apps/plugins-workspace
-npm    @tauri-apps/plugin-dialog 2.8.4  —  MIT OR Apache-2.0
+npm    @tauri-apps/plugin-dialog 2.8.4  |  MIT OR Apache-2.0
        https://github.com/tauri-apps/plugins-workspace
-npm    react 19.3.1  —  MIT
+npm    react 19.3.1  |  MIT
        https://github.com/react/react.git
-npm    react-dom 19.3.1  —  MIT
+npm    react-dom 19.3.1  |  MIT
        https://github.com/react/react.git
-npm    scheduler 0.28.0  —  MIT
+npm    scheduler 0.28.0  |  MIT
        https://github.com/react/react.git
 
 These packages ship no license file of their own. They are distributed

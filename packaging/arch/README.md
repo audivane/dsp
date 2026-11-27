@@ -15,19 +15,19 @@ makepkg -si
 `audivane-dsp-<version>.tar.zst` next to the `PKGBUILD`. The package never
 downloads sources (the tarball is the only `source` entry, `sha256sums=SKIP`).
 
-Flags / variants:
+Flags:
 
-- `./make-source.sh --worktree` — pack the *working tree* instead of HEAD,
+- `./make-source.sh --worktree`: pack the *working tree* instead of HEAD,
   including uncommitted changes (`target/`, `node_modules/`, `app/dist/` are
   excluded). For testing local edits only; the resulting package is not
   reproducible.
 
 ## What gets installed
 
-- `/usr/bin/audivane-dsp` — the DSP engine daemon
-- `/usr/bin/avdsp` — CLI (offline processing + `avdsp ctl` daemon control)
-- `/usr/bin/audivane-dsp-ui` — desktop app (only once `app/src-tauri` builds)
-- `/usr/lib/systemd/user/audivane-dsp.service` — user service
+- `/usr/bin/audivane-dsp`: the DSP engine daemon
+- `/usr/bin/avdsp`: CLI (offline processing + `avdsp ctl` daemon control)
+- `/usr/bin/audivane-dsp-ui`: desktop app (only once `app/src-tauri` builds)
+- `/usr/lib/systemd/user/audivane-dsp.service`: user service
   (`ExecStart=/usr/bin/audivane-dsp --foreground`)
 - `/usr/share/applications/audivane-dsp-ui.desktop` (named after the UI binary, which is also its Wayland app ID)
 - icons in `/usr/share/icons/hicolor/` (`audivane-dsp.svg` scalable plus the
@@ -42,7 +42,7 @@ library). `rtkit` is optional but recommended
 
 ## Enable the engine
 
-The package deliberately never touches systemd for you:
+The package does not touch systemd for you:
 
 ```sh
 systemctl --user daemon-reload

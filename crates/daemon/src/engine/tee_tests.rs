@@ -472,7 +472,7 @@ fn follower_slots_are_keyed_by_device_and_follow_the_master_config() {
     h.remove_follower("hw:CARD=B,DEV=0").unwrap();
     h.add_follower("hw:CARD=D,DEV=0", &cfg).unwrap();
     assert_eq!(h.slots().get("hw:CARD=D,DEV=0").unwrap().slot, 1);
-    assert_eq!(h.set_alignment_ms(75.0), Ok(MAX_ALIGN_MS));
+    assert_eq!(h.set_alignment_ms(150.0), Ok(MAX_ALIGN_MS));
     assert_eq!(h.set_alignment_ms(-1.0), Ok(0.0));
 }
 
@@ -863,13 +863,21 @@ fn the_alignment_delays_the_master_and_never_plays_stale_audio() {
     let mut outs = Vec::new();
     for k in 0..60 {
         if k == 10 {
-            assert_eq!(rig.host().set_alignment_ms(75.0), Ok(MAX_ALIGN_MS));
+            assert_eq!(rig.host().set_alignment_ms(150.0), Ok(MAX_ALIGN_MS));
         }
         refs.extend(reference.block(480, &tone).iter().step_by(2).copied());
         outs.extend(rig.block(480, &tone).iter().step_by(2).copied());
     }
-    // 60 ms = 2880 frames, after the fade.
-    let d = 2880;
+    // The cap (120 ms = 5760 frames), after the fade.
+    let d = max_align_frames(RATE);
+    // In the total latency, not in the filter delay.
+    let total = rig.proc.latency_out_frames(SinkChoice::Dsp);
+    let align = rig.proc.align_out_frames(SinkChoice::Dsp);
+    assert_eq!(align, d);
+    assert_eq!(
+        total - align,
+        reference.proc.latency_out_frames(SinkChoice::Dsp)
+    );
     let from = 10 * 480 + 240;
     for i in from + d..outs.len() {
         assert!(
@@ -886,7 +894,7 @@ fn the_alignment_delays_the_master_and_never_plays_stale_audio() {
         rig.block_on(SinkChoice::Direct, 480, &|_| 0.9);
     }
     let mut back = Vec::new();
-    for _ in 0..10 {
+    for _ in 0..16 {
         back.extend(rig.block(480, &tone).iter().step_by(2).copied());
     }
     assert!(back[..d].iter().all(|&x| x == 0));
@@ -901,6 +909,115 @@ fn the_alignment_delays_the_master_and_never_plays_stale_audio() {
     assert_eq!(rig.proc.tee().delay_frames(), 0);
     assert!(reaped >= 1);
     assert_eq!(rig.proc.tee().stash_len(), 0);
+}
+
+/// A shrink of the alignment waits for silence: while the tone plays it
+/// holds (whatever the wait), it lands once the delay line's history has
+/// been silent for the longer delay plus the margin, and after a restart (a
+/// pause, a new stream) at once. A growth drops a shrink waiting, and a
+/// measurement holds one.
+#[test]
+fn a_shrink_of_the_alignment_lands_only_in_silence() {
+    let mut rig = Rig::new(eq_chain(), RateRatio::ONE, true);
+    rig.host()
+        .add_follower("hw:CARD=USB,DEV=0", &master_cfg())
+        .unwrap();
+    rig.host().set_alignment_ms(80.0).unwrap();
+    let block = 480;
+    for _ in 0..20 {
+        rig.block(block, &tone);
+    }
+    let at = |ms: f64| (ms * 1e-3 * f64::from(RATE)).round() as usize;
+    assert_eq!(rig.proc.tee().delay_frames(), at(80.0));
+    assert_eq!(rig.host().applied_alignment_ms(), 80.0);
+    // Ten seconds of music: it holds.
+    rig.host().shrink_alignment_ms(20.0).unwrap();
+    for _ in 0..1000 {
+        rig.block(block, &tone);
+        assert_eq!(rig.proc.tee().delay_frames(), at(80.0), "shrunk in play");
+    }
+    // A gap shorter than the history and the margin (80 + 150 ms): it
+    // holds; the music comes back.
+    for _ in 0..(at(200.0) / block) {
+        rig.block(block, &|_| 0.0);
+    }
+    assert_eq!(rig.proc.tee().delay_frames(), at(80.0));
+    for _ in 0..10 {
+        rig.block(block, &tone);
+    }
+    // A long enough gap (digital silence or a −90 dBFS floor): it lands in
+    // it, and what plays is silence through the step.
+    let floor = |i: u64| if i.is_multiple_of(2) { 3e-5 } else { -3e-5 };
+    let mut out = Vec::new();
+    let mut landed = None;
+    for k in 0..(at(400.0) / block) {
+        out.extend(rig.block(block, &floor).iter().step_by(2).copied());
+        if landed.is_none() && rig.proc.tee().delay_frames() == at(20.0) {
+            landed = Some(k);
+        }
+    }
+    let k = landed.expect("the shrink landed in the gap");
+    assert!(
+        k * block >= at(80.0 + 150.0) - block,
+        "landed after {} ms of silence",
+        k * block * 1000 / RATE as usize
+    );
+    // (Before it, the delay still plays the music out.)
+    let loud = out[k * block..]
+        .iter()
+        .map(|x| x.unsigned_abs())
+        .max()
+        .unwrap();
+    assert!(
+        f64::from(loud) / 2_147_483_648.0 < 2e-4,
+        "the step played something: {loud}"
+    );
+    assert_eq!(rig.host().applied_alignment_ms(), 20.0);
+    // A growth drops a shrink waiting.
+    rig.host().set_alignment_ms(40.0).unwrap();
+    rig.block(block, &tone);
+    rig.host().shrink_alignment_ms(10.0).unwrap();
+    rig.block(block, &tone);
+    rig.host().set_alignment_ms(45.0).unwrap();
+    for _ in 0..(at(1000.0) / block) {
+        rig.block(block, &|_| 0.0);
+    }
+    assert_eq!(rig.host().applied_alignment_ms(), 45.0);
+    assert_eq!(rig.proc.tee().delay_frames(), at(45.0));
+    // After a restart (a pause, a new stream: its history is silence) it
+    // lands at the next poll, before any of the new stream plays.
+    for _ in 0..10 {
+        rig.block(block, &tone);
+    }
+    rig.host().shrink_alignment_ms(5.0).unwrap();
+    rig.block(block, &tone);
+    assert_eq!(rig.proc.tee().delay_frames(), at(45.0));
+    rig.proc.reset_dsp_state();
+    rig.block(block, &tone);
+    assert_eq!(rig.proc.tee().delay_frames(), at(5.0));
+    assert_eq!(rig.host().applied_alignment_ms(), 5.0);
+}
+
+/// A measurement holds a shrink waiting, silence or not (it would move the
+/// timing it measures).
+#[test]
+fn a_measurement_holds_a_shrink_of_the_alignment() {
+    let (mut host, mut rt) = TeeHost::pair(2);
+    host.add_follower("hw:CARD=USB,DEV=0", &master_cfg())
+        .unwrap();
+    host.set_alignment_ms(30.0).unwrap();
+    rt.poll_cmds(RATE);
+    assert_eq!(rt.delay_frames(), 1440);
+    host.shrink_alignment_ms(10.0).unwrap();
+    rt.set_measuring(true);
+    rt.poll_cmds(RATE);
+    let d = rt.take_delay();
+    rt.put_delay(d);
+    assert_eq!(rt.delay_frames(), 1440, "shrunk during a measurement");
+    rt.set_measuring(false);
+    rt.poll_cmds(RATE);
+    // (A fresh line's history is silence.)
+    assert_eq!(rt.delay_frames(), 480);
 }
 
 /// The playback time the alignment adds to the frames read at block `k`:
@@ -922,7 +1039,7 @@ fn align_playback_frames(d: &[usize], blocks: &[(usize, usize)], k: usize) -> f6
 
 /// Through speed changes the alignment holds in source frames (a change
 /// would step the master's position under the followers): slowed, it adds
-/// up to 60 ms / speed of playback. A new stream fits it to the speed then
+/// up to the cap / speed of playback. A new stream fits it to the speed then
 /// (here a cap at 0.6), and settled back at 1.0 it is refitted.
 #[test]
 fn the_alignment_holds_in_source_frames_through_speed_changes() {

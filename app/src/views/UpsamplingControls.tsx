@@ -370,6 +370,7 @@ export function FilterControls(props: FilterProps) {
         />
         {mode === "custom" && design && <BasisNote design={design} />}
       </Row>
+      <BuildingNotice />
       {liveDraft && (
         <div className="notice warn ups-draft" role="status">
           <span>Not applied: {errors.length > 0 ? "fix the marked fields." : "the engine refused it."} The design that plays now stays until then.</span>
@@ -400,6 +401,37 @@ export function FilterControls(props: FilterProps) {
         </div>
       )}
     </>
+  );
+}
+
+/**
+ * "Building filter…" while the engine designs the filter it was sent (it
+ * answers once the design is built). A later edit waits for it and runs
+ * after; what played before keeps playing until then.
+ */
+function BuildingNotice() {
+  const building = useApp((s) => s.upsBuilding);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!building) return;
+    setNow(Date.now());
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [building]);
+  if (!building) return null;
+  const secs = Math.max(0, Math.floor((now - building.since) / 1000));
+  // Quick builds finish before anything shows.
+  if (secs < 1) return null;
+  return (
+    <div className="notice ups-building" role="status" aria-live="polite">
+      <span className="ups-building-dot" aria-hidden="true" />
+      <span>
+        Building filter… {secs} s.{" "}
+        {building.waiting
+          ? "Taking longer than usual: still waiting for the engine."
+          : "Long filters take a while; the one that plays now stays until it is done. A newer edit runs after it."}
+      </span>
+    </div>
   );
 }
 

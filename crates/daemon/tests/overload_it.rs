@@ -24,8 +24,10 @@ use std::time::{Duration, Instant};
 fn slow_machine() -> &'static KernelRates {
     Box::leak(Box::new(KernelRates {
         dot: vec![(256 << 10, 1.0e9), (8 << 20, 0.8e9)],
-        spectral: vec![(256 << 10, 0.25e9), (8 << 20, 0.2e9), (64 << 20, 0.12e9)],
-        fft: vec![(2048, 1.0e-9), (32768, 1.0e-9)],
+        // Slow spectra and transforms (a slow core): on a desktop the FFT
+        // polyphase engine runs the heavy designs below well within budget.
+        spectral: vec![(256 << 10, 0.06e9), (8 << 20, 0.05e9), (64 << 20, 0.03e9)],
+        fft: vec![(2048, 4.0e-9), (32768, 4.0e-9)],
         mul_add: 0.3e9,
         quantizer: KernelRates::floor().quantizer,
         elapsed: Duration::ZERO,
@@ -149,9 +151,11 @@ fn varispeed_steps_come_first_and_leave_the_config_alone() {
 #[test]
 fn a_saved_config_that_overloads_falls_back_and_is_kept() {
     // The saved config at start: 4 Mi taps at x16. Starting never refuses.
+    // Without channel workers, so the refusal below prices one thread.
     let h = Harness::start_with("overload", |cfg| {
         cfg.rate.allowed_rates = vec![48_000];
         cfg.chain.upsampler = manual(4 << 20);
+        cfg.channel_workers = false;
     });
     *h.engine.cpu_rates.lock().unwrap() = Some(slow_machine());
     let mut events = h.client();
@@ -191,7 +195,7 @@ fn a_saved_config_that_overloads_falls_back_and_is_kept() {
         Reply::Error(e) => {
             assert!(
                 e.message
-                    .starts_with("Too heavy for this CPU at 768 kHz: about "),
+                    .starts_with("Too heavy for this CPU at 768 kHz from a "),
                 "{}",
                 e.message
             );
@@ -299,6 +303,7 @@ fn caps(rates: &[u32]) -> audivane_protocol::ipc::DeviceCapabilities {
         rate_min: 0,
         rate_max: 0,
         formats: vec![SampleFormat::S32],
+        modes: Vec::new(),
     }
 }
 
@@ -504,4 +509,174 @@ fn set_varispeed_ends_varispeed_overload_step_and_releases_hold() {
         h.engine.varispeed_holds.lock().unwrap().last(),
         Some(&VarispeedHold::None)
     );
+}
+
+/// A design to 768 kHz (x16 from 48 kHz, x4 from 192 kHz) and its config
+/// over both rates: on the slow machine it fits at 48 kHz and not at 192
+/// kHz.
+fn per_rate_config(cfg: &mut EngineConfig) {
+    cfg.rate.allowed_rates = vec![48_000, 192_000];
+    cfg.chain.upsampler = UpsamplerConfig {
+        target: RateTarget::MaxRate(768_000),
+        ..manual(1 << 20)
+    };
+}
+
+#[test]
+fn a_design_that_fits_the_rate_playing_is_admitted_and_falls_back_per_rate() {
+    use audivane_protocol::ipc::RateFallbackCause;
+    let h = Harness::start_with("overload-per-rate", |cfg| {
+        cfg.rate.allowed_rates = vec![48_000, 192_000];
+    });
+    *h.engine.cpu_rates.lock().unwrap() = Some(slow_machine());
+    let mut want = h.engine.config_now();
+    per_rate_config(&mut want);
+    let rates = slow_machine();
+    let costs =
+        audivane_dsp_daemon::control::cpu_budget::landing_costs(rates, &want, None).unwrap();
+    let at = |r: u32| {
+        costs
+            .iter()
+            .find(|(_, w)| w.source_rate == r)
+            .unwrap()
+            .1
+            .load
+    };
+    let budget = audivane_dsp_daemon::control::cpu_budget::RT_BUDGET;
+    assert!(at(48_000) <= budget && at(192_000) > budget, "{costs:?}");
+
+    // Playing 192 kHz: refused, naming the source rate.
+    h.engine.set_snapshot(|s| {
+        s.state = EngineState::Playing;
+        s.active_sink = Some(SinkChoice::Dsp);
+        s.graph_rate = 192_000;
+        s.output_rate = 192_000;
+    });
+    match h
+        .client()
+        .call(Call::SetUpsampler(want.chain.upsampler.clone()))
+    {
+        Reply::Error(e) => assert!(
+            e.message
+                .starts_with("Too heavy for this CPU at 768 kHz from a 192 kHz source"),
+            "{}",
+            e.message
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    // Playing 48 kHz: admitted; 192 kHz falls back by the estimate.
+    h.engine.set_snapshot(|s| {
+        s.graph_rate = 48_000;
+        s.output_rate = 768_000;
+        s.ratio = audivane_protocol::RateRatio::integer(16);
+    });
+    h.client()
+        .ok(Call::SetUpsampler(want.chain.upsampler.clone()));
+    assert_eq!(h.engine.config_now().chain.upsampler, want.chain.upsampler);
+    let plan = h.engine.rate_plan.lock().unwrap().clone();
+    let cfg = h.engine.config_now();
+    assert!(plan.substitute(&cfg, 48_000).is_none());
+    let light = plan
+        .substitute(&cfg, 192_000)
+        .expect("192 kHz falls back")
+        .clone();
+    assert_eq!(light.target, want.chain.upsampler.target);
+    let st = status(&h);
+    let row = |st: &Status, r: u32| {
+        st.upsampler_rates
+            .iter()
+            .find(|w| w.source_rate == r)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(row(&st, 48_000).fallback, None);
+    let f = row(&st, 192_000).fallback.unwrap();
+    assert_eq!(f.action, OverloadAction::Recommended);
+    assert_eq!(f.cause, RateFallbackCause::Estimate);
+    assert_eq!(row(&st, 192_000).output_rate, 768_000);
+
+    // A wrong estimate: the request overloads at 48 kHz. The reactive
+    // fallback runs there (the net), made for 48 kHz.
+    let mut events = h.client();
+    events.subscribe(vec![Topic::Status]);
+    h.engine.set_snapshot(|s| s.dsp_load = 1.4);
+    let report = applied_overload(&mut events);
+    assert_eq!(report.source_rate, 48_000);
+    assert_eq!(report.action, OverloadAction::UpsamplerOff);
+    // Playback moves to 192 kHz: the fallback ends (per rate), the request
+    // runs again and the plan builds the light design there; 48 kHz now
+    // counts as overloaded.
+    h.engine.set_snapshot(|s| {
+        s.dsp_load = 0.2;
+        s.graph_rate = 192_000;
+        s.output_rate = 768_000;
+        s.ratio = audivane_protocol::RateRatio::integer(4);
+    });
+    wait_until("the per-rate end", Duration::from_secs(5), || {
+        status(&h).overload.is_none()
+    });
+    assert_eq!(h.engine.config_now().chain.upsampler, want.chain.upsampler);
+    wait_until("48 kHz marked", Duration::from_secs(5), || {
+        row(&status(&h), 48_000)
+            .fallback
+            .is_some_and(|f| f.cause == RateFallbackCause::Overload)
+    });
+    let plan = h.engine.rate_plan.lock().unwrap().clone();
+    assert!(plan.substitute(&cfg, 48_000).is_some());
+    assert!(plan.substitute(&cfg, 192_000).is_some());
+
+    // A new request starts afresh: a lighter design runs everywhere.
+    h.client().ok(Call::SetUpsampler(UpsamplerConfig {
+        target: RateTarget::MaxRate(768_000),
+        ..manual(4095)
+    }));
+    let st = status(&h);
+    assert!(
+        st.upsampler_rates.iter().all(|r| r.fallback.is_none()),
+        "{:?}",
+        st.upsampler_rates
+    );
+    assert_eq!(
+        *h.engine.rate_plan.lock().unwrap(),
+        audivane_dsp_daemon::api::RatePlan::default()
+    );
+}
+
+#[test]
+fn returning_to_a_rate_the_design_fits_runs_it_again() {
+    // 192 kHz falls back by the estimate; 48 kHz runs the request: the
+    // plan is per rate, so nothing sticks after a 192 kHz track.
+    let h = Harness::start_with("overload-return", |cfg| {
+        cfg.rate.allowed_rates = vec![48_000, 192_000];
+    });
+    *h.engine.cpu_rates.lock().unwrap() = Some(slow_machine());
+    let mut want = h.engine.config_now();
+    per_rate_config(&mut want);
+    h.engine.set_snapshot(|s| {
+        s.state = EngineState::Playing;
+        s.active_sink = Some(SinkChoice::Dsp);
+        s.output_rate = 768_000;
+        s.ratio = audivane_protocol::RateRatio::integer(16);
+    });
+    h.client()
+        .ok(Call::SetUpsampler(want.chain.upsampler.clone()));
+    let cfg = h.engine.config_now();
+    for rate in [192_000, 48_000, 192_000, 48_000] {
+        h.engine.set_snapshot(|s| {
+            s.state = EngineState::Playing;
+            s.active_sink = Some(SinkChoice::Dsp);
+            s.graph_rate = rate;
+            s.output_rate = 768_000;
+            s.ratio = audivane_protocol::RateRatio::integer(768_000 / rate);
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        let plan = h.engine.rate_plan.lock().unwrap().clone();
+        assert_eq!(
+            plan.substitute(&cfg, rate).is_some(),
+            rate == 192_000,
+            "{rate}"
+        );
+        assert_eq!(h.engine.config_now().chain.upsampler, want.chain.upsampler);
+        assert!(status(&h).overload.is_none());
+    }
 }

@@ -10,6 +10,13 @@ const fmtF = (v: number) => (v < 100 ? String(Math.round(v * 10) / 10) : String(
 const fmtG = (v: number) => minus(v.toFixed(1));
 const fmtQ = (v: number) => v.toFixed(2);
 
+/** The band frequencies the EQ editor takes (graph handles and clicks stay inside them too). */
+export const BAND_F_MIN = 10;
+export const BAND_F_MAX = 22000;
+/** The Q range the field, the wheel and Page Up/Down all keep to. */
+export const Q_MIN = 0.1;
+export const Q_MAX = 30;
+
 /** Outside the editor's text fields, a press after a double-click (or a
  *  native drag) would select or drag text across the page. */
 export function guardEditorChrome(e: { target: unknown; detail?: number; type: string; preventDefault(): void }) {
@@ -65,9 +72,9 @@ export function BandEditor({ band, index, channelNote, style }: { band: Band; in
         </div>
       </div>
       <div className="ed-fields">
-        <NumField label="Freq" unit="Hz" value={band.freq_hz} format={fmtF} onCommit={(v) => set({ freq_hz: clamp(v, 10, 22000) })} />
+        <NumField label="Freq" unit="Hz" value={band.freq_hz} format={fmtF} onCommit={(v) => set({ freq_hz: clamp(v, BAND_F_MIN, BAND_F_MAX) })} />
         <NumField label="Gain" unit="dB" value={band.gain_db} format={fmtG} disabled={gl} onCommit={(v) => set({ gain_db: Math.round(clamp(v, -30, 30) * 10) / 10 })} />
-        <NumField label="Q" value={band.q} format={fmtQ} onCommit={(v) => set({ q: Math.round(clamp(v, 0.1, 30) * 100) / 100 })} />
+        <NumField label="Q" value={band.q} format={fmtQ} onCommit={(v) => set({ q: Math.round(clamp(v, Q_MIN, Q_MAX) * 100) / 100 })} />
       </div>
     </div>
   );

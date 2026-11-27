@@ -6,16 +6,21 @@
 //! - **Shared headroom** `H` cuts both sides by the same amount, so it never
 //!   changes the comparison. `auto` sizes it from each side's predicted
 //!   worst-case peak gain `P` (sine worst case: EQ `max |H|`, convolution
-//!   `max |H|`, the crossfeed bound): `H = max(0, max(g_A + P_A, g_B + P_B))`,
+//!   `max |H|` (a filter matrix output: its row summed, every input in the
+//!   phase that adds up; both certified between bins, [`row_peak_bound`]),
+//!   the crossfeed bound):
+//!   `H = max(0, max(g_A + P_A, g_B + P_B))`,
 //!   capped at [`AB_HEADROOM_MAX_DB`].
 //! - **The analytic offset** integrates each side's power response over a
 //!   pink reference with K- (default) or A-weighting
 //!   ([`crate::loudness::weighted_offset_db`]). The terms: DC block, EQ (with
 //!   tilt and preamp), crossfeed as a stereo stage at correlation
 //!   [`crate::crossfeed::MATCHED_CORRELATION`], the convolution IRs' magnitude
-//!   (from their FFT) and, when the two sides' upsampler designs differ, the
-//!   upsampler's magnitude (from its measured impulse response), and the
-//!   harmonics stage's loudness change, simulated on loud pink noise.
+//!   (from their FFT; a filter matrix's rows composed with the crossfeed
+//!   and EQ before it, at the sources' correlation) and, when the two
+//!   sides' upsampler designs differ, the upsampler's magnitude (from its
+//!   measured impulse response), and the harmonics stage's loudness
+//!   change, simulated on loud pink noise.
 //!
 //! Everything here runs off the audio thread, when the pair is built.
 
@@ -24,6 +29,7 @@ use crate::biquad::Eq;
 use crate::crossfeed::{Crossfeed, MATCHED_CORRELATION};
 use crate::dc_block::DcBlock;
 use crate::loudness::{Weighting, weighted_offset_db};
+use crate::matrix::{ConvIrs, FilterMatrix};
 use crate::presets::UpsamplerRuntime;
 use crate::{db_to_lin, lin_to_db};
 use audivane_protocol::EqProfile;
@@ -251,48 +257,326 @@ pub struct SideTerms<'a> {
     /// [`crate::harmonics::Harmonics::loudness_change_db`]); 1 when off.
     /// Flat, so it enters the loudness and not the peak prediction.
     pub harmonics_gain: f64,
+    /// The harmonics stage's peak bounds ([`crate::harmonics::Harmonics::peak_bounds`];
+    /// empty when off): it plays at its natural level, so its worst case
+    /// enters the peak prediction.
+    pub harmonics_peaks: &'a [f64],
+}
+
+/// The certified peak's grid, over the row's longest filter: 64 points per
+/// tap (a margin of at most 0.005 dB, [`row_peak_bound`]).
+const PEAK_OVERSAMPLE: usize = 64;
+/// The certified peak's grid at most: 4 Mi points, about 80 MiB of
+/// workspace (64 points per tap up to 64 Ki taps, then 32, 16, 8 and 4 per
+/// tap up to 1 Mi taps: margins up to 0.021, 0.085, 0.35 and 1.6 dB).
+/// Longer filters take their L1 norm instead (valid for any input, looser).
+const PEAK_GRID_MAX: usize = 1 << 22;
+/// The matrix power spectra's grid at most: 256 Ki points (0.18 Hz bins at
+/// 48 kHz). A longer filter is wrapped into it, which keeps the values at
+/// the bins exact.
+const POWER_GRID_MAX: usize = 1 << 18;
+
+/// Certified sine worst-case gains of a row of filters `(w_i, taps_i)`, on
+/// a grid of at most `grid_max` points: the row's (at least `max_θ Σ_i
+/// |w_i| |F_i(e^{iθ})|`) and each filter's own (`max_θ |F_i|`, unweighted).
+///
+/// Every filter is evaluated on one common grid of `N` points,
+/// [`PEAK_OVERSAMPLE`] per tap of the longest filter (fewer as the grid
+/// reaches `grid_max`, never under 4), and the grid's largest sum `G` is
+/// raised by the between-bin margin `1 / sqrt(1 - (π d / N)² / 2)`, `d` the
+/// longest filter's length less one. Why it bounds: for any fixed phases
+/// `φ_i`, `q(θ) = Σ_i |w_i| e^{iφ_i} F_i(e^{iθ})` is a polynomial of degree
+/// `d`, so `f = |q|²` is a real trigonometric polynomial of degree `d`; at
+/// its maximum `M²`, `f' = 0`, and Bernstein's inequality gives `|f''| <=
+/// d² M²`, so within `π / N` of it (where a grid point lies) `f >= M² (1 -
+/// (π d / N)² / 2)`. The grid point's sum is at least `|q|` there, so `M <=
+/// G × margin` for every choice of phases (a filter of a lower degree is a
+/// polynomial of degree `d` too). When 4 points per tap would not fit in
+/// `grid_max`, each filter's L1 norm (`Σ |h|`, a bound for any input) is
+/// taken instead.
+fn certified_peaks(row: &[(f64, &[f64])], grid_max: usize) -> (f64, Vec<f64>) {
+    let len = row.iter().map(|(_, t)| t.len()).max().unwrap_or(0);
+    if len == 0 {
+        return (0.0, vec![0.0; row.len()]);
+    }
+    if (4 * len).next_power_of_two() > grid_max {
+        let l1: Vec<f64> = row
+            .iter()
+            .map(|(_, t)| t.iter().map(|v| v.abs()).sum())
+            .collect();
+        let sum = row.iter().zip(&l1).map(|((w, _), l)| w.abs() * l).sum();
+        return (sum, l1);
+    }
+    let n = (PEAK_OVERSAMPLE * len)
+        .next_power_of_two()
+        .min(grid_max)
+        .max(16);
+    let mut planner = RealFftPlanner::<f64>::new();
+    let fft = planner.plan_fft_forward(n);
+    let mut input = vec![0.0; n];
+    let mut spectrum = vec![Complex64::new(0.0, 0.0); n / 2 + 1];
+    let mut sum = vec![0.0; n / 2 + 1];
+    let mut own = Vec::with_capacity(row.len());
+    for &(w, taps) in row {
+        input.fill(0.0);
+        input[..taps.len()].copy_from_slice(taps);
+        // Lengths are the plan's own; the call cannot fail.
+        let _ = fft.process(&mut input, &mut spectrum);
+        let mut max = 0.0_f64;
+        for (acc, h) in sum.iter_mut().zip(&spectrum) {
+            let m = h.norm();
+            *acc += w.abs() * m;
+            max = max.max(m);
+        }
+        own.push(max);
+    }
+    // Bins 0..=N/2 cover [0, π]; |F| is even in θ for real taps, so every
+    // frequency lies within π / N of one.
+    let grid = sum.iter().fold(0.0_f64, |m, &v| m.max(v));
+    let x = std::f64::consts::PI * (len - 1) as f64 / n as f64;
+    let margin = 1.0 / (1.0 - 0.5 * x * x).sqrt();
+    (grid * margin, own.into_iter().map(|m| m * margin).collect())
+}
+
+/// A certified sine worst-case gain of a row of filters `(w_i, taps_i)`:
+/// at least `max_θ Σ_i |w_i| |F_i(e^{iθ})|` over the whole band (every
+/// filter driven by a sine of one frequency in the phase that adds up), on
+/// a bounded grid (`PEAK_GRID_MAX`; the L1 norm past it). A bin maximum
+/// alone can miss a peak between bins by up to 3.9 dB on a grid of one
+/// point per tap.
+pub fn row_peak_bound(row: &[(f64, &[f64])]) -> f64 {
+    certified_peaks(row, PEAK_GRID_MAX).0
+}
+
+/// One output of a filter matrix: its inputs, the products `F_a F_b*` of
+/// its entries' responses on a uniform grid (pairs `a <= b`, row-major
+/// over `inputs`) and its certified peaks (the row's at unit weights, and
+/// each entry's).
+#[derive(Clone, Debug)]
+struct MatrixRow {
+    inputs: Vec<usize>,
+    pairs: Vec<Vec<Complex64>>,
+    peak_sum: f64,
+    peak_own: Vec<f64>,
+}
+
+/// A filter matrix's A/B terms: per output, the entries' cross spectra
+/// for the loudness and the certified peaks. Built once, the taps not
+/// kept; workspace bounded (`POWER_GRID_MAX`, `PEAK_GRID_MAX`).
+#[derive(Clone, Debug)]
+pub struct MatrixSpectra {
+    channels: usize,
+    bin_hz: f64,
+    rows: Vec<MatrixRow>,
+}
+
+/// Index of the pair `(a, b)`, `a <= b`, among `n` entries.
+fn pair_index(a: usize, b: usize, n: usize) -> usize {
+    a * n - a * (a + 1) / 2 + b
+}
+
+impl MatrixSpectra {
+    pub fn of_matrix(m: &FilterMatrix, rate: f64) -> Self {
+        let c = m.channels();
+        let longest = m.max_len();
+        let n = longest
+            .max(rate.ceil() as usize)
+            .max(2)
+            .next_power_of_two()
+            .min(POWER_GRID_MAX);
+        let mut planner = RealFftPlanner::<f64>::new();
+        let fft = planner.plan_fft_forward(n);
+        let mut input = vec![0.0; n];
+        let rows = (0..c)
+            .map(|out| {
+                let entries: Vec<(usize, &[f64])> = (0..c)
+                    .filter_map(|i| m.get(out, i).map(|t| (i, t)))
+                    .collect();
+                // Each entry's response at the bins, the taps wrapped into
+                // the grid (exact at the bins).
+                let spectra: Vec<Vec<Complex64>> = entries
+                    .iter()
+                    .map(|(_, taps)| {
+                        input.fill(0.0);
+                        for (k, &v) in taps.iter().enumerate() {
+                            input[k % n] += v;
+                        }
+                        let mut bins = vec![Complex64::new(0.0, 0.0); n / 2 + 1];
+                        let _ = fft.process(&mut input, &mut bins);
+                        bins
+                    })
+                    .collect();
+                let k = spectra.len();
+                let mut pairs = Vec::with_capacity(k * (k + 1) / 2);
+                for a in 0..k {
+                    for b in a..k {
+                        pairs.push(
+                            spectra[a]
+                                .iter()
+                                .zip(&spectra[b])
+                                .map(|(x, y)| x * y.conj())
+                                .collect(),
+                        );
+                    }
+                }
+                let unit: Vec<(f64, &[f64])> = entries.iter().map(|&(_, t)| (1.0, t)).collect();
+                let (peak_sum, peak_own) = certified_peaks(&unit, PEAK_GRID_MAX);
+                MatrixRow {
+                    inputs: entries.iter().map(|&(i, _)| i).collect(),
+                    pairs,
+                    peak_sum,
+                    peak_own,
+                }
+            })
+            .collect();
+        Self {
+            channels: c,
+            bin_hz: rate / n as f64,
+            rows,
+        }
+    }
+
+    /// A pair's product at `f`, linearly interpolated between bins (0
+    /// above Nyquist). Products of entries do not rotate where both are
+    /// delayed alike (and `|F|²` never does): no null between bins.
+    fn product_at(&self, bins: &[Complex64], f: f64) -> Complex64 {
+        let x = f / self.bin_hz;
+        if !x.is_finite() || x < 0.0 {
+            return Complex64::new(0.0, 0.0);
+        }
+        let i = x.floor() as usize;
+        match (bins.get(i), bins.get(i + 1)) {
+            (Some(&h0), Some(&h1)) => h0 + (h1 - h0) * (x - i as f64),
+            (Some(&h0), None) => h0,
+            _ => Complex64::new(0.0, 0.0),
+        }
+    }
+
+    /// Output `out`'s power at `f` for source channels at unit power each
+    /// and inter-channel correlation `rho`, the matrix's input `i` taking
+    /// `pre(i, k)` of source channel `k` (the crossfeed and the EQ before
+    /// the matrix): `Σ_a Σ_b G_ab Q_ab`, `G_ab = F_a F_b*` (interpolated
+    /// between bins), `Q_ab = Σ_k Σ_l ρ_kl pre(a, k) pre(b, l)*` (exact at
+    /// `f`), `ρ_kk = 1`.
+    fn power(&self, out: usize, f: f64, rho: f64, pre: &dyn Fn(usize, usize) -> Complex64) -> f64 {
+        let row = &self.rows[out];
+        let n = row.inputs.len();
+        let c = self.channels;
+        let q = |a: usize, b: usize| -> Complex64 {
+            let mut sum = Complex64::new(0.0, 0.0);
+            for k in 0..c {
+                for l in 0..c {
+                    let r = if k == l { 1.0 } else { rho };
+                    sum += pre(a, k) * pre(b, l).conj() * r;
+                }
+            }
+            sum
+        };
+        let mut p = 0.0;
+        for a in 0..n {
+            for b in a..n {
+                let g = self.product_at(&row.pairs[pair_index(a, b, n)], f);
+                let term = (g * q(row.inputs[a], row.inputs[b])).re;
+                p += if a == b { term } else { 2.0 * term };
+            }
+        }
+        p.max(0.0)
+    }
+
+    /// Output `out`'s certified sine worst-case gain, each input scaled by
+    /// `pre_peak(i)` (its EQ `max |H|`): the smaller of the row's bound at
+    /// unit weights times the largest weight and the weighted sum of each
+    /// entry's bound (both bound `max_f Σ_i w_i |F_i(f)|`). 0 for an output
+    /// with no entry.
+    fn peak(&self, out: usize, pre_peak: &dyn Fn(usize) -> f64) -> f64 {
+        let row = &self.rows[out];
+        let w: Vec<f64> = row.inputs.iter().map(|&i| pre_peak(i).abs()).collect();
+        let largest = w.iter().fold(0.0_f64, |m, &v| m.max(v));
+        let each: f64 = w.iter().zip(&row.peak_own).map(|(w, p)| w * p).sum();
+        (largest * row.peak_sum).min(each)
+    }
+}
+
+/// A convolution item's flat gain for the config-only estimate (the IR
+/// samples are not known there): its `gain_db`, times, for a filter
+/// matrix, the largest row's sum of entry gains (an output summing two
+/// inputs can reach twice the level).
+pub fn config_conv_gain(conv: &audivane_protocol::ConvolutionConfig) -> f64 {
+    let row_sum = conv.matrix.as_ref().map_or(1.0, |entries| {
+        let outs = entries.iter().map(|e| e.output).max().map_or(0, |m| m + 1);
+        (0..outs)
+            .map(|o| {
+                entries
+                    .iter()
+                    .filter(|e| e.output == o)
+                    .map(|e| db_to_lin(e.gain_db))
+                    .sum::<f64>()
+            })
+            .fold(0.0, f64::max)
+    });
+    db_to_lin(conv.gain_db) * row_sum
 }
 
 /// The convolution stage's contribution.
 #[derive(Clone, Debug)]
 pub enum ConvTerm {
-    /// A flat linear gain (none: 1; config-only estimate: the enabled
-    /// entries' `gain_db`).
+    /// A flat linear gain (none: 1; config-only estimate:
+    /// [`config_conv_gain`] of the enabled entries).
     Gain(f64),
-    /// The combined IRs' spectra: one (mono) or one per channel.
-    Irs(Vec<PowerSpectrum>),
+    /// The combined IRs' spectra and certified peaks ([`row_peak_bound`]):
+    /// one (mono) or one per channel.
+    Irs {
+        spectra: Vec<PowerSpectrum>,
+        peaks: Vec<f64>,
+    },
+    /// A filter matrix's spectra.
+    Matrix(MatrixSpectra),
 }
 
 impl ConvTerm {
     /// From combined IRs (already scaled by each entry's `gain_db`).
     pub fn of_irs(irs: &[Vec<f64>], rate: f64) -> Self {
-        Self::Irs(
-            irs.iter()
+        Self::Irs {
+            spectra: irs
+                .iter()
                 .map(|ir| PowerSpectrum::of_taps(ir, rate, 1.0))
                 .collect(),
-        )
-    }
-
-    /// Channel `c`'s IR (a mono IR serves every channel).
-    fn channel(irs: &[PowerSpectrum], c: usize) -> &PowerSpectrum {
-        &irs[c.min(irs.len() - 1)]
-    }
-
-    /// |H|² of channel `c` at `f`.
-    fn power(&self, c: usize, f: f64) -> f64 {
-        match self {
-            Self::Gain(g) => g * g,
-            Self::Irs(irs) if irs.is_empty() => 1.0,
-            Self::Irs(irs) => Self::channel(irs, c).power_at(f),
+            peaks: irs.iter().map(|ir| row_peak_bound(&[(1.0, ir)])).collect(),
         }
     }
 
-    /// Largest |H| of channel `c` up to `nyquist`.
-    fn peak(&self, c: usize, nyquist: f64) -> f64 {
+    /// From a chain's combined convolution (per channel or a matrix).
+    pub fn of_conv(irs: &ConvIrs, rate: f64) -> Self {
+        match irs {
+            ConvIrs::Channels(irs) => Self::of_irs(irs, rate),
+            ConvIrs::Matrix(m) => Self::Matrix(MatrixSpectra::of_matrix(m, rate)),
+        }
+    }
+
+    /// Channel `c`'s entry (a mono IR serves every channel).
+    fn channel<T>(irs: &[T], c: usize) -> &T {
+        &irs[c.min(irs.len() - 1)]
+    }
+
+    /// |H|² of channel `c` at `f` (the per-channel terms; a matrix is
+    /// handled by [`SideTerms`] itself).
+    fn power(&self, c: usize, f: f64) -> f64 {
+        match self {
+            Self::Gain(g) => g * g,
+            Self::Irs { spectra, .. } if spectra.is_empty() => 1.0,
+            Self::Irs { spectra, .. } => Self::channel(spectra, c).power_at(f),
+            Self::Matrix(_) => unreachable!("matrix terms are taken per output"),
+        }
+    }
+
+    /// Certified `max |H|` of channel `c` over the band (per-channel
+    /// terms).
+    fn peak(&self, c: usize) -> f64 {
         match self {
             Self::Gain(g) => g.abs(),
-            Self::Irs(irs) if irs.is_empty() => 1.0,
-            Self::Irs(irs) => Self::channel(irs, c).peak_below(nyquist),
+            Self::Irs { peaks, .. } if peaks.is_empty() => 1.0,
+            Self::Irs { peaks, .. } => *Self::channel(peaks, c),
+            Self::Matrix(_) => unreachable!("matrix terms are taken per output"),
         }
     }
 }
@@ -302,17 +586,44 @@ impl SideTerms<'_> {
     /// channel's EQ and IR taken together.
     pub fn power(&self, f_hz: f64) -> f64 {
         let dc = self.dc.map_or(1.0, |d| d.response(f_hz).norm_sqr());
+        let up = self.upsampler.as_ref().map_or(1.0, |u| u.power_at(f_hz));
+        let harm = self.harmonics_gain * self.harmonics_gain;
+        if let ConvTerm::Matrix(m) = &self.conv {
+            // A matrix mixes the channels after the crossfeed and the EQ:
+            // each output's response to each source channel is composed
+            // (crossfeed direct and cross paths, the EQ of the matrix
+            // input, the entry), then taken at the sources' matched
+            // correlation. The crossfeed's own correlation change (and its
+            // width) is in the composition, not assumed.
+            let one = Complex64::new(1.0, 0.0);
+            let paths = self.crossfeed.map(|x| x.stereo_paths(f_hz));
+            let pre = |i: usize, k: usize| {
+                let x = match paths {
+                    Some((d, c)) => {
+                        if i == k {
+                            d
+                        } else {
+                            c
+                        }
+                    }
+                    None if i == k => one,
+                    None => Complex64::new(0.0, 0.0),
+                };
+                let eq = self.eq.map_or(one, |e| e.response_channel(i, f_hz));
+                x * eq
+            };
+            let out = |j: usize| m.power(j, f_hz, MATCHED_CORRELATION, &pre);
+            return dc * up * harm * 0.5 * (out(0) + out(1));
+        }
         let xf = self
             .crossfeed
             .map_or(1.0, |x| x.stereo_power_response(f_hz, MATCHED_CORRELATION));
-        let up = self.upsampler.as_ref().map_or(1.0, |u| u.power_at(f_hz));
         let channel = |c: usize| {
             let eq = self
                 .eq
                 .map_or(1.0, |e| e.response_channel(c, f_hz).norm_sqr());
             eq * self.conv.power(c, f_hz)
         };
-        let harm = self.harmonics_gain * self.harmonics_gain;
         dc * xf * up * harm * 0.5 * (channel(0) + channel(1))
     }
 
@@ -324,13 +635,26 @@ impl SideTerms<'_> {
         let eq_db = self.eq_profile.map_or([0.0; 2], |p| {
             Eq::channel_peak_gains_db(p, self.sample_rate).unwrap_or([p.preamp_db; 2])
         });
-        let channel_db = |c: usize| eq_db[c] + lin_to_db(self.conv.peak(c, nyquist));
+        let channel_db = |c: usize| match &self.conv {
+            ConvTerm::Matrix(m) => lin_to_db(m.peak(c, &|i| db_to_lin(eq_db[i.min(1)]))),
+            conv => eq_db[c] + lin_to_db(conv.peak(c)),
+        };
         let xf = self.crossfeed.map_or(1.0, Crossfeed::peak_gain_bound);
         let up = self
             .upsampler
             .as_ref()
             .map_or(1.0, |u| u.peak_below(nyquist));
         let total = channel_db(0).max(channel_db(1)) + lin_to_db(xf * up);
+        // The harmonics stage sits after the upsampler: it shapes what
+        // reaches it within full scale and passes the excess.
+        let total = if self.harmonics_peaks.is_empty() || !total.is_finite() {
+            total
+        } else {
+            lin_to_db(crate::harmonics::peak_reach(
+                self.harmonics_peaks,
+                db_to_lin(total),
+            ))
+        };
         if total.is_finite() { total } else { 0.0 }
     }
 }
@@ -380,6 +704,348 @@ mod tests {
             AbGains::new(0.0, AbHeadroom::Fixed { db: -2.0 }, 0.0, 0.0).headroom_db,
             0.0
         );
+    }
+
+    /// The matrix peak bound sums a row: a worst-case input (each input a
+    /// sine at the worst bin, phased so every entry of the row adds up)
+    /// stays within it, and reaches it, above the larger entry alone.
+    #[test]
+    fn matrix_peak_bound_holds_on_a_worst_case_input() {
+        use crate::Stage;
+        use crate::matrix::MatrixConvolver;
+        let rate = 48_000.0;
+        let mut seed = 3_u64;
+        let mut noise = |n: usize| -> Vec<f64> {
+            (0..n)
+                .map(|k| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let x = ((seed >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0;
+                    x * (-(k as f64) / 40.0).exp()
+                })
+                .collect()
+        };
+        let mut m = FilterMatrix::new(2);
+        m.set(0, 0, noise(200));
+        m.set(0, 1, noise(150));
+        m.set(1, 1, noise(180));
+        let spectra = MatrixSpectra::of_matrix(&m, rate);
+        let terms = SideTerms {
+            sample_rate: rate,
+            dc: None,
+            crossfeed: None,
+            eq: None,
+            eq_profile: None,
+            conv: ConvTerm::Matrix(spectra),
+            upsampler: None,
+            harmonics_gain: 1.0,
+            harmonics_peaks: &[],
+        };
+        let bound = db_to_lin(terms.peak_gain_db());
+
+        // Output 0's worst frequency (on a dense grid of its own) and the
+        // phases that line its entries up.
+        let n = 1 << 16;
+        let mut planner = RealFftPlanner::<f64>::new();
+        let fft = planner.plan_fft_forward(n);
+        let dense = |taps: &[f64]| {
+            let mut input = vec![0.0; n];
+            input[..taps.len()].copy_from_slice(taps);
+            let mut out = vec![Complex64::new(0.0, 0.0); n / 2 + 1];
+            let _ = fft.process(&mut input, &mut out);
+            out
+        };
+        let row: Vec<(usize, Vec<Complex64>)> = (0..2)
+            .filter_map(|i| m.get(0, i).map(|t| (i, dense(t))))
+            .collect();
+        let k = (0..n / 2 + 1)
+            .max_by(|&a, &b| {
+                let sum = |k: usize| row.iter().map(|(_, s)| s[k].norm()).sum::<f64>();
+                sum(a).total_cmp(&sum(b))
+            })
+            .unwrap();
+        let f = k as f64 * rate / n as f64;
+        let single = row.iter().map(|(_, s)| s[k].norm()).fold(0.0, f64::max);
+        let frames = 40_000;
+        let x: Vec<Vec<f64>> = (0..2)
+            .map(|i| {
+                let phase = -row
+                    .iter()
+                    .find(|(j, _)| *j == i)
+                    .map_or(0.0, |(_, s)| s[k].arg());
+                (0..frames)
+                    .map(|n| (std::f64::consts::TAU * f * n as f64 / rate + phase).cos())
+                    .collect()
+            })
+            .collect();
+        let mut y = x.clone();
+        let mut conv = MatrixConvolver::new(&m, 512);
+        for start in (0..frames).step_by(512) {
+            let end = (start + 512).min(frames);
+            let (a, b) = y.split_at_mut(1);
+            conv.process(&mut [&mut a[0][start..end], &mut b[0][start..end]]);
+        }
+        let peak = y
+            .iter()
+            .flat_map(|c| c[2_000..].iter())
+            .fold(0.0_f64, |p, &v| p.max(v.abs()));
+        assert!(
+            peak <= bound * (1.0 + 1e-9),
+            "peak {peak} over bound {bound}"
+        );
+        // Within the certified margin of the true maximum (64 points per
+        // tap: at most 0.06 %).
+        assert!(peak > bound / 1.001, "peak {peak} well under bound {bound}");
+        assert!(bound > 1.2 * single, "the row sums: {bound} vs {single}");
+    }
+
+    /// A row's power sums its entries at the matched correlation: a 2 -> 1
+    /// sum of two halves reads 0.25 + 0.25 + 2ρ·0.25 on that output, none
+    /// on the silent one.
+    fn side(conv: ConvTerm, crossfeed: Option<&Crossfeed>) -> SideTerms<'_> {
+        SideTerms {
+            sample_rate: 48_000.0,
+            dc: None,
+            crossfeed,
+            eq: None,
+            eq_profile: None,
+            conv,
+            upsampler: None,
+            harmonics_gain: 1.0,
+            harmonics_peaks: &[],
+        }
+    }
+
+    /// `|H|` of `taps` at `f / rate` cycles, evaluated directly.
+    fn dtft_abs(taps: &[f64], f: f64, rate: f64) -> f64 {
+        let w = std::f64::consts::TAU * f / rate;
+        let (re, im) = taps
+            .iter()
+            .enumerate()
+            .fold((0.0, 0.0), |(re, im), (n, &h)| {
+                (re + h * (w * n as f64).cos(), im - h * (w * n as f64).sin())
+            });
+        re.hypot(im)
+    }
+
+    /// A row's entries of different lengths share one grid: the bound is
+    /// the same with the long entry first or second, and lies between the
+    /// densely evaluated maximum and that times the certified margin.
+    #[test]
+    fn mixed_length_rows_share_one_grid_in_either_order() {
+        let mut seed = 11_u64;
+        let mut noise = |n: usize, decay: f64| -> Vec<f64> {
+            (0..n)
+                .map(|k| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let x = ((seed >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0;
+                    x * (-(k as f64) / decay).exp()
+                })
+                .collect()
+        };
+        let long = noise(16_384, 4_000.0);
+        let short: Vec<f64> = noise(100, 30.0).iter().map(|v| v * 3.0).collect();
+        let bound = |first: &[f64], second: &[f64]| {
+            let mut m = FilterMatrix::new(2);
+            m.set(0, 0, first.to_vec());
+            m.set(0, 1, second.to_vec());
+            let t = side(
+                ConvTerm::Matrix(MatrixSpectra::of_matrix(&m, 48_000.0)),
+                None,
+            );
+            db_to_lin(t.peak_gain_db())
+        };
+        let long_first = bound(&long, &short);
+        let short_first = bound(&short, &long);
+        assert_eq!(long_first.to_bits(), short_first.to_bits());
+        // The row sum, densely (64 points per tap of the long entry).
+        let n = 64 * long.len();
+        let mut planner = RealFftPlanner::<f64>::new();
+        let fft = planner.plan_fft_forward(n);
+        let dense = |taps: &[f64]| {
+            let mut input = vec![0.0; n];
+            input[..taps.len()].copy_from_slice(taps);
+            let mut out = vec![Complex64::new(0.0, 0.0); n / 2 + 1];
+            let _ = fft.process(&mut input, &mut out);
+            out
+        };
+        let (a, b) = (dense(&long), dense(&short));
+        let truth = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| x.norm() + y.norm())
+            .fold(0.0, f64::max);
+        assert!(
+            long_first >= truth,
+            "bound {long_first} under the row's maximum {truth}"
+        );
+        assert!(
+            long_first <= truth * 1.001,
+            "bound {long_first} loose against {truth}"
+        );
+    }
+
+    /// A peak between bins: a 16384-tap cross route that rings at a
+    /// half-bin frequency (on one point per tap, the bins read about 2 / π
+    /// of its peak). A sine there, through the convolver, stays under the
+    /// matrix bound and the per-channel bound alike; the old bin maximum
+    /// would have been passed.
+    #[test]
+    fn an_off_bin_worst_case_stays_under_the_bound() {
+        use crate::Stage;
+        use crate::matrix::MatrixConvolver;
+        let rate = 16_000.0;
+        let len = 16_384;
+        let k0 = 700.5;
+        let ir: Vec<f64> = (0..len)
+            .map(|n| 2.4 / len as f64 * (std::f64::consts::TAU * k0 * n as f64 / len as f64).cos())
+            .collect();
+        let f = k0 * rate / len as f64;
+        let truth = dtft_abs(&ir, f, rate);
+        assert!(truth > 1.15, "{truth}");
+        // The old per-channel peak: a bin maximum on a grid of one point
+        // per tap (16384 >= the rate).
+        let old = PowerSpectrum::of_taps(&ir, rate, 1.0).peak_below(rate / 2.0);
+        assert!(old < 0.8, "the bins miss the peak: {old}");
+
+        let mut m = FilterMatrix::new(2);
+        m.set(0, 1, ir.clone());
+        let terms = SideTerms {
+            sample_rate: rate,
+            ..side(ConvTerm::Matrix(MatrixSpectra::of_matrix(&m, rate)), None)
+        };
+        let bound = db_to_lin(terms.peak_gain_db());
+        let frames = 3 * len;
+        let mut x = [vec![0.0; frames], vec![0.0; frames]];
+        for (n, v) in x[1].iter_mut().enumerate() {
+            *v = (std::f64::consts::TAU * f * n as f64 / rate).cos();
+        }
+        let mut conv = MatrixConvolver::new(&m, 1024);
+        for start in (0..frames).step_by(1024) {
+            let end = (start + 1024).min(frames);
+            let (a, b) = x.split_at_mut(1);
+            conv.process(&mut [&mut a[0][start..end], &mut b[0][start..end]]);
+        }
+        let peak = x[0][2 * len..].iter().fold(0.0_f64, |p, &v| p.max(v.abs()));
+        assert!(
+            peak > old * 1.4,
+            "the sine reaches past the bins: {peak} vs {old}"
+        );
+        assert!(peak <= bound, "peak {peak} over the matrix bound {bound}");
+        assert!(bound < truth * 1.001, "bound {bound} loose against {truth}");
+
+        // The per-channel path: the same certified bound.
+        let per_channel = SideTerms {
+            sample_rate: rate,
+            ..side(ConvTerm::of_irs(&[ir], rate), None)
+        };
+        let pc = db_to_lin(per_channel.peak_gain_db());
+        assert!(pc >= truth && pc <= truth * 1.001, "{pc} vs {truth}");
+    }
+
+    /// A row that subtracts the channels after a narrowed image (flat
+    /// width 0.25): the composed response sees the side signal cut to a
+    /// quarter, `|d - c|² (2 - 2ρ)` on that output, where per-channel
+    /// powers at an assumed correlation would read it 10.9 dB louder.
+    #[test]
+    fn matrix_power_composes_the_crossfeed_width() {
+        let cfg = audivane_protocol::CrossfeedConfig {
+            mode: audivane_protocol::CrossfeedMode::None,
+            width: 0.25,
+            width_shape: audivane_protocol::StereoWidthShape::Flat,
+            ..Default::default()
+        };
+        let cf = Crossfeed::try_new(&cfg, 48_000.0, 2).unwrap();
+        let mut m = FilterMatrix::new(2);
+        m.set(0, 0, vec![1.0]);
+        m.set(0, 1, vec![-1.0]);
+        let terms = side(
+            ConvTerm::Matrix(MatrixSpectra::of_matrix(&m, 48_000.0)),
+            Some(&cf),
+        );
+        let rho = MATCHED_CORRELATION;
+        for f in [50.0, 1000.0, 12_000.0] {
+            let (d, c) = cf.stereo_paths(f);
+            let want = 0.5 * (d - c).norm_sqr() * (2.0 - 2.0 * rho);
+            let got = terms.power(f);
+            assert!((got - want).abs() < 1e-12, "{f}: {got} vs {want}");
+            // Flat width 0.25: the side signal at a quarter.
+            assert!((got - 0.5 * 0.0625).abs() < 1e-9, "{f}: {got}");
+            let old = cf.stereo_power_response(f, rho) * 0.5 * (2.0 - 2.0 * rho);
+            assert!(lin_to_db(old / got) / 2.0 > 10.0, "{f}: {old} vs {got}");
+        }
+    }
+
+    /// A unity stereo swap delayed 32768 samples at 48 kHz is as loud as
+    /// bypass: the entries' phase turns by π per bin of the power grid,
+    /// which an interpolated complex response would read as nulls between
+    /// bins (4.7 dB K-weighted); their products do not turn.
+    #[test]
+    fn a_delayed_stereo_swap_is_as_loud_as_bypass() {
+        let mut delay = vec![0.0; 32_769];
+        delay[32_768] = 1.0;
+        let mut m = FilterMatrix::new(2);
+        m.set(0, 1, delay.clone());
+        m.set(1, 0, delay);
+        let bypass = side(ConvTerm::Gain(1.0), None);
+        let swap = side(
+            ConvTerm::Matrix(MatrixSpectra::of_matrix(&m, 48_000.0)),
+            None,
+        );
+        for w in [Weighting::K, Weighting::A] {
+            let o = analytic_offset_db(&bypass, &swap, w);
+            assert!(o.abs() < 1e-6, "{w:?}: {o} dB");
+        }
+        for f in [20.0, 20.3, 997.5, 15_001.25] {
+            assert!((swap.power(f) - 1.0).abs() < 1e-9, "{f}: {}", swap.power(f));
+        }
+    }
+
+    /// Past the grid's workspace the certified peak falls back to each
+    /// filter's L1 norm: valid for any input, never under the true peak.
+    #[test]
+    fn a_filter_too_long_for_the_grid_takes_its_l1_norm() {
+        let a: Vec<f64> = (0..300)
+            .map(|k| ((k * 37 % 11) as f64 - 5.0) * 0.01)
+            .collect();
+        let b: Vec<f64> = (0..120)
+            .map(|k| ((k * 13 % 7) as f64 - 3.0) * 0.02)
+            .collect();
+        let row = [(2.0, a.as_slice()), (0.5, b.as_slice())];
+        let l1 = |t: &[f64]| t.iter().map(|v| v.abs()).sum::<f64>();
+        // 4 points per tap of 300 taps need 2048: a grid of 1024 cannot.
+        let (sum, own) = certified_peaks(&row, 1024);
+        assert_eq!(own, vec![l1(&a), l1(&b)]);
+        assert!((sum - (2.0 * l1(&a) + 0.5 * l1(&b))).abs() < 1e-12);
+        let (grid_sum, grid_own) = certified_peaks(&row, PEAK_GRID_MAX);
+        assert!(grid_sum <= sum && grid_own[0] <= own[0] && grid_own[1] <= own[1]);
+        assert!(grid_sum > 0.0);
+    }
+
+    #[test]
+    fn matrix_power_counts_the_correlation() {
+        let mut m = FilterMatrix::new(2);
+        m.set(0, 0, vec![0.5]);
+        m.set(0, 1, vec![0.5]);
+        let terms = SideTerms {
+            sample_rate: 48_000.0,
+            dc: None,
+            crossfeed: None,
+            eq: None,
+            eq_profile: None,
+            conv: ConvTerm::Matrix(MatrixSpectra::of_matrix(&m, 48_000.0)),
+            upsampler: None,
+            harmonics_gain: 1.0,
+            harmonics_peaks: &[],
+        };
+        let want = 0.5 * (0.5 + 2.0 * MATCHED_CORRELATION * 0.25);
+        for f in [20.0, 1000.0, 15_000.0] {
+            assert!((terms.power(f) - want).abs() < 1e-12, "{f}");
+        }
+        assert!(terms.peak_gain_db().abs() < 1e-9, "0.5 + 0.5 is unity");
     }
 
     #[test]

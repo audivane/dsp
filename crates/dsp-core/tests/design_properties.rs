@@ -262,6 +262,7 @@ fn band(rng: &mut Rng, a: f64) -> BandSpec {
     let pe = rng.range(0.7, 0.95);
     BandSpec {
         passband_end: pe,
+        passband_end_hz: None,
         stopband_start: (pe + rng.range(0.05, 0.3)).min(1.5),
         attenuation_db: a,
     }
@@ -525,6 +526,7 @@ fn runtime_kind(rng: &mut Rng, kind: Kind, cap: usize) -> (FilterDesign, RateRat
         ),
         Kind::Interpolator => (
             FilterDesign::Interpolator(rng.pick(&[
+                InterpMethod::Nos,
                 InterpMethod::Cosine,
                 InterpMethod::CatmullRom,
                 InterpMethod::TableSinc,
@@ -999,6 +1001,7 @@ fn with_cutoff(c: Cutoff) -> KernelDesign {
 fn band_spec(pe: f64, se: f64, a: f64) -> Cutoff {
     Cutoff::Band(BandSpec {
         passband_end: pe,
+        passband_end_hz: None,
         stopband_start: se,
         attenuation_db: a,
     })

@@ -419,3 +419,254 @@ fn rate_estimator_sees_the_raw_clock_offset() {
     let (ppm2, _) = est.ppm(g).unwrap();
     assert!((ppm2 - ppm).abs() < 1e-9);
 }
+
+/// One update of a loop on a plant with reading noise (uniform within
+/// ±`noise` frames) and an outlier of `outlier` frames when set: the true
+/// error `e` after the update's skip, and the loop's lock.
+struct Plant {
+    g: f64,
+    h: f64,
+    delta: f64,
+    e: f64,
+    from: (f64, f64),
+    rng: u64,
+    noise: f64,
+    skips: usize,
+}
+
+impl Plant {
+    fn new(delta: f64, e: f64, noise: f64) -> Self {
+        Self {
+            g: 48_000.0,
+            h: 1024.0 / 48_000.0,
+            delta,
+            e,
+            from: (0.0, 0.0),
+            rng: 0x2545_f491_4f6c_dd1d,
+            noise,
+            skips: 0,
+        }
+    }
+
+    fn unit(&mut self) -> f64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        (self.rng >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn step(&mut self, lp: &mut DriftLoop, outlier: f64) -> (f64, bool) {
+        let reading = self.e + self.noise * (2.0 * self.unit() - 1.0) + outlier;
+        let c = lp.update(reading, self.h);
+        if c.skip != 0 {
+            self.skips += 1;
+            self.e -= c.skip as f64;
+        }
+        let to = (c.eps, c.eps_slope);
+        let h = self.h;
+        let int = h * (self.from.0 + to.0) / 2.0 + h * h * (self.from.1 - to.1) / 12.0;
+        let at = self.e;
+        self.e -= self.g * (self.delta * h + int);
+        self.from = to;
+        (at, c.locked)
+    }
+}
+
+/// The placement floor at 48 kHz, frames.
+const FLOOR: f64 = 0.05e-3 * 48_000.0;
+
+/// A locked loop whose phase jumps (the master's stream restarted after a
+/// pause): placed again within a fraction of a second, within the floor
+/// at its first locked update and from there on, its rate state and
+/// bandwidth kept, one skip.
+#[test]
+fn a_locked_loop_is_placed_again_after_a_phase_jump() {
+    let delta = 3e-5;
+    let (mut lp, e, _) = closed_loop(LoopConfig::default(), delta, 3.0, 400.0);
+    assert!(lp.locked() && !lp.placed());
+    let (bw, ppm) = (lp.bandwidth(), lp.ppm());
+    for jump in [240_000.37, -31_999.8, 0.4] {
+        let mut p = Plant::new(delta, e + jump, 3.0);
+        p.from = (lp.eps(), 0.0);
+        assert!(lp.realign());
+        assert!(!lp.locked() && lp.trusted());
+        let mut first = None;
+        for i in 0..(10.0 / p.h) as usize {
+            let (at, locked) = p.step(&mut lp, 0.0);
+            if locked {
+                first.get_or_insert((i as f64 * p.h, at));
+                assert!(at.abs() < FLOOR, "jump {jump}: {at} frames at update {i}");
+            } else {
+                assert!(first.is_none(), "jump {jump}: muted again at update {i}");
+            }
+        }
+        let (t, at) = first.expect("never placed");
+        println!("jump {jump}: heard after {t:.3} s at {at:.2} frames");
+        assert!(t < 0.6, "jump {jump}: {t} s");
+        // (A jump under a frame may round to a frame on noisy readings.)
+        assert!(p.skips <= 1, "jump {jump}: {} skips", p.skips);
+        assert!(lp.bandwidth() <= bw, "{}", lp.bandwidth());
+        // (Correcting a placement's residual moves the rate state a little.)
+        assert!((lp.ppm() - ppm).abs() < 1.5, "{} vs {ppm}", lp.ppm());
+    }
+}
+
+/// A fresh loop seeded with a remembered rate (a reopen of the same
+/// device) places the follower from its first readings, without an
+/// acquisition: heard within a second, within the floor; the same loop
+/// unseeded acquires as before (seconds, muted).
+#[test]
+fn a_seeded_loop_places_without_acquiring() {
+    let delta = -4.2e-5;
+    let cfg = LoopConfig::default();
+    let mut lp = DriftLoop::new(cfg, 48_000.0, 0.03).unwrap();
+    lp.seed(-delta);
+    assert!(lp.trusted() && !lp.aligned());
+    assert!(lp.bandwidth() <= cfg.lock_hz);
+    let mut p = Plant::new(delta, 5000.6, 3.0);
+    p.from = (-delta, 0.0);
+    let mut first = None;
+    for i in 0..(20.0 / p.h) as usize {
+        let (at, locked) = p.step(&mut lp, 0.0);
+        if locked {
+            first.get_or_insert((i as f64 * p.h, at));
+            assert!(at.abs() < FLOOR, "{at} frames at update {i}");
+        }
+        assert!(lp.bandwidth() <= cfg.lock_hz);
+    }
+    let (t, at) = first.expect("never placed");
+    println!("seeded: heard after {t:.3} s at {at:.2} frames");
+    assert!(t < 0.6, "{t}");
+    assert_eq!(p.skips, 1);
+    assert!((lp.ppm() - delta * 1e6).abs() < 1.0, "{}", lp.ppm());
+    // Unseeded: the acquisition, as before.
+    let mut lp = DriftLoop::new(cfg, 48_000.0, 0.03).unwrap();
+    let mut p = Plant::new(delta, 5000.6, 3.0);
+    let mut lock_at = None;
+    for i in 0..(60.0 / p.h) as usize {
+        if p.step(&mut lp, 0.0).1 {
+            lock_at.get_or_insert(i as f64 * p.h);
+        }
+    }
+    let t = lock_at.expect("cold start never locked");
+    println!("cold: locked after {t:.1} s");
+    assert!(t > 5.0 && t < 30.0, "{t}");
+    assert!(!lp.placed() && lp.trusted());
+}
+
+/// A seeded rate that is wrong (the remembered ε 60 ppm off): the follower
+/// is placed, drifts, and is muted once it leaves the floor (not far
+/// beyond it); the loop pulls the rate in and it is heard again, in place.
+#[test]
+fn a_wrong_seed_mutes_once_out_of_the_floor() {
+    let delta = 2e-5;
+    let mut lp = DriftLoop::new(LoopConfig::default(), 48_000.0, 0.03).unwrap();
+    lp.seed(-delta + 60e-6);
+    let mut p = Plant::new(delta, -700.2, 2.0);
+    p.from = (lp.eps(), 0.0);
+    let mut worst: f64 = 0.0;
+    let mut mutes = 0;
+    let mut was = false;
+    for _ in 0..(120.0 / p.h) as usize {
+        let (at, locked) = p.step(&mut lp, 0.0);
+        if locked {
+            worst = worst.max(at.abs());
+        }
+        if was && !locked {
+            mutes += 1;
+        }
+        was = locked;
+    }
+    println!("wrong seed: worst heard {worst:.2} frames, {mutes} mutes");
+    assert!(worst < 2.0 * FLOOR, "{worst}");
+    assert!(lp.locked(), "never heard again");
+    assert!((lp.ppm() - delta * 1e6).abs() < 1.0, "{}", lp.ppm());
+}
+
+/// The outlier gate still holds a locked loop (trusted: a phase jump would
+/// place it again): single outliers are replaced, nothing skips or mutes.
+#[test]
+fn the_gate_holds_a_locked_loop_through_outliers() {
+    let delta = 3e-5;
+    let (mut lp, e, _) = closed_loop(LoopConfig::default(), delta, 3.0, 400.0);
+    let mut p = Plant::new(delta, e, 1.0);
+    p.from = (lp.eps(), 0.0);
+    let gated = lp.gated();
+    for i in 0..3000 {
+        let outlier = if i % 50 == 7 { 300.0 } else { 0.0 };
+        let (at, locked) = p.step(&mut lp, outlier);
+        assert!(locked, "muted at update {i}");
+        assert!(at.abs() < 1.0, "{at} at update {i}");
+    }
+    assert_eq!(p.skips, 0);
+    assert!(lp.aligned());
+    assert_eq!(lp.gated() - gated, 60);
+}
+
+/// A device read on 1 ms packets at a phase sweeping against its 10 ms
+/// wakeups (a reading bias of 0 to 48 frames, round every 5.5 s): the
+/// tracker reads it as coarse, takes nothing out (and claims no RMS) until
+/// its phase has wrapped a whole sweep apart, then leaves the readings at
+/// their long-run mean (half a packet behind) to a fraction of a frame;
+/// over a new stream it keeps the line's slope and corrects again from
+/// the next wrap.
+#[test]
+fn a_bias_tracker_takes_a_sweeping_grid_out() {
+    let rate = 48_000.0;
+    let clock = 1.0 + 40e-6;
+    let packet = 48.0;
+    let read = |t: f64, origin: f64| {
+        // The pointer at its last packet; the wakeups slide a seventh of
+        // a packet a second against the grid, and the clock's offset too.
+        let true_pos = (t * clock * rate) + origin;
+        let phase = ((t / 7.0).fract() * packet + true_pos).rem_euclid(packet);
+        (true_pos - phase, true_pos)
+    };
+    let mut b = BiasTracker::new();
+    let mut worst = 0.0f64;
+    let mut t = 0.0;
+    let mut first = None;
+    while t < 60.0 {
+        let (pos, true_pos) = read(t, 0.0);
+        match b.push(pos, t, rate) {
+            Some(dev) => {
+                first.get_or_insert(t);
+                // The reading less its deviation: the long-run mean of the
+                // bias is what stays (-24 frames).
+                let corrected = pos - dev - true_pos;
+                worst = worst.max((corrected + 24.0).abs());
+            }
+            None => assert!(
+                first.is_none() || b.coarse_grid_s().is_none(),
+                "lost at {t}"
+            ),
+        }
+        if first.is_none() {
+            assert!(!b.rms_known(), "an RMS claimed at {t}");
+        }
+        t += 0.010;
+    }
+    assert!(b.coarse_grid_s().is_some());
+    let first = first.unwrap();
+    println!("first corrected at {first:.2} s, at most {worst:.3} frames from the mean");
+    assert!(first < 14.0, "{first}");
+    assert!(worst < 0.5, "{worst}");
+    // A new stream: positions from elsewhere, the same clock.
+    b.rebase();
+    assert!(!b.established());
+    let mut again = None;
+    let mut worst = 0.0f64;
+    let t0 = t;
+    while t < t0 + 20.0 {
+        let (pos, true_pos) = read(t, 1.0e6);
+        if let Some(dev) = b.push(pos, t, rate) {
+            again.get_or_insert(t - t0);
+            worst = worst.max((pos - dev - true_pos + 24.0).abs());
+        }
+        t += 0.010;
+    }
+    let again = again.unwrap();
+    println!("after a rebase corrected after {again:.2} s, at most {worst:.3} frames");
+    assert!(again < 8.0, "{again}");
+    assert!(worst < 0.5, "{worst}");
+}
