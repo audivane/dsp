@@ -21,8 +21,12 @@ export interface UiSettings {
   reverse_wheel: boolean;
 }
 
-export const STEP_MIN_DB = 0.5;
-export const STEP_MAX_DB = 3;
+/** The volume-key steps the setting offers (dB); the app snaps to them. */
+export const VOLUME_STEPS_DB = [0.1, 0.5, 1, 1.5, 2, 2.5, 3];
+export function snapVolumeStep(db: number): number {
+  if (!Number.isFinite(db)) return 1;
+  return VOLUME_STEPS_DB.reduce((best, s) => (Math.abs(s - db) < Math.abs(best - db) ? s : best));
+}
 
 export type KeyAction = "up" | "down" | "mute";
 

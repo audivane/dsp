@@ -2,7 +2,8 @@
 //
 // A `Taper` maps a slider position (0..1, left to right) to a dB value and
 // back. Both directions are exact inverses, so the value a person sees is the
-// value they dragged to, and keyboard/wheel steps move it by whole 0.1 dB.
+// value they dragged to. Drags land on the 0.1 dB grid; keyboard, wheel and
+// typed changes on the 0.01 dB grid.
 
 export interface Taper {
   /** Smallest and largest dB the slider can reach. */
@@ -94,6 +95,9 @@ export function balanceTaper(maxDb: number, innerDb = 3, innerFrac = 0.7): Taper
   return { min: -max, max, db, pos };
 }
 
+/** The finest step: keyboard, wheel and typed values land on this grid. */
+export const FINE_STEP_DB = 0.01;
+
 /** Round a dB value to the slider's resolution and keep it in range. */
 export function quantiseDb(db: number, taper: Taper, step = 0.1): number {
   const v = Math.round(db / step) * step;
@@ -106,7 +110,7 @@ export function quantiseDb(db: number, taper: Taper, step = 0.1): number {
  * ends above `value` (the range may start above it, when the daemon reports
  * a narrower range than the level it holds), and a step up never below.
  */
-export function stepDb(value: number, wanted: number, taper: Taper, step = 0.1): number {
+export function stepDb(value: number, wanted: number, taper: Taper, step = FINE_STEP_DB): number {
   const db = quantiseDb(wanted, { ...taper, min: Math.min(taper.min, value), max: Math.max(taper.max, value) }, step);
   if (wanted < value) return Math.min(db, value);
   if (wanted > value) return Math.max(db, value);
@@ -117,10 +121,10 @@ export function stepDb(value: number, wanted: number, taper: Taper, step = 0.1):
 export const PAGE_STEP_DB = 6;
 
 /** The value an arrow, Page, Home or End key moves to (`null`: not a slider
- *  key). Arrows move 0.5 dB, 0.1 dB with Shift; Page Up/Down 6 dB; Home and
- *  End go to the ends. */
-export function keyStepDb(key: string, shift: boolean, value: number, taper: Taper): number | null {
-  const step = shift ? 0.1 : 0.5;
+ *  key). Arrows move 0.5 dB, 0.1 dB with Shift, 0.01 dB with Alt; Page
+ *  Up/Down 6 dB; Home and End go to the ends. */
+export function keyStepDb(key: string, shift: boolean, value: number, taper: Taper, alt = false): number | null {
+  const step = alt ? FINE_STEP_DB : shift ? 0.1 : 0.5;
   if (key === "ArrowRight" || key === "ArrowUp") return stepDb(value, value + step, taper);
   if (key === "ArrowLeft" || key === "ArrowDown") return stepDb(value, value - step, taper);
   if (key === "PageUp") return stepDb(value, value + PAGE_STEP_DB, taper);
@@ -133,7 +137,7 @@ export function keyStepDb(key: string, shift: boolean, value: number, taper: Tap
 
 /** The value one wheel notch moves to (up = louder), as the arrows.
  *  `null` for a gesture without vertical movement (a horizontal scroll). */
-export function wheelStepDb(deltaY: number, shift: boolean, value: number, taper: Taper): number | null {
+export function wheelStepDb(deltaY: number, shift: boolean, value: number, taper: Taper, alt = false): number | null {
   if (!(deltaY < 0 || deltaY > 0)) return null;
-  return keyStepDb(deltaY < 0 ? "ArrowUp" : "ArrowDown", shift, value, taper);
+  return keyStepDb(deltaY < 0 ? "ArrowUp" : "ArrowDown", shift, value, taper, alt);
 }

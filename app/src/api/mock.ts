@@ -12,7 +12,7 @@
 // DAC without a hardware mixer (digital volume); `?measure=silent` makes
 // "Match to this track" hear side B as silent (its no-match path).
 
-import { DEFAULT_UI_SETTINGS, STEP_MAX_DB, STEP_MIN_DB, type KeysState, type MainViewMemory, type OsdPayload, type ShellEvent, type ShellView, type UiSettings, type WindowLabel } from "./shell";
+import { DEFAULT_UI_SETTINGS, snapVolumeStep, type KeysState, type MainViewMemory, type OsdPayload, type ShellEvent, type ShellView, type UiSettings, type WindowLabel } from "./shell";
 import { autoPreampDb, profileAutoPreampDb, profileChannelResponseDb } from "../lib/eqmath";
 import { bandRationalProblem, kaiserAttenuationDb, manualRationalProblem, minimumPhaseBlockReason, nyquistStopBlockReason, nyquistStopCutoff } from "../lib/upsamplerLimits";
 import { parseApo } from "../lib/apo";
@@ -3219,7 +3219,7 @@ export class MockTransport implements Transport {
 
   async setUiSettings(s: UiSettings): Promise<ShellView> {
     await new Promise((r) => setTimeout(r, this.latency.request));
-    const step = Number.isFinite(s.volume_step_db) ? Math.round(Math.min(STEP_MAX_DB, Math.max(STEP_MIN_DB, s.volume_step_db)) * 2) / 2 : 1;
+    const step = snapVolumeStep(s.volume_step_db);
     const was = this.shell.settings.volume_keys;
     this.shell.settings = { ...s, volume_step_db: step };
     if (s.volume_keys !== was) this.setKeys(s.volume_keys);

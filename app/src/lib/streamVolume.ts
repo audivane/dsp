@@ -2,7 +2,7 @@
 // the Routing view share.
 
 import type { StreamInfo, StreamVolume } from "../api/types";
-import { fmtDb } from "./format";
+import { fmtDb, fmtLevelDb } from "./format";
 
 /** An edit of one stream: only the fields present change. */
 export interface StreamLevelEdit {
@@ -56,5 +56,5 @@ export function streamLimitNote(r: StreamVolume): string | null {
 export function streamDbText(db: number | null): string {
   if (db === null) return "-";
   if (db <= -120) return "−∞ dB";
-  return `${fmtDb(db, 1, false)} dB`;
+  return `${fmtLevelDb(db)} dB`;
 }

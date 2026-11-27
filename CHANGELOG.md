@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.11.1
+
+- Engine: A/B level matching no longer misjudges a pair where only one
+  side has harmonics and the two sides use different upsampling filters.
+  The side without harmonics read 3 dB quieter than it was (the output
+  headroom counted against it), so the louder side was turned down by
+  about 3 dB too much.
+- Engine: the automatic A/B headroom only makes room for what B needs
+  beyond A's own peaks. Chain A already plays at its natural gain (the
+  output headroom and the limiter handle its peaks), so turning A/B on no
+  longer turns A down when B peaks no higher, as when B only switches
+  the DC block or harmonics off.
+- App: finer volume and balance. Alt with the arrow keys or the wheel
+  moves 0.01 dB, typed values keep two decimals, and the readout shows
+  them. The volume-key step offers 0.1 dB.
+
 ## 0.11.0
 
 ### Highlights

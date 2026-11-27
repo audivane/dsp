@@ -56,7 +56,7 @@ export function TrayPopup({ transport }: { transport: Transport }) {
   const npText = nowPlayingText(np);
   const ceiling = vs?.ceiling_db ?? null;
   const up = conn === "up" && !!status;
-  const hint = "Arrow keys: 0.5 dB, Shift+arrows: 0.1 dB, Page Up/Down: 6 dB, the wheel likewise. Double-click the value to type it.";
+  const hint = "Arrow keys or wheel: 0.5 dB, with Shift 0.1 dB, with Alt 0.01 dB; Page Up/Down: 6 dB. Double-click the value to type it.";
 
   return (
     <div className="popup" ref={root} role="dialog" aria-label="Audivane DSP volume">

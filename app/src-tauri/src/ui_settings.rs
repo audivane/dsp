@@ -6,9 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// The volume-key step range in dB, and its default.
-pub const STEP_MIN_DB: f64 = 0.5;
-pub const STEP_MAX_DB: f64 = 3.0;
+/// The volume-key steps the setting offers (dB), and the default.
+pub const STEPS_DB: [f64; 7] = [0.1, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0];
 pub const STEP_DEFAULT_DB: f64 = 1.0;
 
 /// What a left click on the tray icon does.
@@ -67,9 +66,11 @@ impl UiSettings {
     pub fn normalized(mut self) -> Self {
         let s = self.volume_step_db;
         self.volume_step_db = if s.is_finite() {
-            // Half-dB steps, like the setting offers.
-            ((s.clamp(STEP_MIN_DB, STEP_MAX_DB) * 2.0).round() / 2.0)
-                .clamp(STEP_MIN_DB, STEP_MAX_DB)
+            // The nearest step the setting offers.
+            STEPS_DB
+                .into_iter()
+                .min_by(|a, b| (a - s).abs().total_cmp(&(b - s).abs()))
+                .unwrap_or(STEP_DEFAULT_DB)
         } else {
             STEP_DEFAULT_DB
         };
@@ -126,7 +127,7 @@ mod tests {
     }
 
     #[test]
-    fn step_is_clamped_to_half_db_steps() {
+    fn step_snaps_to_the_offered_steps() {
         let n = |db: f64| {
             UiSettings {
                 volume_step_db: db,
@@ -135,7 +136,9 @@ mod tests {
             .normalized()
             .volume_step_db
         };
-        assert_eq!(n(0.1), 0.5);
+        assert_eq!(n(0.1), 0.1);
+        assert_eq!(n(0.0), 0.1);
+        assert_eq!(n(0.4), 0.5);
         assert_eq!(n(9.0), 3.0);
         assert_eq!(n(1.3), 1.5);
         assert_eq!(n(2.0), 2.0);

@@ -1,5 +1,5 @@
-// A dB slider with a taper, 0.1 dB steps and keyboard/wheel/typing:
-// arrows move 0.5 dB (Shift 0.1), Page Up/Down 6 dB, the wheel (vertical only)
+// A dB slider with a taper and keyboard/wheel/typing: drags move in 0.1 dB,
+// arrows 0.5 dB (Shift 0.1, Alt 0.01), Page Up/Down 6 dB, the wheel (vertical only)
 // moves like the arrows, no step ever goes against its direction, double-clicking the
 // value lets you type one, and double-clicking the track resets (balance:
 // centre). The native range input is not used because its value would be the
@@ -84,7 +84,7 @@ export function FineSlider(props: FineSliderProps) {
       const cur = wheel.current ? wheel.current.last : p.value;
       // Never against the wheel's direction (see `stepDb`), and leave
       // scrolling past the end to the page.
-      const probe = wheelStepDb(dir > 0 ? -1 : 1, e.shiftKey, cur, p.taper);
+      const probe = wheelStepDb(dir > 0 ? -1 : 1, e.shiftKey, cur, p.taper, e.altKey);
       if (probe === null || probe === cur) {
         wheelAcc.current.reset();
         return;
@@ -94,7 +94,7 @@ export function FineSlider(props: FineSliderProps) {
       let next = cur;
       const stepDeltaY = steps > 0 ? -1 : 1;
       for (let i = 0; i < Math.abs(steps); i++) {
-        const stepped = wheelStepDb(stepDeltaY, e.shiftKey, next, p.taper);
+        const stepped = wheelStepDb(stepDeltaY, e.shiftKey, next, p.taper, e.altKey);
         if (stepped === null || stepped === next) break;
         next = stepped;
       }
@@ -192,7 +192,7 @@ export function FineSlider(props: FineSliderProps) {
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (disabled) return;
     // A step down never ends higher, even below the reported range.
-    const db = keyStepDb(e.key, e.shiftKey, value, taper);
+    const db = keyStepDb(e.key, e.shiftKey, value, taper, e.altKey);
     if (db === null) return;
     e.preventDefault();
     if (db !== value) once(db);
@@ -225,7 +225,7 @@ export function FineSlider(props: FineSliderProps) {
         aria-orientation="horizontal"
         aria-valuemin={taper.min}
         aria-valuemax={taper.max}
-        aria-valuenow={known ? Math.round(value * 10) / 10 : undefined}
+        aria-valuenow={known ? Math.round(value * 100) / 100 : undefined}
         aria-valuetext={text}
         aria-disabled={disabled || undefined}
         title={title}

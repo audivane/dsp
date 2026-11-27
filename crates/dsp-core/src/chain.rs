@@ -255,6 +255,10 @@ struct Pipeline {
     /// The output headroom gain still to apply after harmonics: 1 when
     /// `output.headroom_db` is 0 or folded into the upsampler's kernel.
     out_gain: f64,
+    /// The output headroom (dB) folded into the upsampler's kernel, 0 when
+    /// none is: the A/B level terms take it back out of the measured
+    /// kernel, since both sides lose the same output headroom.
+    up_folded_db: f64,
     /// Interleaved input is deinterleaved here, at the source rate.
     planar: Vec<Vec<f64>>,
     /// Upsampler output (only allocated when `up` is `Some`).
@@ -903,6 +907,7 @@ impl Pipeline {
             conv,
             matrix,
             up,
+            up_folded_db: if fold_headroom { headroom_db } else { 0.0 },
             harmonics_peaks: harmonics
                 .as_ref()
                 .map_or_else(Vec::new, Harmonics::peak_bounds),
@@ -2813,11 +2818,16 @@ impl AbChain {
             .max(pipeline_b.tail_out + (latency_out - pipeline_b.latency_out));
 
         // The upsampler enters the level terms only where the two designs
-        // differ; the same design on both sides cancels.
+        // differ; the same design on both sides cancels. A side without
+        // harmonics carries the output headroom in its kernel: it is taken
+        // back out, as both sides lose the same output headroom (`cut`
+        // below), whatever stage applies it.
         let (up_a, up_b) = if wants_terms && a.config.upsampler != b.config.upsampler {
             let measure = |p: &mut Pipeline, block: usize| {
-                p.up.as_mut()
-                    .map(|up| crate::ab_level::upsampler_spectrum(up.as_mut(), channels, block, sr))
+                let unfold = db_to_lin(p.up_folded_db);
+                p.up.as_mut().map(|up| {
+                    crate::ab_level::upsampler_spectrum(up.as_mut(), channels, block, sr, unfold)
+                })
             };
             (
                 measure(&mut pipeline_a, a.max_block),
@@ -4609,6 +4619,59 @@ mod tests {
         ab.reset();
         ab.process_f32(&[0.0; 32], &mut out);
         assert!(out.iter().all(|&s| s == 0));
+    }
+
+    /// The output headroom is folded into the upsampler's kernel only on a
+    /// side without harmonics: with harmonics on one side and two
+    /// upsampler designs, the pair's offset and peaks must not see it
+    /// (it once read as B quieter by the whole output headroom).
+    #[test]
+    fn ab_upsampler_term_ignores_the_folded_output_headroom() {
+        use audivane_protocol::ipc::AbHeadroom;
+        let up = |taps| {
+            crate::resample::ManualConfig {
+                target: RateTarget::Ratio(2),
+                taps,
+                ..Default::default()
+            }
+            .into_upsampler_config()
+            .unwrap()
+        };
+        let output = OutputConfig {
+            headroom_db: 3.0,
+            ..quiet_output()
+        };
+        let harmonics = audivane_protocol::HarmonicsConfig::from_preset("triode").unwrap();
+        let side = |taps, harm: bool| ChainConfig {
+            upsampler: up(taps),
+            harmonics: harm.then(|| harmonics.clone()),
+            output,
+            ..ChainConfig::neutral()
+        };
+        let level = AbLevel {
+            offset: AbOffset::Analytic(Weighting::K),
+            headroom: AbHeadroom::Auto,
+        };
+        let pair = |a: ChainConfig, b: ChainConfig| {
+            AbChain::new(spec(a, 2, 256), spec(b, 2, 256), level)
+                .unwrap()
+                .gains()
+        };
+        let up_only = pair(side(512, false), side(2048, false));
+        let both = pair(side(512, true), side(2048, false));
+        let change = Harmonics::loudness_change_db(&harmonics).unwrap();
+        // Harmonics on A only: B moves by A's loudness change, nothing more.
+        let want = up_only.offset_db + change;
+        assert!(
+            (both.offset_db - want).abs() < 0.05,
+            "{both:?} vs {up_only:?} and {change}"
+        );
+        // A side without harmonics peaks at its kernel's gain less the
+        // output headroom, counted once.
+        for p in up_only.peak_db {
+            assert!((p + 3.0).abs() < 0.2, "{up_only:?}");
+        }
+        assert!((both.peak_db[1] + 3.0).abs() < 0.2, "{both:?}");
     }
 
     #[test]

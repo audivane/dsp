@@ -4265,14 +4265,18 @@ levels deeper than the stopband attenuation minus 3 dB are omitted).
   engine plays A at `gain_a = min(0, −o)` and B at `gain_b = gain_a + o`:
   the louder side is cut and nothing is raised. Then the **shared headroom**
   `H` cuts both sides equally, so it never changes the comparison: `auto`
-  is `max(0, gain_a + P_a, gain_b + P_b)`, capped at 12 dB, where `P` is the
+  is `max(0, max(gain_a + P_a, gain_b + P_b) − max(0, P_a))`, capped at
+  12 dB: A alone plays at its natural gain (the output headroom and the
+  limiter handle its peaks), so only what B needs beyond A's own peaks is
+  cut, and a B that peaks no higher than A costs nothing. `P` is the
   side's predicted sine worst-case peak gain (per channel, EQ `max |H|` with
   every preamp, negative when the EQ only cuts, plus convolution `max |H|`,
   certified between bins; a filter matrix output sums its row, "FIR
   matrix" above; the louder channel, times the crossfeed bound, then
   carried through the harmonics stage's peak bound), minus `output.headroom_db`
-  (cut before the mix, so peaks it already took off need no more). The
-  comparison plays up to
+  (cut before the mix, so peaks it already took off need no more; an
+  upsampler's magnitude is taken without the output headroom folded into
+  its kernel). The comparison plays up to
   `|o| + H` quieter than chain A alone. Gains are static per comparison,
   never a moving AGC; a change ramps over 50 ms.
 - **The analytic offset** integrates each side's power response over a
@@ -4282,9 +4286,9 @@ levels deeper than the stopband attenuation minus 3 dB are omitted).
   a filter matrix's rows composed with the crossfeed and EQ before it, at
   that correlation of the sources)
   when B's upsampler design differs from A's, both upsamplers'
-  magnitude, and the harmonics stage's loudness change, metered in LUFS on
-  4 s of loud pink noise (the anti-clip scale, the compression on loud
-  passages and the added harmonics), each channel's EQ and IR taken
+  magnitude (without the output headroom folded into a kernel), and the
+  harmonics stage's loudness change, metered in LUFS on 4 s of loud pink
+  noise (the compression on loud passages and the added harmonics), each channel's EQ and IR taken
   together. A built pair computes
   it from its own stages and IRs. Until the engine has built one (at
   start-up, while idle or with DSP off, before a reopen), status and the

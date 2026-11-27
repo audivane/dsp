@@ -3,14 +3,13 @@
 // default) and the on-screen display. These are the app's own settings,
 // kept by the app process (src-tauri/src/ui_settings.rs), not the engine's.
 
-import type { KeysState, OsdMode, TrayClick } from "../api/shell";
+import { VOLUME_STEPS_DB, type KeysState, type OsdMode, type TrayClick } from "../api/shell";
 import { Seg } from "../components/Seg";
 import { useEffect, useState } from "react";
 import { Close } from "../components/Icons";
 import { setAutostart, setUiSettings, useShell } from "../store/shell";
 import { store, useApp } from "../store/store";
 
-const STEPS = [0.5, 1, 1.5, 2, 2.5, 3];
 const ACTION_NAME = { up: "Volume up", down: "Volume down", mute: "Mute" } as const;
 
 const HIDE_MISSING_KEY = "avdsp-hide-missing-keys";
@@ -146,7 +145,7 @@ export function TraySettings() {
           label="Volume step per key press"
           value={s.volume_step_db}
           onChange={(volume_step_db) => void setUiSettings({ volume_step_db })}
-          options={STEPS.map((db) => [db, `${db} dB`, `${db} dB per key press or wheel notch`])}
+          options={VOLUME_STEPS_DB.map((db) => [db, `${db} dB`, `${db} dB per key press or wheel notch`])}
         />
       </div>
       <div className="row">

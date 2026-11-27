@@ -8,9 +8,13 @@
 //!   worst-case peak gain `P` (sine worst case: EQ `max |H|`, convolution
 //!   `max |H|` (a filter matrix output: its row summed, every input in the
 //!   phase that adds up; both certified between bins, [`row_peak_bound`]),
-//!   the crossfeed bound):
-//!   `H = max(0, max(g_A + P_A, g_B + P_B))`,
-//!   capped at [`AB_HEADROOM_MAX_DB`].
+//!   the crossfeed bound, the upsampler, the harmonics reach), after the
+//!   output headroom. A alone plays at its natural gain (the output
+//!   headroom and the limiter handle its peaks), so the pair cuts only
+//!   what B needs beyond A's own peaks:
+//!   `H = max(0, max(g_A + P_A, g_B + P_B) - max(0, P_A))`,
+//!   capped at [`AB_HEADROOM_MAX_DB`]. Turning A/B on never turns A down
+//!   unless B peaks higher than A.
 //! - **The analytic offset** integrates each side's power response over a
 //!   pink reference with K- (default) or A-weighting
 //!   ([`crate::loudness::weighted_offset_db`]). The terms: DC block, EQ (with
@@ -106,7 +110,10 @@ impl AbGains {
         let gain_b_db = gain_b_db.min(0.0);
         let headroom_db = match headroom {
             AbHeadroom::Auto => {
-                let need = (gain_a_db + peak_a_db).max(gain_b_db + peak_b_db);
+                // A's own peaks are what playing A alone already risks:
+                // only B's excess over them (or over full scale) is cut.
+                let allowed = peak_a_db.max(0.0);
+                let need = (gain_a_db + peak_a_db).max(gain_b_db + peak_b_db) - allowed;
                 if need.is_finite() { need } else { 0.0 }
             }
             AbHeadroom::Fixed { db } => {
@@ -200,13 +207,15 @@ impl PowerSpectrum {
 }
 
 /// The impulse response of `rt` (channel 0, an impulse on every channel at
-/// input frame 0), normalised to unity DC gain, as a spectrum at the output
-/// rate. `rt` is reset afterwards.
+/// input frame 0), normalised by the ratio (a unity DC gain for a kernel
+/// without a folded gain) and scaled by `scale`, as a spectrum at the
+/// output rate. `rt` is reset afterwards.
 pub fn upsampler_spectrum(
     rt: &mut dyn UpsamplerRuntime,
     channels: usize,
     max_block: usize,
     input_rate: f64,
+    scale: f64,
 ) -> PowerSpectrum {
     let r = rt.ratio();
     let (l, m) = (r.up as usize, r.down as usize);
@@ -239,7 +248,7 @@ pub fn upsampler_spectrum(
     taps.truncate(span);
     rt.reset();
     let ratio = r.as_f64();
-    PowerSpectrum::of_taps(&taps, input_rate * ratio, 1.0 / ratio)
+    PowerSpectrum::of_taps(&taps, input_rate * ratio, scale / ratio)
 }
 
 /// The stages of one side that the analytic offset and the peak prediction
@@ -694,6 +703,21 @@ mod tests {
         assert_eq!(
             AbGains::new(3.0, AbHeadroom::Auto, -1.0, 0.0).headroom_db,
             0.0
+        );
+        // A already peaks over full scale (a room correction's bass
+        // boost): a B with the same peaks costs nothing, A plays as it
+        // does alone.
+        assert_eq!(
+            AbGains::new(0.0, AbHeadroom::Auto, 2.1, 2.1).headroom_db,
+            0.0
+        );
+        // Only B's excess over A's peak is cut.
+        let g = AbGains::new(0.0, AbHeadroom::Auto, 2.0, 3.5);
+        assert!((g.headroom_db - 1.5).abs() < 1e-12, "{g:?}");
+        // A matched down by its offset leaves B's peak alone.
+        assert_eq!(
+            AbGains::new(1.0, AbHeadroom::Auto, 2.0, 2.5).headroom_db,
+            0.5
         );
         // Capped.
         assert_eq!(

@@ -162,7 +162,12 @@ describe("keyboard, wheel and typed steps", () => {
 
   it("steps inside the range are quantised and clamped as before", () => {
     expect(stepDb(-20, -20.5, t)).toBe(-20.5);
-    expect(stepDb(-20, -19.95, t)).toBe(-19.9);
+    expect(stepDb(-20, -19.95, t)).toBe(-19.95);
+    expect(stepDb(-20, -19.954, t)).toBe(-19.95);
+    expect(keyStepDb("ArrowUp", false, -20, t, true)).toBe(-19.99);
+    expect(keyStepDb("ArrowDown", true, -8.03, t, true)).toBe(-8.04);
+    expect(keyStepDb("ArrowUp", false, -8.03, t)).toBe(-7.53);
+    expect(wheelStepDb(100, false, -20, t, true)).toBe(-20.01);
     expect(stepDb(-63.8, -64.3, t)).toBe(-64);
     expect(stepDb(-0.2, 0.3, t)).toBe(0);
   });

@@ -184,7 +184,8 @@ describe("stream volume helpers", () => {
     expect(streamLimitNote({ node: 1, volume_db: -12, muted: false, max_db: -12, limited_by: "app_volume" })).toMatch(/app's own volume/);
     expect(streamLimitNote({ node: 1, volume_db: -12, muted: false, max_db: -12, limited_by: "stream_max" })).toMatch(/^Held at −12\.0 dB: the app stream cap/);
     expect(streamDbText(null)).toBe("-");
-    expect(streamDbText(-3.25)).toBe("−3.3 dB");
+    expect(streamDbText(-3.25)).toBe("−3.25 dB");
+    expect(streamDbText(-3.2000004)).toBe("−3.2 dB");
     expect(streamDbText(0)).toBe("0.0 dB");
     expect(streamDbText(-120)).toBe("−∞ dB");
   });

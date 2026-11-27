@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { BALANCE_MAX_DB, VOLUME_MAX_DB, VOLUME_MIN_DB, type VolumeStatus } from "../api/types";
-import { fmtDb } from "../lib/format";
+import { fmtDb, fmtLevelDb } from "../lib/format";
 import { HeldHeadroomTag } from "./HeldHeadroom";
 import { balanceTaper, volumeSliderTaper } from "../lib/taper";
 import { volumeOnDac } from "../lib/volumeKeys";
@@ -80,7 +80,7 @@ export function useVolumeModel() {
   // A level below the reported range (an engine that reports its card's
   // floor) still shows where it is.
   const volTaper = volumeSliderTaper(vs?.min_db, vs?.max_db, v && vs ? v.volume_db : null, VOLUME_MIN_DB, VOLUME_MAX_DB);
-  const volText = bitPerfect ? "on DAC" : v && vs ? `${fmtDb(v.volume_db, 1, false)} dB` : "-";
+  const volText = bitPerfect ? "on DAC" : v && vs ? `${fmtLevelDb(v.volume_db)} dB` : "-";
   return { st, vs, v, epoch, begin, bitPerfect, off, dspBypassed, title, volTaper, volText };
 }
 
@@ -135,9 +135,9 @@ export function VolumeControls() {
   const balOff = off || dspBypassed;
   const BAL_BYPASS_TIP = "Balance is applied on the DSP path only; Direct playback and Bypass stay bit-perfect.";
   const bal = v?.balance_db ?? 0;
-  const balText = !v ? "-" : bal === 0 ? "C" : (bal < 0 ? "L " : "R ") + Math.abs(bal).toFixed(1);
+  const balText = !v ? "-" : bal === 0 ? "C" : (bal < 0 ? "L " : "R ") + fmtLevelDb(Math.abs(bal));
   const balTaper = balanceTaper(BALANCE_MAX_DB);
-  const hint = `Arrow keys: 0.5 dB, Shift+arrows: 0.1 dB, Page Up/Down: 6 dB. Double-click the value to type it. ${WHEEL_HINT}`;
+  const hint = `Arrow keys or wheel: 0.5 dB, with Shift 0.1 dB, with Alt 0.01 dB; Page Up/Down: 6 dB. Double-click the value to type it. ${WHEEL_HINT}`;
   return (
     <>
       <div className={"ctl" + (bitPerfect ? " bit-perfect" : "")} title={off ? title : hint}>

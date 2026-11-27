@@ -3301,7 +3301,8 @@ impl Default for LevelMatch {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum AbHeadroom {
-    /// From each side's predicted worst-case peak gain after matching,
+    /// From each side's predicted worst-case peak gain after matching:
+    /// what B needs beyond A's own peaks (A alone already plays them),
     /// capped at [`AB_HEADROOM_MAX_DB`] (default).
     #[default]
     Auto,

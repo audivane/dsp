@@ -16,7 +16,7 @@ function fmtStream(s: StreamInfo) {
 
 const STREAM_TAPER = volumeTaper(VOLUME_MIN_DB, VOLUME_MAX_DB);
 const STREAM_TIP =
-  `This app's own volume in Audivane, 0 dB = 100%, down to −120 dB. It sets the app's stream in PipeWire, so the app's own slider still works, and it never goes above the app stream cap. Below 0 dB the stream is not bit-perfect. Arrow keys: 0.5 dB, Shift+arrows: 0.1 dB, Page Up/Down: 6 dB. Double-click the value to type it. ${WHEEL_HINT}`;
+  `This app's own volume in Audivane, 0 dB = 100%, down to −120 dB. It sets the app's stream in PipeWire, so the app's own slider still works, and it never goes above the app stream cap. Below 0 dB the stream is not bit-perfect. Arrow keys or wheel: 0.5 dB, with Shift 0.1 dB, with Alt 0.01 dB; Page Up/Down: 6 dB. Double-click the value to type it. ${WHEEL_HINT}`;
 
 /** One stream's volume: a dB slider, a mute toggle, and the engine's note
  *  or refusal beside them. */

@@ -11,6 +11,13 @@ export function fmtDb(db: number, digits = 1, signed = true): string {
   return (signed && v > 0 ? "+" : "") + minus(s);
 }
 
+/** A volume or balance level: one decimal on the 0.1 dB grid, two off it
+ *  (a fine step). */
+export function fmtLevelDb(db: number, signed = false): string {
+  const fine = Number.isFinite(db) && Math.abs(Math.round(db * 10) - db * 10) > 0.05;
+  return fmtDb(db, fine ? 2 : 1, signed);
+}
+
 export function fmtFreq(f: number): string {
   if (f >= 1000) {
     const k = f / 1000;
