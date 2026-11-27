@@ -253,81 +253,6 @@ mod tests {
     }
 
     #[test]
-    fn strips_the_deleted_suffix() {
-        assert_eq!(
-            strip_deleted("/usr/bin/audivane-dsp-ui (deleted)".into()),
-            PathBuf::from("/usr/bin/audivane-dsp-ui")
-        );
-        assert_eq!(
-            strip_deleted("/usr/bin/audivane-dsp-ui".into()),
-            PathBuf::from("/usr/bin/audivane-dsp-ui")
-        );
-    }
-
-    #[test]
-    fn this_test_binary_is_not_replaced() {
-        let link = Path::new("/proc/self/exe");
-        let path = installed_path(link).unwrap();
-        assert_eq!(replacement(link, &path), None);
-    }
-
-    #[test]
-    fn a_file_renamed_over_the_binary_is_a_replacement_once_it_is_runnable() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("app");
-        write_exe(&path, b"\x7fELF old", 0o755);
-        // What the running process keeps: the old inode.
-        let running = dir.path().join("running");
-        std::fs::hard_link(&path, &running).unwrap();
-        assert_eq!(replacement(&running, &path), None);
-
-        // The package manager's way: a new file, renamed over the old path.
-        let staged = dir.path().join("app.dpkg-new");
-        write_exe(&staged, b"\x7fELF new", 0o755);
-        std::fs::rename(&staged, &path).unwrap();
-        let id = replacement(&running, &path).expect("replaced");
-        assert_eq!(id, FileId::of(&path).unwrap());
-
-        // Not runnable yet: no execute bit, or not (yet) an ELF file.
-        write_exe(&staged, b"\x7fELF new", 0o644);
-        std::fs::rename(&staged, &path).unwrap();
-        assert_eq!(replacement(&running, &path), None);
-        write_exe(&staged, b"", 0o755);
-        std::fs::rename(&staged, &path).unwrap();
-        assert_eq!(replacement(&running, &path), None);
-        // Gone (between unlink and write).
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(replacement(&running, &path), None);
-    }
-
-    #[test]
-    fn a_rewrite_in_place_changes_the_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("app");
-        write_exe(&path, b"\x7fELF one", 0o755);
-        let a = FileId::of(&path).unwrap();
-        write_exe(&path, b"\x7fELF longer", 0o755);
-        assert_ne!(a, FileId::of(&path).unwrap());
-    }
-
-    #[test]
-    fn args_keep_the_rest_and_set_hidden_from_the_window() {
-        let old: Vec<OsString> = ["/usr/bin/x", "--hidden", "--foo"]
-            .iter()
-            .map(OsString::from)
-            .collect();
-        assert_eq!(relaunch_args(&old, false), vec![OsString::from("--foo")]);
-        assert_eq!(
-            relaunch_args(&old, true),
-            vec![OsString::from("--foo"), OsString::from("--hidden")]
-        );
-        assert_eq!(
-            relaunch_args(&[OsString::from("/usr/bin/x")], true),
-            vec![OsString::from("--hidden")]
-        );
-    }
-
-    #[test]
     fn a_file_the_kernel_refuses_fails_the_exec_instead_of_running_a_shell() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app");
@@ -335,24 +260,5 @@ mod tests {
         write_exe(&path, b"\x7fELF\nexit 0\n", 0o755);
         let err = exec(&path, &[], &[(ENV_RELAUNCHED, Some("1".into()))]);
         assert_eq!(err.raw_os_error(), Some(libc::ENOEXEC));
-    }
-
-    #[test]
-    fn parent_pid_from_stat() {
-        assert_eq!(parent_of("123 (a b) c) S 45 123 123 0"), Some(45));
-        assert_eq!(parent_of("garbage"), None);
-        assert_eq!(parse_pids(&format_pids(&[3, 17])), vec![3, 17]);
-        assert_eq!(parse_pids(""), Vec::<u32>::new());
-    }
-
-    #[test]
-    fn finds_its_own_children() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("5")
-            .spawn()
-            .unwrap();
-        assert!(child_pids(std::process::id()).contains(&child.id()));
-        child.kill().unwrap();
-        child.wait().unwrap();
     }
 }

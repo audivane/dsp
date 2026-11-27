@@ -445,55 +445,6 @@ mod tests {
         FilterPreset::TableSinc,
     ];
 
-    #[test]
-    fn impulse_peak_and_span() {
-        for preset in INTERP_PRESETS {
-            for &ratio in &[2usize, 3, 6, 8] {
-                let mut rt = super::build(preset, 44_100, ratio, 1, 64).unwrap();
-                let total_in = rt.impulse_span_out_frames().div_ceil(ratio) + 4;
-                let mut inp = vec![0.0; total_in];
-                inp[0] = 1.0;
-                let mut out = vec![0.0; total_in * ratio];
-                rt.process(&[&inp], &mut [&mut out]);
-
-                if preset == FilterPreset::Nos {
-                    assert!(
-                        out[..ratio].iter().all(|&v| v == 1.0),
-                        "nos x{ratio} impulse {out:?}"
-                    );
-                    assert_eq!(rt.latency_out_frames(), ratio / 2);
-                    assert_eq!(rt.latency_out_exact(), (ratio - 1) as f64 * 0.5);
-                } else {
-                    let peak_idx = out
-                        .iter()
-                        .enumerate()
-                        .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
-                        .unwrap()
-                        .0;
-                    assert_eq!(
-                        peak_idx,
-                        rt.latency_out_frames(),
-                        "{} x{ratio} peak mismatch",
-                        preset.name()
-                    );
-                    assert!(
-                        (out[peak_idx] - 1.0).abs() < 1e-12,
-                        "{} x{ratio} peak value {}",
-                        preset.name(),
-                        out[peak_idx]
-                    );
-                }
-
-                let span = rt.impulse_span_out_frames();
-                assert!(
-                    out[span..].iter().all(|&v| v == 0.0),
-                    "{} x{ratio} non-zero past span {span}",
-                    preset.name()
-                );
-            }
-        }
-    }
-
     /// At ratios that are not powers of two the phases fall between table
     /// entries; the linear interpolation must track the continuous
     /// windowed sinc (truncating to the lower entry would be ~1e-3 off).
@@ -562,53 +513,6 @@ mod tests {
     }
 
     #[test]
-    fn reset_and_zero_length_block() {
-        for preset in INTERP_PRESETS {
-            let mut rt = super::build(preset, 44_100, 4, 1, 32).unwrap();
-            let inp = [0.25; 16];
-            let mut out = [0.0; 64];
-            rt.process(&[&inp], &mut [&mut out]);
-
-            let empty: [f64; 0] = [];
-            let mut empty_out: [f64; 0] = [];
-            rt.process(&[&empty], &mut [&mut empty_out]);
-
-            rt.reset();
-            let zeros = [0.0; 32];
-            let mut zout = [1.0; 128];
-            rt.process(&[&zeros], &mut [&mut zout]);
-            assert!(zout.iter().all(|&v| v == 0.0));
-        }
-    }
-
-    #[test]
-    fn cosine_and_catmull_rom_exact_values() {
-        // Cosine x2 on [1.0, 0.0, 0.0]:
-        // n=0: y1=0, y2=0 -> [0, 0]
-        // n=1: y1=0, y2=1 -> [0.5*(1 - cos(pi/2)), 0.5*(1 - cos(pi))] = [0.5, 1.0]
-        // n=2: y1=1, y2=0 -> [0.5*(1 + cos(pi/2)), 0.5*(1 + cos(pi))] = [0.5, 0.0]
-        let mut cos_rt = super::build(FilterPreset::Cosine, 44_100, 2, 1, 8).unwrap();
-        let mut out = [0.0; 6];
-        cos_rt.process(&[&[1.0, 0.0, 0.0]], &mut [&mut out]);
-        assert_eq!(out[0], 0.0);
-        assert_eq!(out[1], 0.0);
-        assert!((out[2] - 0.5).abs() < 1e-15);
-        assert_eq!(out[3], 1.0);
-        assert!((out[4] - 0.5).abs() < 1e-15);
-        assert_eq!(out[5], 0.0);
-
-        // Catmull-Rom x2 on [1.0, 0.0, 0.0, 0.0]:
-        // Keys cubic with a = -0.5: at n=0, h=[0,0,0,1], m0=0, m1=1, mu=0.5 -> -0.0625.
-        let mut cr_rt = super::build(FilterPreset::CatmullRom, 44_100, 2, 1, 8).unwrap();
-        let mut cr_out = [0.0; 8];
-        cr_rt.process(&[&[1.0, 0.0, 0.0, 0.0]], &mut [&mut cr_out]);
-        let expected = [-0.0625, 0.0, 0.5625, 1.0, 0.5625, 0.0, -0.0625, 0.0];
-        for (a, b) in cr_out.iter().zip(expected.iter()) {
-            assert!((a - b).abs() < 1e-15, "got {cr_out:?}");
-        }
-    }
-
-    #[test]
     fn nos_repeats_samples_bit_for_bit() {
         let samples = [
             0.0_f64,
@@ -646,69 +550,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn nos_sinc_droop_and_images() {
-        use audivane_protocol::{RateTarget, UpsamplerConfig};
-
-        let cfg_x4 = UpsamplerConfig {
-            target: RateTarget::Ratio(4),
-            preset: Some("nos".into()),
-            design: None,
-        };
-        let discrete_zoh_db = |f: f64, fs: f64, r: usize| -> f64 {
-            let num = (PI * f / fs).sin().abs();
-            let den = r as f64 * (PI * f / (r as f64 * fs)).sin().abs();
-            20.0 * (num / den).log10()
-        };
-
-        // 44.1 kHz x4: impulse is [1, 1, 1, 1], droop at 20 kHz matches discrete ZOH sinc,
-        // and imaging lobes remain above source Nyquist.
-        let m44 = crate::resample::measure_upsampler(&cfg_x4, 44_100).unwrap();
-        assert_eq!(m44.response.impulse, vec![1.0; 4]);
-        assert_eq!(m44.response.taps, 4);
-        let [mag_20k_44, img_34k, null_44k] =
-            m44.magnitude_db_at(&[20_000.0, 34_100.0, 44_100.0])[..]
-        else {
-            unreachable!()
-        };
-        let want_20k_44 = discrete_zoh_db(20_000.0, 44_100.0, 4);
-        assert!(
-            (mag_20k_44 - want_20k_44).abs() < 0.05,
-            "44.1k x4 at 20 kHz: got {mag_20k_44:.4} dB, want {want_20k_44:.4} dB"
-        );
-        // First image of 10 kHz sits at 44.1 - 10 = 34.1 kHz and must not be filtered out.
-        let want_34k = discrete_zoh_db(34_100.0, 44_100.0, 4);
-        assert!(
-            (img_34k - want_34k).abs() < 0.05 && img_34k > -15.0,
-            "44.1k x4 image at 34.1 kHz: got {img_34k:.4} dB, want {want_34k:.4} dB"
-        );
-        // Null at fs = 44.1 kHz.
-        assert!(null_44k < -100.0);
-
-        // 96 kHz x4: droop at 20 kHz is about -0.6 dB.
-        let m96 = crate::resample::measure_upsampler(&cfg_x4, 96_000).unwrap();
-        let mag_20k_96 = m96.magnitude_db_at(&[20_000.0])[0];
-        let want_20k_96 = discrete_zoh_db(20_000.0, 96_000.0, 4);
-        assert!(
-            (mag_20k_96 - want_20k_96).abs() < 0.05,
-            "96k x4 at 20 kHz: got {mag_20k_96:.4} dB, want {want_20k_96:.4} dB"
-        );
-
-        // At high ratio (x16), discrete ZOH converges to continuous sinc(f / fs).
-        let cfg_x16 = UpsamplerConfig {
-            target: RateTarget::Ratio(16),
-            preset: Some("nos".into()),
-            design: None,
-        };
-        let m44_x16 = crate::resample::measure_upsampler(&cfg_x16, 44_100).unwrap();
-        let x = PI * 20_000.0 / 44_100.0;
-        let cont_sinc_db = 20.0 * (x.sin() / x).abs().log10();
-        let mag_20k_x16 = m44_x16.magnitude_db_at(&[20_000.0])[0];
-        assert!(
-            (mag_20k_x16 - cont_sinc_db).abs() < 0.05,
-            "44.1k x16 at 20 kHz: got {mag_20k_x16:.4} dB, continuous sinc {cont_sinc_db:.4} dB"
-        );
     }
 }

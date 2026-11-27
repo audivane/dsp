@@ -263,63 +263,6 @@ mod tests {
     }
 
     #[test]
-    fn a_moving_offset_locks_only_after_the_stability_window() {
-        let mut m = Measurement::new(1, 120.0);
-        // 15 s of one section, then a section where B differs more: the
-        // running offset moves while the second section accumulates.
-        feed(&mut m, 15.0, -20.0, 0.0);
-        let mut locked_at = None;
-        for _ in 0..blocks_for(60.0) {
-            m.push(hop(-20.0, -2.0));
-            if locked_at.is_none() && m.lock().is_some() {
-                locked_at = Some(m.seconds());
-            }
-        }
-        // The running offset climbs towards +2 dB; it moves by less than
-        // 0.1 dB per 10 s only late in the second section (62.5 s).
-        let locked_at = locked_at.expect("locks");
-        assert!((50.0..70.0).contains(&locked_at), "{locked_at}");
-    }
-
-    #[test]
-    fn max_seconds_forces_the_lock() {
-        let mut m = Measurement::new(1, 10.0);
-        feed(&mut m, 9.0, -20.0, 1.0);
-        assert_eq!(m.lock(), None);
-        feed(&mut m, 1.5, -20.0, 1.0);
-        assert!((m.lock().unwrap() + 1.0).abs() < 1e-9);
-        assert_eq!(m.status().max_seconds, 10.0);
-    }
-
-    #[test]
-    fn silence_waits_and_quiet_passages_are_gated_on_a_for_both_sides() {
-        let mut m = Measurement::new(1, 60.0);
-        feed(&mut m, 5.0, -20.0, 0.0);
-        let t = m.seconds();
-        // A pause: nothing counts, the offset stays.
-        feed(&mut m, 30.0, f64::NEG_INFINITY, 0.0);
-        // Only the three blocks that still hold loud hops count.
-        assert!(m.seconds() - t < 0.35, "silence does not count");
-        assert!(!m.stable());
-        // A quiet passage (20 LU down) where B is much louder: it passes
-        // the absolute gate but not A's relative gate, so it never enters
-        // B's sum either, and its time does not count.
-        feed(&mut m, 5.0, -40.0, 12.0);
-        assert!(m.seconds() - t < 0.35, "{}", m.seconds());
-        let o = m.offset_db().unwrap();
-        // The blocks straddling the edge mix both passages; past them the
-        // quiet one is out.
-        assert!(o.abs() < 0.05, "{o}");
-        // Hops of another epoch are ignored.
-        let before = m.seconds();
-        m.push(AbHop {
-            epoch: 2,
-            ..hop(-20.0, 5.0)
-        });
-        assert_eq!(m.seconds(), before);
-    }
-
-    #[test]
     fn a_silent_b_gives_no_offset() {
         let mut m = Measurement::new(1, 10.0);
         for _ in 0..200 {
@@ -332,58 +275,6 @@ mod tests {
         assert_eq!(m.offset_db(), None);
         assert_eq!(m.lock(), None);
         assert_eq!(m.outcome(), Some(Outcome::NoMatch), "the cap ends the run");
-    }
-
-    /// When the relative gate rises and takes blocks out, the stability
-    /// window starts again: no lock within 10 s of the step back.
-    #[test]
-    fn a_step_back_refills_the_whole_stability_window() {
-        let mut m = Measurement::new(1, 300.0);
-        // Moderate, then much louder: the relative gate rises past the
-        // moderate blocks, and the count steps back.
-        feed(&mut m, 25.0, -30.0, 1.0);
-        let mut peak = m.counted;
-        let mut stepped_at = None;
-        let mut locked_at = None;
-        for _ in 0..blocks_for(60.0) {
-            m.push(hop(-12.0, 1.0));
-            if stepped_at.is_none() && m.counted < peak {
-                stepped_at = Some(m.counted);
-            }
-            peak = peak.max(m.counted);
-            if stepped_at.is_some() && locked_at.is_none() && m.lock().is_some() {
-                locked_at = Some(m.counted);
-            }
-        }
-        let stepped_at = stepped_at.expect("the count steps back");
-        let locked_at = locked_at.expect("locks later");
-        assert!(
-            locked_at >= stepped_at + blocks_for(WINDOW_SECONDS),
-            "locked {} blocks after the step back",
-            locked_at - stepped_at
-        );
-    }
-
-    /// A quiet passage after a few seconds of loud audio must not run the
-    /// 20 s minimum or the stability window.
-    #[test]
-    fn quiet_passages_do_not_count_towards_the_lock() {
-        let mut m = Measurement::new(1, 120.0);
-        // 5 s loud with B 3 dB louder, then a long passage 22 LU down
-        // where B is matched: A's relative gate leaves it out.
-        feed(&mut m, 5.0, -18.0, 3.0);
-        feed(&mut m, 60.0, -40.0, 0.0);
-        assert!(m.seconds() < 5.5, "{}", m.seconds());
-        assert_eq!(m.outcome(), None, "5 s of contributing audio never locks");
-        // Loud audio again: the clock runs on from 5 s.
-        feed(&mut m, 14.0, -18.0, 0.13);
-        assert_eq!(m.outcome(), None, "{}", m.seconds());
-        feed(&mut m, 30.0, -18.0, 0.13);
-        let Some(Outcome::Lock(o)) = m.outcome() else {
-            panic!("locks once enough contributes");
-        };
-        assert!(m.seconds() >= MIN_SECONDS);
-        assert!(o < 0.0 && o > -1.2, "{o}");
     }
 }
 

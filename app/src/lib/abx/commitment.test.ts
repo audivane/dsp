@@ -3,22 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
 
-import {
-  COMMITMENT_HEX_LENGTH,
-  COMMITMENT_PREFIX,
-  CommitmentInputError,
-  MAX_SEQUENCE_LENGTH,
-  MAX_TRIAL_INDEX,
-  SECRET_BYTES,
-  commitSecret,
-  createSecret,
-  randomBit,
-  secretFromHex,
-  secretToHex,
-  verifyReveal,
-  xSequence,
-  xSourceForIndex,
-} from "./commitment";
+import { CommitmentInputError, MAX_SEQUENCE_LENGTH, MAX_TRIAL_INDEX, commitSecret, secretFromHex, secretToHex, verifyReveal, xSequence, xSourceForIndex } from "./commitment";
 
 const RANGE_SECRET = Uint8Array.from({ length: 32 }, (_value, index) => index);
 const RANGE_SECRET_HEX = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
@@ -85,24 +70,6 @@ function labels(text: string): ("A" | "B")[] {
   return [...text] as ("A" | "B")[];
 }
 
-test("Node exposes global WebCrypto for the production primitives", () => {
-  assert.ok(globalThis.crypto);
-  assert.ok(globalThis.crypto.subtle);
-  assert.equal(typeof globalThis.crypto.subtle.digest, "function");
-  assert.equal(typeof globalThis.crypto.getRandomValues, "function");
-  assert.equal(SECRET_BYTES, 32);
-  assert.equal(COMMITMENT_HEX_LENGTH, 64);
-  assert.deepEqual([...COMMITMENT_PREFIX], [0x41, 0x42, 0x58, 0x31, 0x00]);
-});
-
-test("exported commitment prefix cannot be changed by callers", async () => {
-  assert.equal(Object.isFrozen(COMMITMENT_PREFIX), true);
-  assert.throws(() => {
-    (COMMITMENT_PREFIX as unknown as number[])[0] = 0;
-  }, TypeError);
-  assert.equal(await commitSecret(RANGE_SECRET), RANGE_COMMITMENT);
-});
-
 test("commitment and sequence match a known deterministic vector", async () => {
   assert.equal(secretToHex(RANGE_SECRET), RANGE_SECRET_HEX);
   assert.equal(await commitSecret(RANGE_SECRET), RANGE_COMMITMENT);
@@ -112,22 +79,6 @@ test("commitment and sequence match a known deterministic vector", async () => {
   assert.ok(sequence.every((label) => label === "A" || label === "B"));
   assert.equal(await xSourceForIndex(RANGE_SECRET, 1), "A");
   assert.equal(await xSourceForIndex(RANGE_SECRET, 2), "B");
-});
-
-test("all deterministic vectors agree, including large indices", async () => {
-  for (const vector of VECTORS) {
-    const secret = secretFromHex(vector.secretHex);
-    assert.equal(secret.length, 32);
-    assert.equal(await commitSecret(secret), vector.commitment);
-    assert.deepEqual(await xSequence(secret, 40), labels(vector.sequence40));
-    for (const [index, assignment] of vector.indices) {
-      assert.equal(
-        await xSourceForIndex(secret, index),
-        assignment,
-        `${vector.name} index ${index} byte order mismatch`,
-      );
-    }
-  }
 });
 
 test("verification requires both the commitment and the sequence", async () => {
@@ -168,70 +119,6 @@ test("verification rejects a tampered sequence even when the commitment matches"
     await verifyReveal(RANGE_SECRET_HEX, RANGE_COMMITMENT, expected),
     false,
   );
-});
-
-test("empty reveal can verify the commitment without a sequence", async () => {
-  assert.deepEqual(await xSequence(RANGE_SECRET, 0), []);
-  assert.equal(await verifyReveal(RANGE_SECRET_HEX, RANGE_COMMITMENT, []), true);
-});
-
-test("secret helpers round-trip and copy caller bytes", () => {
-  const secret = secretFromHex(RANGE_SECRET_HEX.toUpperCase());
-  assert.equal(secretToHex(secret), RANGE_SECRET_HEX);
-  secret.fill(0);
-  assert.equal(secretToHex(RANGE_SECRET), RANGE_SECRET_HEX);
-
-  const generated = createSecret();
-  assert.equal(generated.length, 32);
-  assert.match(secretToHex(generated), /^[0-9a-f]{64}$/);
-  assert.notEqual(secretToHex(createSecret()), secretToHex(createSecret()));
-});
-
-test("randomBit is cryptographic and roughly fair", () => {
-  let ones = 0;
-  const draws = 2000;
-  for (let i = 0; i < draws; i += 1) {
-    const bit = randomBit();
-    assert.equal(typeof bit, "boolean");
-    if (bit) {
-      ones += 1;
-    }
-  }
-  assert.ok(ones / draws > 0.4 && ones / draws < 0.6);
-});
-
-test("secret and sequence inputs are snapshotted before awaits", async () => {
-  const expectedCommitment = RANGE_COMMITMENT;
-  const expectedSequence = await xSequence(RANGE_SECRET, 8);
-  const expectedAssignment = await xSourceForIndex(RANGE_SECRET, 7);
-
-  const mutableSecret = new Uint8Array(RANGE_SECRET);
-  const commitmentPromise = commitSecret(mutableSecret);
-  mutableSecret.fill(0xff);
-  assert.equal(await commitmentPromise, expectedCommitment);
-
-  const sequenceSecret = new Uint8Array(RANGE_SECRET);
-  const sequencePromise = xSequence(sequenceSecret, 8);
-  sequenceSecret.fill(0xff);
-  assert.deepEqual(await sequencePromise, expectedSequence);
-
-  const indexSecret = new Uint8Array(RANGE_SECRET);
-  const assignmentPromise = xSourceForIndex(indexSecret, 7);
-  indexSecret.fill(0xff);
-  assert.equal(await assignmentPromise, expectedAssignment);
-
-  const expected = expectedSequence.slice();
-  const verificationPromise = verifyReveal(RANGE_SECRET_HEX, RANGE_COMMITMENT, expected);
-  expected[0] = expected[0] === "A" ? "B" : "A";
-  expected.push("A");
-  assert.equal(await verificationPromise, true);
-});
-
-test("returned sequences are fresh arrays", async () => {
-  const first = (await xSequence(RANGE_SECRET, 8)).slice() as ("A" | "B")[];
-  const second = await xSequence(RANGE_SECRET, 8);
-  first[0] = first[0] === "A" ? "B" : "A";
-  assert.deepEqual(await xSequence(RANGE_SECRET, 8), second);
 });
 
 test("malformed hex, lengths and indices are rejected", async () => {

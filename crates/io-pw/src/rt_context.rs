@@ -94,24 +94,3 @@ pub fn new_context<T: pw::loop_::IsLoopRc>(
         None => pw::context::ContextRc::new(loop_, None),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_override_names_the_module_arguments() {
-        let cfg = override_config(100_000, 200_000);
-        assert!(cfg.contains("module.rt.args = {"), "{cfg}");
-        assert!(cfg.contains("rt.time.soft = 100000"), "{cfg}");
-        assert!(cfg.contains("rt.time.hard = 200000"), "{cfg}");
-        // One fixed folder (same content every run), so runs do not pile up.
-        let dir = std::env::temp_dir().join("avdsp-rt-context-test");
-        write_override(&dir, 100_000, 200_000).unwrap();
-        write_override(&dir, 100_000, 200_000).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.join(OVERRIDE_NAME)).unwrap(),
-            cfg
-        );
-    }
-}

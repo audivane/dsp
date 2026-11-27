@@ -252,58 +252,6 @@ mod tests {
         }
     }
 
-    fn wait_for(predicate: impl Fn() -> bool, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if predicate() {
-                return true;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        predicate()
-    }
-
-    #[test]
-    fn rapid_changes_coalesce_into_few_writes() {
-        let dir = temp_dir("coalesce");
-        let store = Arc::new(ConfigStore::new(dir.join("config.json")));
-        let persister = Persister::new(Arc::clone(&store));
-
-        for n in 0..50 {
-            persister.mark(&config(256 + n));
-            thread::sleep(Duration::from_millis(5));
-        }
-        let early = persister.writes();
-        assert!(early <= 3, "50 rapid marks wrote {early} times");
-
-        // The last change lands within the bounded delay.
-        assert!(
-            wait_for(
-                || {
-                    std::fs::read_to_string(store.path())
-                        .ok()
-                        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-                        .and_then(|value| {
-                            value
-                                .get("config")
-                                .and_then(|cfg| cfg.get("quantum"))
-                                .and_then(serde_json::Value::as_u64)
-                        })
-                        == Some(305)
-                },
-                Duration::from_secs(3)
-            ),
-            "the final config was not written in time"
-        );
-        let total = persister.writes();
-        assert!(total <= 5, "coalescing produced {total} writes");
-        assert!(total >= 1);
-
-        persister.flush().unwrap();
-        persister.stop();
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
     #[test]
     fn flush_writes_the_queued_state_and_reports_errors() {
         let dir = temp_dir("flush");

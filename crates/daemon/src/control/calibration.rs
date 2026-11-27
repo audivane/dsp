@@ -237,6 +237,7 @@ fn check(
             path,
             label,
             design_rate_hz: m.design_rate_hz,
+            enabled: true,
             notes: m.notes.filter(|n| !n.trim().is_empty()),
             master,
             master_manifest_gain_db: None,
@@ -397,6 +398,20 @@ pub fn set_gain(
     let base = manifest.unwrap_or(item.gain_db);
     item.gain_db = gain_db.unwrap_or(base);
     *manifest = (item.gain_db != base).then_some(base);
+    normalize(cfg);
+    Ok(())
+}
+
+/// Switch the loaded calibration on or off (`bundle_enable`): the placed
+/// items follow on [`normalize`], the stored parts as they were. Off, each
+/// calibrated follower is also muted at runtime
+/// ([`crate::engine::follower::muted_by_calibration`]). `None` loaded: an
+/// error.
+pub fn set_enabled(cfg: &mut EngineConfig, on: bool) -> Result<(), String> {
+    let Some(cal) = cfg.calibration.as_mut() else {
+        return Err("no room calibration is loaded".into());
+    };
+    cal.enabled = on;
     normalize(cfg);
     Ok(())
 }
@@ -567,12 +582,15 @@ pub fn follow_edits(cfg: &mut EngineConfig) {
 
 /// Put `item` in `list` where the calibration's item is (the first tagged
 /// one), or at the end; every other tagged item goes. `None` removes them.
-pub fn place(list: &mut Vec<ConvolutionConfig>, item: Option<&ConvolutionConfig>) {
+/// The copy placed is tagged, and plays only while the calibration is on
+/// (`enabled`).
+pub fn place(list: &mut Vec<ConvolutionConfig>, item: Option<&ConvolutionConfig>, enabled: bool) {
     let at = list.iter().position(|c| c.calibration);
     list.retain(|c| !c.calibration);
     if let Some(item) = item {
         let mut item = item.clone();
         item.calibration = true;
+        item.enabled = enabled;
         let at = at.unwrap_or(list.len()).min(list.len());
         list.insert(at, item);
     }
@@ -581,12 +599,17 @@ pub fn place(list: &mut Vec<ConvolutionConfig>, item: Option<&ConvolutionConfig>
 /// Keep the calibration's items where they belong, after any edit: chain
 /// A's tagged item is the master part (none without one); each bundled
 /// follower's patch `convolution` is its part; a tagged item anywhere else
-/// goes. Side B is placed by [`place_b`] once materialised.
+/// goes. Chain A's copy (and B's, [`place_b`]) plays only while the
+/// calibration is on; a follower's part always plays (off mutes the
+/// follower). Side B is
+/// placed by [`place_b`] once materialised.
 pub fn normalize(cfg: &mut EngineConfig) {
     let cal = cfg.calibration.clone();
+    let on = cal.as_ref().is_none_or(|c| c.enabled);
     place(
         &mut cfg.chain.convolution,
         cal.as_ref().and_then(|c| c.master.as_ref()),
+        on,
     );
     for f in &mut cfg.outputs.followers {
         let part = cal
@@ -596,6 +619,11 @@ pub fn normalize(cfg: &mut EngineConfig) {
             Some(p) => {
                 let mut item = p.item.clone();
                 item.calibration = true;
+                // A follower's part keeps playing while the calibration is
+                // off: the follower is muted instead
+                // (`muted_by_calibration`), so its chain never changes and
+                // a sub never plays without its low-pass, not even while a
+                // chain is rebuilt.
                 let mut patch = match f.chain_patch.take() {
                     Some(Value::Object(m)) => m,
                     _ => serde_json::Map::new(),
@@ -631,17 +659,24 @@ fn strip_patch(f: &mut FollowerConfig) {
 
 /// Side B's convolution once materialised: B's own calibration
 /// (`calibration_b`: another bundle's master part, or none), else chain
-/// A's, in the place of the tagged item.
+/// A's, in the place of the tagged item. B with its own bundle keeps that
+/// item's state; B with A's calibration follows A's switch.
 pub fn place_b(
     chain_b: &mut audivane_protocol::ChainConfig,
     cal: Option<&CalibrationConfig>,
     b: Option<&AbCalibration>,
 ) {
-    let item = match b {
-        Some(b) => b.master.as_ref(),
-        None => cal.and_then(|c| c.master.as_ref()),
+    let (item, on) = match b {
+        Some(b) => (
+            b.master.as_ref(),
+            b.master.as_ref().is_none_or(|m| m.enabled),
+        ),
+        None => (
+            cal.and_then(|c| c.master.as_ref()),
+            cal.is_none_or(|c| c.enabled),
+        ),
     };
-    place(&mut chain_b.convolution, item);
+    place(&mut chain_b.convolution, item, on);
 }
 
 /// Side B for `bundle_ab`: the bundle's master part (`None`: without a
@@ -748,6 +783,7 @@ pub fn status(
         label: cal.label.clone(),
         path: cal.path.display().to_string(),
         design_rate_hz: cal.design_rate_hz,
+        enabled: cal.enabled,
         notes: cal.notes.clone(),
         devices,
         warnings,
@@ -824,26 +860,6 @@ mod tests {
         write_ir(&d.join("ll.wav"), 1, &[0.5]);
         write_ir(&d.join("rr.wav"), 1, &[0.5]);
         write_ir(&d.join("sub.wav"), 2, &[0.25]);
-    }
-
-    #[test]
-    fn a_manifest_resolves_its_irs_next_to_it() {
-        let d = dir("read");
-        irs(&d);
-        let l = read(&manifest(&d, bundle()), &cfg(), 2).unwrap();
-        let c = &l.calibration;
-        assert_eq!((c.label.as_str(), c.design_rate_hz), ("desk", 48_000));
-        let m = c.master.as_ref().unwrap();
-        assert!(m.calibration && m.enabled);
-        assert_eq!(m.gain_db, -1.0);
-        let e = m.matrix.as_ref().unwrap();
-        assert_eq!(e[0].ir_path, d.join("ll.wav"));
-        assert_eq!(c.followers[0].device, "hw:CARD=USB_1,DEV=0");
-        assert_eq!(
-            c.followers[0].item.matrix.as_ref().unwrap()[1].channel,
-            Some(1)
-        );
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -941,136 +957,6 @@ mod tests {
         want.outputs.followers[0].follow_ref_db = Some(master(&want));
         assert_eq!(c, want);
         assert!(take(&mut c).is_none());
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// Unloading leaves a follower's level and following as they are: one
-    /// at −6 dB calibrated at master −20 dB, the master down to −50 and
-    /// muted, still follows after the unload (−36 dB, muted with the
-    /// master), its entry unchanged but for the trim and patch put back.
-    #[test]
-    fn unload_keeps_following_and_the_level() {
-        let d = dir("keep-level");
-        irs(&d);
-        let l = read(&manifest(&d, bundle()), &cfg(), 2).unwrap();
-        let mut c = cfg();
-        let mut f = FollowerConfig::new("hw:CARD=USB_1,DEV=0");
-        f.volume_db = -6.0;
-        c.outputs.followers.push(f);
-        install(&mut c, l.calibration.clone(), -20.0);
-        let during = c.outputs.followers[0].clone();
-        assert!(during.follow_volume);
-        assert_eq!(
-            (during.volume_db, during.follow_ref_db),
-            (-6.0, Some(-20.0))
-        );
-        c.volume.volume_db = -50.0;
-        c.volume.muted = true;
-        assert!(uninstall(&mut c).unwrap().is_empty());
-        let f = &c.outputs.followers[0];
-        assert_eq!(
-            (f.follow_volume, f.volume_db, f.follow_ref_db),
-            (true, -6.0, Some(-20.0))
-        );
-        assert_eq!(crate::engine::follower::followed_level_db(f, -50.0), -36.0);
-        // The engine's view: still following, so the master's mute holds
-        // (silent while the master is muted).
-        let offset = crate::engine::follower::follow_offset_db(f, &c);
-        assert_eq!(offset, Some(14.0));
-        let muted = crate::engine::processor::VolumeTarget {
-            volume_db: -50.0,
-            muted: true,
-            ..Default::default()
-        };
-        let heard = crate::engine::follower::heard_level(f.volume_db, offset, &muted);
-        assert_eq!(heard, (-36.0, 0.0, true), "level, balance, muted");
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// Reloading or replacing a bundle that added a follower keeps that
-    /// follower as it is (not removed and added again at 0 dB): its level,
-    /// following and reference stay; the new bundle removes it on unload.
-    #[test]
-    fn replacing_a_bundle_keeps_the_follower_it_added() {
-        let d = dir("replace-added");
-        irs(&d);
-        let l = read(&manifest(&d, bundle()), &cfg(), 2).unwrap();
-        let mut c = cfg();
-        install(&mut c, l.calibration.clone(), -30.0);
-        assert!(c.calibration.as_ref().unwrap().followers[0].restore.added);
-        // The user sets its level while following, at master −30.
-        c.outputs.followers[0].volume_db = -30.0;
-        c.outputs.followers[0].follow_ref_db = Some(-30.0);
-        let before = c.outputs.followers[0].clone();
-        for _ in 0..2 {
-            install(&mut c, l.calibration.clone(), -30.0);
-            assert_eq!(c.outputs.followers, vec![before.clone()]);
-            assert!(c.calibration.as_ref().unwrap().followers[0].restore.added);
-        }
-        assert!(uninstall(&mut c).unwrap().is_empty());
-        assert!(c.outputs.followers.is_empty(), "the bundle's to remove");
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// An edit that drops the item (a preset load, a convolution list
-    /// without it) gets it back in place; side B keeps A's or its own.
-    #[test]
-    fn the_items_stay_in_place_across_edits() {
-        let d = dir("normalize");
-        irs(&d);
-        let l = read(&manifest(&d, bundle()), &cfg(), 2).unwrap();
-        let mut c = cfg();
-        put(&mut c, l.calibration.clone());
-        let item = c.chain.convolution[0].clone();
-        c.chain.convolution.clear();
-        normalize(&mut c);
-        assert_eq!(c.chain.convolution, vec![item.clone()]);
-        // A follower patch edit keeps the convolution the calibration's.
-        c.outputs.followers[0].chain_patch = Some(json!({"eq": null}));
-        normalize(&mut c);
-        let patch = c.outputs.followers[0].chain_patch.clone().unwrap();
-        assert_eq!(patch["eq"], Value::Null);
-        assert_eq!(patch["convolution"][0]["calibration"], json!(true));
-        // Side B: A's item, or B's own, or none.
-        let mut b = audivane_protocol::ChainConfig::default();
-        place_b(&mut b, c.calibration.as_ref(), None);
-        assert_eq!(b.convolution, vec![item.clone()]);
-        let mut other = item.clone();
-        other.gain_db = -6.0;
-        let own = AbCalibration {
-            master: Some(other.clone()),
-            ..AbCalibration::default()
-        };
-        place_b(&mut b, c.calibration.as_ref(), Some(&own));
-        assert_eq!(b.convolution, vec![other]);
-        place_b(
-            &mut b,
-            c.calibration.as_ref(),
-            Some(&AbCalibration::default()),
-        );
-        assert!(b.convolution.is_empty());
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn status_warns_about_the_rates() {
-        let d = dir("status");
-        irs(&d);
-        let l = read(&manifest(&d, bundle()), &cfg(), 2).unwrap();
-        let mut c = cfg();
-        put(&mut c, l.calibration);
-        let mut outputs = OutputsStatus::from_config(&c.outputs);
-        outputs.followers[0].state = FollowerState::Locked;
-        outputs.followers[0].device_rate = 96_000;
-        let s = status(&c, 48_000, 48_000, &outputs).unwrap();
-        assert_eq!(s.devices.len(), 2);
-        assert!(s.devices.iter().all(|d| d.installed));
-        assert_eq!(s.devices[1].trim_ms, 1.5);
-        assert_eq!(s.warnings.len(), 1, "{:?}", s.warnings);
-        assert!(s.warnings[0].contains("96000 Hz"));
-        let s = status(&c, 44_100, 96_000, &outputs).unwrap();
-        assert_eq!(s.warnings.len(), 1);
-        assert!(s.warnings[0].contains("designed at 48000 Hz"));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

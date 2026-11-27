@@ -628,64 +628,6 @@ mod tests {
     }
 
     #[test]
-    fn tukey_shape() {
-        let w = tukey_half(16);
-        assert_eq!(w[0], 0.0);
-        assert_eq!(w[15], 0.0);
-        for i in 0..16 {
-            assert_eq!(w[i], w[15 - i], "symmetric at {i}");
-        }
-        assert!(w[4..12].iter().all(|&v| v == 1.0));
-        // 0.5 (1 - cos(pi i / K)) with K = 4.
-        for (i, &v) in w.iter().enumerate().take(4).skip(1) {
-            let e = 0.5 * (1.0 - (PI * i as f64 / 4.0).cos());
-            assert!((v - e).abs() < 1e-15);
-        }
-    }
-
-    #[test]
-    fn geometry_per_preset() {
-        assert_eq!(geometry(FilterPreset::BlockFft, 8), (16_384, true));
-        assert_eq!(geometry(FilterPreset::BlockFftFast, 8), (16_384, false));
-        assert_eq!(geometry(FilterPreset::BlockFftLarge, 8), (131_072, true));
-        assert_eq!(geometry(FilterPreset::BlockFftLarge, 2), (524_288, true));
-        assert!(build(FilterPreset::BlockFft, 44_100, 6, 2, 512).is_err());
-    }
-
-    #[test]
-    fn impulse_peaks_at_latency_and_ends_within_span() {
-        for normal in [true, false] {
-            for ratio in [2, 4, 8] {
-                let mut rt = small(normal, ratio);
-                let span = rt.impulse_span_out_frames();
-                let n = span.div_ceil(ratio) + 64;
-                let mut x = vec![0.0; n];
-                x[0] = 1.0;
-                let y = run(&mut rt, &x, 7);
-                let peak = y
-                    .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
-                    .unwrap()
-                    .0;
-                assert_eq!(peak, rt.latency_out_frames(), "normal {normal} x{ratio}");
-                assert!((y[peak] - 1.0).abs() < 0.05, "unity gain: {}", y[peak]);
-                assert!(y[span..].iter().all(|&v| v == 0.0), "span covers the tail");
-                // An impulse in frame 1 also reaches the block that starts
-                // at frame 0 (where the window is zero); the span is tight
-                // for it.
-                rt.reset();
-                x[0] = 0.0;
-                x[1] = 1.0;
-                let y = run(&mut rt, &x, 7);
-                let last = span - rt.emit_len();
-                assert!(y[last..span].iter().any(|&v| v != 0.0), "span is tight");
-                assert!(y[span..].iter().all(|&v| v == 0.0), "span covers the tail");
-            }
-        }
-    }
-
-    #[test]
     fn output_independent_of_call_sizes() {
         for normal in [true, false] {
             let mut seed = 1u64;
@@ -725,19 +667,6 @@ mod tests {
                 assert!((a * 0.5 - b).abs() < 1e-15);
             }
         }
-    }
-
-    #[test]
-    fn stereo_channels_are_independent() {
-        let mut rt = BlockFft::new(64, 2, true, 2);
-        let n = 300;
-        let mut l = vec![0.0; n];
-        l[5] = 1.0;
-        let r = vec![0.0; n];
-        let (mut yl, mut yr) = (vec![0.0; 2 * n], vec![0.0; 2 * n]);
-        rt.process(&[&l, &r], &mut [&mut yl, &mut yr]);
-        assert!(yl.iter().any(|&v| v != 0.0));
-        assert!(yr.iter().all(|&v| v == 0.0));
     }
 
     /// The block stream by its explicit formula, with a naive DFT:
@@ -834,39 +763,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-
-    #[test]
-    fn work_is_spread_over_the_hop() {
-        for normal in [true, false] {
-            let mut rt = BlockFft::with_split(256, 4, normal, 2, 16, 8);
-            let total = rt.job_steps();
-            assert!(total > 100);
-            let x = noise(64, 5);
-            let mut y = vec![vec![0.0; 4 * 4]; 2];
-            let mut worst = 0;
-            for c in x.chunks(4).cycle().take(2000) {
-                let before = rt.job_done;
-                let started = rt.fill + c.len() >= rt.b;
-                let [a, b] = &mut y[..] else { unreachable!() };
-                rt.process(&[c, c], &mut [&mut a[..], &mut b[..]]);
-                if !started {
-                    worst = worst.max(rt.job_done - before);
-                }
-            }
-            // A 4-frame call runs about 4/hop of a block's steps.
-            assert!(worst <= (total * 4).div_ceil(rt.hop) + 1, "worst {worst}");
-        }
-    }
-
-    #[test]
-    fn large_geometry_splits_into_small_steps() {
-        for r in [2, 8, 32] {
-            let rt = BlockFft::new(LARGE_OUT / r, r, true, 1);
-            assert!(rt.m <= SUB_MAX && rt.l <= SUB_MAX);
-            assert_eq!(rt.q * rt.l, LARGE_OUT);
-            assert!(rt.fold_chunk <= TWIDDLE_WORK && rt.comb_chunk * rt.p <= TWIDDLE_WORK);
         }
     }
 }

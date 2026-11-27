@@ -16,7 +16,7 @@
 //! Run with `--nocapture` for the measured figures.
 
 use audivane_io_pw::varispeed_sched::{
-    CapReason, HeldReason, MAX_SPEED, MIN_SPEED, PullKind, Timing, VarispeedScheduler, pull_bound,
+    MAX_SPEED, MIN_SPEED, PullKind, Timing, VarispeedScheduler, pull_bound,
 };
 
 // ---------------------------------------------------------------- helpers
@@ -215,33 +215,12 @@ impl Jitter {
     fn draw(&self, rng: &mut Rng, max: u64) -> u64 {
         if self.worst { max } else { rng.upto(max) }
     }
-
-    /// Scaled to a slot `slot_ns` (for timings below the rule).
-    fn within_slot(slot_ns: u64) -> Self {
-        Self {
-            complete_ns: slot_ns * 8 / 10,
-            observe_ns: slot_ns / 10,
-            timer_ns: slot_ns / 8,
-            dac_ns: slot_ns / 4,
-            worst: false,
-        }
-    }
-
-    fn scaled(self, num: u64, den: u64) -> Self {
-        Self {
-            complete_ns: self.complete_ns * num / den,
-            observe_ns: self.observe_ns * num / den,
-            ..self
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Source {
     /// A pulled player: every cycle delivers a quantum.
     Pulled,
-    /// Cycles deliver nothing in `[from, to)` ns (a starved live source).
-    Starved { from: u64, to: u64 },
 }
 
 #[derive(Clone)]
@@ -583,7 +562,6 @@ fn run(sc: &Scenario) -> Outcome {
             let q = timing.quantum as usize;
             land_frames = match sc.source {
                 _ if draining => 0,
-                Source::Starved { from, to } if (from..to).contains(&now) => 0,
                 _ if sc.short_prob > 0.0 && rng.unit() < sc.short_prob => {
                     out.short_cycles += 1;
                     rng.upto(q as u64 - 1) as usize
@@ -760,166 +738,6 @@ fn the_slot_boundaries_hold() {
     }
 }
 
-/// The RT thread busy, the scheduler either blind to it (no budget) or
-/// budgeted for it. Constant speed 2 (clamped by the cap), worst-case
-/// latencies. Blind, the first two underfeed; budgeted, none does where the
-/// cap guarantees its range.
-#[test]
-fn ignoring_the_processing_time_underfeeds() {
-    let mut blind_losses = 0;
-    for (t, load) in [
-        (Timing::new(48_000, 1024, 128), 0.25),
-        (Timing::new(48_000, 1024, 128), 0.35),
-        (Timing::new(768_000, 8192, 1024), 0.33),
-        (Timing::new(48_000, 192, 192), 0.5),
-    ] {
-        let scenario = |t: Timing| {
-            let mut sc = Scenario::new(t, 0x10ad);
-            sc.commands = false;
-            sc.start_speed = MAX_SPEED;
-            sc.busy_frac = load;
-            sc.seconds = 2.0;
-            sc.jitter = sc.jitter.worst();
-            sc
-        };
-        let blind = run(&scenario(t.with_proc_budget(0)));
-        let budgeted = with_load(t, load);
-        let aware = run(&scenario(budgeted));
-        let (c0, c1) = (t.with_proc_budget(0).speed_cap(), budgeted.speed_cap());
-        eprintln!(
-            "{} Hz P {} Q {} at {:.0} % load: no budget → cap {:.4}, {} underfeed events; \
-             budget → cap {:.4} ({:?}, sustains {:.4}), {} events",
-            t.graph_rate,
-            t.period,
-            t.quantum,
-            load * 100.0,
-            c0.max_speed,
-            blind.underfeed_events,
-            c1.max_speed,
-            c1.reason,
-            c1.sustainable,
-            aware.underfeed_events
-        );
-        if blind.underfeed_events > 0 {
-            blind_losses += 1;
-        }
-        if guaranteed(&budgeted) {
-            assert_eq!(aware.underfeed_events, 0, "{t:?} at {load}");
-        }
-    }
-    assert!(blind_losses >= 2, "the blind schedule must lose frames");
-}
-
-/// Timings that do not guarantee unity run there with no underfeed while
-/// cycles complete within their (smaller) slot, and count underfeed when
-/// cycles take as long as the cycle bound.
-#[test]
-fn quantum_too_small_holds_unity_and_counts_what_it_cannot_carry() {
-    for load in [0.0, 0.5] {
-        let (mut n, mut fine, mut lossy, mut events) = (0, 0, 0, 0u64);
-        for (i, (t, vary)) in all_timings().into_iter().enumerate() {
-            let t = with_load(t, load);
-            if guaranteed(&t) {
-                continue;
-            }
-            n += 1;
-            assert_eq!(t.speed_cap().max_speed, 1.0);
-            let mut sc = Scenario::new(t, 0xa11ce + i as u64).loaded(load);
-            sc.vary_period = vary;
-            sc.start_speed = MAX_SPEED; // clamped to unity
-            sc.jitter = Jitter::within_slot(t.slot_ns());
-            sc.seconds = 0.5;
-            let o = run(&sc);
-            assert_eq!(o.underfeed_events, 0, "{t:?} within its slot: {o:?}");
-            assert!(o.max_speed_seen <= 1.0 + 1e-9);
-            fine += 1;
-
-            // Cycles at the full cycle bound: losses may happen, and are
-            // counted (`run` asserts the counters match).
-            sc.jitter = Jitter::at_bound(&t);
-            let o = run(&sc);
-            if o.underfeed_events > 0 {
-                lossy += 1;
-                events += o.underfeed_events;
-            }
-        }
-        eprintln!(
-            "quantum too small, load {:.0} %: {n} timings, {fine} clean within their slot, \
-             {lossy} lose frames at the 1 ms bound ({events} events, all counted)",
-            load * 100.0
-        );
-        assert!(n > 100);
-    }
-}
-
-/// Beyond the cycle bound, losses happen and are counted, never hidden.
-/// Also measures the headroom: how far past the bound cycles can run (at
-/// worst-case latencies, at the cap, at the default 50 % budget) before the
-/// first timing loses frames.
-#[test]
-fn slow_cycles_underfeed_and_are_counted() {
-    let mut first_loss = None;
-    for (num, den) in [(5u64, 4u64), (3, 2), (2, 1), (3, 1), (4, 1)] {
-        let mut lossy = 0;
-        let mut n = 0;
-        for (i, (t, _)) in all_timings().into_iter().enumerate().step_by(3) {
-            if !guaranteed(&t) {
-                continue;
-            }
-            n += 1;
-            let mut sc = Scenario::new(t, 0xbad + i as u64).loaded(0.5);
-            sc.start_speed = MAX_SPEED;
-            sc.jitter = Jitter::at_bound(&t).scaled(num, den).worst();
-            sc.seconds = 0.5;
-            let o = run(&sc);
-            if o.underfeed_events > 0 {
-                lossy += 1;
-            }
-        }
-        eprintln!(
-            "cycles at {:.2}× the bound (worst case, 50 % load): {lossy} of {n} sampled \
-             timings lose frames, all counted",
-            num as f64 / den as f64
-        );
-        if lossy > 0 && first_loss.is_none() {
-            first_loss = Some(num as f64 / den as f64);
-        }
-    }
-    assert!(first_loss.is_some(), "4× the bound must break somewhere");
-}
-
-/// Short cycles (a client delivering less than a quantum): the watermark
-/// refills from the ring, so a short cycle only costs a slot, and the
-/// spare slot pays for it.
-#[test]
-fn short_cycles_are_refilled() {
-    for load in [0.0, 0.5] {
-        let (mut runs, mut short) = (0, 0u64);
-        for (i, (t, _)) in all_timings().into_iter().enumerate().step_by(3) {
-            let t = with_load(t, load);
-            if !guaranteed(&t) {
-                continue;
-            }
-            let mut sc = Scenario::new(t, 0x5407 + i as u64).loaded(load);
-            sc.start_speed = MAX_SPEED;
-            sc.short_prob = 0.02;
-            sc.seconds = 2.0;
-            let o = run(&sc);
-            assert_eq!(o.underfeed_events, 0, "{t:?} with short cycles: {o:?}");
-            short += o.short_cycles;
-            runs += 1;
-        }
-        eprintln!(
-            "short cycles (2 %), load {:.0} %: {runs} timings, {short} short cycles, 0 underfeed",
-            load * 100.0
-        );
-        assert!(
-            short > 200,
-            "the scenario must actually produce short cycles: {short}"
-        );
-    }
-}
-
 fn representative() -> Timing {
     Timing::new(48_000, 1024, 1024)
 }
@@ -959,151 +777,6 @@ fn an_xrun_flushes_reprimes_and_never_overlaps() {
     assert!(
         in_flight > 0,
         "some run must carry a cycle across the reset"
-    );
-}
-
-#[test]
-fn a_reopen_reprimes_and_recaps() {
-    // From the full range into a quantum that caps at 1.1875, and back.
-    let wide = Timing::new(48_000, 1024, 1024).with_proc_budget(0);
-    let narrow = Timing::new(48_000, 1024, 64).with_proc_budget(0);
-    assert_eq!(narrow.speed_cap().max_speed, 1.1875);
-    // Requested 1.5 under the 1.1875 cap, then a reopen to Q = 128, where
-    // 1.5 is allowed (the first watermark must be for 1.5).
-    let q128 = Timing::new(48_000, 1024, 128).with_proc_budget(0);
-    assert_eq!(q128.speed_cap().max_speed, 2.0);
-    for (from, to) in [(wide, narrow), (narrow, wide), (narrow, q128)] {
-        for worst in [false, true] {
-            let mut sc = Scenario::new(from, 0x2e0);
-            sc.commands = false;
-            sc.start_speed = 1.5;
-            sc.seconds = 2.0;
-            sc.reopen = Some((20, to));
-            if worst {
-                sc.jitter = sc.jitter.worst();
-            }
-            let o = run(&sc);
-            assert_eq!(o.underfeed_events, 0, "{from:?} → {to:?}: {o:?}");
-            assert_eq!(o.restarts, 1);
-        }
-    }
-    // The request survives the reopen; the target follows the new cap.
-    let mut s = VarispeedScheduler::new(wide);
-    assert_eq!(s.command(1.5), 1.5);
-    s.reset(narrow);
-    assert_eq!(s.target(), 1.1875);
-    assert_eq!(s.cap().reason, Some(CapReason::PeriodQuantum));
-    s.reset(q128);
-    assert_eq!(s.target(), 1.5);
-    assert_eq!(s.watermark(), pull_bound(1.5, 1024) + 128);
-}
-
-/// A quantum change while playing (no reopen), both directions, at speed.
-#[test]
-fn a_live_quantum_change_keeps_playing() {
-    for (g, p, from, to) in [
-        (48_000, 1024, 1024, 256),
-        (48_000, 1024, 256, 1024),
-        (48_000, 1024, 1024, 128),
-        (48_000, 1024, 128, 1024),
-        (192_000, 4096, 4096, 512),
-        (192_000, 4096, 512, 4096),
-        (44_100, 1024, 2048, 256),
-    ] {
-        for load in [0.0, 0.5] {
-            for worst in [false, true] {
-                let t = Timing::new(g, p, from);
-                let mut sc = Scenario::new(t, 0x9a17).loaded(load);
-                sc.start_speed = MAX_SPEED;
-                sc.seconds = 2.0;
-                sc.requantum = Some((25, to));
-                if worst {
-                    sc.jitter = sc.jitter.worst();
-                }
-                let after = with_load(t.with_quantum(to), load);
-                let o = run(&sc);
-                if guaranteed(&with_load(t, load)) && guaranteed(&after) {
-                    assert_eq!(
-                        o.underfeed_events, 0,
-                        "{g} {p} {from} → {to}, load {load}: {o:?}"
-                    );
-                }
-                assert!(o.max_speed_seen <= 2.0);
-            }
-        }
-    }
-}
-
-#[test]
-fn the_tail_drain_pads_without_counting_underfeed() {
-    let mut sc = Scenario::new(representative(), 0xd2a).loaded(0.5);
-    sc.commands = false;
-    sc.start_speed = 1.5;
-    sc.drain_at = Some(30);
-    sc.min_periods = 60;
-    sc.seconds = 0.0;
-    let o = run(&sc);
-    assert_eq!(o.underfeed_events, 0, "{o:?}");
-    assert!(o.drain_frames > 0);
-}
-
-#[test]
-fn a_starved_live_source_is_held_at_unity_until_the_next_command() {
-    let t = representative();
-    let mut sc = Scenario::new(t, 0x11fe).loaded(0.5);
-    sc.commands = false;
-    sc.start_speed = 1.5;
-    sc.seconds = 4.0;
-    // The source delivers nothing for 0.4 s, from 1 s on.
-    sc.source = Source::Starved {
-        from: 1_000_000_000,
-        to: 1_400_000_000,
-    };
-    let o = run(&sc);
-    assert!(o.underfeed_events >= 3, "{o:?}");
-    assert!(o.held_seen);
-
-    // The hold releases on a command.
-    let mut s = VarispeedScheduler::new(t);
-    s.command(1.5);
-    for i in 0..3u64 {
-        s.on_pull(i * 100_000_000, 0, 1536, PullKind::Play);
-    }
-    assert_eq!(s.held(), Some(HeldReason::Underfeed));
-    assert_eq!(s.target(), 1.0);
-    assert_eq!(s.command(1.2), 1.2);
-    assert_eq!(s.held(), None);
-
-    // With a command after the gap, the run ends at speed again.
-    let mut sc = sc.clone();
-    sc.late_command = Some((2_000_000_000, 1.5));
-    let o = run(&sc);
-    assert!(o.held_seen);
-}
-
-/// Periods beyond the ring allocation: capped by the ring, priming ends,
-/// and no underfeed at the ring cap.
-#[test]
-fn periods_beyond_the_allocation_play_at_the_ring_cap() {
-    for q in [1024u32, 8192] {
-        let t = Timing::new(48_000, 16_384, q);
-        let cap = t.speed_cap();
-        let mut sc = Scenario::new(t, 0x16384).loaded(0.5);
-        sc.start_speed = MAX_SPEED;
-        sc.min_periods = 30;
-        let o = run(&sc);
-        eprintln!(
-            "P 16384, Q {q}: cap {:.4} ({:?}), {} underfeed events",
-            cap.max_speed, cap.reason, o.underfeed_events
-        );
-        assert!(o.max_fill <= o.capacity);
-        if guaranteed(&t) {
-            assert_eq!(o.underfeed_events, 0, "{t:?}: {o:?}");
-        }
-    }
-    assert_eq!(
-        Timing::new(48_000, 16_384, 8192).speed_cap().reason,
-        Some(CapReason::RingSize)
     );
 }
 

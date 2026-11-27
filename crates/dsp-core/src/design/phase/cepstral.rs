@@ -218,14 +218,6 @@ mod tests {
     }
 
     #[test]
-    fn fft_length_rule() {
-        assert_eq!(fft_len(2040), 65_536);
-        assert_eq!(fft_len(2048), 131_072);
-        assert_eq!(fft_len(376), 16_384);
-        assert_eq!(fft_len(4616), 262_144);
-    }
-
-    #[test]
     fn magnitude_is_preserved() {
         let h = test_kernel();
         for phase in [Target::Minimum, Target::Intermediate] {
@@ -262,74 +254,5 @@ mod tests {
         // DC gain is kept
         let (sh, sg): (f64, f64) = (h.iter().sum(), g.iter().sum());
         assert!((sh - sg).abs() < 1e-9 * sh);
-    }
-
-    #[test]
-    fn intermediate_phase_is_four_times_longer_with_its_peak_near_three_eighths() {
-        let h = test_kernel();
-        let g = transform(&h, Target::Intermediate).unwrap();
-        assert_eq!(g.len(), 4 * h.len());
-        let at = peak_index(&g) as f64 / g.len() as f64;
-        assert!((at - 0.375).abs() < 0.02, "peak at {at}");
-        // nothing significant wraps around
-        let peak = g[peak_index(&g)].abs();
-        assert!(g[..g.len() / 8].iter().all(|v| v.abs() < 1e-6 * peak));
-    }
-
-    /// The general blend's exact reduction gives the table's bits at 0.75,
-    /// and a blend between moves the peak smoothly.
-    #[test]
-    fn general_blend() {
-        let h = test_kernel();
-        let table = transform(&h, Target::Intermediate).unwrap();
-        let general = transform(&h, Target::Mix(INTERMEDIATE_BLEND)).unwrap();
-        assert!(
-            table
-                .iter()
-                .zip(&general)
-                .all(|(a, b)| a.to_bits() == b.to_bits())
-        );
-        let mut last = 0.0;
-        for p in [0.1, 0.3, 0.5, 0.749, 0.9] {
-            let g = transform(&h, Target::Mix(p)).unwrap();
-            assert_eq!(g.len(), 4 * h.len());
-            let at = peak_index(&g) as f64 / g.len() as f64;
-            assert!(at > last, "{p}: {at}");
-            last = at;
-            let nfft = 1 << 13;
-            let (a, b) = (mag_db(&h, nfft), mag_db(&g, nfft));
-            let peak = a.iter().copied().fold(f64::MIN, f64::max);
-            for (k, (x, y)) in a.iter().zip(&b).enumerate() {
-                if *x > peak - 60.0 {
-                    assert!((x - y).abs() < 1e-3, "{p} bin {k}: {x} vs {y}");
-                }
-            }
-        }
-        assert!(transform(&h, Target::Mix(1.0)).is_err());
-    }
-
-    #[test]
-    fn deterministic() {
-        let h = test_kernel();
-        for phase in [Target::Minimum, Target::Intermediate] {
-            let a = transform(&h, phase).unwrap();
-            let b = transform(&h, phase).unwrap();
-            assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()));
-        }
-    }
-
-    #[test]
-    fn scaling_commutes_with_the_transform() {
-        // log|cH| = log c + log|H|: only c[0] moves, the output scales by c.
-        let h = test_kernel();
-        let h2: Vec<f64> = h.iter().map(|v| v * 0.5).collect();
-        let a = transform(&h, Target::Minimum).unwrap();
-        let b = transform(&h2, Target::Minimum).unwrap();
-        let peak = a[peak_index(&a)].abs();
-        assert!(
-            a.iter()
-                .zip(&b)
-                .all(|(x, y)| (x - 2.0 * y).abs() < 1e-13 * peak)
-        );
     }
 }

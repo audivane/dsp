@@ -197,11 +197,12 @@ $R bash -lc "cd $W/app && CARGO_TARGET_DIR=$W/target/arch npx tauri build --no-b
   preset is marked, with a reset back to it; `lib/effects.ts` holds the
   ranges and the series maths.
 - Room calibration (`views/ConvolutionView.tsx`): its own line above
-  the impulse-response list (label, devices, warnings) with Load
-  (`bundle_load`), Unload (`bundle_unload`) and a level per part
-  (`bundle_gain`, back to the bundle's with the reset); the daemon keeps the
-  tagged item and `store.convolution()` leaves it out of the editable
-  list.
+  the impulse-response list (label, devices, warnings) with a power
+  button (`bundle_enable`: off, the mains play unfiltered and its
+  followers are muted), Load (`bundle_load`), Unload (`bundle_unload`) and
+  a level per part (`bundle_gain`, back to the bundle's with the reset);
+  the daemon keeps the tagged item and `store.convolution()` leaves it out
+  of the editable list.
 - Output channels (`components/OutputPairPicker.tsx`): the master's
   channel pair on the Device page and each follower's in its card
   (`set_device` / `set_follower` with `output_channels`).

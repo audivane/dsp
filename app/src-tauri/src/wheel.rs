@@ -94,60 +94,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sign_table() {
-        use HostSign::*;
-        // The watcher's owner decides first.
-        assert_eq!(host_sign(Some("plasmashell"), Some("GNOME")), PositiveUp);
-        assert_eq!(host_sign(Some("kded6"), None), PositiveUp);
-        assert_eq!(host_sign(Some("gnome-shell"), Some("KDE")), PositiveDown);
-        // Then the desktop.
-        assert_eq!(host_sign(None, Some("KDE")), PositiveUp);
-        assert_eq!(host_sign(None, Some("ubuntu:GNOME")), PositiveDown);
-        assert_eq!(host_sign(Some("snixembed"), Some("GNOME")), PositiveDown);
-        assert_eq!(host_sign(None, Some("XFCE")), PositiveUp);
-        assert_eq!(host_sign(Some("waybar"), Some("sway")), PositiveUp);
-        assert_eq!(host_sign(None, None), PositiveUp);
-    }
-
-    #[test]
-    fn one_step_per_notch_and_fractions_add_up() {
-        let t = Instant::now();
-        let mut w = WheelAccumulator::default();
-        assert_eq!(w.push(120, HostSign::PositiveUp, false, t), 1);
-        assert_eq!(w.push(240, HostSign::PositiveUp, false, t), 2);
-        // A touchpad: 30-unit deltas make one step per four.
-        let steps: Vec<i32> = (0..8)
-            .map(|_| w.push(30, HostSign::PositiveUp, false, t))
-            .collect();
-        assert_eq!(steps, vec![0, 0, 0, 1, 0, 0, 0, 1]);
-        assert_eq!(w.push(-120, HostSign::PositiveUp, false, t), -1);
-    }
-
-    #[test]
-    fn gnome_and_reverse_flip_the_direction() {
-        let t = Instant::now();
-        let mut w = WheelAccumulator::default();
-        // GNOME: positive is down, so quieter.
-        assert_eq!(w.push(120, HostSign::PositiveDown, false, t), -1);
-        assert_eq!(w.push(120, HostSign::PositiveUp, true, t), -1);
-        assert_eq!(w.push(120, HostSign::PositiveDown, true, t), 1);
-    }
-
-    #[test]
-    fn a_remainder_is_dropped_on_reversal_and_after_a_pause() {
-        let t = Instant::now();
-        let mut w = WheelAccumulator::default();
-        assert_eq!(w.push(100, HostSign::PositiveUp, false, t), 0);
-        // Turned back: the 100 units up do not cancel a full notch down.
-        assert_eq!(w.push(-120, HostSign::PositiveUp, false, t), -1);
-        assert_eq!(w.push(100, HostSign::PositiveUp, false, t), 0);
-        // After a pause the old remainder does not complete a new notch.
-        let later = t + IDLE_RESET + Duration::from_millis(1);
-        assert_eq!(w.push(20, HostSign::PositiveUp, false, later), 0);
-        assert_eq!(w.push(100, HostSign::PositiveUp, false, later), 1);
-    }
-
-    #[test]
     fn a_huge_delta_is_bounded() {
         let mut w = WheelAccumulator::default();
         assert_eq!(

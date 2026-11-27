@@ -4,7 +4,7 @@
 # first with ./make-source.sh, then `makepkg -si` (see README.md).
 
 pkgname=audivane-dsp
-pkgver=0.11.1
+pkgver=0.11.2
 pkgrel=1
 pkgdesc="Bit-perfect system-wide DSP engine for PipeWire, with CLI and desktop UI"
 arch=(x86_64)

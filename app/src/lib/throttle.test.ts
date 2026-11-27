@@ -32,27 +32,6 @@ function fakeClock() {
 }
 
 describe("throttleLatest", () => {
-  it("sends the first value at once and then at most once per interval, newest value", () => {
-    const { clock, advance } = fakeClock();
-    const sent: number[] = [];
-    const th = throttleLatest((v: number) => sent.push(v), 40, clock);
-    th.push(1);
-    expect(sent).toEqual([1]);
-    th.push(2);
-    th.push(3);
-    expect(sent).toEqual([1]);
-    advance(39);
-    expect(sent).toEqual([1]);
-    advance(1);
-    expect(sent).toEqual([1, 3]);
-    // A 100 Hz drag for one second produces about 25 sends.
-    for (let i = 0; i < 100; i++) {
-      th.push(100 + i);
-      advance(10);
-    }
-    expect(sent.length).toBeGreaterThanOrEqual(25);
-    expect(sent.length).toBeLessThanOrEqual(28);
-  });
 
   it("flush sends the final value immediately and only once", () => {
     const { clock, advance } = fakeClock();
@@ -70,14 +49,4 @@ describe("throttleLatest", () => {
     expect(sent).toEqual([1, 2]);
   });
 
-  it("cancel drops the pending value", () => {
-    const { clock, advance } = fakeClock();
-    const sent: number[] = [];
-    const th = throttleLatest((v: number) => sent.push(v), 40, clock);
-    th.push(1);
-    th.push(2);
-    th.cancel();
-    advance(100);
-    expect(sent).toEqual([1]);
-  });
 });

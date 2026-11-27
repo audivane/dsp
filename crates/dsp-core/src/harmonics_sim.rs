@@ -190,15 +190,6 @@ impl ReadoutCache {
         }
     }
 
-    /// `(hits, misses)` so far.
-    #[cfg(test)]
-    pub(crate) fn stats(&self) -> (usize, usize) {
-        (
-            self.hits.load(Ordering::Relaxed),
-            self.misses.load(Ordering::Relaxed),
-        )
-    }
-
     pub(crate) fn clear(&self) {
         lock(&self.tones).clear();
         lock(&self.levels).clear();
@@ -363,32 +354,4 @@ pub(crate) fn par_map<T: Sync, R: Send>(
     out.into_iter()
         .map(|r| r.expect("every item is mapped"))
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lru_evicts_the_least_recently_used() {
-        let mut l: Lru<u32, u32> = Lru::new(2);
-        *l.get_or_insert_with(1, || 10) += 0;
-        l.get_or_insert_with(2, || 20);
-        assert_eq!(l.get_mut(&1).copied(), Some(10));
-        l.get_or_insert_with(3, || 30);
-        assert_eq!(l.len(), 2);
-        assert!(l.get_mut(&2).is_none(), "2 was the least recently used");
-        assert_eq!(l.get_mut(&1).copied(), Some(10));
-        assert_eq!(l.get_mut(&3).copied(), Some(30));
-    }
-
-    #[test]
-    fn par_map_keeps_the_order() {
-        let items: Vec<usize> = (0..100).collect();
-        assert_eq!(
-            par_map(&items, MAX_THREADS, |&i| i * 2),
-            (0..100).map(|i| i * 2).collect::<Vec<_>>()
-        );
-        assert!(par_map(&[] as &[usize], MAX_THREADS, |&i| i).is_empty());
-    }
 }

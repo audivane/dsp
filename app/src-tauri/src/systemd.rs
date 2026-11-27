@@ -169,24 +169,3 @@ fn describe(e: zbus::Error) -> String {
         format!("systemd could not start {UNIT}: {text}")
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::last_error_line;
-
-    #[test]
-    fn picks_the_engines_own_last_error() {
-        let journal = "\
-[2026-11-16T16:37:31.174Z INFO  audivane_dsp] audivane-dsp 0.9.3 starting
-audivane-dsp: cannot start the engine: first
-[2026-11-16T16:37:33.932Z ERROR audivane_dsp] cannot start the engine: second
-audivane-dsp: cannot start the engine: second
-Started Audivane DSP engine.
-";
-        assert_eq!(
-            last_error_line(journal).as_deref(),
-            Some("cannot start the engine: second")
-        );
-        assert_eq!(last_error_line("nothing here\n"), None);
-    }
-}

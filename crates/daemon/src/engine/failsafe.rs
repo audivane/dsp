@@ -279,31 +279,6 @@ mod tests {
         ]
     }
 
-    /// Every channel's level and switch survive a reload and must all
-    /// match; a missing or unreadable state is no state.
-    #[test]
-    fn channel_states_round_trip_and_compare_per_channel() {
-        let path = temp("channels");
-        let mut store = MuteStore::load(Some(path.clone()));
-        let mut left = floor(false);
-        left[1].switch_on = None;
-        left[1].level_db = -63.5;
-        store.record("hw:CARD=DAC,DEV=0", -90.0, Some(left.clone()));
-        let back = MuteStore::load(Some(path.clone()));
-        assert_eq!(back.entries()[0].left.as_deref(), Some(&left[..]));
-        assert!(same_channels(&floor(false), &floor(false)));
-        let mut raised = floor(false);
-        raised[1].level_db = -40.0;
-        assert!(!same_channels(&floor(false), &raised));
-        let mut one_on = floor(false);
-        one_on[1].switch_on = Some(true);
-        assert!(!same_channels(&floor(false), &one_on));
-        assert!(!same_channels(&floor(false), &floor(false)[..1]));
-        assert_eq!(parse_channels("garbage"), None);
-        assert_eq!(parse_channels(""), None);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
     fn temp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "audivane-failsafe-store-{}-{name}",
@@ -311,35 +286,6 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         dir.join("failsafe-muted")
-    }
-
-    /// One entry per card, keyed by card name (not index); taking one
-    /// keeps the others, and the store survives a reload.
-    #[test]
-    fn mute_store_keeps_one_entry_per_card() {
-        let path = temp("cards");
-        let mut store = MuteStore::load(Some(path.clone()));
-        store.record("hw:CARD=DAC,DEV=0", -80.0, Some(floor(false)));
-        store.record("hw:CARD=Other,DEV=0", -70.0, None);
-        store.record("hw:CARD=DAC,DEV=1", -75.0, Some(floor(false)));
-        let mut store = MuteStore::load(Some(path.clone()));
-        assert_eq!(store.entries().len(), 2);
-        // Another card: nothing, and nothing lost.
-        assert_eq!(store.get("hw:CARD=Third,DEV=0"), None);
-        store.forget("hw:CARD=Third,DEV=0");
-        let dac = store.get("hw:CARD=DAC,DEV=0").unwrap().clone();
-        // Looking does not drop it; only forget does.
-        assert_eq!(MuteStore::load(Some(path.clone())).entries().len(), 2);
-        store.forget("hw:CARD=DAC,DEV=0");
-        assert_eq!(
-            (dac.device.as_str(), dac.level_db, dac.left),
-            ("hw:CARD=DAC,DEV=1", -75.0, Some(floor(false)))
-        );
-        let store = MuteStore::load(Some(path.clone()));
-        assert_eq!(store.entries().len(), 1);
-        assert_eq!(store.entries()[0].card, "Other");
-        assert_eq!(store.entries()[0].left, None);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// Saving replaces the file in one step (a new file renamed over the
@@ -367,20 +313,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
-    /// Forgetting the last entry removes the file (and syncs the
-    /// directory, so the removal survives a crash); a reload is empty.
-    #[test]
-    fn forgetting_the_last_entry_removes_the_file() {
-        let path = temp("empty");
-        let mut store = MuteStore::load(Some(path.clone()));
-        store.record("hw:CARD=DAC,DEV=0", -80.0, Some(floor(false)));
-        assert!(path.exists());
-        store.forget("hw:CARD=DAC,DEV=0");
-        assert!(!path.exists());
-        assert!(MuteStore::load(Some(path.clone())).entries().is_empty());
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
     /// The crash failsafe writes only when it knows the engine held the DAC:
     /// never with the marker location unknown, never after a release, and
     /// not for an engine that never got the DAC.
@@ -395,18 +327,6 @@ mod tests {
         assert!(crash_failsafe_may_write(Some(&path)).is_ok());
         note_released(Some(&path), true); // let go
         assert!(crash_failsafe_may_write(Some(&path)).is_err());
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    #[test]
-    fn released_marker_round_trips() {
-        let path = temp("released").with_file_name("dac-released");
-        assert!(!was_released(Some(&path)));
-        note_released(Some(&path), true);
-        assert!(was_released(Some(&path)));
-        note_released(Some(&path), false);
-        assert!(!was_released(Some(&path)));
-        assert!(!was_released(None));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

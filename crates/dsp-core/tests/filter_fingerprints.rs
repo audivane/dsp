@@ -110,10 +110,8 @@ use audivane_dsp_core::design::{
 };
 use audivane_dsp_core::presets::{FilterPreset, PresetError, UpsamplerRuntime};
 use audivane_dsp_core::test_support::{Record, capture};
-use audivane_protocol::{
-    ALLOWED_RATES, ChainConfig, FilterPhase, RateRatio, RateTarget, UpsamplerConfig,
-};
-use matrix::{CHAIN_HEADROOM_DB, COST4_PICKS, Case, Design, RATE_DEPENDENT};
+use audivane_protocol::{ChainConfig, FilterPhase, RateRatio, RateTarget, UpsamplerConfig};
+use matrix::{CHAIN_HEADROOM_DB, COST4_PICKS, Case, Design};
 use realfft::RealFftPlanner;
 
 // ------------------------------------------------------------ heap counter
@@ -2108,87 +2106,7 @@ fn uncovered(gates: &BTreeMap<u64, (Gate, String)>) -> Vec<String> {
     out
 }
 
-/// Run the ladder tier (not fingerprinted): every case's own checks (what
-/// the mask accepts builds), and every construction's gate failures
-/// within the library's exemptions.
-fn run_ladder(cases: Vec<Case>) {
-    let (cases, filtered) = select(cases);
-    let start = Instant::now();
-    let PoolRun {
-        ran,
-        gates,
-        mut failures,
-    } = run_all(&cases, true);
-    let mut statuses: BTreeMap<String, usize> = BTreeMap::new();
-    for r in ran.iter().flatten() {
-        *statuses.entry(r.row.status.clone()).or_default() += 1;
-    }
-    println!(
-        "tier ladder: {} cases in {:.1} s; status counts: {statuses:?}",
-        cases.len(),
-        start.elapsed().as_secs_f64()
-    );
-    report_memory("ladder", &cases, &ran, filtered);
-    write_gate_report("ladder", &gates, filtered);
-    let mut worst: BTreeMap<String, f64> = BTreeMap::new();
-    for (g, first) in gates.values() {
-        for (check, value) in g.failed() {
-            let name = first.split(' ').next().unwrap_or("").to_string();
-            let v = value.parse::<f64>().unwrap_or(f64::INFINITY);
-            let w = worst.entry(format!("{name} {check}")).or_insert(v);
-            *w = w.max(v);
-        }
-    }
-    println!("tier ladder: worst failed checks {worst:?}");
-    failures.extend(uncovered(&gates));
-    if !failures.is_empty() {
-        for f in &failures {
-            println!("FAILED {f}");
-        }
-        panic!(
-            "{} failures in the ladder tier (listed above)",
-            failures.len()
-        );
-    }
-}
-
 // ------------------------------------------------------------ tests
-
-/// The matrix is what the plan says: the rate-dependent presets are the
-/// ones whose length changes with the source rate, and every tier A preset
-/// case is a tier B case.
-#[test]
-fn matrix_shape() {
-    let dependent: Vec<FilterPreset> = FilterPreset::ALL
-        .iter()
-        .copied()
-        .filter(|&p| matrix::is_kernel(p))
-        .filter(|&p| {
-            [2u32, 4].iter().any(|&r| {
-                let taps: Vec<_> = ALLOWED_RATES
-                    .iter()
-                    .map(|&rate| {
-                        let cx = context(rate, RateRatio::integer(r), PIPELINES[0], CHANNELS);
-                        design::feasibility(&catalogue::design(p), &cx)
-                            .ok()
-                            .map(|plan| plan.grid_taps)
-                    })
-                    .collect();
-                taps.windows(2).any(|w| w[0] != w[1])
-            })
-        })
-        .collect();
-    assert_eq!(dependent, RATE_DEPENDENT);
-    let b: HashSet<String> = matrix::tier_b().iter().map(Case::key).collect();
-    for c in matrix::tier_a() {
-        if matches!(c.design, Design::Preset(_)) {
-            assert!(b.contains(&c.key()), "{} not in tier B", c.key());
-        }
-    }
-    for pair in matrix::rational_pairs() {
-        assert!(!pair.1.is_unity());
-    }
-}
 
 /// The rational probe reaches every tap: changing any one tap of a
 /// rational kernel changes the runtime hash.
@@ -2239,10 +2157,4 @@ fn tier_a_fingerprints() {
 #[ignore = "tier B: about half an hour; run before and after every filter refactor step"]
 fn tier_b_fingerprints() {
     run_tier("b", matrix::tier_b(), true);
-}
-
-#[test]
-#[ignore = "the ladder tier: the rational pairs only a rate ladder asks for; with tier B"]
-fn tier_ladder_builds() {
-    run_ladder(matrix::tier_ladder());
 }

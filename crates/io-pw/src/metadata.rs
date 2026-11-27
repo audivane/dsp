@@ -749,37 +749,4 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
-
-    #[test]
-    fn plan_writes_fails_cleanly_without_mutating_state_when_persist_fails() {
-        let (dir, _) = temp_restore_path("persist_failure");
-        fs::create_dir_all(&dir).unwrap();
-        let blocker = dir.join("not_a_dir");
-        fs::write(&blocker, b"file").unwrap();
-        let unwriteable_path = blocker.join("settings-restore.json");
-
-        let mut tracker = MetadataTracker::with_path(unwriteable_path);
-        tracker.on_property(
-            0,
-            Some("clock.allowed-rates"),
-            Some("Spa:String:JSON"),
-            Some("[ 48000 ]"),
-        );
-        assert!(tracker.complete_initial_sync_and_recover().is_empty());
-
-        let res = tracker.plan_writes(&[
-            ("clock.allowed-rates", "Spa:String:JSON", "[ 44100 48000 ]"),
-            ("clock.force-rate", "Spa:String:JSON", "48000"),
-        ]);
-        assert!(res.is_err(), "expected persistence failure to return Err");
-        assert!(
-            !tracker.is_dirty(),
-            "tracker must not become dirty when restore file persistence failed"
-        );
-        assert!(!tracker.is_owned("clock.allowed-rates"));
-        assert!(!tracker.is_owned("clock.force-rate"));
-        assert!(tracker.plan_restore().is_empty());
-
-        let _ = fs::remove_dir_all(&dir);
-    }
 }

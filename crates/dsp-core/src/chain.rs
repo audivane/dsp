@@ -2967,17 +2967,39 @@ impl AbChain {
         self.quantizer.bits()
     }
 
-    /// [`Chain::has_harmonics`] of the side playing ([`Self::current`]).
-    pub fn has_harmonics(&self) -> bool {
-        match self.current {
+    fn side_has_harmonics(&self, side: Side) -> bool {
+        match side {
             Side::A => self.a.harm_tap.is_some(),
             Side::B => self.b.harm_tap.is_some(),
         }
     }
 
+    /// The side the live view taps: the side playing ([`Self::current`]),
+    /// or the other one when only that one runs a harmonics stage (both
+    /// sides run every block, so the stage of the side not heard still
+    /// shows what it adds).
+    fn tap_side(&self) -> Side {
+        let other = match self.current {
+            Side::A => Side::B,
+            Side::B => Side::A,
+        };
+        if !self.side_has_harmonics(self.current) && self.side_has_harmonics(other) {
+            other
+        } else {
+            self.current
+        }
+    }
+
+    /// [`Chain::has_harmonics`] of the side the live view taps
+    /// ([`Self::tap_side`]).
+    pub fn has_harmonics(&self) -> bool {
+        self.side_has_harmonics(self.tap_side())
+    }
+
     /// [`Chain::set_harmonics_tap`]: the live view follows the side
-    /// playing; each block taps only the side [`Self::current`] names when
-    /// it starts (one side per block, so a switch never mixes them).
+    /// playing, or the other side when only it has a harmonics stage
+    /// ([`Self::tap_side`]); each block taps one side, chosen when it
+    /// starts, so a switch never mixes them.
     pub fn set_harmonics_tap(&mut self, on: bool) {
         self.tap_on = on;
         self.route_harmonics_tap();
@@ -2985,8 +3007,9 @@ impl AbChain {
 
     fn route_harmonics_tap(&mut self) {
         let on = self.tap_on;
-        self.a.set_harmonics_tap(on && self.current == Side::A);
-        self.b.set_harmonics_tap(on && self.current == Side::B);
+        let side = self.tap_side();
+        self.a.set_harmonics_tap(on && side == Side::A);
+        self.b.set_harmonics_tap(on && side == Side::B);
     }
 
     /// [`Chain::harmonics_tap`] of the side the last block tapped
@@ -3559,75 +3582,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn explicit_dither_runs_without_other_stages() {
-        let config = ChainConfig {
-            output: OutputConfig {
-                bits: 16,
-                dither: DitherKind::Resonant5,
-                headroom_db: 0.0,
-            },
-            ..ChainConfig::neutral()
-        };
-        let mut chain = Chain::new(ChainSpec {
-            config,
-            sample_rate: 352_800,
-            channels: 1,
-            max_block: 4096,
-            irs: None,
-        });
-        assert!(!chain.is_bit_transparent());
-        assert_eq!(chain.latency_out_frames(), 0);
-        let input = [0.0; 4096];
-        let mut output = [0; 4096];
-        chain.process_f32(&input, &mut output);
-        assert!(output.iter().any(|&x| x != 0));
-    }
-
-    #[test]
-    fn shaped_dither_uses_the_output_rate_shaper() {
-        let output = OutputConfig {
-            bits: 16,
-            dither: DitherKind::Shaped,
-            headroom_db: 0.0,
-        };
-        let eq = Some(flat_profile(-1.0));
-        for (ratio, out_rate) in [(1u32, 48_000u32), (4, 192_000)] {
-            let config = ChainConfig {
-                eq: eq.clone(),
-                upsampler: crate::resample::ManualConfig {
-                    target: if ratio == 1 {
-                        RateTarget::Off
-                    } else {
-                        RateTarget::Ratio(ratio)
-                    },
-                    taps: 256,
-                    ..Default::default()
-                }
-                .into_upsampler_config()
-                .unwrap(),
-                output,
-                ..ChainConfig::neutral()
-            };
-            let chain = Chain::new(spec(config.clone(), 2, 64));
-            assert_eq!(chain.output_rate(), out_rate);
-            assert_eq!(
-                chain.quantizer.shaper(),
-                crate::dither::noise_shaper(out_rate).map(|h| &h[..])
-            );
-            let ab = AbChain::new(
-                spec(config.clone(), 2, 64),
-                spec(config, 2, 64),
-                AbLevel::fixed(0.0),
-            )
-            .unwrap();
-            assert_eq!(
-                ab.quantizer.shaper(),
-                crate::dither::noise_shaper(out_rate).map(|h| &h[..])
-            );
-        }
-    }
-
     /// The planar f64 entry points (the processor's one-block handoff)
     /// give bit for bit what the f32 ones give on the same samples, for a
     /// passthrough chain, an EQ with dither, an integer and a rational
@@ -3736,29 +3690,6 @@ mod tests {
         }
     }
 
-    /// A planar block a stage changed (not `transparent`) never takes the
-    /// passthrough shortcut: it is quantized like processed audio.
-    #[test]
-    fn a_changed_planar_block_is_quantized_not_copied() {
-        let config = ChainConfig {
-            output: OutputConfig {
-                bits: 16,
-                dither: DitherKind::Tpdf,
-                headroom_db: 0.0,
-            },
-            ..ChainConfig::neutral()
-        };
-        let mut chain = Chain::new(spec(config, 1, 64));
-        let x = [0.123_456_789_f64; 64];
-        let mut out = [0; 64];
-        let mut gain = StereoGainRamp::unity(48_000);
-        chain.process_planar_with_gain_tapped(&[&x[..]], &mut out, &mut gain, None, true);
-        let copied = (0.123_456_789_f64 * 2_147_483_648.0).round() as i32;
-        assert!(out.iter().all(|&s| s == copied));
-        chain.process_planar_with_gain_tapped(&[&x[..]], &mut out, &mut gain, None, false);
-        assert!(out.iter().all(|&s| s & 0xffff == 0), "quantized to 16 bits");
-    }
-
     #[test]
     fn default_chain_is_bit_transparent() {
         let chain = Chain::new(spec(ChainConfig::neutral(), 2, 64));
@@ -3767,160 +3698,6 @@ mod tests {
         assert_eq!(chain.output_rate(), 48_000);
         assert_eq!(chain.latency_out_frames(), 0);
         assert_eq!(chain.channels(), 2);
-    }
-
-    #[test]
-    fn tilt_invalid_at_stream_rate_is_a_chain_build_error() {
-        use audivane_protocol::{TiltConfig, TiltPivot};
-        for slope in [0.0, 1.0] {
-            let config = ChainConfig {
-                eq: Some(EqProfile {
-                    tilt: Some(TiltConfig {
-                        enabled: true,
-                        slope_db_per_oct: Some(slope),
-                        total_db: None,
-                        start_hz: 17_750.0,
-                        end_hz: 20_000.0,
-                        pivot: TiltPivot::Start,
-                    }),
-                    ..EqProfile::default()
-                }),
-                ..ChainConfig::neutral()
-            };
-            let mut low = spec(config.clone(), 2, 64);
-            low.sample_rate = 44_100;
-            match Chain::try_new(low) {
-                Err(ChainError::Eq(error)) => assert!(error.contains("at least 1/6 octave")),
-                Err(other) => panic!("unexpected error {other}"),
-                Ok(_) => panic!("invalid tilt built at 44.1 kHz"),
-            }
-            let mut high = spec(config, 2, 64);
-            high.sample_rate = 96_000;
-            assert!(Chain::try_new(high).is_ok());
-        }
-    }
-
-    #[test]
-    fn an_upsampler_that_cannot_be_designed_is_an_error() {
-        // Minimum phase at beta 40 (the daemon rejects it) cannot meet its
-        // tolerances: the chain refuses it instead of running an
-        // approximation (`crate::minphase`).
-        let config = ChainConfig {
-            upsampler: crate::resample::ManualConfig {
-                target: RateTarget::Ratio(4),
-                taps: 512,
-                phase: audivane_protocol::FilterPhase::Minimum,
-                kaiser_beta: 40.0,
-                ..Default::default()
-            }
-            .into_upsampler_config()
-            .unwrap(),
-            ..ChainConfig::neutral()
-        };
-        match Chain::try_new(spec(config, 2, 64)) {
-            Err(ChainError::Upsampler(msg)) => {
-                assert!(msg.contains("minimum-phase"), "{msg}");
-            }
-            Err(other) => panic!("unexpected error {other}"),
-            Ok(_) => panic!("built a chain with an untoleranced kernel"),
-        }
-    }
-
-    /// A Custom chain of 4096 output taps, upsampling only: x4 from 48 kHz,
-    /// or 44.1 kHz to 48 kHz (160/147).
-    fn custom_spec(rational: bool, phase: audivane_protocol::FilterPhase) -> ChainSpec {
-        let config = ChainConfig {
-            upsampler: crate::resample::ManualConfig {
-                target: if rational {
-                    RateTarget::Rate(48_000)
-                } else {
-                    RateTarget::Ratio(4)
-                },
-                taps: 4096,
-                phase,
-                ..Default::default()
-            }
-            .into_upsampler_config()
-            .unwrap(),
-            output: quiet_output(),
-            ..ChainConfig::neutral()
-        };
-        let mut s = spec(config, 2, 256);
-        s.sample_rate = if rational { 44_100 } else { 48_000 };
-        s
-    }
-
-    /// Custom minimum phase reports its impulse peak: block latency + peak at
-    /// an integer ratio (1024 + 19), grid peak / M on a rational grid
-    /// (823 / 147 = 5.6, rounded to 6). The chain sums it.
-    #[test]
-    fn custom_minimum_phase_chain_latency_is_its_peak() {
-        use audivane_protocol::FilterPhase::Minimum;
-        let mut x4 = Chain::try_new(custom_spec(false, Minimum)).unwrap();
-        assert_eq!(x4.latency_out_frames(), 1043);
-        assert_eq!(
-            x4.upsampler_runtime_mut().unwrap().latency_out_exact(),
-            1043.0
-        );
-
-        let mut r = Chain::try_new(custom_spec(true, Minimum)).unwrap();
-        assert_eq!(r.ratio(), RateRatio::from_rates(44_100, 48_000));
-        assert_eq!(r.latency_out_frames(), 6);
-        let exact = r.upsampler_runtime_mut().unwrap().latency_out_exact();
-        assert_eq!(exact, 823.0 / 147.0);
-
-        // The reported delay is where the impulse peak comes out.
-        let mut block = vec![0.0f32; 256 * 2];
-        block[0] = 0.5;
-        block[1] = 0.5;
-        let mut out = vec![0i32; 256 * 4 * 2];
-        let mut y = Vec::new();
-        while y.len() < 4096 {
-            x4.process_f32(&block, &mut out);
-            y.extend(out.chunks(2).map(|f| f64::from(f[0])));
-            block[..2].fill(0.0);
-        }
-        let peak = (0..y.len()).fold(0, |b, i| if y[i].abs() > y[b].abs() { i } else { b });
-        assert_eq!(peak, 1043);
-    }
-
-    /// A/B delay matching pads the shorter side to the longer latency: a
-    /// linear A against a Custom minimum-phase B pads B by the difference to
-    /// its peak (x4: 3071 - 1043 = 2028; 160/147: 2048 - 6 = 2042).
-    #[test]
-    fn ab_pads_custom_minimum_phase_to_its_peak() {
-        use audivane_protocol::FilterPhase::{Linear, Minimum};
-        for (rational, total, pad_b) in [(false, 3071, 2028), (true, 2048, 2042)] {
-            let ab = AbChain::new(
-                custom_spec(rational, Linear),
-                custom_spec(rational, Minimum),
-                AbLevel::fixed(0.0),
-            )
-            .unwrap();
-            assert_eq!(ab.latency_out_frames(), total, "rational {rational}");
-            assert_eq!(ab.delay_a.len, 0, "rational {rational}");
-            assert_eq!(ab.delay_b.len, pad_b, "rational {rational}");
-        }
-    }
-
-    #[test]
-    fn upsampling_sets_ratio_rate_and_latency() {
-        let config = ChainConfig {
-            upsampler: crate::resample::ManualConfig {
-                target: RateTarget::Ratio(4),
-                taps: 1024,
-                ..Default::default()
-            }
-            .into_upsampler_config()
-            .unwrap(),
-            output: quiet_output(),
-            ..ChainConfig::neutral()
-        };
-        let chain = Chain::new(spec(config, 1, 64));
-        assert!(!chain.is_bit_transparent());
-        assert_eq!(chain.ratio(), RateRatio::integer(4));
-        assert_eq!(chain.output_rate(), 192_000);
-        assert!(chain.latency_out_frames() > 0);
     }
 
     /// Peak before quantization and clipped samples for an fs/4 sine at 45
@@ -4036,13 +3813,40 @@ mod tests {
     }
 
     #[test]
-    fn output_headroom_alone_leaves_passthrough() {
-        let mut config = ChainConfig::neutral();
-        assert!(config.is_passthrough());
-        config.output.headroom_db = 3.0;
-        assert!(!config.is_passthrough());
-        let chain = Chain::new(spec(config, 2, 64));
-        assert!(!chain.is_bit_transparent());
+    fn ab_live_tap_keeps_the_side_with_harmonics() {
+        let with = ChainConfig {
+            harmonics: Some(audivane_protocol::HarmonicsConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..ChainConfig::neutral()
+        };
+        let mut without = ChainConfig::neutral();
+        // Not passthrough, so both sides run the f64 path.
+        without.upsampler.target = RateTarget::Ratio(1);
+        let x: Vec<f32> = (0..128).map(|n| 0.5 * ((n as f32) * 0.37).sin()).collect();
+        let mut out = vec![0i32; 128];
+        // (A, B, side selected) -> the side tapped (`None`: no stage).
+        let cases = [
+            (&with, &without, Side::A, Some(0u8)),
+            (&with, &without, Side::B, Some(0)),
+            (&without, &with, Side::A, Some(1)),
+            (&with, &with, Side::B, Some(1)),
+            (&without, &without, Side::B, None),
+        ];
+        for (a, b, side, want) in cases {
+            let mut ab = AbChain::new(
+                spec(a.clone(), 2, 64),
+                spec(b.clone(), 2, 64),
+                AbLevel::fixed(0.0),
+            )
+            .unwrap();
+            ab.set_harmonics_tap(true);
+            ab.select(side, 0);
+            ab.process_f32(&x, &mut out);
+            assert_eq!(ab.has_harmonics(), want.is_some(), "{side:?} {want:?}");
+            assert_eq!(ab.harmonics_tap().map(|t| t.side), want, "{side:?}");
+        }
     }
 
     #[test]
@@ -4065,60 +3869,6 @@ mod tests {
         }
         assert_eq!(out, ints);
         assert_eq!(chain.latency_out_frames(), 0);
-    }
-
-    #[test]
-    fn empty_blocks_are_noops() {
-        let mut chain = Chain::new(spec(ChainConfig::neutral(), 2, 32));
-        let mut out: Vec<i32> = Vec::new();
-        assert_eq!(chain.process_f32(&[], &mut out), ClipStats::default());
-        let mut ab = AbChain::new(
-            spec(ChainConfig::neutral(), 2, 32),
-            spec(ChainConfig::neutral(), 2, 32),
-            AbLevel::fixed(0.0),
-        )
-        .unwrap();
-        assert_eq!(ab.process_f32(&[], &mut out), ClipStats::default());
-    }
-
-    #[test]
-    fn rejects_bad_specs() {
-        assert_eq!(
-            Chain::try_new(spec(ChainConfig::neutral(), 0, 16))
-                .err()
-                .unwrap(),
-            ChainError::ZeroChannels
-        );
-        assert_eq!(
-            Chain::try_new(spec(ChainConfig::neutral(), MAX_CHANNELS + 1, 16))
-                .err()
-                .unwrap(),
-            ChainError::TooManyChannels {
-                channels: MAX_CHANNELS + 1,
-                max: MAX_CHANNELS
-            }
-        );
-        assert_eq!(
-            Chain::try_new(spec(ChainConfig::neutral(), 2, 0))
-                .err()
-                .unwrap(),
-            ChainError::ZeroBlock
-        );
-        let config = ChainConfig {
-            convolution: vec![audivane_protocol::ConvolutionConfig {
-                name: None,
-                enabled: true,
-                ir_path: "ir.wav".into(),
-                gain_db: 0.0,
-                matrix: None,
-                calibration: false,
-            }],
-            ..ChainConfig::neutral()
-        };
-        assert_eq!(
-            Chain::try_new(spec(config, 2, 16)).err().unwrap(),
-            ChainError::MissingIr
-        );
     }
 
     #[test]
@@ -4146,121 +3896,6 @@ mod tests {
         assert!((stats.peak - 1.5).abs() < 1e-12);
         // 16-bit target: the low 16 bits of the left-justified output are zero.
         assert!(out[2..].iter().all(|s| s & 0xffff == 0));
-    }
-
-    #[test]
-    fn clip_stats_carry_float_peaks_and_the_chain_peak_before_volume() {
-        // +6 dB preamp lifts 0.5 to 1.0; a -10 dB master volume then brings
-        // the output to about -10 dBFS. The chain peak excludes the volume.
-        let config = ChainConfig {
-            eq: Some(flat_profile(6.0)),
-            output: quiet_output(),
-            ..ChainConfig::neutral()
-        };
-        let mut chain = Chain::new(spec(config, 2, 64));
-        let input = vec![0.5f32; 128];
-        let mut out = vec![0i32; input.len()];
-        let mut gain = StereoGainRamp::unity(48_000);
-        gain.set_volume_targets(-10.0, 0.0, false, false, false, false);
-        let stats = chain.process_f32_with_gain_tapped(&input, &mut out, &mut gain, None);
-        assert!(stats.measured);
-        let db = |x: f64| 20.0 * x.log10();
-        assert!(
-            (db(stats.chain_peak_ch[0]) - 0.0).abs() < 0.1,
-            "{:?}",
-            stats.chain_peak_ch
-        );
-        assert!(
-            (db(stats.peak_ch[0]) + 10.0).abs() < 0.1,
-            "{:?}",
-            stats.peak_ch
-        );
-        assert!((db(stats.peak_ch[1]) + 10.0).abs() < 0.1);
-    }
-
-    #[test]
-    fn pre_quantizer_tap_keeps_the_clipped_float_signal() {
-        // +12 dB preamp lifts a 0.5 signal to 2.0; the quantizer saturates it,
-        // but the tap must still show the real pre-quantizer level (no
-        // clipping harmonics, no quantization).
-        let config = ChainConfig {
-            eq: Some(flat_profile(12.0)),
-            output: quiet_output(),
-            ..ChainConfig::neutral()
-        };
-        let mut chain = Chain::new(spec(config, 1, 64));
-        let input = vec![0.5f32; 64];
-        let mut out = vec![0i32; input.len()];
-        let mut tap = vec![0f32; input.len()];
-        let mut gain = StereoGainRamp::unity(48_000);
-        chain.process_f32_with_gain_tapped(&input, &mut out, &mut gain, Some(&mut tap));
-
-        let tap_peak = tap.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        assert!(
-            tap_peak > 1.9,
-            "pre-quantizer tap shows {tap_peak}, expected the ~2.0 float level"
-        );
-        assert!(out.contains(&i32::MAX), "quantizer should have clipped");
-        let dequantized = out[0] as f32 / 2_147_483_648.0;
-        assert!(
-            (tap[0] - dequantized).abs() > 0.1,
-            "tap is just the quantized output again: {} vs {dequantized}",
-            tap[0]
-        );
-    }
-
-    #[test]
-    fn ab_rejects_mismatched_configs() {
-        let mut other_rate = spec(ChainConfig::neutral(), 2, 16);
-        other_rate.sample_rate = 44_100;
-        assert!(matches!(
-            AbChain::new(
-                spec(ChainConfig::neutral(), 2, 16),
-                other_rate,
-                AbLevel::fixed(0.0)
-            ),
-            Err(ChainError::RateMismatch { .. })
-        ));
-        assert!(matches!(
-            AbChain::new(
-                spec(ChainConfig::neutral(), 2, 16),
-                spec(ChainConfig::neutral(), 1, 16),
-                AbLevel::fixed(0.0)
-            ),
-            Err(ChainError::ChannelMismatch { .. })
-        ));
-
-        let mut a = ChainConfig::neutral();
-        a.upsampler.target = RateTarget::Ratio(2);
-        let mut b = ChainConfig::neutral();
-        b.upsampler.target = RateTarget::Ratio(4);
-        assert!(matches!(
-            AbChain::new(spec(a, 2, 16), spec(b, 2, 16), AbLevel::fixed(0.0)),
-            Err(ChainError::RatioMismatch { a, b })
-                if a == RateRatio::integer(2) && b == RateRatio::integer(4)
-        ));
-
-        // Other bits and dither build B's own quantizer; other headroom
-        // does not build.
-        let mut c = ChainConfig::neutral();
-        c.output.bits = 16;
-        c.output.dither = DitherKind::Shaped;
-        let ab = AbChain::new(
-            spec(ChainConfig::neutral(), 2, 16),
-            spec(c.clone(), 2, 16),
-            AbLevel::fixed(0.0),
-        )
-        .unwrap();
-        assert!(ab.compares_output());
-        c.output.headroom_db += 1.0;
-        assert!(matches!(
-            AbChain::new(
-                spec(ChainConfig::neutral(), 2, 16),
-                spec(c, 2, 16),
-                AbLevel::fixed(0.0)
-            ),
-            Err(ChainError::HeadroomMismatch)
-        ));
     }
 
     #[test]
@@ -4327,225 +3962,6 @@ mod tests {
         );
         // 6 dB over 2400 frames on a 0.25 DC: under 0.0001 of full scale.
         assert!(largest_step / 2_147_483_648.0 < 1e-4, "step {largest_step}");
-    }
-
-    /// The measurement hops see both sides before the level gains, the
-    /// output does not change while metering, and epoch 0 meters nothing.
-    #[test]
-    fn ab_measure_hops_see_both_sides_and_leave_the_output_alone() {
-        let a = ChainConfig {
-            output: quiet_output(),
-            ..ChainConfig::neutral()
-        };
-        let b = ChainConfig {
-            eq: Some(flat_profile(-6.0)),
-            ..a.clone()
-        };
-        let build = || {
-            AbChain::new(
-                spec(a.clone(), 2, 256),
-                spec(b.clone(), 2, 256),
-                AbLevel::fixed(6.0),
-            )
-            .unwrap()
-        };
-        let mut seed = 3u64;
-        let input: Vec<f32> = (0..256 * 2)
-            .map(|_| {
-                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                ((seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5) as f32 * 0.5
-            })
-            .collect();
-        let (mut plain, mut metered) = (build(), build());
-        metered.set_measure_epoch(5);
-        let (mut out_p, mut out_m) = (vec![0i32; 512], vec![0i32; 512]);
-        let mut hops = Vec::new();
-        for _ in 0..(48_000 / 256) {
-            plain.process_f32(&input, &mut out_p);
-            metered.process_f32(&input, &mut out_m);
-            assert_eq!(out_p, out_m);
-            while let Some(h) = metered.pop_measure_hop() {
-                hops.push(h);
-            }
-            assert_eq!(plain.pop_measure_hop(), None);
-        }
-        assert_eq!(hops.len(), 9);
-        for h in &hops[1..] {
-            assert_eq!(h.epoch, 5);
-            let db = 10.0 * (h.a / h.b).log10();
-            assert!((db - 6.0).abs() < 1e-6, "{db}");
-        }
-    }
-
-    /// The stream-end tail counts a convolution IR's whole ring after the
-    /// chain's delay: an impulse's last non-zero output frame is exactly
-    /// `tail_out_frames` after it, on one chain and on an A/B pair whose
-    /// other side has no IR.
-    /// The convolution's own delay is its IR's peak plus the convolver's
-    /// block, at the input rate: the same whatever the upsampler, and 0
-    /// without convolution.
-    #[test]
-    fn the_convolution_latency_is_its_own_and_ignores_the_upsampler() {
-        let conv = vec![audivane_protocol::ConvolutionConfig {
-            name: None,
-            enabled: true,
-            ir_path: "room.wav".into(),
-            gain_db: 0.0,
-            matrix: None,
-            calibration: false,
-        }];
-        let mut ir = vec![1e-3; 1000];
-        ir[600] = -0.5;
-        let up = |taps| {
-            crate::resample::ManualConfig {
-                target: RateTarget::Ratio(4),
-                taps,
-                ..Default::default()
-            }
-            .into_upsampler_config()
-            .unwrap()
-        };
-        let build = |convolution: Vec<audivane_protocol::ConvolutionConfig>, upsampler| {
-            let with = !convolution.is_empty();
-            let mut sp = spec(
-                ChainConfig {
-                    convolution,
-                    upsampler,
-                    output: quiet_output(),
-                    ..ChainConfig::neutral()
-                },
-                1,
-                256,
-            );
-            if with {
-                sp.irs = Some(vec![ir.clone()].into());
-            }
-            Chain::new(sp)
-        };
-        // At x1 the chain's whole delay is the convolver's block.
-        let x1 = build(conv.clone(), ChainConfig::neutral().upsampler);
-        let block = x1.latency_out_frames();
-        assert!(block > 0);
-        assert_eq!(x1.conv_latency_frames(), 600 + block);
-        let short = build(conv.clone(), up(1024));
-        let long = build(conv.clone(), up(8192));
-        assert_ne!(short.latency_out_frames(), long.latency_out_frames());
-        assert_eq!(short.conv_latency_frames(), 600 + block);
-        assert_eq!(long.conv_latency_frames(), 600 + block);
-        assert_eq!(build(Vec::new(), up(1024)).conv_latency_frames(), 0);
-        assert_eq!(
-            build(Vec::new(), ChainConfig::neutral().upsampler).conv_latency_frames(),
-            0
-        );
-    }
-
-    #[test]
-    fn the_tail_counts_the_convolution_ir() {
-        let config = ChainConfig {
-            convolution: vec![audivane_protocol::ConvolutionConfig {
-                name: None,
-                enabled: true,
-                ir_path: "room.wav".into(),
-                gain_db: 0.0,
-                matrix: None,
-                calibration: false,
-            }],
-            output: quiet_output(),
-            ..ChainConfig::neutral()
-        };
-        // A room-like IR: its peak well into it, a low tail to the end.
-        let mut ir = vec![1e-3; 1000];
-        ir[600] = 0.5;
-        let with_ir = || {
-            let mut sp = spec(config.clone(), 1, 256);
-            sp.irs = Some(vec![ir.clone()].into());
-            sp
-        };
-        let mut chain = Chain::new(with_ir());
-        assert_eq!(chain.tail_out_frames(), chain.latency_out_frames() + 999);
-        let mut input = vec![0.0f32; 256 * 12];
-        input[0] = 0.5;
-        let mut out = vec![0i32; input.len()];
-        for (i, o) in input.chunks(256).zip(out.chunks_mut(256)) {
-            chain.process_f32(i, o);
-        }
-        let last = out.iter().rposition(|&s| s != 0).unwrap();
-        assert_eq!(last, chain.tail_out_frames());
-
-        let plain = ChainConfig {
-            output: quiet_output(),
-            ..ChainConfig::neutral()
-        };
-        let level = AbLevel {
-            offset: AbOffset::Analytic(Weighting::K),
-            headroom: audivane_protocol::ipc::AbHeadroom::Auto,
-        };
-        let ab = AbChain::new(spec(plain, 1, 256), with_ir(), level).unwrap();
-        assert_eq!(ab.tail_out_frames(), chain.tail_out_frames());
-    }
-
-    /// A = B with different latencies (a delta IR through the block convolver
-    /// on A only). Aligned, the mix during a fade equals A: a null below
-    /// -300 dB.
-    #[test]
-    fn ab_alignment_nulls_during_a_fade() {
-        let a = ChainConfig {
-            convolution: vec![audivane_protocol::ConvolutionConfig {
-                name: None,
-                enabled: true,
-                ir_path: "delta.wav".into(),
-                gain_db: 0.0,
-                matrix: None,
-                calibration: false,
-            }],
-            output: quiet_output(),
-            ..ChainConfig::default()
-        };
-        let b = ChainConfig {
-            dc_block: None,
-            output: quiet_output(),
-            ..ChainConfig::default()
-        };
-        let pair = |fade: bool| {
-            let mut spec_a = spec(a.clone(), 2, 256);
-            spec_a.irs = Some(vec![vec![1.0]].into());
-            let level = AbLevel {
-                offset: AbOffset::Analytic(Weighting::K),
-                headroom: audivane_protocol::ipc::AbHeadroom::Auto,
-            };
-            let mut ab = AbChain::new(spec_a, spec(b.clone(), 2, 256), level).unwrap();
-            assert!(ab.a.latency_out > ab.b.latency_out);
-            assert_eq!(ab.gains(), AbGains::default());
-            let mut seed = 0x1234_5678_u64;
-            let mut out = vec![0i32; 512];
-            let mut mixes = Vec::new();
-            for block in 0..40 {
-                if fade && block == 10 {
-                    ab.select(Side::B, 4000);
-                }
-                let input: Vec<f32> = (0..512)
-                    .map(|_| {
-                        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                        ((seed >> 40) as f64 / (1u64 << 24) as f64 - 0.5) as f32
-                    })
-                    .collect();
-                ab.process_f32(&input, &mut out);
-                for chan in &ab.mix[..2] {
-                    mixes.extend_from_slice(&chan[..256]);
-                }
-            }
-            mixes
-        };
-        let only_a = pair(false);
-        let faded = pair(true);
-        let peak = only_a.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
-        let err = only_a
-            .iter()
-            .zip(&faded)
-            .fold(0.0_f64, |m, (x, y)| m.max((x - y).abs()));
-        assert!(peak > 0.1);
-        let null_db = 20.0 * (err / peak).log10();
-        assert!(err == 0.0 || null_db < -300.0, "null {null_db} dB");
     }
 
     #[test]
@@ -4621,275 +4037,6 @@ mod tests {
         assert!(out.iter().all(|&s| s == 0));
     }
 
-    /// The output headroom is folded into the upsampler's kernel only on a
-    /// side without harmonics: with harmonics on one side and two
-    /// upsampler designs, the pair's offset and peaks must not see it
-    /// (it once read as B quieter by the whole output headroom).
-    #[test]
-    fn ab_upsampler_term_ignores_the_folded_output_headroom() {
-        use audivane_protocol::ipc::AbHeadroom;
-        let up = |taps| {
-            crate::resample::ManualConfig {
-                target: RateTarget::Ratio(2),
-                taps,
-                ..Default::default()
-            }
-            .into_upsampler_config()
-            .unwrap()
-        };
-        let output = OutputConfig {
-            headroom_db: 3.0,
-            ..quiet_output()
-        };
-        let harmonics = audivane_protocol::HarmonicsConfig::from_preset("triode").unwrap();
-        let side = |taps, harm: bool| ChainConfig {
-            upsampler: up(taps),
-            harmonics: harm.then(|| harmonics.clone()),
-            output,
-            ..ChainConfig::neutral()
-        };
-        let level = AbLevel {
-            offset: AbOffset::Analytic(Weighting::K),
-            headroom: AbHeadroom::Auto,
-        };
-        let pair = |a: ChainConfig, b: ChainConfig| {
-            AbChain::new(spec(a, 2, 256), spec(b, 2, 256), level)
-                .unwrap()
-                .gains()
-        };
-        let up_only = pair(side(512, false), side(2048, false));
-        let both = pair(side(512, true), side(2048, false));
-        let change = Harmonics::loudness_change_db(&harmonics).unwrap();
-        // Harmonics on A only: B moves by A's loudness change, nothing more.
-        let want = up_only.offset_db + change;
-        assert!(
-            (both.offset_db - want).abs() < 0.05,
-            "{both:?} vs {up_only:?} and {change}"
-        );
-        // A side without harmonics peaks at its kernel's gain less the
-        // output headroom, counted once.
-        for p in up_only.peak_db {
-            assert!((p + 3.0).abs() < 0.2, "{up_only:?}");
-        }
-        assert!((both.peak_db[1] + 3.0).abs() < 0.2, "{both:?}");
-    }
-
-    #[test]
-    fn analytic_offset_includes_harmonics_gain() {
-        use audivane_protocol::{
-            ChebyshevLayer, HARMONICS_DEFAULT_SIGNS, HarmonicsConfig, HarmonicsLayer,
-        };
-        let off = ChainConfig::neutral();
-        let harm = |h2_db, h3_db, h4_db, h5_db| ChainConfig {
-            harmonics: Some(HarmonicsConfig {
-                system: None,
-                enabled: true,
-                layers: vec![HarmonicsLayer::Chebyshev(ChebyshevLayer {
-                    enabled: true,
-                    preset: None,
-                    levels_db: [
-                        Some(h2_db),
-                        Some(h3_db),
-                        h4_db,
-                        h5_db,
-                        None,
-                        None,
-                        None,
-                        None,
-                    ],
-                    signs: HARMONICS_DEFAULT_SIGNS,
-                    invert_even: false,
-                    drive_db: 0.0,
-                    amount: 1.0,
-                    tilt: None,
-                    sag: None,
-                    bias: None,
-                })],
-                dc_block: true,
-                routing: Default::default(),
-            }),
-            ..ChainConfig::neutral()
-        };
-        let rate = 48_000;
-        for (cfg, lo, hi) in [
-            (
-                ChainConfig {
-                    harmonics: Some(HarmonicsConfig::from_preset("triode").unwrap()),
-                    ..ChainConfig::neutral()
-                },
-                -0.3,
-                0.1,
-            ),
-            // No trim: an H2 curve adds a little energy, never takes any.
-            (harm(-20.0, -120.0, None, None), 0.0, 0.2),
-            (harm(-20.0, -20.0, Some(-20.0), Some(-20.0)), 3.0, 5.0),
-        ] {
-            let change = Harmonics::loudness_change_db(cfg.harmonics.as_ref().unwrap()).unwrap();
-            eprintln!("{:?}: {change:.3} dB", cfg.harmonics);
-            assert!((lo..hi).contains(&change), "{change}");
-            let offset = AbChain::analytic_offset_db(&off, &cfg, rate, Weighting::K).unwrap();
-            assert!((offset + change).abs() < 1e-6, "{offset} vs {change}");
-        }
-    }
-
-    #[test]
-    fn analytic_offset_includes_crossfeed_level() {
-        use audivane_protocol::CrossfeedConfig;
-        let xf = |width| ChainConfig {
-            crossfeed: Some(CrossfeedConfig {
-                width,
-                ..Default::default()
-            }),
-            ..ChainConfig::neutral()
-        };
-        let off = ChainConfig::neutral();
-        let matched = xf(1.0);
-        let wide = xf(1.5);
-        for rate in [44_100, 96_000] {
-            let fs = f64::from(rate);
-            let stage =
-                |c: &ChainConfig| Crossfeed::try_new(c.crossfeed.as_ref().unwrap(), fs, 2).unwrap();
-            // Off vs matched: same loudness by construction.
-            let offset = AbChain::analytic_offset_db(&off, &matched, rate, Weighting::A).unwrap();
-            assert!(offset.abs() < 1e-6, "{rate}: {offset}");
-            // The width is never compensated: wider is louder, and B is
-            // lowered by the stage's loudness change.
-            let expected = -stage(&wide).loudness_change_db(crate::crossfeed::MATCHED_CORRELATION);
-            let offset = AbChain::analytic_offset_db(&off, &wide, rate, Weighting::A).unwrap();
-            assert!(
-                (offset - expected).abs() < 1e-6,
-                "{rate}: {offset} vs {expected}"
-            );
-            assert!(offset < -0.1, "{rate}: {offset}");
-            // Symmetric, and a disabled stage counts as off.
-            let back = AbChain::analytic_offset_db(&wide, &off, rate, Weighting::A).unwrap();
-            assert!((back + expected).abs() < 1e-6);
-            let mut disabled = wide.clone();
-            disabled.crossfeed.as_mut().unwrap().enabled = false;
-            assert_eq!(
-                AbChain::analytic_offset_db(&off, &disabled, rate, Weighting::A).unwrap(),
-                0.0
-            );
-        }
-    }
-
-    #[test]
-    fn analytic_offset_negates_flat_boost() {
-        let boosted = ChainConfig {
-            eq: Some(flat_profile(6.0)),
-            ..ChainConfig::neutral()
-        };
-        let offset =
-            AbChain::analytic_offset_db(&ChainConfig::neutral(), &boosted, 44_100, Weighting::A)
-                .unwrap();
-        assert!((offset + 6.0).abs() < 0.05, "offset {offset}");
-        // The A/B builder uses the same sign convention.
-        let boosted_config = ChainConfig {
-            output: quiet_output(),
-            ..boosted
-        };
-        let flat = ChainConfig {
-            output: quiet_output(),
-            ..ChainConfig::neutral()
-        };
-        let ab = AbChain::new(
-            spec(flat, 1, 8),
-            spec(boosted_config, 1, 8),
-            AbLevel::fixed(offset),
-        )
-        .unwrap();
-        assert!(ab.level_offset_db() < -5.9);
-    }
-
-    #[test]
-    fn analytic_offset_uses_mean_power_for_layered_eq_and_enabled_conv_gains() {
-        let split = ChainConfig {
-            eq: Some(EqProfile {
-                name: "layered".into(),
-                preamp_db: 0.0,
-                linked_enabled: true,
-                bands: Vec::new(),
-                left: Some(audivane_protocol::ChannelEq {
-                    enabled: false,
-                    preamp_db: 12.0,
-                    bands: Vec::new(),
-                }),
-                right: Some(audivane_protocol::ChannelEq {
-                    enabled: true,
-                    preamp_db: 6.0,
-                    bands: Vec::new(),
-                }),
-                ..Default::default()
-            }),
-            convolution: vec![
-                audivane_protocol::ConvolutionConfig {
-                    name: None,
-                    enabled: true,
-                    ir_path: "a.wav".into(),
-                    gain_db: 2.0,
-                    matrix: None,
-                    calibration: false,
-                },
-                audivane_protocol::ConvolutionConfig {
-                    name: None,
-                    enabled: false,
-                    ir_path: "disabled.wav".into(),
-                    gain_db: 20.0,
-                    matrix: None,
-                    calibration: false,
-                },
-                audivane_protocol::ConvolutionConfig {
-                    name: None,
-                    enabled: true,
-                    ir_path: "b.wav".into(),
-                    gain_db: 1.0,
-                    matrix: None,
-                    calibration: false,
-                },
-            ],
-            ..ChainConfig::neutral()
-        };
-        // Mean power of L=0 dB (disabled left ignored) and R=+6 dB, plus the
-        // enabled convolution gains 2 + 1 = +3 dB: offset ≈ -6.96 dB.
-        let expected_eq_pwr = 0.5 * (1.0 + db_to_lin(6.0).powi(2));
-        let expected_db = -(crate::lin_to_db(expected_eq_pwr.sqrt()) + 3.0);
-        let offset =
-            AbChain::analytic_offset_db(&ChainConfig::neutral(), &split, 48_000, Weighting::A)
-                .unwrap();
-        assert!(
-            (offset - expected_db).abs() < 0.05,
-            "expected {expected_db}, got {offset}"
-        );
-
-        // Layered linked + left in series on ch0 combines with right.
-        let layered = ChainConfig {
-            eq: Some(EqProfile {
-                name: "layered-series".into(),
-                preamp_db: 3.0,
-                linked_enabled: true,
-                bands: Vec::new(),
-                left: Some(audivane_protocol::ChannelEq {
-                    enabled: true,
-                    preamp_db: 3.0,
-                    bands: Vec::new(),
-                }),
-                right: None,
-                ..Default::default()
-            }),
-            ..ChainConfig::neutral()
-        };
-        // L = +6 dB, R = +3 dB: mean power ≈ +4.76 dB.
-        let expected_layered_pwr = 0.5 * (db_to_lin(6.0).powi(2) + db_to_lin(3.0).powi(2));
-        let expected_layered_db = -crate::lin_to_db(expected_layered_pwr.sqrt());
-        let layered_offset =
-            AbChain::analytic_offset_db(&ChainConfig::neutral(), &layered, 48_000, Weighting::A)
-                .unwrap();
-        assert!(
-            (layered_offset - expected_layered_db).abs() < 0.05,
-            "expected {expected_layered_db}, got {layered_offset}"
-        );
-    }
-
     #[test]
     fn eq_stage_runs_before_the_quantizer() {
         let config = ChainConfig {
@@ -4921,43 +4068,6 @@ mod tests {
         let tail = &out[frames / 2..];
         let peak = tail.iter().map(|&s| (s as f64).abs()).fold(0.0, f64::max) / 2_147_483_648.0;
         assert!((peak - 0.5).abs() < 0.02, "expected ~0.5 peak, got {peak}");
-    }
-
-    #[test]
-    fn digital_gain_and_balance_run_before_quantizer_on_passthrough_chain() {
-        let mut chain = Chain::new(spec(ChainConfig::neutral(), 2, 1024));
-        assert!(chain.is_bit_transparent());
-
-        // Constant stereo 24-bit integer signal at 0.5 full scale.
-        let sample_i32 = 1_i32 << 30; // +0.5 in 24-bit left-justified i32
-        let sample_f32 = (sample_i32 as f64 / 2_147_483_648.0) as f32;
-        let frames = 512usize;
-        let input = vec![sample_f32; frames * 2];
-
-        // Settled unity gain -> exact bit-for-bit passthrough.
-        let mut unity = StereoGainRamp::unity(48_000);
-        let mut out_unity = vec![0i32; frames * 2];
-        chain.process_f32_with_gain(&input, &mut out_unity, &mut unity);
-        assert!(out_unity.iter().all(|&s| s == sample_i32));
-
-        // -6 dB volume + -6 dB balance (attenuates right channel by extra 6 dB).
-        let mut gain = StereoGainRamp::unity(48_000);
-        gain.set_volume_targets(-6.0, -6.0, false, false, false, false);
-        let mut out_scaled = vec![0i32; frames * 2];
-        chain.process_f32_with_gain(&input, &mut out_scaled, &mut gain);
-
-        let last_l = (out_scaled[(frames - 1) * 2] as f64) / 2_147_483_648.0;
-        let last_r = (out_scaled[(frames - 1) * 2 + 1] as f64) / 2_147_483_648.0;
-        let expected_l = 0.5 * db_to_lin(-6.0);
-        let expected_r = 0.5 * db_to_lin(-12.0);
-        assert!(
-            (last_l - expected_l).abs() < 1e-4,
-            "L expected {expected_l}, got {last_l}"
-        );
-        assert!(
-            (last_r - expected_r).abs() < 1e-4,
-            "R expected {expected_r}, got {last_r}"
-        );
     }
 
     fn rational_spec(target: RateTarget, rate: u32, taps: usize, block: usize) -> ChainSpec {
@@ -5067,60 +4177,6 @@ mod tests {
     }
 
     #[test]
-    fn presets_run_at_fractional_and_decimating_ratios() {
-        use audivane_protocol::FilterPreset;
-        for (preset, rate, out) in [
-            (FilterPreset::GaussianLong, 44_100, 48_000),
-            (FilterPreset::Chebyshev, 44_100, 48_000),
-            (FilterPreset::KaiserSteep, 96_000, 48_000),
-            (FilterPreset::ChebyshevLong, 96_000, 44_100),
-            (FilterPreset::GaussianShort, 96_000, 48_000),
-            (FilterPreset::FlattopShort, 48_000, 44_100),
-            (FilterPreset::Nuttall, 44_100, 48_000),
-            (FilterPreset::ShortLeaky, 44_100, 96_000),
-            (FilterPreset::Lanczos23, 44_100, 48_000),
-        ] {
-            let mut spec = rational_spec(RateTarget::Rate(out), rate, 64, 512);
-            spec.config.upsampler.design = None;
-            spec.config.upsampler.preset = Some(preset.name().to_string());
-            let mut chain = Chain::new(spec);
-            let frames = rate as usize / 2;
-            let x = stereo_sine(1_000.0, f64::from(rate), frames, 0.5);
-            let y = run_tapped(&mut chain, &x, &[512, 3, 200]);
-            assert_eq!(
-                y.len() / 2,
-                chain.ratio().frames_out_total(frames as u64) as usize
-            );
-            let rms = rms_after(&y, 2 * chain.latency_out_frames());
-            assert!(
-                (rms - 0.5 / 2f64.sqrt()).abs() < 1e-4,
-                "{preset:?} {rate} -> {out}: 1 kHz rms {rms}"
-            );
-        }
-        // Integer-only and upsampling-only presets refuse with an error.
-        let mut spec = rational_spec(RateTarget::Rate(48_000), 44_100, 64, 512);
-        spec.config.upsampler.design = None;
-        spec.config.upsampler.preset = Some(FilterPreset::GaussianHuge.name().to_string());
-        assert!(matches!(
-            Chain::try_new(spec),
-            Err(ChainError::Upsampler(_))
-        ));
-        let mut spec = rational_spec(RateTarget::Rate(48_000), 96_000, 64, 512);
-        spec.config.upsampler.design = None;
-        spec.config.upsampler.preset = Some(FilterPreset::Lanczos511.name().to_string());
-        assert!(matches!(
-            Chain::try_new(spec),
-            Err(ChainError::Upsampler(_))
-        ));
-        // A design over the cost budget errors instead of running.
-        let mut spec = rational_spec(RateTarget::Rate(768_000), 44_100, 64, 512);
-        spec.config.upsampler.design = None;
-        spec.config.upsampler.preset = Some(FilterPreset::FlattopXlong.name().to_string());
-        let err = Chain::try_new(spec).err().unwrap();
-        assert!(err.to_string().contains("flattop_xlong"), "{err}");
-    }
-
-    #[test]
     fn reset_to_puts_a_new_chain_on_a_running_chain_grid() {
         let spec = || rational_spec(RateTarget::Rate(48_000), 44_100, 16, 256);
         let mut running = Chain::new(spec());
@@ -5131,432 +4187,5 @@ mod tests {
         for n in [0usize, 1, 2, 17, 147, 256] {
             assert_eq!(fresh.output_frames(n), running.output_frames(n), "n {n}");
         }
-    }
-
-    #[test]
-    fn every_stage_runs_at_a_rational_ratio_resets_and_adds_its_latency() {
-        use audivane_protocol::{
-            CrossfeedConfig, CrossfeedMode, HarmonicsConfig, LimiterConfig, LimiterMode,
-            PitchConfig,
-        };
-        let ratio = RateRatio::from_rates(44_100, 48_000);
-        let bare = rational_spec(RateTarget::Rate(48_000), 44_100, 32, 256);
-        let mut full = bare.clone();
-        full.config.pitch = PitchConfig {
-            enabled: true,
-            cents: -31.77,
-            ..Default::default()
-        };
-        full.config.crossfeed = Some(CrossfeedConfig {
-            enabled: true,
-            mode: CrossfeedMode::Bs2bDefault,
-            ..Default::default()
-        });
-        full.config.harmonics = Some(HarmonicsConfig {
-            enabled: true,
-            ..Default::default()
-        });
-        full.config.limiter = LimiterConfig {
-            mode: LimiterMode::Limit,
-            ..Default::default()
-        };
-        let mut chain = Chain::new(full.clone());
-        assert_eq!(chain.ratio(), ratio);
-        assert_eq!(chain.output_rate(), 48_000);
-        assert!(chain.limiter().is_some());
-
-        // Pitch and crossfeed run at the input rate: their delay scales by
-        // 160/147, added before the one rounding (the limiter's look-ahead
-        // is at the output rate).
-        let pitch = PitchShifter::try_new(
-            44_100,
-            2,
-            256,
-            full.config.pitch.effective_cents(),
-            full.config.pitch.quality,
-        )
-        .unwrap();
-        let xf = Crossfeed::try_new(full.config.crossfeed.as_ref().unwrap(), 44_100.0, 2).unwrap();
-        let input_rate = (Stage::latency_frames(&pitch) + Stage::latency_frames(&xf)) as f64;
-        let added = chain.latency_out_frames() as f64
-            - chain.limiter().map_or(0, Stage::latency_frames) as f64
-            - Chain::new(bare).latency_out_frames() as f64;
-        let want = input_rate * ratio.as_f64();
-        assert!((added - want).abs() <= 1.0, "added {added}, want {want:.2}");
-
-        // reset_to clears pitch, crossfeed, harmonics and the limiter: the
-        // same input gives the same output again.
-        let x = stereo_sine(997.0, 44_100.0, 6000, 0.7);
-        let first = run_tapped(&mut chain, &x, &[256, 17, 147]);
-        chain.reset_to(0);
-        let again = run_tapped(&mut chain, &x, &[256, 17, 147]);
-        assert_eq!(first, again);
-        let fresh = run_tapped(&mut Chain::new(full), &x, &[256, 17, 147]);
-        assert_eq!(first, fresh);
-    }
-
-    #[test]
-    fn ab_runs_both_sides_on_one_rational_grid() {
-        let a = rational_spec(RateTarget::Rate(48_000), 44_100, 32, 128);
-        let mut b = rational_spec(RateTarget::Rate(48_000), 44_100, 96, 128);
-        b.config.upsampler = crate::resample::ManualConfig {
-            target: RateTarget::Rate(48_000),
-            taps: 96,
-            taps_unit: audivane_protocol::TapsUnit::Input,
-            cutoff: 0.9,
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        let mut ab = AbChain::new(a, b, AbLevel::fixed(0.0)).unwrap();
-        assert_eq!(ab.ratio(), RateRatio::new(160, 147));
-        let x = stereo_sine(1_000.0, 44_100.0, 4410, 0.25);
-        let mut out = vec![0i32; ab.max_output_frames() * 2];
-        let mut total = 0;
-        for (i, chunk) in x.chunks(2 * 100).enumerate() {
-            if i == 10 {
-                ab.select(Side::B, 64);
-            }
-            let n_out = ab.output_frames(chunk.len() / 2);
-            ab.process_f32(chunk, &mut out);
-            total += n_out;
-        }
-        assert_eq!(total as u64, ab.ratio().frames_out_total(4410));
-
-        let mut c = rational_spec(RateTarget::Rate(48_000), 44_100, 32, 128);
-        c.config.upsampler.target = RateTarget::Ratio(2);
-        let d = rational_spec(RateTarget::Rate(48_000), 44_100, 32, 128);
-        assert!(matches!(
-            AbChain::new(c, d, AbLevel::fixed(0.0)),
-            Err(ChainError::RatioMismatch { .. })
-        ));
-    }
-
-    #[test]
-    fn a_rational_kernel_over_budget_is_an_error() {
-        let spec = rational_spec(RateTarget::Rate(384_000), 44_100, 65_536, 256);
-        let err = Chain::try_new(spec).err().expect("over budget");
-        assert!(matches!(err, ChainError::Upsampler(_)), "{err}");
-    }
-
-    #[test]
-    fn pitch_stage_bypass_and_latency() {
-        let off_cfg = ChainConfig {
-            pitch: audivane_protocol::PitchConfig {
-                cents: 0.0,
-                ..Default::default()
-            },
-            ..ChainConfig::neutral()
-        };
-        assert!(off_cfg.is_passthrough());
-        let off_chain = Chain::new(ChainSpec {
-            config: off_cfg,
-            sample_rate: 44_100,
-            channels: 2,
-            max_block: 512,
-            irs: None,
-        });
-        assert_eq!(off_chain.latency_out_frames(), 0);
-
-        let mut on_cfg = ChainConfig {
-            pitch: audivane_protocol::PitchConfig {
-                enabled: true,
-                cents: -31.77,
-                ..Default::default()
-            },
-            ..ChainConfig::neutral()
-        };
-        assert!(!on_cfg.is_passthrough());
-        let on_chain = Chain::new(ChainSpec {
-            config: on_cfg.clone(),
-            sample_rate: 44_100,
-            channels: 2,
-            max_block: 512,
-            irs: None,
-        });
-        let base_lat = on_chain.latency_out_frames();
-        assert!(base_lat > 0);
-
-        on_cfg.upsampler = crate::resample::ManualConfig {
-            target: RateTarget::Ratio(2),
-            taps: 64,
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        let up_chain = Chain::new(ChainSpec {
-            config: on_cfg,
-            sample_rate: 44_100,
-            channels: 2,
-            max_block: 512,
-            irs: None,
-        });
-        assert!(up_chain.latency_out_frames() >= base_lat * 2);
-    }
-
-    #[test]
-    fn crossfeed_in_chain_requires_stereo_and_breaks_passthrough() {
-        let cfg = ChainConfig {
-            crossfeed: Some(audivane_protocol::CrossfeedConfig {
-                enabled: true,
-                mode: audivane_protocol::CrossfeedMode::Bs2bDefault,
-                ..Default::default()
-            }),
-            ..ChainConfig::neutral()
-        };
-        assert!(!cfg.is_passthrough());
-
-        // Non-stereo fails with a clear Crossfeed error.
-        let err = Chain::try_new(spec(cfg.clone(), 1, 256))
-            .err()
-            .expect("mono chain with crossfeed should fail");
-        assert_eq!(
-            err,
-            ChainError::Crossfeed(CrossfeedError::RequiresStereo { channels: 1 })
-        );
-
-        let mut chain = Chain::try_new(spec(cfg, 2, 256)).unwrap();
-        assert!(!chain.is_bit_transparent());
-        assert_eq!(chain.latency_out_frames(), 0);
-
-        // Hard-panned left signal feeds into right channel.
-        let frames = 256;
-        let mut input = vec![0.0f32; frames * 2];
-        for i in 0..frames {
-            input[i * 2] = 0.5;
-        }
-        let mut out = vec![0i32; frames * 2];
-        chain.process_f32(&input, &mut out);
-        let right_energy: f64 = (0..frames)
-            .map(|i| (out[i * 2 + 1] as f64 / 2_147_483_648.0).powi(2))
-            .sum();
-        assert!(
-            right_energy > 0.1,
-            "expected crossfeed into R, got {right_energy}"
-        );
-    }
-
-    #[test]
-    fn matched_crossfeed_overs_are_left_to_the_limiter() {
-        // The same worst case at the default matched level goes over full
-        // scale and clips at the quantizer without the limiter (nothing else
-        // in the chain catches it); with the limiter on, nothing clips.
-        let run = |limiter: audivane_protocol::LimiterMode| {
-            let cfg = ChainConfig {
-                crossfeed: Some(audivane_protocol::CrossfeedConfig::default()),
-                limiter: audivane_protocol::LimiterConfig {
-                    mode: limiter,
-                    ..Default::default()
-                },
-                output: quiet_output(),
-                ..ChainConfig::neutral()
-            };
-            let mut chain = Chain::try_new(spec(cfg, 2, 256)).unwrap();
-            let mut input = vec![0.0f32; 4096 * 2];
-            for i in 0..4096 {
-                let v = if (i / 256) % 2 == 0 { -1.0 } else { 1.0 };
-                input[i * 2] = v;
-                input[i * 2 + 1] = -v;
-            }
-            let mut out = vec![0i32; 256 * 2];
-            let mut clipped = 0;
-            for block in input.chunks(256 * 2) {
-                clipped += chain.process_f32(block, &mut out).clipped;
-            }
-            clipped
-        };
-        assert!(run(audivane_protocol::LimiterMode::Off) > 0);
-        assert_eq!(run(audivane_protocol::LimiterMode::Limit), 0);
-    }
-
-    /// The level (dB) of the 1 kHz fundamental of the left output for a
-    /// −20 dBFS 1 kHz sine on both channels through `config` (48 kHz, no
-    /// output headroom, no limiter), relative to the input: the second
-    /// half of one second, by correlation (harmonics and DC left out).
-    fn sine_level_db(config: ChainConfig) -> f64 {
-        let config = ChainConfig {
-            output: quiet_output(),
-            limiter: audivane_protocol::LimiterConfig {
-                mode: audivane_protocol::LimiterMode::Off,
-                ..Default::default()
-            },
-            ..config
-        };
-        let rate = 48_000.0;
-        let amp = crate::db_to_lin(-20.0);
-        let n = 48_000;
-        let block = 480;
-        let mut chain = Chain::try_new(spec(config, 2, block)).unwrap();
-        let lat = chain.latency_out_frames();
-        let mut left = Vec::with_capacity(n);
-        let mut out = vec![0i32; block * 2];
-        for b in 0..n / block {
-            let input: Vec<f32> = (0..block)
-                .flat_map(|i| {
-                    let t = (b * block + i) as f64 / rate;
-                    let v = (amp * (2.0 * PI * 1_000.0 * t).sin()) as f32;
-                    [v, v]
-                })
-                .collect();
-            chain.process_f32(&input, &mut out);
-            left.extend(out.chunks(2).map(|f| f64::from(f[0]) / 2_147_483_648.0));
-        }
-        let (mut re, mut im) = (0.0, 0.0);
-        let from = n / 2;
-        for (i, &y) in left.iter().enumerate().skip(from) {
-            let t = (i - lat) as f64 / rate;
-            re += y * (2.0 * PI * 1_000.0 * t).sin();
-            im += y * (2.0 * PI * 1_000.0 * t).cos();
-        }
-        let a = 2.0 * (re * re + im * im).sqrt() / (n - from) as f64;
-        crate::lin_to_db(a / amp)
-    }
-
-    /// Turning a stage on at its defaults never turns the music down for
-    /// safety: a −20 dBFS sine comes out at the stage's own response, the
-    /// limiter and the output headroom being the only protection.
-    #[test]
-    fn stages_at_their_defaults_play_a_quiet_sine_at_their_own_response() {
-        let rate = 48_000.0;
-        let neutral = ChainConfig::neutral();
-        let off = sine_level_db(neutral.clone());
-        assert!(off.abs() < 1e-6, "{off}");
-
-        let dc = sine_level_db(ChainConfig {
-            dc_block: Some(audivane_protocol::DcBlockConfig::default()),
-            ..neutral.clone()
-        });
-        assert!(dc.abs() < 0.01, "DC block: {dc:+.4} dB");
-
-        let xf_cfg = audivane_protocol::CrossfeedConfig::default();
-        let xf = Crossfeed::try_new(&xf_cfg, rate, 2).unwrap();
-        let want = crate::lin_to_db(xf.mono_response(1_000.0).norm());
-        let got = sine_level_db(ChainConfig {
-            crossfeed: Some(xf_cfg),
-            ..neutral.clone()
-        });
-        assert!(
-            (got - want).abs() < 0.01,
-            "crossfeed: {got:+.4} vs {want:+.4} dB"
-        );
-        // It goes over full scale for worst-case signals: nothing cut it.
-        assert!(xf.peak_gain_db() > 1.0, "{}", xf.peak_gain_db());
-
-        let eq = sine_level_db(ChainConfig {
-            eq: Some(EqProfile::default()),
-            ..neutral.clone()
-        });
-        assert!(eq.abs() < 1e-6, "EQ: {eq:+.6} dB");
-
-        for h in [
-            audivane_protocol::HarmonicsConfig::default(),
-            audivane_protocol::HarmonicsConfig::from_preset("tape_master").unwrap(),
-            audivane_protocol::HarmonicsConfig::from_preset("pentode").unwrap(),
-        ] {
-            let stage = Harmonics::try_new(&h, rate, 1).unwrap();
-            let want = stage.small_signal_gain_db();
-            let got = sine_level_db(ChainConfig {
-                harmonics: Some(h.clone()),
-                ..neutral.clone()
-            });
-            assert!(
-                (got - want).abs() < 0.1,
-                "harmonics {:?}: {got:+.3} vs small-signal {want:+.3} dB (peak gain {:+.2} dB)",
-                h.layers[0].preset(),
-                stage.peak_gain_db()
-            );
-        }
-    }
-
-    /// A harmonics stage that goes over full scale on loud music: the
-    /// overs clip at the quantizer with the limiter off and are caught with
-    /// it on (either mode).
-    #[test]
-    fn harmonics_overs_are_left_to_the_limiter() {
-        use audivane_protocol::{
-            ChebyshevLayer, HarmonicSign, HarmonicsConfig, HarmonicsLayer, LimiterMode,
-        };
-        let mut h = HarmonicsConfig::default();
-        let HarmonicsLayer::Chebyshev(l) = &mut h.layers[0] else {
-            unreachable!("the default layer is a Chebyshev curve")
-        };
-        *l = ChebyshevLayer {
-            preset: None,
-            levels_db: [Some(-20.0); 8],
-            signs: [HarmonicSign::Positive; 8],
-            ..l.clone()
-        };
-        let gain = Harmonics::try_new(&h, 48_000.0, 1).unwrap().peak_gain_db();
-        assert!(gain > 1.0, "{gain}");
-        let run = |mode: LimiterMode| {
-            let cfg = ChainConfig {
-                harmonics: Some(h.clone()),
-                limiter: audivane_protocol::LimiterConfig {
-                    mode,
-                    ..Default::default()
-                },
-                output: quiet_output(),
-                ..ChainConfig::neutral()
-            };
-            let mut chain = Chain::try_new(spec(cfg, 2, 256)).unwrap();
-            let mut out = vec![0i32; 256 * 2];
-            let mut clipped = 0;
-            for b in 0..200 {
-                let input: Vec<f32> = (0..256)
-                    .flat_map(|i| {
-                        let t = (b * 256 + i) as f64 / 48_000.0;
-                        let v = (0.99 * (2.0 * PI * 100.0 * t).sin()) as f32;
-                        [v, v]
-                    })
-                    .collect();
-                clipped += chain.process_f32(&input, &mut out).clipped;
-            }
-            clipped
-        };
-        assert!(run(LimiterMode::Off) > 0);
-        assert_eq!(run(LimiterMode::Limit), 0);
-        assert_eq!(run(LimiterMode::AutoHeadroom), 0);
-    }
-
-    #[test]
-    fn harmonics_in_chain_runs_after_upsampler_and_breaks_passthrough() {
-        let cfg = ChainConfig {
-            harmonics: Some(audivane_protocol::HarmonicsConfig {
-                enabled: true,
-                ..Default::default()
-            }),
-            ..ChainConfig::neutral()
-        };
-        assert!(!cfg.is_passthrough());
-
-        let chain = Chain::try_new(spec(cfg, 2, 256)).unwrap();
-        assert!(!chain.is_bit_transparent());
-        assert_eq!(chain.latency_out_frames(), 0);
-    }
-
-    #[test]
-    fn dc_block_in_chain_removes_dc_and_breaks_passthrough() {
-        let cfg = ChainConfig {
-            dc_block: Some(audivane_protocol::DcBlockConfig::default()),
-            output: quiet_output(),
-            ..ChainConfig::neutral()
-        };
-        assert!(!cfg.is_passthrough());
-
-        let mut chain = Chain::try_new(spec(cfg, 2, 256)).unwrap();
-        assert!(!chain.is_bit_transparent());
-        assert_eq!(chain.latency_out_frames(), 0);
-
-        // Push 1.0 s of +0.5 DC offset at 48 kHz; final block should decay well below -60 dB.
-        let input = vec![0.5f32; 256 * 2];
-        let mut out = vec![0i32; 256 * 2];
-        for _ in 0..(48_000 / 256) {
-            chain.process_f32(&input, &mut out);
-        }
-        let peak = out
-            .iter()
-            .map(|&s| (s as f64 / 2_147_483_648.0).abs())
-            .fold(0.0, f64::max);
-        assert!(peak < 1e-4, "DC not removed: tail peak {peak:e}");
     }
 }

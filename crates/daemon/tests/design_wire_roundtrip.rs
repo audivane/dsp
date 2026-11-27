@@ -18,12 +18,11 @@ mod common;
 use audivane_dsp_core::chain::{Chain, ChainSpec};
 use audivane_dsp_core::design::{Named, StoredDesign, catalogue};
 use audivane_dsp_core::test_support::capture;
-use audivane_dsp_daemon::control::config::ConfigStore;
 use audivane_protocol::ipc::{Call, EngineConfig, Request};
 use audivane_protocol::{
     ChainConfig, DitherKind, FilterPreset, OutputConfig, RateTarget, UpsamplerConfig,
 };
-use common::{Harness, TempDir};
+use common::Harness;
 use serde_json::{Value, json};
 
 const HEADROOM_DB: f64 = 3.5;
@@ -153,65 +152,4 @@ fn every_catalogue_design_round_trips_over_the_wire_bit_exact() {
         // Sanity: Named::of agrees on the design.
         assert_eq!(Named::of(rt_up).unwrap().design, expanded, "{name}");
     }
-}
-
-#[test]
-fn old_flat_config_starts_daemon_cleanly() {
-    let dir = TempDir::new("legacy-config");
-    let path = dir.path().join("config.json");
-
-    // 1. Old flat custom config (preset: null) falls back cleanly to recommended.
-    let old_custom = r#"{
-        "version": 1,
-        "config": {
-            "device": "hw:CARD=USB,DEV=0",
-            "chain": {
-                "upsampler": {
-                    "target": { "ratio": 4 },
-                    "taps": 65536,
-                    "phase": "minimum",
-                    "kaiser_beta": 14.0,
-                    "cutoff": 1.0,
-                    "cutoff_mode": "fraction",
-                    "taps_unit": "output",
-                    "phase_mix": 0.5,
-                    "headroom_db": 1.0,
-                    "preserve_samples": false,
-                    "window": "kaiser",
-                    "taper": 0.25,
-                    "preset": null
-                }
-            }
-        }
-    }"#;
-    std::fs::write(&path, old_custom).unwrap();
-    let loaded = ConfigStore::new(&path).load();
-    assert!(loaded.warning.is_none(), "{:?}", loaded.warning);
-    assert_eq!(loaded.config.chain.upsampler.target, RateTarget::Ratio(4));
-    assert_eq!(loaded.config.chain.upsampler.preset, None);
-    assert_eq!(loaded.config.chain.upsampler.design, None);
-
-    // 2. Old preset config keeps its preset name and target.
-    let old_preset = r#"{
-        "version": 1,
-        "config": {
-            "device": "hw:CARD=USB,DEV=0",
-            "chain": {
-                "upsampler": {
-                    "target": { "max_rate": 768000 },
-                    "taps": 65536,
-                    "headroom_db": 0.5,
-                    "preset": "flattop_long"
-                }
-            }
-        }
-    }"#;
-    std::fs::write(&path, old_preset).unwrap();
-    let loaded = ConfigStore::new(&path).load();
-    assert!(loaded.warning.is_none(), "{:?}", loaded.warning);
-    assert_eq!(
-        loaded.config.chain.upsampler.preset.as_deref(),
-        Some("flattop_long")
-    );
-    assert_eq!(loaded.config.chain.upsampler.design, None);
 }

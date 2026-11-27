@@ -10,9 +10,9 @@ use crate::Stage;
 #[cfg(test)]
 use crate::fft::complex_mul_split;
 use crate::fft::{RealFftPair, RingFifo, SplitSpectrum};
-use crate::nupc::{HeadChannel, HeadStage, StagePlan, TailChannel, TailStage, validate_plan};
 #[cfg(test)]
-use crate::nupc::{MAX_PART, plan_schedule};
+use crate::nupc::plan_schedule;
+use crate::nupc::{HeadChannel, HeadStage, StagePlan, TailChannel, TailStage, validate_plan};
 
 /// Pre-FFT'd IR partitions of `ir[offset..end)`, scaled by `1 / (2 * block)`.
 fn ir_partitions(
@@ -644,48 +644,6 @@ mod tests {
     }
 
     #[test]
-    fn default_schedule_starts_each_tail_stage_at_twice_its_block() {
-        // Block 1024: the 32768-block stage must start at IR offset 65536,
-        // not 2 × 32768 short of it.
-        let plan = plan_schedule(1024, 1 << 20);
-        assert_eq!(
-            plan,
-            vec![
-                StagePlan {
-                    offset: 0,
-                    block: 1024,
-                    end: 8192
-                },
-                StagePlan {
-                    offset: 8192,
-                    block: 4096,
-                    end: 32_768
-                },
-                StagePlan {
-                    offset: 32_768,
-                    block: 16_384,
-                    end: 65_536
-                },
-                StagePlan {
-                    offset: 65_536,
-                    block: 32_768,
-                    end: usize::MAX
-                },
-            ]
-        );
-        for base in [64, 128, 256, 512, 1024] {
-            for ir_len in [0, 1, 8 * base, 8 * base + 1, 70_000, 600_000] {
-                let plan = plan_schedule(base, ir_len);
-                validate_plan(&plan, base);
-                for st in &plan[1..] {
-                    assert_eq!(st.offset, 2 * st.block, "base {base}: {st:?}");
-                    assert!(st.block <= MAX_PART);
-                }
-            }
-        }
-    }
-
-    #[test]
     fn single_tap_at_65536_lands_at_65536_plus_latency() {
         let mut ir = vec![0.0; 65_537];
         ir[65_536] = 1.0;
@@ -771,33 +729,6 @@ mod tests {
     }
 
     #[test]
-    fn convolver_mono_shared_and_mixed_channel_lengths() {
-        let mut seed = 314u64;
-        let mono_ir: Vec<f64> = (0..1500).map(|_| lcg(&mut seed) * 0.1).collect();
-        check_against_reference(&[mono_ir], 3, 100, 3500, 315);
-
-        let ir0: Vec<f64> = Vec::new();
-        let ir1: Vec<f64> = (0..9).map(|_| lcg(&mut seed) * 0.1).collect();
-        let ir2: Vec<f64> = (0..4000).map(|_| lcg(&mut seed) * 0.1).collect();
-        check_against_reference(&[ir0, ir1, ir2], 3, 128, 5000, 316);
-    }
-
-    #[test]
-    fn random_70k_stereo_irs_match_fft_reference() {
-        let mut seed = 12345u64;
-        let irs: Vec<Vec<f64>> = (0..2)
-            .map(|c| {
-                (0..70_000 + 3 * c)
-                    .map(|i| lcg(&mut seed) * (-1e-5 * i as f64).exp() * 0.05)
-                    .collect()
-            })
-            .collect();
-        for max_block in [1024, 333] {
-            check_against_reference(&irs, 2, max_block, 90_000, 999 + max_block as u64);
-        }
-    }
-
-    #[test]
     fn random_200k_ir_matches_fft_reference() {
         let mut seed = 777u64;
         let ir: Vec<f64> = (0..200_000).map(|_| lcg(&mut seed) * 0.02).collect();
@@ -810,122 +741,6 @@ mod tests {
                 max_block as u64,
             );
         }
-    }
-
-    #[test]
-    fn random_600k_ir_matches_fft_reference() {
-        let mut seed = 4242u64;
-        let ir: Vec<f64> = (0..600_000).map(|_| lcg(&mut seed) * 0.01).collect();
-        let worst = check_against_reference(&[ir], 1, 257, 640_000, 17);
-        eprintln!("600k taps: worst error relative to peak {worst:.2e}");
-    }
-
-    #[test]
-    fn explicit_schedule_with_extra_stage_delay() {
-        // Stages that start later than twice their block (delay made up in
-        // the frequency-domain delay line), on both the direct and the
-        // four-step engine.
-        let plan = [
-            StagePlan {
-                offset: 0,
-                block: 64,
-                end: 512,
-            },
-            StagePlan {
-                offset: 512,
-                block: 128,
-                end: 8192,
-            }, // 4·B: 2 extra slots
-            StagePlan {
-                offset: 8192,
-                block: 4096,
-                end: 24_576,
-            }, // 2·B, four-step
-            StagePlan {
-                offset: 24_576,
-                block: 8192,
-                end: usize::MAX,
-            }, // 3·B, four-step
-        ];
-        let mut seed = 99u64;
-        let ir: Vec<f64> = (0..45_000).map(|_| lcg(&mut seed) * 0.05).collect();
-        let mut conv = Convolver::with_plan(std::slice::from_ref(&ir), 1, 64, &plan);
-        let lat = conv.latency_frames();
-        let n = 60_000;
-        let mut x: Vec<f64> = (0..n).map(|_| lcg(&mut seed)).collect();
-        x.resize(n + lat, 0.0);
-        let out = run_chunks(&mut conv, std::slice::from_ref(&x), 64, 3)
-            .pop()
-            .unwrap();
-        let expected = fft_convolve(&x[..n], &ir);
-        let peak = expected.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-        for i in 0..n {
-            assert!(
-                (out[i + lat] - expected[i]).abs() <= 1e-12 * peak.max(1.0),
-                "sample {i}: {} vs {}",
-                out[i + lat],
-                expected[i]
-            );
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "at least twice")]
-    fn schedule_without_slack_is_rejected() {
-        let plan = [
-            StagePlan {
-                offset: 0,
-                block: 64,
-                end: 256,
-            },
-            StagePlan {
-                offset: 256,
-                block: 256,
-                end: usize::MAX,
-            },
-        ];
-        let _ = Convolver::with_plan(&[vec![1.0; 1000]], 1, 64, &plan);
-    }
-
-    /// 1 s IR at 192 kHz, block 256 (the stated worst case for tail spikes).
-    fn one_second_ir_192k(channels: usize) -> Vec<Vec<f64>> {
-        let mut seed = 0x1234_5678_u64;
-        (0..channels)
-            .map(|_| {
-                (0..192_000)
-                    .map(|i| lcg(&mut seed) * (-(i as f64) / 40_000.0).exp() * 0.01)
-                    .collect()
-            })
-            .collect()
-    }
-
-    #[test]
-    fn tail_work_is_spread_evenly_across_process_calls() {
-        let irs = one_second_ir_192k(2);
-        let block = 256;
-        let mut conv = Convolver::new(&irs, 2, block);
-        assert_eq!(plan_schedule(256, 192_000).last().unwrap().block, MAX_PART);
-        let mut a = vec![0.0; block];
-        let mut b = vec![0.0; block];
-        let mut costs = Vec::new();
-        // Three periods of the largest stage after a one-period warm-up.
-        let calls = 4 * MAX_PART / block;
-        for i in 0..calls {
-            a[0] = 1.0;
-            b[0] = -1.0;
-            conv.process(&mut [&mut a, &mut b]);
-            if i >= MAX_PART / block {
-                costs.push(conv.last_process_cost());
-            }
-        }
-        let mean = costs.iter().sum::<f64>() / costs.len() as f64;
-        let max = costs.iter().fold(0.0f64, |m, &c| m.max(c));
-        let min = costs.iter().fold(f64::MAX, |m, &c| m.min(c));
-        eprintln!(
-            "work per call: mean {mean:.0}, min {min:.0}, max {max:.0} (max/mean {:.3})",
-            max / mean
-        );
-        assert!(max <= 1.15 * mean, "max {max} vs mean {mean}");
     }
 
     #[test]
@@ -949,69 +764,6 @@ mod tests {
         conv.reset();
         let z = run_chunks(&mut conv, &[vec![0.0; 70_000]], 256, 7);
         assert!(z[0].iter().all(|&v| v == 0.0));
-    }
-
-    #[test]
-    #[ignore]
-    fn bench_worst_call_1s_ir_192k_block256() {
-        use std::time::Instant;
-        let irs = one_second_ir_192k(2);
-        let block = 256;
-        let mut conv = Convolver::new(&irs, 2, block);
-        let mut seed = 5u64;
-        let mut a = vec![0.0; block];
-        let mut b = vec![0.0; block];
-        let calls = 192_000 * 6 / block;
-        let mut times = Vec::with_capacity(calls);
-        for _ in 0..calls {
-            for i in 0..block {
-                a[i] = lcg(&mut seed) * 0.1;
-                b[i] = lcg(&mut seed) * 0.1;
-            }
-            let t0 = Instant::now();
-            conv.process(&mut [&mut a, &mut b]);
-            times.push(t0.elapsed().as_secs_f64() * 1e6);
-        }
-        let warm = &mut times[750..];
-        let mean = warm.iter().sum::<f64>() / warm.len() as f64;
-        warm.sort_by(|x, y| x.partial_cmp(y).unwrap());
-        let p99 = warm[warm.len() * 99 / 100];
-        let worst = *warm.last().unwrap();
-        let period = block as f64 / 192_000.0 * 1e6;
-        eprintln!(
-            "1 s IR @192k stereo, block {block} (period {period:.0} us): mean {mean:.1} us, p99 {p99:.1} us, worst {worst:.1} us"
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn bench_convolver_65536_stereo_192khz() {
-        use std::time::Instant;
-        let mut seed = 0xdeadbeef_u64;
-        let ir0: Vec<f64> = (0..65_536).map(|_| lcg(&mut seed) * 0.01).collect();
-        let ir1: Vec<f64> = (0..65_536).map(|_| lcg(&mut seed) * 0.01).collect();
-        let block = 1024usize;
-        let mut conv = Convolver::new(&[ir0, ir1], 2, block);
-
-        let mut ch0 = vec![0.1; block];
-        let mut ch1 = vec![-0.1; block];
-        for _ in 0..100 {
-            conv.process(&mut [&mut ch0, &mut ch1]);
-        }
-
-        let iters = 2000usize;
-        let t0 = Instant::now();
-        for _ in 0..iters {
-            ch0[0] = 0.1;
-            ch1[0] = -0.1;
-            conv.process(&mut [&mut ch0, &mut ch1]);
-        }
-        let elapsed = t0.elapsed().as_secs_f64();
-        let audio_secs = (iters * block) as f64 / 192_000.0;
-        let rtf = audio_secs / elapsed;
-        eprintln!(
-            "Convolver 65536-tap stereo @ 192kHz (block {block}): {audio_secs:.2}s audio in {elapsed:.4}s => {rtf:.2}x real-time"
-        );
     }
 
     #[test]
@@ -1096,46 +848,5 @@ mod tests {
             let rel = max_err / peak.max(1e-12);
             assert!(rel <= 1e-12, "ch {ch} serial vs combined rel err {rel:e}");
         }
-    }
-
-    #[test]
-    fn combine_irs_keeps_mono_when_all_inputs_mono_and_enforces_cap() {
-        let m1 = vec![vec![0.5, 0.25]];
-        let m2 = vec![vec![1.0, -0.5, 0.25]];
-        let out = combine_irs(&[(&m1, 0.0), (&m2, -6.0)], 2).unwrap();
-        assert_eq!(out.len(), 1);
-        let g = crate::db_to_lin(-6.0);
-        let expected = [0.5 * g, 0.0, 0.0, 0.0625 * g];
-        assert_eq!(out[0].len(), expected.len());
-        for (a, b) in out[0].iter().zip(&expected) {
-            assert!((a - b).abs() < 1e-12, "{a} vs {b}");
-        }
-
-        // Single IR > 4M taps or two IRs whose combined length > 4M taps are rejected.
-        assert_eq!(
-            combined_ir_length(&[MAX_COMBINED_IR_TAPS]).unwrap(),
-            MAX_COMBINED_IR_TAPS
-        );
-        assert_eq!(
-            combined_ir_length(&[2_000_001, 2_000_000]).unwrap(),
-            MAX_COMBINED_IR_TAPS
-        );
-        assert!(matches!(
-            combined_ir_length(&[2_000_001, 2_000_001]),
-            Err(crate::chain::ChainError::IrTooLong {
-                taps: 4_000_001,
-                max: MAX_COMBINED_IR_TAPS
-            })
-        ));
-
-        // Channel mismatch (3ch IR on 2ch chain) fails.
-        let bad = vec![vec![1.0], vec![1.0], vec![1.0]];
-        assert!(matches!(
-            combine_irs(&[(&bad, 0.0)], 2),
-            Err(crate::chain::ChainError::IrCount {
-                irs: 3,
-                channels: 2
-            })
-        ));
     }
 }

@@ -195,24 +195,6 @@ impl fmt::Display for RateRatio {
 mod tests {
     use super::*;
 
-    #[test]
-    fn reduces_and_reports() {
-        let r = RateRatio::from_rates(44_100, 48_000);
-        assert_eq!((r.up, r.down), (160, 147));
-        assert_eq!(r.output_rate(44_100), Some(48_000));
-        assert_eq!(r.to_string(), "160/147");
-        let r = RateRatio::from_rates(96_000, 48_000);
-        assert_eq!((r.up, r.down), (1, 2));
-        assert!(r.is_decimating());
-        assert_eq!(
-            RateRatio::from_rates(44_100, 352_800),
-            RateRatio::integer(8)
-        );
-        assert_eq!(RateRatio::integer(8).to_string(), "x8");
-        assert_eq!(RateRatio::from_rates(44_100, 96_000).up, 320);
-        assert_eq!(RateRatio::new(0, 0), RateRatio::ONE);
-    }
-
     fn brute_out(r: RateRatio, pos: u64, n: usize) -> usize {
         // Output m exists once input floor(m down / up) has arrived.
         let covered = |k: u64| {

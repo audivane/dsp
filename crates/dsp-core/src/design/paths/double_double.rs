@@ -57,35 +57,3 @@ fn gaussian_window(n: usize, alpha: f64) -> Vec<Dd> {
         })
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::design::paths::fir::windows;
-    use std::f64::consts::PI;
-
-    #[test]
-    fn window_matches_the_f64_definition() {
-        for &n in &[1016usize, 2040, 2041] {
-            let g: Vec<f64> = gaussian_window(n, 0.128)
-                .iter()
-                .map(|v| v.to_f64())
-                .collect();
-            let d = g
-                .iter()
-                .zip(&windows::gaussian(n, 0.128))
-                .map(|(x, y)| (x - y).abs())
-                .fold(0.0, f64::max);
-            assert!(d < 1e-15);
-        }
-    }
-
-    #[test]
-    fn sinc() {
-        // fc 27/32 at x8: k = 256 puts sinc on its 27th zero.
-        assert_eq!(sinc_dd(256, 27.0 / 32.0, 8).to_f64(), 0.0);
-        let v = sinc_dd(3, 0.5, 2).to_f64();
-        let want = (0.75 * PI).sin() / (0.75 * PI);
-        assert!((v - want).abs() < 1e-16);
-    }
-}

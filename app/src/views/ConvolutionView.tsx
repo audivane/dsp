@@ -134,7 +134,10 @@ export function ConvolutionView() {
 function CalibrationLine() {
   const st = store();
   const cal = useApp((s) => s.status?.calibration ?? null);
-  const parts = calibrationParts(useApp((s) => s.config?.calibration));
+  const stored = useApp((s) => s.config?.calibration);
+  const parts = calibrationParts(stored);
+  // The status is the daemon's word; the config's flag is the fallback (on unless switched off).
+  const enabled = cal?.enabled ?? stored?.enabled ?? true;
   const devices = cal?.devices ?? [];
   const facts = devices
     .map((d) => `${d.role === "master" ? "Main" : d.device}: ${d.entries} filter${d.entries === 1 ? "" : "s"}${d.role === "follower" && d.trim_ms !== 0 ? `, ${fmtMs(d.trim_ms)}` : ""}${d.installed ? "" : " (removed)"}`)
@@ -142,11 +145,19 @@ function CalibrationLine() {
   return (
     <div className="panel">
       <div className="ir-card">
-        <div />
+        {cal ? (
+          <button className="pwr" aria-pressed={enabled} aria-label="Room calibration on" title={enabled ? "Turn the room calibration off" : "Turn the room calibration on"} onClick={() => void st.setCalibrationEnabled(!enabled)}>
+            <Power />
+          </button>
+        ) : (
+          <div />
+        )}
         <div style={{ minWidth: 0 }}>
           <div className="n">Room calibration{cal ? `: ${cal.label}` : ""}</div>
           <div className="m" title={cal?.path}>
-            {cal ? `${facts} · designed at ${fmtRate(cal.design_rate_hz)}` : "None loaded. A bundle sets every device's filters and trims in one go."}
+            {cal
+              ? `${facts} · designed at ${fmtRate(cal.design_rate_hz)}${enabled ? "" : " · off: the main speakers play unfiltered and the calibrated followers are muted"}`
+              : "None loaded. A bundle sets every device's filters and trims in one go."}
           </div>
           {cal?.warnings.map((w, i) => (
             <div key={i} className="m" style={{ color: "var(--warn)" }}>

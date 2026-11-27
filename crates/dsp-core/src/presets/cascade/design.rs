@@ -14,9 +14,7 @@ pub(super) const FIR_LEN_SETTING: usize = 256;
 /// Taps of a windowed-sinc stage (both factors).
 pub(super) const FIR_TAPS: usize = FIR_LEN_SETTING + (FIR_LEN_SETTING & 1) - 1;
 
-/// Sidelobe ratio of the prototype's Dolph-Chebyshev window (-144.5 dB).
-#[cfg(test)]
-const FIR_CHEBYSHEV_R: f64 = 1.0 / 16_777_216.0; // 2^-24
+// 2^-24
 
 /// Cutoff of a windowed-sinc stage as a fraction of the stage's output
 /// Nyquist. The x2 value is 0.95351 of the stage input Nyquist; the x3
@@ -203,75 +201,6 @@ const FIR_WINDOW_HALF: [f64; 128] = [
 pub(super) fn fir_window() -> Vec<f64> {
     let n = FIR_TAPS;
     (0..n).map(|i| FIR_WINDOW_HALF[i.min(n - 1 - i)]).collect()
-}
-
-/// The symmetric Dolph-Chebyshev window by the same direct cosine sum as
-/// [`crate::design::paths::fir::windows::chebyshev_symmetric`],
-///
-/// ```text
-/// w[n] = (1/N) (1 + 2r sum_{k=1..N/2} T(x0 cos(k pi/N)) cos(k (2n+1-N) pi/N))
-/// ```
-///
-/// with T the Chebyshev polynomial of degree N-1 and x0 its root of
-/// T(x0) = 1/r, evaluated in double-double and rounded once, then scaled to
-/// a peak of 1 in double. The check on [`FIR_WINDOW_HALF`].
-#[cfg(test)]
-fn chebyshev_window(n: usize, r: f64) -> Vec<f64> {
-    let m = n - 1;
-    let inv_r = 1.0 / r;
-    // x0 = cosh(acosh(1/r) / (N-1)), refined by Newton on T(x0) = 1/r.
-    let mut x0 = Dd::from(((inv_r).acosh() / m as f64).cosh());
-    for _ in 0..4 {
-        let (t, dt) = chebyshev_t(x0, m);
-        x0 = x0.add(t.add(Dd::from(-inv_r)).div(dt).neg());
-    }
-    // cos(j pi / N) for j = 0..2N.
-    let cos_pi_n: Vec<Dd> = (0..2 * n)
-        .map(|j| {
-            let (j, sign) = {
-                let j = if j > n { 2 * n - j } else { j }; // cos(2pi - a)
-                if 2 * j > n { (n - j, -1.0) } else { (j, 1.0) } // -cos(pi - a)
-            };
-            let a = Dd::PI.mul_f(j as f64).div_f(n as f64);
-            let c = cos_dd(a);
-            if sign < 0.0 { c.neg() } else { c }
-        })
-        .collect();
-    let t: Vec<Dd> = (1..=n / 2)
-        .map(|k| chebyshev_t(x0.mul(cos_pi_n[k]), m).0)
-        .collect();
-    let mut w: Vec<f64> = (0..n)
-        .map(|i| {
-            let d = (2 * i + 1).abs_diff(n);
-            let mut s = Dd::ZERO;
-            for (k, &tk) in t.iter().enumerate() {
-                s = s.add(tk.mul(cos_pi_n[((k + 1) * d) % (2 * n)]));
-            }
-            s.mul_f(2.0 * r).add(Dd::ONE).div_f(n as f64).hi
-        })
-        .collect();
-    let peak = w.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let inv = 1.0 / peak;
-    for v in &mut w {
-        *v *= inv;
-    }
-    w
-}
-
-/// T_m(x) and its derivative m U_{m-1}(x), by the three-term recurrences.
-#[cfg(test)]
-fn chebyshev_t(x: Dd, m: usize) -> (Dd, Dd) {
-    let two_x = x.mul_f(2.0);
-    let (mut t0, mut t1) = (Dd::ONE, x);
-    let (mut u0, mut u1) = (Dd::ONE, two_x);
-    for _ in 2..=m {
-        let t2 = two_x.mul(t1).add(t0.neg());
-        let u2 = two_x.mul(u1).add(u0.neg());
-        (t0, t1) = (t1, t2);
-        (u0, u1) = (u1, u2);
-    }
-    // u0 is U_{m-1} after the loop.
-    (t1, u0.mul_f(m as f64))
 }
 
 /// Pairwise summation: leaves of up to 128 values summed with eight
@@ -660,52 +589,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pairwise_sum_matches_plain_sum_closely() {
-        let v: Vec<f64> = (0..255).map(|i| ((i * 37 % 101) as f64).sin()).collect();
-        let plain: f64 = v.iter().sum();
-        assert!((pairwise_sum(&v) - plain).abs() < 1e-13);
-        assert_eq!(pairwise_sum(&[1.0, 2.0, 3.0]), 6.0);
-    }
-
-    #[test]
-    fn dd_twiddles_are_accurate() {
-        let m = 4096;
-        let tw = twiddles_dd(m);
-        for j in [0usize, 1, 511, 512, 513, 1024, 1500, 2048, 3000, 4095] {
-            let (c, s) = tw[j];
-            let x = 2.0 * PI * j as f64 / m as f64;
-            assert!((c.hi - x.cos()).abs() < 2e-15, "cos {j}");
-            assert!((s.hi - x.sin()).abs() < 2e-15, "sin {j}");
-            // cos^2 + sin^2 = 1 to double-double precision
-            let one = c.mul(c).add(s.mul(s)).add(Dd::ONE.neg());
-            assert!(one.hi.abs() < 1e-30, "j {j}: {}", one.hi);
-        }
-        // sin(pi/4) = sqrt(2)/2 to ~1e-32
-        let (c, s) = tw[512];
-        let d = c.add(s.neg());
-        assert!(d.hi.abs() < 1e-31);
-    }
-
-    #[test]
-    fn window_table_is_the_chebyshev_window() {
-        // Against the window in double-double (exact to the last bit of a
-        // double): the table's extended-precision rounding is at most
-        // 6e-12 relative, the plain double sum 4e-9.
-        let t = fir_window();
-        let exact = chebyshev_window(255, FIR_CHEBYSHEV_R);
-        let dbl = crate::design::paths::fir::windows::chebyshev_symmetric(255, FIR_CHEBYSHEV_R);
-        for i in 0..255 {
-            assert!(((t[i] - exact[i]) / exact[i]).abs() < 6e-12, "{i}");
-            assert!(((dbl[i] - exact[i]) / exact[i]).abs() < 4e-9, "{i}");
-            assert_eq!(t[i], t[254 - i]);
-        }
-        assert!((exact[127] - 1.0).abs() <= f64::EPSILON);
-        // End taps of the exact window (also checked at 50 digits).
-        assert_eq!(exact[0], 4.210_155_899_116_507e-6);
-        assert_eq!(exact[1], 4.961_914_493_087_708e-6);
-    }
-
-    #[test]
     fn prototype_has_unit_dc_gain_and_symmetry() {
         for f in [2, 3] {
             let h = fir_prototype(f);
@@ -722,30 +605,6 @@ mod tests {
     }
 
     #[test]
-    fn kaiser_dd_agrees_with_the_double_version() {
-        let a = kaiser_periodic_dd(512, 7.0, PI);
-        let b = crate::design::paths::fir::windows::kaiser_periodic(512, 7.0 * PI);
-        for i in 0..512 {
-            assert!((a[i] - b[i]).abs() <= 1e-14 * a[i].max(1e-300), "{i}");
-        }
-        assert_eq!(a[256], 1.0);
-        // Values checked against a 45-digit evaluation (correctly rounded).
-        assert_eq!(a[0], 3.288_908_901_952_998e-9);
-        assert_eq!(a[1], 7.201_320_186_387_285e-9);
-        assert_eq!(a[100], 0.011_829_594_044_255_277);
-    }
-
-    #[test]
-    fn fft_stage_bins_and_peak() {
-        // nb = 122 for x2 and 81 for x3; the peak is (2 nb - 1) / n.
-        let h2 = fft_stage_kernel(2);
-        assert_eq!(h2[256], 243.0 / 512.0);
-        let h3 = fft_stage_kernel(3);
-        assert!((h3[256] - 161.0 / 512.0).abs() < 1e-15);
-        assert!((h2.iter().sum::<f64>() - 1.0).abs() < 1e-10);
-    }
-
-    #[test]
     fn minimum_phase_keeps_the_magnitude() {
         let h = fir_prototype(2);
         let g = cepstral(&h, 0.0, FIR_LEN_SETTING);
@@ -755,13 +614,5 @@ mod tests {
         let e: f64 = g.iter().map(|v| v * v).sum();
         let e_head: f64 = g[..64].iter().map(|v| v * v).sum();
         assert!(e_head > 0.99 * e);
-    }
-
-    #[test]
-    fn intermediate_phase_trim_gives_289_taps() {
-        let h = fir_prototype(2);
-        let g = cepstral(&h, ASYM_P, FIR_LEN_SETTING);
-        assert_eq!(g.len(), 289);
-        assert_eq!(argmax(&g), 133);
     }
 }

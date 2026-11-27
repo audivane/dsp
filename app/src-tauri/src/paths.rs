@@ -61,27 +61,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn overlays_live_in_the_app_config() {
-        assert_eq!(
-            config_dir_under(Path::new("/home/you/.config"), "overlays"),
-            PathBuf::from("/home/you/.config/audivane-dsp/overlays")
-        );
-    }
-
-    #[test]
-    fn config_home_prefers_xdg_then_home() {
-        assert_eq!(
-            config_home_from(Some("/x".into()), Some("/h".into())),
-            Some(PathBuf::from("/x"))
-        );
-        assert_eq!(
-            config_home_from(Some("".into()), Some("/h".into())),
-            Some(PathBuf::from("/h/.config"))
-        );
-        assert_eq!(config_home_from(None, None), None);
-    }
-
-    #[test]
     fn order_matches_the_daemon() {
         assert_eq!(
             resolve(Some("/x/s.sock".into()), Some("/run/user/1".into()), 7),

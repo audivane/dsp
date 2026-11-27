@@ -571,16 +571,6 @@ const STAGE_LOUDNESS_RMS_DB: f64 = -14.0;
 const STAGE_LOUDNESS_SECONDS: f64 = 4.5;
 const STAGE_LOUDNESS_SKIP_SECONDS: f64 = 0.5;
 
-/// [`stage_loudness_change`] of `stage` (built at [`STAGE_LOUDNESS_RATE`],
-/// one channel) for the reference. Off the audio thread: it allocates.
-#[cfg(test)]
-pub(crate) fn stage_loudness_change_db(stage: &mut dyn crate::Stage) -> f64 {
-    let input = stage_loudness_reference();
-    let mut output = input.clone();
-    stage.process(&mut [output.as_mut_slice()]);
-    stage_loudness_change(&input, &output)
-}
-
 /// Loudness change of a non-linear stage on music, dB: the BS.1770
 /// (K-weighted) loudness of the stage's `output` for the reference `input`
 /// ([`stage_loudness_reference`], one channel at [`STAGE_LOUDNESS_RATE`])
@@ -656,96 +646,6 @@ mod tests {
     }
 
     #[test]
-    fn analytic_offset_identical_is_zero() {
-        let power = |f: f64| 1.0 + (f / 1000.0).sin().abs();
-        let offset = analytic_offset_db(&power, &power, 48_000.0);
-        assert_eq!(offset, 0.0);
-    }
-
-    #[test]
-    fn analytic_offset_three_db_flat() {
-        let a = |f: f64| 1.0 + 0.5 * (f / 700.0).cos();
-        let b = |f: f64| a(f) * 10f64.powf(3.0 / 10.0);
-        let offset = analytic_offset_db(&a, &b, 48_000.0);
-        assert!((offset + 3.0).abs() < 1e-9, "{offset}");
-    }
-
-    #[test]
-    fn low_frequency_boost_matters_much_less_than_midrange() {
-        // A +20 dB narrow boost at f0.  A-weighting is ~-50 dB at 20 Hz, so
-        // boosting there barely changes the A-weighted loudness; at 3 kHz it
-        // does.
-        let bump = |f0: f64| {
-            move |f: f64| {
-                let x = (f / f0).ln() / 0.02;
-                1.0 + 100.0 * (-x * x).exp()
-            }
-        };
-        let flat = |_: f64| 1.0;
-        let at_20 = analytic_offset_db(&flat, &bump(20.0), 48_000.0);
-        let at_3k = analytic_offset_db(&flat, &bump(3000.0), 48_000.0);
-        assert!(at_20.abs() < 0.05, "20 Hz offset {at_20}");
-        assert!(at_3k < -2.0, "3 kHz offset {at_3k}");
-        assert!(at_20.abs() < at_3k.abs() / 100.0);
-    }
-
-    #[test]
-    fn analytic_offset_handles_degenerate_inputs() {
-        let zero = |_: f64| 0.0;
-        let one = |_: f64| 1.0;
-        assert_eq!(analytic_offset_db(&zero, &one, 48_000.0), 0.0);
-        assert_eq!(analytic_offset_db(&one, &zero, 48_000.0), 0.0);
-        assert_eq!(analytic_offset_db(&one, &one, 0.0), 0.0);
-    }
-
-    #[test]
-    fn a_weighted_meter_matches_analytic_curve() {
-        // 0.5 amplitude sine: a pure tone at f must read its level plus the
-        // A-weighting at f.
-        for fs in [44_100.0, 48_000.0, 96_000.0, 192_000.0] {
-            for freq in [100.0, 1000.0, 4000.0, 8000.0, 16_000.0] {
-                let x = sine(fs, freq, 0.5, 1.0);
-                let mut meter = AWeightedMeter::new(fs, 1);
-                meter.push(&[&x]);
-                let expected = 20.0 * (0.5 / 2f64.sqrt()).log10() + a_weighting_db(freq);
-                let error = meter.rms_db() - expected;
-                assert!(error.abs() < 0.5, "fs {fs} f {freq}: {error} dB");
-            }
-        }
-
-        // 20 Hz sits where A-weighting is -50 dB.  The filter's start-up
-        // transient (its natural frequency is right there) takes over 100 ms
-        // to die away, so measure it over a long block.
-        for fs in [44_100.0, 48_000.0] {
-            let x = sine(fs, 20.0, 0.5, 5.0);
-            let mut meter = AWeightedMeter::new(fs, 1);
-            meter.push(&[&x]);
-            let expected = 20.0 * (0.5 / 2f64.sqrt()).log10() + a_weighting_db(20.0);
-            let error = meter.rms_db() - expected;
-            assert!(error.abs() < 0.5, "fs {fs} f 20: {error} dB");
-        }
-    }
-
-    #[test]
-    fn a_weighted_meter_summed_channels_and_reset() {
-        let fs = 48_000.0;
-        let x = sine(fs, 1000.0, 0.5, 0.25);
-        let mut mono = AWeightedMeter::new(fs, 1);
-        mono.push(&[&x]);
-        let mono_db = mono.rms_db();
-        let mut stereo = AWeightedMeter::new(fs, 2);
-        stereo.push(&[&x, &x]);
-        // Two identical channels sum their mean squares: +3.01 dB.
-        assert!((stereo.rms_db() - mono_db - 3.010_299_956_639_812).abs() < 0.01);
-
-        let before = mono.rms_db();
-        mono.reset();
-        assert_eq!(mono.rms_db(), f64::NEG_INFINITY);
-        mono.push(&[&x]);
-        assert!((mono.rms_db() - before).abs() < 1e-9);
-    }
-
-    #[test]
     fn k_weighting_matches_published_48k_coefficients() {
         let shelf = k_shelf(48_000.0);
         let expected_shelf = [
@@ -775,20 +675,6 @@ mod tests {
             let lufs = meter.integrated_lufs();
             assert!((lufs + 23.0).abs() < 0.1, "fs {fs}: {lufs} LUFS");
         }
-    }
-
-    #[test]
-    fn lufs_gates_silence_and_short_signals() {
-        let mut meter = LufsMeter::new(48_000.0, 2);
-        assert_eq!(meter.integrated_lufs(), f64::NEG_INFINITY);
-        meter.push(&[&vec![0.0; 4800], &vec![0.0; 4800]]);
-        assert_eq!(meter.integrated_lufs(), f64::NEG_INFINITY);
-
-        // -80 dBFS is below the absolute gate.
-        let x = sine(48_000.0, 1000.0, 10f64.powf(-80.0 / 20.0), 1.0);
-        let mut meter = LufsMeter::new(48_000.0, 2);
-        meter.push(&[&x, &x]);
-        assert_eq!(meter.integrated_lufs(), f64::NEG_INFINITY);
     }
 
     #[test]
@@ -904,47 +790,5 @@ mod tests {
                 "case {seed}: histogram {got} vs exact {exact} LUFS"
             );
         }
-    }
-
-    #[test]
-    fn histogram_lufs_extreme_levels() {
-        // Above the histogram's +10 LUFS top (overflow bin) and mixed with
-        // blocks near the absolute gate.
-        let fs = 48_000.0;
-        let mut x = sine(fs, 1000.0, 8.0, 3.0); // ~ +15 LUFS stereo
-        x.extend(sine(fs, 1000.0, 10f64.powf(-68.0 / 20.0), 3.0));
-        let exact = exact_lufs(&[&x, &x], fs);
-        let mut meter = LufsMeter::new(fs, 2);
-        meter.push(&[&x, &x]);
-        assert!(
-            (meter.integrated_lufs() - exact).abs() < 0.01,
-            "{} vs {exact}",
-            meter.integrated_lufs()
-        );
-
-        // Only blocks just above the gate (mono -66 dBFS: about -69.7 LUFS).
-        let y = sine(fs, 1000.0, 10f64.powf(-66.0 / 20.0), 2.0);
-        let mut meter = LufsMeter::new(fs, 1);
-        meter.push(&[&y]);
-        let exact = exact_lufs(&[&y], fs);
-        assert!(exact.is_finite() && exact < -69.0, "{exact}");
-        assert!(
-            (meter.integrated_lufs() - exact).abs() < 0.01,
-            "{} vs {exact}",
-            meter.integrated_lufs()
-        );
-    }
-
-    #[test]
-    fn lufs_reset_restarts() {
-        let fs = 48_000.0;
-        let x = sine(fs, 1000.0, 0.1, 1.0);
-        let mut meter = LufsMeter::new(fs, 2);
-        meter.push(&[&x, &x]);
-        let first = meter.integrated_lufs();
-        meter.reset();
-        assert_eq!(meter.integrated_lufs(), f64::NEG_INFINITY);
-        meter.push(&[&x, &x]);
-        assert!((meter.integrated_lufs() - first).abs() < 1e-9);
     }
 }

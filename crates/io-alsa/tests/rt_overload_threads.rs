@@ -18,7 +18,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
-const HARD_USEC: u64 = 60_000;
+/// The hard limit: wide enough that the handler, on a busy normal-priority
+/// thread, takes the signal well before the kernel kills the process
+/// (half of it between the two limits), but never above what rtkit set.
+fn hard_usec() -> u64 {
+    const WANTED: u64 = 400_000;
+    let mut cur = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit into a local.
+    if unsafe { libc::getrlimit(libc::RLIMIT_RTTIME, &mut cur) } != 0
+        || cur.rlim_max == libc::RLIM_INFINITY
+    {
+        return WANTED;
+    }
+    WANTED.min(cur.rlim_max)
+}
 
 fn spin_for(d: Duration) -> u64 {
     let t0 = Instant::now();
@@ -76,11 +92,12 @@ fn the_audio_thread_is_demoted_when_another_thread_takes_the_signal() {
         let signals = overload_signals();
         let demotions = audio_thread_demotions();
         if real {
-            set_rttime_limits(HARD_USEC).unwrap();
-            // 300 ms without sleeping: past the soft limit (30 ms) and far
-            // past the hard one (60 ms). The signal is blocked here, so
-            // another thread handles it and must demote this one by id.
-            std::hint::black_box(spin_for(Duration::from_millis(300)));
+            let hard = hard_usec();
+            set_rttime_limits(hard).unwrap();
+            // Without sleeping, past the soft limit (half the hard one) and
+            // far past the hard one. The signal is blocked here, so another
+            // thread handles it and must demote this one by id.
+            std::hint::black_box(spin_for(Duration::from_micros(3 * hard)));
         } else {
             eprintln!("rt_overload_threads: rtkit promotion unavailable");
             unsafe {

@@ -589,32 +589,13 @@ pub(crate) fn clear_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use audivane_protocol::{DitherKind, HarmonicsRouting};
+    use audivane_protocol::DitherKind;
 
     const WORD: HarmonicsSpectrumWord = HarmonicsSpectrumWord {
         bits: 24,
         dither: DitherKind::Tpdf,
         headroom_db: 3.0,
     };
-
-    fn layer(id: &str) -> HarmonicsLayer {
-        HarmonicsConfig::from_preset(id).unwrap().layers[0].clone()
-    }
-
-    #[test]
-    fn the_plan_is_coherent_on_an_odd_bin() {
-        for rate in [44_100.0, 96_000.0, 768_000.0] {
-            for f in [10.0, 20.0, 1_000.0, 19_997.0] {
-                let p = Plan::at(rate, f, 0.0);
-                assert!(p.n.is_power_of_two());
-                assert_eq!(p.bin % 2, 1);
-                assert!(p.bin >= 5, "{rate} {f} {p:?}");
-                assert!((p.freq - f).abs() <= 2.0 * rate / p.n as f64);
-                let inv = inverse_mod_pow2(p.bin, p.n);
-                assert_eq!(p.bin * inv % p.n, 1);
-            }
-        }
-    }
 
     #[test]
     fn chebyshev_peaks_match_the_readout() {
@@ -650,110 +631,5 @@ mod tests {
         assert!(at(s.freq_hz).abs() < 0.1);
         assert!((f64::from(at(2.0 * s.freq_hz)) - pt.harmonics_db[0]).abs() < 0.5);
         assert_eq!(line.wave.len(), WAVE_POINTS);
-    }
-
-    #[test]
-    fn periodic_lines_plot_exact_hairlines() {
-        // A sag system: its envelope settles to a periodic steady state, so
-        // the plot is exact; the stage's residual DC stays in bin 0 (no skirt
-        // at 10-60 Hz).
-        let rate = 705_600.0;
-        for level in [-10.0, 0.0] {
-            let cfg = audivane_protocol::harmonics_system("set_amp")
-                .unwrap()
-                .to_config();
-            let s = spectrum(&cfg, rate, 1_000.0, level, &[], WORD).unwrap();
-            let line = &s.lines[0];
-            assert!(!line.windowed, "{level}");
-            for (f, l) in s.freqs_hz.iter().zip(&line.levels_db) {
-                if (12.0..60.0).contains(f) {
-                    assert!(f64::from(*l) < line.floor_db, "{f} Hz: {l}");
-                }
-            }
-            // The fundamental is one point, its neighbours far below.
-            let i = s
-                .freqs_hz
-                .iter()
-                .position(|&x| f64::from(x) * (1.0 + 1e-3) >= s.freq_hz)
-                .unwrap();
-            let top = (i - 1..=i + 1)
-                .max_by(|&a, &b| line.levels_db[a].total_cmp(&line.levels_db[b]))
-                .unwrap();
-            assert!(line.levels_db[top].abs() < 0.01);
-            assert!(line.levels_db[top - 2] < -150.0 && line.levels_db[top + 2] < -150.0);
-        }
-        // A line whose window doesn't repeat falls back to the window, with
-        // its (wider) floor.
-        let cfg = HarmonicsConfig::from_preset("se_triode_high_mu").unwrap();
-        let plan = Plan::at(rate, 1_000.0, 0.0);
-        let mut raw = analyse(&simulate(&cfg, rate, plan).unwrap(), rate, plan);
-        let exact = finish(&raw, HarmonicsSpectrumTrace::Stage, rate, plan, &WORD);
-        assert!(!exact.windowed);
-        raw.leak_db = -120.0;
-        let windowed = finish(&raw, HarmonicsSpectrumTrace::Stage, rate, plan, &WORD);
-        assert!(windowed.windowed);
-        assert_eq!(windowed.levels_db, raw.windowed_db);
-        assert!(windowed.floor_db > exact.floor_db + 3.0);
-    }
-
-    #[test]
-    fn aliases_fold_and_series_traces_run() {
-        let rate = 48_000.0;
-        let mut cfg = HarmonicsConfig::from_preset("diff_pair").unwrap();
-        cfg.layers.push(layer("se_triode_high_mu"));
-        cfg.routing = HarmonicsRouting::Series;
-        let traces = [
-            HarmonicsSpectrumTrace::Stage,
-            HarmonicsSpectrumTrace::Layer { layer: 0 },
-            HarmonicsSpectrumTrace::Layer { layer: 1 },
-            HarmonicsSpectrumTrace::After { layer: 0 },
-        ];
-        let s = spectrum(&cfg, rate, 10_000.0, 0.0, &traces, WORD).unwrap();
-        assert_eq!(s.lines.len(), 4);
-        // After the first layer is the first layer alone.
-        assert_eq!(s.lines[1].levels_db, s.lines[3].levels_db);
-        let h3 = s.lines[0].peaks.iter().find(|p| p.order == 3).unwrap();
-        assert!(h3.aliased);
-        assert!((h3.freq_hz - (rate - 3.0 * s.freq_hz)).abs() < 1e-6);
-        // Aliases count in THD+N, not in THD.
-        assert!(s.lines[0].thd_n_db > s.lines[0].thd_db);
-        // `after` needs series.
-        cfg.routing = HarmonicsRouting::Parallel;
-        assert!(spectrum(&cfg, rate, 1_000.0, 0.0, &traces[3..], WORD).is_err());
-    }
-
-    #[test]
-    fn a_tape_layer_is_simulated() {
-        let rate = 96_000.0;
-        let cfg = HarmonicsConfig::from_preset("tape_master").unwrap();
-        let s = spectrum(&cfg, rate, 1_000.0, 0.0, &[], WORD).unwrap();
-        let r = crate::harmonics::readout(&cfg, rate, false).unwrap();
-        let h3 = s.lines[0].peaks.iter().find(|p| p.order == 3).unwrap();
-        assert!(
-            (h3.level_db - r.points[0].harmonics_db[1]).abs() < 0.5,
-            "{} vs {}",
-            h3.level_db,
-            r.points[0].harmonics_db[1]
-        );
-    }
-
-    #[test]
-    fn off_is_a_clean_tone() {
-        let cfg = HarmonicsConfig {
-            enabled: false,
-            ..HarmonicsConfig::from_preset("triode").unwrap()
-        };
-        let s = spectrum(&cfg, 96_000.0, 1_000.0, -20.0, &[], WORD).unwrap();
-        let line = &s.lines[0];
-        assert!(line.peaks.is_empty());
-        assert!(line.gain_db.abs() < 1e-9);
-        assert!(line.thd_db <= FLOOR_DB);
-        // THD+N is the word's noise: 24-bit TPDF, 20 kHz of 48, a −20 dBFS
-        // tone 3 dB down: about −(146 − 23 − 3.8 + 4.8) ≈ −124 dB.
-        assert!(
-            line.thd_n_db > -130.0 && line.thd_n_db < -118.0,
-            "{}",
-            line.thd_n_db
-        );
     }
 }

@@ -60,6 +60,7 @@ import {
 } from "../lib/effects";
 import { fmtDb, fmtFreq, fmtRate, minus } from "../lib/format";
 import { errorText, store, useApp } from "../store/store";
+import { chainB } from "../lib/abPatch";
 import { Seg } from "../components/Seg";
 import { CompareButton, InlineError, MissingNotice, StageHead, useStageMissing } from "../components/StageParts";
 import { ValueSlider } from "../components/ValueSlider";
@@ -1377,6 +1378,7 @@ function AnalysisPanel({
   freq: ReactNode;
 }) {
   const layers = config.layers;
+  const otherSide = useOtherSide();
   const named = (i: number) => (layers[i] ? `${layerName(layers[i], presets)} (layer ${i + 1})` : `Layer ${i + 1}`);
   const rate = readout?.rate_hz ?? (live?.frame && live.frame.rate > 0 ? live.frame.rate : null);
   return (
@@ -1411,7 +1413,9 @@ function AnalysisPanel({
               <i className="harm-live-dot" aria-hidden />
               Now, on the music
             </div>
-            <LiveStats live={live} blind={blind} unit={unit} readout={readout} />
+            {otherSide && !blind && <p className="stage-note">{otherSide.text}</p>}
+            {/* The readout is this page's stage (side A): not for side B's frames. */}
+            <LiveStats live={live} blind={blind} unit={unit} readout={otherSide?.shows === "b" ? null : readout} />
           </section>
         )}
         {readout && (
@@ -1924,4 +1928,26 @@ function FreqPlot({ readout, levelDbfs, unit, height: h, resize, now }: { readou
       )}
     </div>
   );
+}
+
+/**
+ * During an A/B comparison where only the side not heard has a harmonics
+ * stage, the live view shows that side (both sides run): say so.
+ */
+function useOtherSide(): { text: string; shows: "a" | "b" } | null {
+  const current = useApp((a) => (a.status?.ab?.enabled ? a.status.ab.current : null));
+  const cfg = useApp((a) => a.config);
+  return useMemo(() => {
+    if (!current || !cfg?.ab) return null;
+    const onA = !!cfg.chain.harmonics?.enabled;
+    let onB = onA;
+    try {
+      onB = !!chainB(cfg.ab, cfg.chain).harmonics?.enabled;
+    } catch {
+      return null;
+    }
+    if (current === "b" && onA && !onB) return { text: "Side B plays without harmonics: this is what side A's stage adds.", shows: "a" };
+    if (current === "a" && onB && !onA) return { text: "Side A plays without harmonics: this is what side B's stage adds.", shows: "b" };
+    return null;
+  }, [current, cfg]);
 }

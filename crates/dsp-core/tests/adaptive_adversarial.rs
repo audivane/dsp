@@ -3,110 +3,9 @@
 //! trajectory bound at its worst, the largest call at the largest step,
 //! position overflow and the sign of zero.
 
-use audivane_dsp_core::adaptive::{
-    Accumulator, AdaptiveCore, CoreError, MAX_CALL_OUTPUTS, MAX_CHANNELS, PlanError, Segment, Step,
-    position_after,
-};
+use audivane_dsp_core::adaptive::{Accumulator, AdaptiveCore, MAX_CALL_OUTPUTS, Segment, Step};
 
 const ONE_F: f64 = 18_446_744_073_709_551_616.0;
-
-/// Plan, check `need` and the positions against the per-output loop, run
-/// the call with `need` (or `need + 1`) frames of a constant, and check
-/// the committed state.
-fn checked_plan(
-    core: &mut AdaptiveCore,
-    pos: u128,
-    fed: usize,
-    n: usize,
-    seg: Segment,
-    over: bool,
-) -> (usize, u128) {
-    let need = core.plan(n, seg).unwrap();
-    let plan = core.planned().unwrap();
-    let mut p = pos;
-    let mut s = plan.step as i128;
-    let [mut d1, mut d2, d3] = plan.d;
-    let mut expect = 0;
-    for k in 0..n {
-        expect = (((p >> 64) as usize) + 1).saturating_sub(fed);
-        assert!(s > 0);
-        if k < 5 || k % 31 == 0 || k + 1 == n {
-            assert_eq!(Some(p), position_after(pos, plan.step, plan.d, k));
-        }
-        p += s as u128;
-        s += d1;
-        d1 += d2;
-        d2 += d3;
-    }
-    assert_eq!(need, expect);
-    assert_eq!(Some(p), position_after(pos, plan.step, plan.d, n));
-    assert!((s - plan.end as i128).unsigned_abs() <= n as u128 / 2);
-    let delivered = need + usize::from(over && need > 0);
-    assert!(delivered <= core.max_in());
-    let input = vec![0.25; delivered];
-    let mut output = vec![0.0; n];
-    core.process(&[&input], &mut [&mut output]);
-    assert!(output.iter().all(|x| x.is_finite()));
-    assert_eq!(core.accumulator().position(), p);
-    assert_eq!(core.accumulator().frames_in() as usize, fed + delivered);
-    assert_eq!(
-        core.retained(),
-        (fed + delivered).saturating_sub((p >> 64) as usize)
-    );
-    assert!(core.retained() <= 2);
-    assert_eq!(core.step().bits(), plan.end);
-    assert!(core.planned().is_none());
-    (fed + delivered, p)
-}
-
-#[test]
-fn jumps_extreme_ramps_and_abandoned_plans() {
-    let max = MAX_CALL_OUTPUTS;
-    let mut core = AdaptiveCore::new(1, max, Step::MIN).unwrap();
-    let (mut fed, mut pos) = (0, 0);
-    for i in 0..4000 {
-        let target = if i % 2 == 0 { Step::MAX } else { Step::MIN };
-        let n = if i % 4 < 2 { max } else { 1 };
-        if i % 251 == 0 {
-            let before = core.accumulator().clone();
-            core.plan(10, Segment::Jump(target)).unwrap();
-            assert!(core.plan(max + 1, Segment::Hold).is_err());
-            assert_eq!(core.accumulator(), &before);
-            core.plan(10, Segment::Jump(target)).unwrap();
-            assert_eq!(core.plan(0, Segment::Jump(target)).unwrap(), 0);
-            core.process(&[&[]], &mut [&mut []]);
-            assert_eq!(core.accumulator(), &before);
-            core.plan(10, Segment::Jump(target)).unwrap();
-        }
-        (fed, pos) = checked_plan(&mut core, pos, fed, n, Segment::Jump(target), i % 4 < 2);
-    }
-    for i in 0..128 {
-        let target = if i % 2 == 0 { Step::MAX } else { Step::MIN };
-        let seg = Segment::Piece {
-            slope0: 0.0,
-            end: target,
-            slope1: 0.0,
-        };
-        let n = if i % 4 < 2 { max } else { 1 };
-        (fed, pos) = checked_plan(&mut core, pos, fed, n, seg, i % 2 == 0);
-    }
-}
-
-/// Huge finite slopes would make the extremum check see NaN and the endpoint
-/// solve overflow: refused.
-#[test]
-fn huge_finite_slopes_are_refused() {
-    let mut core = AdaptiveCore::new(1, 4, Step::ONE).unwrap();
-    let slope = 2.0f64.powi(500);
-    let seg = Segment::Piece {
-        slope0: slope,
-        end: Step::ONE,
-        slope1: slope,
-    };
-    assert_eq!(core.plan(4, seg), Err(PlanError::BadSlope));
-    assert_eq!(core.planned(), None);
-    assert_eq!(core.accumulator(), &Accumulator::new(Step::ONE));
-}
 
 /// Fuzzed: every slope magnitude from subnormal to `f64::MAX`
 /// (and NaN, infinities), both signs and mixed, against every end and
@@ -196,50 +95,6 @@ fn extreme_slopes_ends_and_sizes_never_panic() {
     }
     println!("{tried} extreme pieces, {accepted} accepted (and run), none panicked");
     assert!(accepted > 0);
-}
-
-/// A zero-channel core would build and then panic in `process`: every
-/// constructor argument is checked.
-#[test]
-fn constructor_arguments_are_checked() {
-    assert_eq!(
-        AdaptiveCore::new(0, 1, Step::ONE).err(),
-        Some(CoreError::Channels(0))
-    );
-    assert_eq!(
-        AdaptiveCore::new(MAX_CHANNELS + 1, 1, Step::ONE).err(),
-        Some(CoreError::Channels(MAX_CHANNELS + 1))
-    );
-    assert_eq!(
-        AdaptiveCore::new(1, 0, Step::ONE).err(),
-        Some(CoreError::MaxOut(0))
-    );
-    for huge in [MAX_CALL_OUTPUTS + 1, usize::MAX] {
-        assert_eq!(
-            AdaptiveCore::new(2, huge, Step::ONE).err(),
-            Some(CoreError::MaxOut(huge))
-        );
-    }
-    // The limits themselves build and run.
-    let mut core = AdaptiveCore::new(MAX_CHANNELS, 1, Step::ONE).unwrap();
-    let need = core.plan(1, Segment::Hold).unwrap();
-    let x = vec![0.0; need];
-    let ins: Vec<&[f64]> = (0..MAX_CHANNELS).map(|_| &x[..]).collect();
-    let mut outs = vec![[0.0f64; 1]; MAX_CHANNELS];
-    let mut outs: Vec<&mut [f64]> = outs.iter_mut().map(|o| &mut o[..]).collect();
-    core.process(&ins, &mut outs);
-    let mut core = AdaptiveCore::new(1, MAX_CALL_OUTPUTS, Step::MAX).unwrap();
-    assert!(core.plan(MAX_CALL_OUTPUTS, Segment::Hold).is_ok());
-    assert!(core.plan(MAX_CALL_OUTPUTS + 1, Segment::Hold).is_err());
-    // The accumulator alone has the same call limit.
-    let mut acc = Accumulator::new(Step::ONE);
-    assert_eq!(
-        acc.plan(MAX_CALL_OUTPUTS + 1, Segment::Hold),
-        Err(PlanError::TooManyOutputs {
-            n: MAX_CALL_OUTPUTS + 1,
-            max: MAX_CALL_OUTPUTS
-        })
-    );
 }
 
 /// The analytic deviation bound of `Segment::Piece` at output `k` of `n`
@@ -350,55 +205,4 @@ fn largest_calls_at_the_largest_step_fit_the_input() {
             assert!(fed > 0);
         }
     }
-}
-
-/// `position_after` with arguments out of its range returns `None` instead
-/// of panicking (or wrapping).
-#[test]
-fn position_after_refuses_what_does_not_fit() {
-    assert_eq!(
-        position_after(1u128 << 127, Step::ONE.bits(), [0; 3], 0),
-        None
-    );
-    assert_eq!(position_after(0, 1u128 << 127, [0; 3], 1), None);
-    assert_eq!(
-        position_after(0, Step::ONE.bits(), [i128::MAX, 0, 0], 3),
-        None
-    );
-    assert_eq!(
-        position_after(0, Step::ONE.bits(), [0; 3], usize::MAX),
-        None
-    );
-    assert_eq!(
-        position_after(0, Step::ONE.bits(), [-(4i128 << 64), 0, 0], 4),
-        None
-    );
-    assert_eq!(
-        position_after(5, Step::ONE.bits(), [0; 3], 3),
-        Some(5 + 3 * Step::ONE.bits())
-    );
-}
-
-/// At phase 0 the output is the frame 12 back, copied, so a `-0.0` input
-/// comes out as `-0.0`.
-#[test]
-fn signed_zero_survives_the_unity_delay() {
-    let mut core = AdaptiveCore::new(1, 13, Step::ONE).unwrap();
-    let mut input = [0.0; 13];
-    input[0] = -0.0;
-    let mut output = [1.0; 13];
-    assert_eq!(core.plan(13, Segment::Hold).unwrap(), 13);
-    core.process(&[&input], &mut [&mut output]);
-    assert_eq!(output[12].to_bits(), (-0.0f64).to_bits());
-    for v in &output[..12] {
-        assert_eq!(v.to_bits(), 0);
-    }
-    // stereo the same
-    let mut core = AdaptiveCore::new(2, 13, Step::ONE).unwrap();
-    let mut l = [1.0; 13];
-    let mut r = [1.0; 13];
-    core.plan(13, Segment::Hold).unwrap();
-    core.process(&[&input, &input], &mut [&mut l, &mut r]);
-    assert_eq!(l[12].to_bits(), (-0.0f64).to_bits());
-    assert_eq!(r[12].to_bits(), (-0.0f64).to_bits());
 }

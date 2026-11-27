@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.11.2
+
+- Room calibration: a switch. The loaded calibration can be turned off and
+  on without unloading it, from its row on the Convolution page, the
+  sidebar or `avdsp ctl bundle enable off|on` (`bundle_enable` on the
+  control socket). Off, the main speakers play without it and the
+  followers it calibrates (a sub) are muted; a follower keeps its filter
+  loaded, so a sub never plays full range. The sidebar's Convolution
+  button no longer pretends to switch a loaded calibration, and its
+  per-filter buttons switch the right filter when a calibration is
+  loaded.
+- Harmonics: during an A/B comparison where only one side has a
+  harmonics stage, the live view keeps showing what that stage adds while
+  the other side plays, and says which side it shows.
+- Pitch: Reset to 0 in the Tuning (Hz) view stays in that view.
+- Output: the noise-shaping note and its rate warning line up under the
+  controls at every window width.
+- Stereo image: marker labels on the response graph no longer overlap.
+
 ## 0.11.1
 
 - Engine: A/B level matching no longer misjudges a pair where only one

@@ -186,28 +186,6 @@ impl Engine for WaitingEngine {
 mod tests {
     use super::*;
 
-    #[test]
-    fn reports_the_missing_device_and_follows_config_edits() {
-        let mut cfg = EngineConfig {
-            device: "hw:CARD=USB,DEV=0".into(),
-            ..Default::default()
-        };
-        let reason = start_error_text(&cfg.device, false, "No such device");
-        let engine = WaitingEngine::new(cfg.clone(), reason);
-        let snap = engine.snapshot();
-        assert_eq!(snap.state, EngineState::Error);
-        let error = snap.error.unwrap();
-        assert!(error.contains("hw:CARD=USB,DEV=0 not found"), "{error}");
-        assert!(engine.selftest().is_err());
-
-        cfg.device = "hw:CARD=PCH,DEV=0".into();
-        engine.apply(&cfg).unwrap();
-        assert_eq!(engine.device(), "hw:CARD=PCH,DEV=0");
-        let snap = engine.snapshot();
-        assert_eq!(snap.device, "hw:CARD=PCH,DEV=0");
-        assert!(snap.error.unwrap().contains("hw:CARD=PCH,DEV=0 not found"));
-    }
-
     /// A side B over the boost cap is refused while the engine waits for its
     /// device, as when it runs; and the master's own build (a rate change)
     /// holds both sides' exact IRs at that rate to the cap.

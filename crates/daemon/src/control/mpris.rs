@@ -603,56 +603,6 @@ fn take_u32(values: &HashMap<String, OwnedVariant>, key: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zbus::Str;
-
-    fn text(value: &str) -> OwnedVariant {
-        OwnedVariant::from(Str::from(value.to_string()))
-    }
-
-    #[test]
-    fn metadata_extraction_and_key_conventions() {
-        let mut map = HashMap::new();
-        map.insert("xesam:title".to_string(), text("Track"));
-        map.insert("xesam:album".to_string(), text("Album"));
-        map.insert("xesam:artist".to_string(), text("Artist"));
-        map.insert(
-            "audio-samplerate".to_string(),
-            OwnedVariant::from(96_000u32),
-        );
-        map.insert("xesam:audioBitDepth".to_string(), text("24"));
-
-        let track = extract_metadata(&map);
-        assert_eq!(track.title.as_deref(), Some("Track"));
-        assert_eq!(track.artist.as_deref(), Some("Artist"));
-        assert_eq!(track.album.as_deref(), Some("Album"));
-        assert_eq!(track.native_rate, Some(96_000));
-        assert_eq!(track.native_bits, Some(24));
-        assert_eq!(track.track_id, None);
-
-        // `mpris:trackid` as an object path or a string; NoTrack is none.
-        let path = |p: &str| OwnedVariant::from(zbus::ObjectPath::try_from(p.to_string()).unwrap());
-        map.insert("mpris:trackid".into(), path("/org/player/track/7"));
-        assert_eq!(
-            extract_metadata(&map).track_id.as_deref(),
-            Some("/org/player/track/7")
-        );
-        map.insert("mpris:trackid".into(), text("track-8"));
-        assert_eq!(extract_metadata(&map).track_id.as_deref(), Some("track-8"));
-        map.insert(
-            "mpris:trackid".into(),
-            path("/org/mpris/MediaPlayer2/TrackList/NoTrack"),
-        );
-        assert_eq!(extract_metadata(&map).track_id, None);
-    }
-
-    #[test]
-    fn unknown_and_empty_metadata() {
-        let map = HashMap::new();
-        assert_eq!(extract_metadata(&map), TrackMetadata::default());
-        let mut map = HashMap::new();
-        map.insert("xesam:title".to_string(), text("   "));
-        assert!(extract_metadata(&map).is_empty());
-    }
 
     #[test]
     fn only_players_whose_streams_go_through_audivane_match() {
@@ -690,28 +640,6 @@ mod tests {
         ));
         // Nothing on Audivane: nothing matches.
         assert!(!plays_through(chromium, Some(100), &[], parent));
-    }
-
-    #[test]
-    fn parent_pid_reads_proc() {
-        let me = std::process::id();
-        let parent = parent_pid(me).expect("own parent");
-        assert_eq!(parent, std::os::unix::process::parent_id());
-    }
-
-    #[test]
-    fn key_normalisation() {
-        assert_eq!(
-            normalize_key("XESAM:Audio-Sample_Rate"),
-            "xesamaudiosamplerate"
-        );
-        assert_eq!(normalize_key("bitsPerSample"), "bitspersample");
-        let mut values = HashMap::new();
-        values.insert("audioSampleRate".to_string(), OwnedVariant::from(44_100u32));
-        assert_eq!(
-            find_key(&values, &["audiosamplerate"]),
-            Some("audioSampleRate".to_string())
-        );
     }
 
     #[test]

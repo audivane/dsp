@@ -1327,22 +1327,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_single_branch_runs_the_convolver_job_order() {
-        for block in [256, 4096] {
-            let s = Schedule::new(block, 1, 256);
-            let jobs: Vec<Job> = s.jobs().collect();
-            assert!(matches!(jobs[0], Job::FwdDirect | Job::FwdA(0)));
-            let macs = jobs.iter().filter(|j| matches!(j, Job::Mac { .. })).count();
-            assert_eq!(macs, (block + 1).div_ceil(MAC_CHUNK));
-            assert_eq!(Schedule::new(block, 2, 256).mac_chunk, POLY_MAC_CHUNK);
-            assert!(matches!(
-                jobs.last().unwrap(),
-                Job::InvDirect { branch: 0 } | Job::InvA { branch: 0, .. }
-            ));
-        }
-    }
-
-    #[test]
     fn every_job_runs_once_per_period_in_order() {
         for (block, branches, base) in [(2048, 16, 512), (512, 4, 64), (32_768, 3, 1024)] {
             let s = Schedule::new(block, branches, base);
@@ -1355,20 +1339,6 @@ mod tests {
             assert_eq!(sliced, s.jobs().collect::<Vec<_>>());
             // Every base block does some of the work.
             assert!(per_tick.iter().all(|&n| n > 0), "{per_tick:?}");
-        }
-    }
-
-    #[test]
-    fn short_polyphase_filters_keep_one_stage() {
-        // The engine's base blocks (a chain block of 512 or more). Measured
-        // crossover: 24 to 32 base blocks per branch at every ratio.
-        for base in [512, 1024] {
-            for branches in 2..=64 {
-                for len in [1, base, 8 * base, 16 * base] {
-                    let plan = polyphase_plan(base, branches, len);
-                    assert_eq!(plan.len(), 1, "base {base} x{branches} len {len}: {plan:?}");
-                }
-            }
         }
     }
 
@@ -1387,124 +1357,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// Real time of each job class of a tail stage against the model, and
-    /// of the four-step transforms against one real FFT of the same size.
-    #[test]
-    #[ignore = "benchmark: cargo test --release -p audivane-dsp-core --lib bench_job_classes -- --ignored --nocapture"]
-    fn bench_job_classes() {
-        use std::time::Instant;
-        let mut seed = 5u64;
-        let mut rnd = move || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((seed >> 11) as f64) / ((1u64 << 53) as f64) - 0.5
-        };
-        for (block, parts, branches) in [
-            (2048usize, 6usize, 16usize),
-            (8192, 6, 16),
-            (32_768, 6, 16),
-            (32_768, 14, 16),
-            (32_768, 30, 4),
-            (8192, 62, 64),
-        ] {
-            let base = 512;
-            let spec = |rnd: &mut dyn FnMut() -> f64| {
-                let mut s = SplitSpectrum::new(block + 1);
-                for (re, im) in s.re.iter_mut().zip(s.im.iter_mut()) {
-                    *re = rnd();
-                    *im = rnd();
-                }
-                s
-            };
-            let spectra = vec![
-                (0..branches)
-                    .map(|_| (0..parts).map(|_| spec(&mut rnd)).collect())
-                    .collect(),
-            ];
-            let plan = StagePlan {
-                offset: 2 * block,
-                block,
-                end: usize::MAX,
-            };
-            let mut st = TailStage::from_spectra(spectra, plan, base, branches);
-            let mut ch = st.new_channel(0).unwrap();
-            let sched = st.sched;
-            let mut model = [0.0f64; 3];
-            let mut real = [0.0f64; 3];
-            // FwdA, FwdB, InvB, InvA.
-            let mut model4 = [0.0f64; 4];
-            let mut real4 = [0.0f64; 4];
-            for _ in 0..3 {
-                // One period's jobs by class.
-                st.sched.begin_tick(&mut ch.slicer);
-                for job in sched.jobs() {
-                    let class = match job {
-                        Job::FwdDirect | Job::FwdA(_) | Job::FwdB(_) => 0,
-                        Job::Mac { .. } => 1,
-                        _ => 2,
-                    };
-                    let t0 = Instant::now();
-                    st.run_job(0, &mut ch, job);
-                    let dt = t0.elapsed().as_secs_f64();
-                    real[class] += dt;
-                    model[class] += sched.job_cost(job, parts) * 1e-9;
-                    let sub = match job {
-                        Job::FwdA(_) => Some(0),
-                        Job::FwdB(_) => Some(1),
-                        Job::InvB { .. } => Some(2),
-                        Job::InvA { .. } => Some(3),
-                        _ => None,
-                    };
-                    if let Some(i) = sub {
-                        real4[i] += dt;
-                        model4[i] += sched.job_cost(job, parts) * 1e-9;
-                    }
-                }
-                ch.slicer.job = Job::Done;
-            }
-            let mut fft = RealFftPair::new(2 * block);
-            let x: Vec<f64> = (0..block).map(|_| rnd()).collect();
-            let mut s = SplitSpectrum::new(block + 1);
-            let mut y = vec![0.0; 2 * block];
-            let t0 = Instant::now();
-            let n = 20;
-            for _ in 0..n {
-                fft.forward_pair_into_split(&x, &x, &mut s);
-                fft.inverse_from_split(&s, &mut y);
-            }
-            let direct = t0.elapsed().as_secs_f64() / (2 * n) as f64;
-            let ir_mib = (parts * branches * (block + 1) * 16) as f64 / 1048576.0;
-            eprintln!(
-                "B {block:5} parts {parts:2} x{branches:2} (IR {ir_mib:6.1} MiB): real/model fwd {:.2} mac {:.2} inv {:.2}; \
-                 fwd {:.0} us, inv {:.0} us/branch, direct real FFT {:.0} us (four-step x{:.2} fwd, x{:.2} inv); \
-                 mac {:.2} G bins/s",
-                real[0] / model[0],
-                real[1] / model[1],
-                real[2] / model[2],
-                real[0] / 3.0 * 1e6,
-                real[2] / 3.0 / branches as f64 * 1e6,
-                direct * 1e6,
-                real[0] / 3.0 / direct,
-                real[2] / 3.0 / branches as f64 / direct,
-                (3 * parts * branches * (block + 1)) as f64 / real[1] / 1e9,
-            );
-            eprintln!(
-                "    real/model fwd A {:.2} fwd B {:.2} inv B {:.2} inv A {:.2}",
-                real4[0] / model4[0],
-                real4[1] / model4[1],
-                real4[2] / model4[2],
-                real4[3] / model4[3]
-            );
-        }
-    }
-
-    #[test]
-    fn the_output_buffer_cap_follows_the_ratio() {
-        assert_eq!(polyphase_max_part(1024, 16), 32_768);
-        assert_eq!(polyphase_max_part(1024, 32), 16_384);
-        assert_eq!(polyphase_max_part(1024, 48), 8192);
-        assert_eq!(polyphase_max_part(1024, 64), 8192);
-        assert_eq!(polyphase_max_part(512, 3), 32_768);
     }
 }

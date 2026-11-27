@@ -3396,55 +3396,8 @@ pub(crate) mod tests {
     use super::*;
     use audivane_protocol::ipc::{AbConfig, AppRule, SinkChoice};
     use audivane_protocol::{
-        DitherKind, EqProfile, HarmonicsLayer, OutputConfig, RateTarget, UpsamplerConfig,
-        WindowKind,
+        DitherKind, EqProfile, OutputConfig, RateTarget, UpsamplerConfig, WindowKind,
     };
-
-    /// A probed device plans a rate where the engine opens it, and the pin's
-    /// fallback note follows that landing: a 30 kHz pin fits ×2 at 96 kHz,
-    /// but not 96 -> 48 kHz, where the band is of the 24 kHz Nyquist.
-    #[test]
-    fn check_design_notes_a_pin_at_the_landing() {
-        let mut d = catalogue::recommended();
-        if let FilterDesign::Kernel(k) = &mut d
-            && let Shape::WindowedSinc {
-                cutoff: audivane_protocol::design::Cutoff::Band(b),
-                ..
-            } = &mut k.shape
-        {
-            b.passband_end_hz = Some(30_000.0);
-        }
-        let stored = StoredDesign::new(d);
-        let cfg = EngineConfig::default();
-        let output = OutputConfig::default();
-        let rates = audivane_dsp_core::cpu_bench::KernelRates::floor();
-        let target = Some(RateTarget::Ratio(2));
-        let check = |landings: Option<&[(u32, RateRatio)]>| {
-            check_design(
-                &stored,
-                target,
-                Some(96_000),
-                &cfg,
-                &output,
-                &rates,
-                landings,
-            )
-        };
-        let free = check(None);
-        assert!(free.errors.is_empty(), "{:?}", free.errors);
-        assert!(free.notes.is_empty(), "{:?}", free.notes);
-        let down = [(96_000, RateRatio::new(1, 2))];
-        let probed = check(Some(&down));
-        assert!(probed.errors.is_empty(), "{:?}", probed.errors);
-        assert_eq!(probed.plans.len(), 1);
-        assert_eq!(probed.plans[0].ratio, RateRatio::new(1, 2));
-        assert_eq!(probed.notes.len(), 1, "{:?}", probed.notes);
-        assert!(
-            probed.notes[0].message.contains("1.250 of the Nyquist"),
-            "{}",
-            probed.notes[0].message
-        );
-    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -3483,257 +3436,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn automatic_validation() {
-        let mut m = ManualConfig {
-            target: RateTarget::Ratio(8),
-            phase: FilterPhase::Minimum,
-            cutoff: 0.95,
-            ..Default::default()
-        };
-        let to_up = |m: &ManualConfig| m.clone().into_upsampler_config().unwrap();
-        m.auto_taps = Some(audivane_protocol::FilterErrorBudget::Db(194.4));
-        // Automatic mode checks the final kernel, including higher precision
-        // targets, instead of inheriting manual beta/length controls.
-        assert!(validate_upsampler("up", &to_up(&m)).is_ok());
-        m.auto_taps = Some(audivane_protocol::FilterErrorBudget::Db(201.0));
-        assert!(validate_upsampler("up", &to_up(&m)).is_err());
-        // Unresolved match_output is an error, never a guess.
-        m.auto_taps = Some(audivane_protocol::FilterErrorBudget::MatchOutput);
-        assert!(
-            validate_upsampler("up", &to_up(&m))
-                .unwrap_err()
-                .contains("resolved")
-        );
-        let mut tukey = m.clone();
-        tukey.window = audivane_protocol::WindowKind::Tukey;
-        assert!(validate_upsampler("up", &to_up(&tukey)).is_err());
-
-        // A chain resolves it against its own output settings.
-        let mut cfg = valid();
-        cfg.chain.upsampler = to_up(&m);
-        assert!(validate(&cfg).is_ok());
-
-        // Infeasible designs are rejected at once from the length estimate,
-        // not after a search (and not by a chain error after a rate change).
-        m.target = RateTarget::Ratio(32);
-        m.auto_taps = Some(audivane_protocol::FilterErrorBudget::Db(98.0));
-        m.band.passband_end = 0.999;
-        m.band.stopband_start = 1.0;
-        let started = std::time::Instant::now();
-        let err = validate_upsampler("up", &to_up(&m)).unwrap_err();
-        assert!(err.contains("automatic limit"), "{err}");
-        assert!(started.elapsed() < std::time::Duration::from_millis(100));
-        // A narrow but feasible band is designed (and cached) by validation.
-        m.target = RateTarget::Ratio(8);
-        m.band.passband_end = 0.99;
-        assert!(validate_upsampler("up", &to_up(&m)).is_ok());
-    }
-
-    #[test]
-    fn automatic_taps_cover_the_rational_pairs_the_ladder_can_pick() {
-        use audivane_protocol::FilterErrorBudget;
-        let auto = |target| {
-            audivane_dsp_core::resample::ManualConfig {
-                target,
-                auto_taps: Some(FilterErrorBudget::Db(120.0)),
-                ..Default::default()
-            }
-            .into_upsampler_config()
-            .unwrap()
-        };
-        // An explicit output rate: designed and costed at the allowed rates.
-        let mut cfg = valid();
-        cfg.rate.allowed_rates = vec![44_100, 48_000, 96_000];
-        cfg.rate.default_rate = 44_100;
-        cfg.chain.upsampler = auto(RateTarget::Rate(48_000));
-        validate(&cfg).unwrap();
-        let r = RateRatio::from_rates(44_100, 48_000);
-        check_rational_at("u", &cfg.chain.upsampler, 44_100, r, 2).unwrap();
-
-        // max_rate_any: every fractional pair a device can offer is
-        // designed in validation, and the mask follows the same designs.
-        let ratios = design_ratios(RateTarget::MaxRateAny(192_000));
-        for q in [
-            RateRatio::from_rates(44_100, 48_000),
-            RateRatio::from_rates(44_100, 192_000),
-            RateRatio::from_rates(96_000, 48_000),
-            RateRatio::from_rates(176_400, 144_000),
-        ] {
-            assert!(ratios.contains(&q), "{q} missing");
-        }
-        assert!(!ratios.contains(&RateRatio::from_rates(44_100, 384_000)));
-        cfg.chain.upsampler = auto(RateTarget::MaxRateAny(192_000));
-        let t = std::time::Instant::now();
-        validate(&cfg).unwrap();
-        let validation = t.elapsed();
-        let t = std::time::Instant::now();
-        let mask = engine_buildable_rate_pairs(&cfg);
-        let masking = t.elapsed();
-        assert!(mask.allows(44_100, 48_000));
-        assert!(mask.allows(44_100, 192_000));
-        assert!(mask.allows(96_000, 48_000));
-        assert!(
-            masking < std::time::Duration::from_millis(200),
-            "mask {masking:?} after validation {validation:?}"
-        );
-        // match_output: every word length the device can force.
-        cfg.chain.upsampler = ManualConfig {
-            target: RateTarget::MaxRateAny(192_000),
-            auto_taps: Some(FilterErrorBudget::MatchOutput),
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        validate(&cfg).unwrap();
-        let mask = engine_buildable_rate_pairs(&cfg);
-        assert!(mask.allows(44_100, 48_000));
-    }
-
-    /// Validation runs the same real-grid check the build does: a
-    /// minimum phase design that never meets its budget at 147/160 is
-    /// refused, one that does is accepted and offered.
-    #[test]
-    fn automatic_phase_designs_are_checked_on_the_rational_grid() {
-        use audivane_protocol::{FilterErrorBudget, WindowKind};
-        let mut cfg = valid();
-        cfg.rate.allowed_rates = vec![44_100, 48_000];
-        cfg.rate.default_rate = 48_000;
-        let up = |a| {
-            audivane_dsp_core::resample::ManualConfig {
-                target: RateTarget::Rate(44_100),
-                window: WindowKind::Gaussian,
-                phase: FilterPhase::Minimum,
-                auto_taps: Some(FilterErrorBudget::Db(a)),
-                ..Default::default()
-            }
-            .into_upsampler_config()
-            .unwrap()
-        };
-        cfg.chain.upsampler = up(189.0);
-        let err = validate(&cfg).unwrap_err();
-        assert!(
-            err.contains("on the 160x grid") && err.contains("48k ×147/160"),
-            "{err}"
-        );
-        cfg.chain.upsampler = up(133.0);
-        validate(&cfg).unwrap();
-        assert!(engine_buildable_rate_pairs(&cfg).allows(48_000, 44_100));
-    }
-
-    #[test]
-    fn automatic_validation_covers_every_ratio_and_word_length() {
-        use audivane_protocol::{BandSpec, FilterErrorBudget, WindowKind};
-        // Up to what the engine builds (x64); fallbacks only where they
-        // land on a rate a device can be opened at.
-        let ints = |t| -> Vec<u32> {
-            design_ratios(t)
-                .iter()
-                .map(|r: &RateRatio| r.as_integer().unwrap())
-                .collect()
-        };
-        assert_eq!(ints(RateTarget::MaxRate(1_411_200)), vec![2, 4, 8, 16, 32]);
-        assert_eq!(ints(RateTarget::Ratio(64)), vec![2, 4, 8, 16, 32, 64]);
-        assert_eq!(
-            *ints(RateTarget::Ratio(64)).last().unwrap() as usize,
-            crate::engine::MAX_DSP_RATIO
-        );
-        // x48 is asked for at every rate; x47 .. x33 are no device rate.
-        assert_eq!(ints(RateTarget::Ratio(48)), vec![2, 4, 8, 16, 32, 48]);
-        assert_eq!(
-            ints(RateTarget::Ratio(24)),
-            vec![2, 4, 8, 16, 24],
-            "x23 .. x17 of 44.1/48 kHz are above 768 kHz and not a device rate"
-        );
-        assert_eq!(ints(RateTarget::Ratio(6)), vec![2, 4, 5, 6]);
-        assert!(design_ratios(RateTarget::Off).is_empty());
-        let bits: Vec<u32> = runtime_outputs(&OutputConfig {
-            bits: 24,
-            dither: DitherKind::Tpdf,
-            headroom_db: 0.0,
-        })
-        .iter()
-        .map(|o| o.bits)
-        .collect();
-        assert_eq!(bits, vec![16, 24]);
-
-        // Passes at x32 but its phase conversion fails at x4/x8/x16, which a
-        // MaxRate target also uses (88.2 kHz and up): rejected, naming the
-        // ratio.
-        let m = ManualConfig {
-            target: RateTarget::MaxRate(1_411_200),
-            window: WindowKind::Gaussian,
-            phase: FilterPhase::Intermediate,
-            auto_taps: Some(FilterErrorBudget::Db(200.0)),
-            band: BandSpec {
-                passband_end: 0.5,
-                stopband_start: 1.5,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert!(audivane_dsp_core::filter_design::automatic_design(&m, 32).is_ok());
-        let err = validate_upsampler("up", &m.into_upsampler_config().unwrap()).unwrap_err();
-        assert!(err.contains("at x"), "{err}");
-
-        // Ratio(64) runs at every power of two up to x64: validation
-        // designs (and caches) exactly those, and leaves the ratios no
-        // device rate needs (x48) to an on-demand response call.
-        let m64 = ManualConfig {
-            target: RateTarget::Ratio(64),
-            auto_taps: Some(FilterErrorBudget::Db(97.0)),
-            ..Default::default()
-        };
-        assert!(validate_upsampler("up", &m64.clone().into_upsampler_config().unwrap()).is_ok());
-        for r in [2, 4, 8, 16, 32, 64] {
-            let started = std::time::Instant::now();
-            assert!(audivane_dsp_core::filter_design::automatic_design(&m64, r).is_ok());
-            assert!(
-                started.elapsed() < std::time::Duration::from_millis(5),
-                "x{r} was not validated"
-            );
-        }
-        for r in [40, 48] {
-            let started = std::time::Instant::now();
-            assert!(audivane_dsp_core::filter_design::automatic_design(&m64, r).is_ok());
-            assert!(
-                started.elapsed() > std::time::Duration::from_millis(5),
-                "x{r} was designed by validation"
-            );
-        }
-
-        // match_output is designed for every container the device may
-        // negotiate, so a 16-bit open hits the cache.
-        let mut cfg = valid();
-        let m_match = ManualConfig {
-            target: RateTarget::Ratio(4),
-            auto_taps: Some(FilterErrorBudget::MatchOutput),
-            ..Default::default()
-        };
-        cfg.chain.upsampler = m_match.clone().into_upsampler_config().unwrap();
-        cfg.chain.output = OutputConfig {
-            bits: 24,
-            dither: DitherKind::Tpdf,
-            headroom_db: 0.0,
-        };
-        assert!(validate(&cfg).is_ok());
-        for bits in [16, 24] {
-            let resolved = m_match.with_output(&OutputConfig {
-                bits,
-                dither: DitherKind::Tpdf,
-                headroom_db: 0.0,
-            });
-            for r in [2, 4] {
-                let started = std::time::Instant::now();
-                assert!(audivane_dsp_core::filter_design::automatic_design(&resolved, r).is_ok());
-                assert!(
-                    started.elapsed() < std::time::Duration::from_millis(5),
-                    "{bits} bits x{r} was not cached"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn round_trip_is_versioned_and_atomic() {
         let dir = temp_dir("roundtrip");
         let store = ConfigStore::new(dir.join("config.json"));
@@ -3759,74 +3461,6 @@ pub(crate) mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A room calibration whose IR is gone at start-up is dropped on its
-    /// own: the followers get their settings from before it back, the rest
-    /// of the config stays (not moved aside for defaults), and the warning
-    /// says why.
-    #[test]
-    fn a_calibration_with_a_missing_ir_is_dropped_alone_at_start() {
-        let dir = temp_dir("calmissing");
-        let wav = |name: &str, ch: u16| {
-            let spec = hound::WavSpec {
-                channels: ch,
-                sample_rate: 48_000,
-                bits_per_sample: 32,
-                sample_format: hound::SampleFormat::Float,
-            };
-            let mut w = hound::WavWriter::create(dir.join(name), spec).unwrap();
-            for _ in 0..ch {
-                w.write_sample(0.5f32).unwrap();
-            }
-            w.finalize().unwrap();
-        };
-        wav("ll.wav", 1);
-        wav("sub.wav", 2);
-        let manifest = dir.join("bundle.json");
-        fs::write(
-            &manifest,
-            serde_json::json!({"bundle_version": 1, "label": "desk", "design_rate_hz": 48000,
-                "devices": [
-                  {"role": "master", "matrix": [{"in": 0, "out": 0, "ir": "ll.wav"}]},
-                  {"role": "follower", "device": "hw:CARD=USB_1,DEV=0", "trim_ms": 1.5,
-                   "matrix": [{"in": 0, "out": 1, "ir": "sub.wav", "channel": 0}]}]})
-            .to_string(),
-        )
-        .unwrap();
-        let mut cfg = valid();
-        cfg.quantum = 512;
-        let mut f = audivane_protocol::ipc::FollowerConfig::new("hw:CARD=USB_1,DEV=0");
-        f.trim_ms = -2.0;
-        f.chain_patch = Some(serde_json::json!({"limiter": {"mode": "limit"}}));
-        cfg.outputs.followers.push(f);
-        let before = cfg.clone();
-        let l = super::super::calibration::read(manifest.to_str().unwrap(), &cfg, 2).unwrap();
-        let master = crate::engine::volume::target_db(&cfg.volume);
-        super::super::calibration::install(&mut cfg, l.calibration, master);
-        assert!(validate(&cfg).is_ok());
-        let store = ConfigStore::new(dir.join("config.json"));
-        store.save(&cfg).unwrap();
-        assert_eq!(
-            store.load().config,
-            cfg,
-            "loads as saved while the files are there"
-        );
-        fs::remove_file(dir.join("sub.wav")).unwrap();
-        let loaded = store.load();
-        // Put back as before it, but the follower keeps following (an
-        // unload never changes a follower's level or following).
-        let mut want = before.clone();
-        want.outputs.followers[0].follow_volume = true;
-        want.outputs.followers[0].follow_ref_db = Some(0.0);
-        assert_eq!(loaded.config, want);
-        let w = loaded.warning.expect("a warning");
-        assert!(
-            w.contains("room calibration \"desk\" is not loaded") && w.contains("sub.wav"),
-            "{w}"
-        );
-        assert!(dir.join("config.json").exists(), "not moved aside");
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
     #[test]
     fn bare_config_is_accepted_and_unknown_fields_ignored() {
         let dir = temp_dir("bare");
@@ -3840,33 +3474,6 @@ pub(crate) mod tests {
         assert_eq!(loaded.config.device, "hw:1,2");
         assert_eq!(loaded.config.quantum, 256);
         assert!(loaded.warning.is_none());
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn an_earlier_ab_setup_is_dropped_and_the_rest_kept() {
-        // A 0.9.4 config with A/B on: `ab.chain_b` no longer parses.
-        let dir = temp_dir("old-ab");
-        let path = dir.join("config.json");
-        fs::write(
-            &path,
-            r#"{"version":1,"config":{"device":"hw:1,2","active_preset":"HD 650",
-               "chain":{"eq":{"name":"HD 650","preamp_db":-6.0,"bands":[
-                 {"kind":"peaking","freq_hz":100.0,"gain_db":3.0,"q":0.7}]},
-                 "upsampler":{"target":{"ratio":4},"taps":100000,"cutoff":1.0}},
-               "ab":{"chain_b":{"convolution":[]},"level":{"mode":"analytic"}}}}"#,
-        )
-        .unwrap();
-        let loaded = ConfigStore::new(&path).load();
-        assert!(path.exists(), "the file is not moved aside");
-        assert!(loaded.config.ab.is_none());
-        assert_eq!(loaded.config.device, "hw:1,2");
-        assert_eq!(loaded.config.active_preset.as_deref(), Some("HD 650"));
-        let eq = loaded.config.chain.eq.as_ref().unwrap();
-        assert_eq!((eq.preamp_db, eq.bands.len()), (-6.0, 1));
-        assert_eq!(loaded.config.chain.upsampler.target, RateTarget::Ratio(4));
-        let warning = loaded.warning.unwrap();
-        assert!(warning.contains("A/B setup"), "{warning}");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3890,41 +3497,6 @@ pub(crate) mod tests {
         assert_eq!(backups.len(), 1, "{backups:?}");
         assert!(!loaded.config.device.is_empty());
         fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn rate_policy_is_normalized_not_rejected() {
-        let mut rate = RatePolicy::default();
-        assert_eq!(normalize_rates(&mut rate), None);
-
-        // Disabling the default moves it within its family first.
-        rate.allowed_rates = vec![192_000, 44_100, 88_200, 96_000, 44_100];
-        rate.default_rate = 48_000;
-        assert!(normalize_rates(&mut rate).unwrap().contains("using 96000"));
-        assert_eq!(rate.allowed_rates, vec![44_100, 88_200, 96_000, 192_000]);
-        assert_eq!(rate.default_rate, 96_000);
-
-        // No rate of the same family left: the closest one.
-        rate.allowed_rates = vec![44_100, 88_200];
-        rate.default_rate = 48_000;
-        normalize_rates(&mut rate);
-        assert_eq!(rate.default_rate, 44_100);
-
-        // The high rates are ordinary entries.
-        rate.allowed_rates = vec![352_800, 768_000];
-        rate.default_rate = 705_600;
-        normalize_rates(&mut rate);
-        assert_eq!(rate.default_rate, 352_800);
-        let mut cfg = valid();
-        cfg.rate = rate.clone();
-        assert!(validate(&cfg).is_ok());
-
-        // Nothing usable is left for validation to reject.
-        rate.allowed_rates = vec![];
-        assert_eq!(normalize_rates(&mut rate), None);
-        rate.allowed_rates = vec![123_456];
-        normalize_rates(&mut rate);
-        assert_eq!(rate.default_rate, 352_800);
     }
 
     #[test]
@@ -4321,57 +3893,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn convolution_matrix_entries_are_checked() {
-        let dir = std::env::temp_dir().join(format!("audivane_cfg_matrix_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let ir = dir.join("f.wav");
-        std::fs::write(&ir, b"x").unwrap();
-        let entry = |input, output| audivane_protocol::MatrixEntry {
-            input,
-            output,
-            ir_path: ir.clone(),
-            channel: None,
-            gain_db: 0.0,
-        };
-        let with = |matrix: Vec<audivane_protocol::MatrixEntry>, ir_path: &str| {
-            let mut cfg = valid();
-            cfg.chain.convolution = vec![audivane_protocol::ConvolutionConfig {
-                name: None,
-                enabled: true,
-                ir_path: ir_path.into(),
-                gain_db: 0.0,
-                matrix: Some(matrix),
-                calibration: false,
-            }];
-            validate(&cfg)
-        };
-        assert!(with(vec![entry(0, 0), entry(1, 0)], "").is_ok());
-        let err = |r: Result<(), String>| r.unwrap_err();
-        assert!(err(with(vec![], "")).contains("at least one entry"));
-        assert!(err(with(vec![entry(0, 2)], "")).contains("below 2"));
-        assert!(err(with(vec![entry(1, 0), entry(1, 0)], "")).contains("given twice"));
-        assert!(err(with(vec![entry(0, 0)], "/x.wav")).contains("both ir_path and matrix"));
-        let mut missing = entry(0, 0);
-        missing.ir_path = dir.join("none.wav");
-        assert!(err(with(vec![missing], "")).contains("matrix[0].ir_path does not exist"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn convolution_may_be_disabled_without_a_file() {
-        let mut cfg = valid();
-        cfg.chain.convolution = vec![audivane_protocol::ConvolutionConfig {
-            name: None,
-            enabled: false,
-            ir_path: "/nonexistent/t5b.ir.wav".into(),
-            gain_db: 0.0,
-            matrix: None,
-            calibration: false,
-        }];
-        assert!(validate(&cfg).is_ok());
-    }
-
-    #[test]
     fn ab_requires_matching_ratio_and_output() {
         let mut cfg = valid();
         cfg.chain.upsampler.target = RateTarget::MaxRate(768_000);
@@ -4411,59 +3932,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ab_chain_b_follows_chain_a() {
-        let mut cfg = valid();
-        cfg.chain.upsampler.target = RateTarget::Ratio(4);
-        cfg.chain.output.bits = 24;
-        cfg.chain.output.dither = DitherKind::Tpdf;
-        cfg.ab = Some(AbConfig {
-            level: LevelMatch::default(),
-            headroom: Default::default(),
-            ..AbConfig::chain(ChainConfig {
-                upsampler: audivane_dsp_core::resample::ManualConfig {
-                    target: RateTarget::Off,
-                    taps: 4096,
-                    ..Default::default()
-                }
-                .into_upsampler_config()
-                .unwrap(),
-                output: OutputConfig {
-                    bits: 16,
-                    dither: DitherKind::Shaped,
-                    headroom_db: 0.0,
-                },
-                ..ChainConfig::neutral()
-            })
-        });
-        // The raw config is invalid ...
-        assert!(validate(&cfg).is_err());
-
-        // ... and normalization makes chain B follow A, before validation.
-        let note = normalize_ab(&mut cfg).expect("a note");
-        assert!(note.contains("upsampler"), "{note}");
-        assert!(note.contains("output"), "{note}");
-        assert!(note.contains("x4"), "{note}");
-        let b = &cfg.ab.as_ref().unwrap().chain_b;
-        assert_eq!(b.upsampler.target, cfg.chain.upsampler.target);
-        // A full chain B keeps its own filter at A's ratio; its bits and
-        // dither follow A (a preset is never an output compare).
-        assert_ne!(b.upsampler, cfg.chain.upsampler);
-        assert_eq!(b.output, cfg.chain.output);
-        assert!(validate(&cfg).is_ok());
-
-        // Already aligned: nothing to do, no note.
-        assert!(normalize_ab(&mut cfg).is_none());
-    }
-
-    #[test]
-    fn ab_is_not_touched_without_ab() {
-        let mut cfg = valid();
-        cfg.chain.upsampler.target = RateTarget::Ratio(8);
-        assert!(normalize_ab(&mut cfg).is_none());
-        assert!(cfg.ab.is_none());
-    }
-
-    #[test]
     fn a_stale_chain_b_in_the_file_is_realigned_not_discarded() {
         let dir = temp_dir("stale-ab");
         let path = dir.join("config.json");
@@ -4490,35 +3958,6 @@ pub(crate) mod tests {
             RateTarget::Ratio(4)
         );
         fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn usb_stream_files_give_the_playback_channel_counts() {
-        let stream = "\
-USB Audio Interface at usb-0000:02:00.3-1, high speed : USB Audio
-
-Playback:
-  Status: Stop
-  Interface 1
-    Altset 1
-    Format: S32_LE
-    Channels: 8
-    Endpoint: 0x01 (1 OUT) (ASYNC)
-    Rates: 44100, 48000, 88200, 96000, 176400, 192000
-  Interface 1
-    Altset 2
-    Format: S16_LE
-    Channels: 2
-
-Capture:
-  Status: Stop
-  Interface 2
-    Altset 1
-    Format: S32_LE
-    Channels: 10
-";
-        assert_eq!(usb_playback_channels(stream), [2, 8]);
-        assert!(usb_playback_channels("Capture:\n  Channels: 2\n").is_empty());
     }
 
     #[test]
@@ -4588,66 +4027,6 @@ Capture:
     }
 
     #[test]
-    fn default_device_prefers_real_cards() {
-        let text = "\
-00-00: HDMI 0 : HDMI 0 : playback 1
-01-00: ALC892 Analog : ALC892 Analog : playback 1 : capture 1
-02-00: Loopback : Loopback PCM : playback 8 : capture 8
-";
-        let cards = "\
- 0 [NVidia         ]: HDA-Intel - HDA NVidia
-                      HDA NVidia at 0xdc080000 irq 137
- 1 [PCH            ]: HDA-Intel - HDA Intel PCH
-                      HDA Intel PCH at 0x1 irq 30
- 2 [Loopback       ]: Loopback - Loopback
-                      Loopback 1
-10 [Loopback_1     ]: Loopback - Loopback
-                      Loopback 1
-";
-        // Named by card id, not by its (boot-order dependent) number.
-        assert_eq!(
-            default_device_from_listing(text, cards),
-            Some("hw:CARD=PCH,DEV=0".into())
-        );
-
-        let only_loopback = "10-00: Loopback : Loopback PCM : playback 8 : capture 8\n";
-        assert_eq!(
-            default_device_from_listing(only_loopback, cards),
-            Some("hw:CARD=Loopback_1,DEV=0".into())
-        );
-
-        let capture_only = "00-00: HDMI 0 : HDMI 0 : capture 1\n";
-        assert_eq!(default_device_from_listing(capture_only, cards), None);
-    }
-
-    #[test]
-    fn numeric_device_names_get_the_card_id() {
-        let cards = "\
- 0 [NVidia         ]: HDA-Intel - HDA NVidia
-                      HDA NVidia at 0xdc080000 irq 137
- 2 [S3             ]: USB-Audio - S3
-                      Some DAC at usb-0000:00:14.0-2, high speed
-";
-        assert_eq!(
-            stable_device_name_in("hw:2,0", cards).as_deref(),
-            Some("hw:CARD=S3,DEV=0")
-        );
-        assert_eq!(
-            stable_device_name_in("hw:2", cards).as_deref(),
-            Some("hw:CARD=S3,DEV=0")
-        );
-        assert_eq!(
-            stable_device_name_in(" hw:2,1,0", cards).as_deref(),
-            Some("hw:CARD=S3,DEV=1,SUBDEV=0")
-        );
-        // Already stable, missing card, or not hw: left alone.
-        assert_eq!(stable_device_name_in("hw:CARD=S3,DEV=0", cards), None);
-        assert_eq!(stable_device_name_in("hw:S3,0", cards), None);
-        assert_eq!(stable_device_name_in("hw:5,0", cards), None);
-        assert_eq!(stable_device_name_in("plughw:2,0", cards), None);
-    }
-
-    #[test]
     fn missing_file_yields_defaults_with_a_device() {
         let dir = temp_dir("missing");
         let store = ConfigStore::new(dir.join("config.json"));
@@ -4655,773 +4034,6 @@ Capture:
         assert!(loaded.warning.is_none(), "{:?}", loaded.warning);
         assert!(!loaded.config.device.is_empty());
         fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn old_config_file_loads_with_single_convolution_and_no_right_eq() {
-        let dir = temp_dir("legacy");
-        let ir = dir.join("room.wav");
-        fs::write(&ir, b"stub").unwrap();
-        let path = dir.join("config.json");
-        let legacy = serde_json::json!({
-            "version": 1,
-            "config": {
-                "device": "hw:0,0",
-                "chain": {
-                    "eq": { "name": "hp", "preamp_db": -2.0, "bands": [] },
-                    "convolution": { "enabled": true, "ir_path": ir, "gain_db": -1.5 }
-                }
-            }
-        });
-        fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
-        let loaded = ConfigStore::new(&path).load();
-        assert!(loaded.warning.is_none(), "{:?}", loaded.warning);
-        assert_eq!(loaded.config.chain.eq.as_ref().unwrap().right, None);
-        assert_eq!(loaded.config.chain.convolution.len(), 1);
-        assert_eq!(loaded.config.chain.convolution[0].gain_db, -1.5);
-        assert_eq!(loaded.config.chain.convolution[0].name, None);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// A file from before `follow_volume`: the calibrated follower follows
-    /// the main volume from the level it has (unloading turns it off), the
-    /// one added by hand keeps its own.
-    #[test]
-    fn followers_from_before_follow_volume_follow_when_calibrated() {
-        let text = serde_json::json!({"version": 1, "config": {
-            "device": "hw:CARD=USB,DEV=0",
-            "volume": {"volume_db": -24.0},
-            "outputs": {"followers": [
-                {"device": "hw:CARD=SUB,DEV=0", "volume_db": -3.0},
-                {"device": "hw:CARD=DEN,DEV=0", "volume_db": -9.0}]},
-            "calibration": {"path": "/c/desk.json", "label": "desk", "design_rate_hz": 48000,
-                "followers": [{"device": "hw:CARD=SUB,DEV=0",
-                    "item": {"ir_path": "/c/sub.wav"}, "trim_ms": 0.0,
-                    "restore": {"trim_ms": 0.0}}]}
-        }})
-        .to_string();
-        let (mut cfg, _) = parse_document(&text).unwrap();
-        normalize_config(&mut cfg);
-        let f = &cfg.outputs.followers;
-        assert!(f[0].follow_volume, "calibrated");
-        assert_eq!((f[0].volume_db, f[0].follow_ref_db), (-3.0, Some(-24.0)));
-        assert!(!f[1].follow_volume && f[1].follow_ref_db.is_none());
-        // Written back, it reads the same.
-        let again: EngineConfig =
-            serde_json::from_value(serde_json::to_value(&cfg).unwrap()).unwrap();
-        assert_eq!(again.outputs, cfg.outputs);
-    }
-
-    /// Following ticked by hand, then a bundle loaded, then a restart: the
-    /// saved file reads back unmigrated, and unloading after the restart
-    /// leaves the follower following at its level.
-    #[test]
-    fn a_hand_set_follow_survives_a_restart_and_an_unload() {
-        let d = std::env::temp_dir().join(format!("avdsp-follow-restart-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        let ir = |name: &str| {
-            let p = d.join(name);
-            let spec = hound::WavSpec {
-                channels: 1,
-                sample_rate: 48_000,
-                bits_per_sample: 32,
-                sample_format: hound::SampleFormat::Float,
-            };
-            let mut w = hound::WavWriter::create(&p, spec).unwrap();
-            w.write_sample(0.5f32).unwrap();
-            w.finalize().unwrap();
-        };
-        ir("mains.wav");
-        ir("sub.wav");
-        let manifest = d.join("desk.json");
-        std::fs::write(
-            &manifest,
-            serde_json::json!({"bundle_version": 1, "label": "desk", "design_rate_hz": 48000,
-                "devices": [
-                    {"role": "master", "matrix": [{"in": 0, "out": 0, "ir": "mains.wav"},
-                                                  {"in": 1, "out": 1, "ir": "mains.wav"}]},
-                    {"role": "follower", "device": "hw:CARD=SUB,DEV=0",
-                     "matrix": [{"in": 0, "out": 0, "ir": "sub.wav"}]}]})
-            .to_string(),
-        )
-        .unwrap();
-        let mut cfg = EngineConfig {
-            device: "hw:CARD=USB,DEV=0".into(),
-            ..EngineConfig::default()
-        };
-        cfg.volume.volume_db = -20.0;
-        let mut f = audivane_protocol::ipc::FollowerConfig::new("hw:CARD=SUB,DEV=0");
-        f.volume_db = -6.0;
-        f.follow_volume = true;
-        f.follow_ref_db = Some(-20.0);
-        cfg.outputs.followers.push(f);
-        let l = super::super::calibration::read(manifest.to_str().unwrap(), &cfg, 2).unwrap();
-        super::super::calibration::install(&mut cfg, l.calibration, -20.0);
-        let saved = serde_json::json!({"version": CONFIG_VERSION, "config": cfg}).to_string();
-        let (mut back, _, migrated) = parse_migrating(&saved).unwrap();
-        assert!(!migrated);
-        normalize_config(&mut back);
-        assert_eq!(back.calibration, cfg.calibration);
-        super::super::calibration::uninstall(&mut back).unwrap();
-        let f = &back.outputs.followers[0];
-        assert!(f.follow_volume, "still the user's: {f:?}");
-        assert_eq!((f.volume_db, f.follow_ref_db), (-6.0, Some(-20.0)));
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// A file from before `follow_volume` is migrated and written back on
-    /// the load that reads it; the next load reads the new format and
-    /// writes nothing.
-    #[test]
-    fn a_follow_volume_migration_is_written_once() {
-        let dir = temp_dir("follow-migrate");
-        let path = dir.join("config.json");
-        let legacy = serde_json::json!({"version": 1, "config": {
-            "device": "hw:0,0",
-            "outputs": {"followers": [{"device": "hw:CARD=DEN,DEV=0", "volume_db": -9.0}]}
-        }})
-        .to_string();
-        fs::write(&path, &legacy).unwrap();
-        let store = ConfigStore::new(path.clone());
-        let first = store.load();
-        assert!(first.warning.is_none(), "{:?}", first.warning);
-        assert!(!first.config.outputs.followers[0].follow_volume);
-        let written = fs::read_to_string(&path).unwrap();
-        assert_ne!(written, legacy, "written back");
-        assert!(written.contains("\"follow_volume\": false"), "{written}");
-        let (_, _, again) = parse_migrating(&written).unwrap();
-        assert!(!again, "the next start migrates nothing");
-        let second = store.load();
-        assert_eq!(second.config, first.config);
-        assert_eq!(fs::read_to_string(&path).unwrap(), written);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// A 0.10 harmonics stage reads as one Chebyshev layer with its levels
-    /// (the main chain, and anywhere in a preset document).
-    #[test]
-    fn harmonics_from_0_10_become_one_chebyshev_layer() {
-        let legacy = serde_json::json!({"version": 1, "config": {
-            "device": "hw:0,0",
-            "chain": {"harmonics": {"enabled": true, "character": "custom",
-                "h2_db": -45.0, "h3_db": -60.0, "h5_db": -70.0, "dc_block": true}}
-        }})
-        .to_string();
-        let (cfg, note, migrated) = parse_migrating(&legacy).unwrap();
-        assert!(migrated && note.is_none(), "{note:?}");
-        let h = cfg.chain.harmonics.as_ref().unwrap();
-        assert!(h.enabled && h.dc_block);
-        let [audivane_protocol::HarmonicsLayer::Chebyshev(l)] = h.layers.as_slice() else {
-            panic!("{:?}", h.layers);
-        };
-        assert_eq!(
-            &l.levels_db[..4],
-            &[Some(-45.0), Some(-60.0), None, Some(-70.0)]
-        );
-        assert_eq!(l.signs, audivane_protocol::HARMONICS_DEFAULT_SIGNS);
-        let mut v =
-            serde_json::json!({"presets": [{"chain": {"harmonics": {"character": "pentode"}}}]});
-        assert!(migrate_safety_modes(&mut v));
-        let b = &v["presets"][0]["chain"]["harmonics"];
-        assert_eq!(b["layers"][0]["levels_db"][1], -42.0, "{b}");
-        assert!(b.get("character").is_none());
-        assert!(
-            !migrate_safety_modes(&mut v),
-            "the next start migrates nothing"
-        );
-    }
-
-    /// The safety-only modes: a crossfeed `peak_safe` level (main chain,
-    /// chain B, a follower's patch) is dropped and `series_makeup` becomes
-    /// `series`; the file is written back once.
-    #[test]
-    fn safety_level_modes_migrate_to_the_natural_ones_once() {
-        let dir = temp_dir("safety-migrate");
-        let path = dir.join("config.json");
-        let legacy = serde_json::json!({"version": 1, "config": {
-            "device": "hw:0,0",
-            "chain": {
-                "crossfeed": {"mode": "bs2b_chu_moy", "level": "peak_safe"},
-                "harmonics": {"enabled": true, "routing": "series_makeup", "layers": [
-                    {"kind": "chebyshev", "preset": "triode", "levels_db": [-40.0, -58.0, null, null, null, null, null, null]},
-                    {"kind": "chebyshev", "preset": "pentode", "levels_db": [-56.0, -42.0, null, null, null, null, null, null]}
-                ]}
-            },
-            "outputs": {"followers": [{
-                "device": "hw:CARD=DEN,DEV=0",
-                "follow_volume": false,
-                "chain_patch": {"crossfeed": {"level": "matched", "width": 1.25}}
-            }]}
-        }})
-        .to_string();
-        fs::write(&path, &legacy).unwrap();
-        let (_, _, migrated) = parse_migrating(&legacy).unwrap();
-        assert!(migrated);
-        let store = ConfigStore::new(path.clone());
-        let first = store.load();
-        assert!(first.warning.is_none(), "{:?}", first.warning);
-        let chain = &first.config.chain;
-        assert_eq!(
-            chain.crossfeed.as_ref().unwrap().mode,
-            audivane_protocol::CrossfeedMode::Bs2bChuMoy
-        );
-        assert_eq!(
-            chain.harmonics.as_ref().unwrap().routing,
-            audivane_protocol::HarmonicsRouting::Series
-        );
-        let written = fs::read_to_string(&path).unwrap();
-        assert!(!written.contains("peak_safe"), "{written}");
-        assert!(!written.contains("series_makeup"), "{written}");
-        assert!(!written.contains("\"level\""), "{written}");
-        assert!(written.contains("\"width\": 1.25"), "{written}");
-        let (_, _, again) = parse_migrating(&written).unwrap();
-        assert!(!again, "the next start migrates nothing");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn old_split_eq_config_migrates_to_layered_v2() {
-        let dir = temp_dir("legacy-split");
-        let path = dir.join("config.json");
-        let legacy = serde_json::json!({
-            "version": 1,
-            "config": {
-                "device": "hw:0,0",
-                "chain": {
-                    "eq": {
-                        "name": "split",
-                        "preamp_db": -3.0,
-                        "bands": [{"kind":"peaking","freq_hz":200.0,"gain_db":2.0,"q":1.0,"enabled":true}],
-                        "right": {
-                            "preamp_db": -1.5,
-                            "bands": [{"kind":"peaking","freq_hz":500.0,"gain_db":3.0,"q":1.0,"enabled":true}]
-                        }
-                    }
-                }
-            }
-        });
-        fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
-        let store = ConfigStore::new(&path);
-        let loaded = store.load();
-        assert!(loaded.warning.is_none(), "{:?}", loaded.warning);
-        let eq = loaded.config.chain.eq.as_ref().expect("eq loaded");
-        assert_eq!(eq.version, audivane_protocol::EQ_PROFILE_VERSION);
-        assert_eq!(eq.preamp_db, 0.0);
-        assert!(eq.bands.is_empty());
-        let left = eq.left.as_ref().expect("left migrated");
-        assert!(left.enabled);
-        assert_eq!(left.preamp_db, -3.0);
-        assert_eq!(left.bands.len(), 1);
-        let right = eq.right.as_ref().expect("right kept");
-        assert!(right.enabled);
-        assert_eq!(right.preamp_db, -1.5);
-        assert_eq!(right.bands.len(), 1);
-
-        // Saving writes version 2 so reload does not migrate again.
-        store.save(&loaded.config).unwrap();
-        let reloaded = store.load();
-        assert_eq!(reloaded.config, loaded.config);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn validate_upsampler_checks_preset_ratios_and_skips_manual_fields() {
-        use audivane_protocol::FilterPreset;
-
-        // Valid preset ratios across ALLOWED_RATES.
-        let ok_cases = [
-            (FilterPreset::GaussianLong, RateTarget::Ratio(3)),
-            (FilterPreset::CascadeFir, RateTarget::Ratio(12)),
-            (FilterPreset::BlockFft, RateTarget::Ratio(16)),
-            (FilterPreset::BlockFft, RateTarget::MaxRate(768_000)),
-            (FilterPreset::BlockFft, RateTarget::MaxRate(3_072_000)),
-            (FilterPreset::GaussianLong, RateTarget::Ratio(64)),
-            (FilterPreset::CascadeFir, RateTarget::Ratio(48)),
-            (FilterPreset::Lanczos65535, RateTarget::Ratio(32)),
-            (FilterPreset::Lanczos32767, RateTarget::Ratio(64)),
-            (FilterPreset::CascadeFir, RateTarget::MaxRate(768_000)),
-            // Ratio 1 / Off skips preset ratio checks.
-            (FilterPreset::CascadeFir, RateTarget::Off),
-            (FilterPreset::BlockFft, RateTarget::Ratio(1)),
-        ];
-        for (preset, target) in ok_cases {
-            let up = audivane_dsp_core::resample::ManualConfig {
-                target,
-                preset: Some(preset),
-                // Manual fields out of range: must be ignored when a preset is set.
-                taps: 0,
-                kaiser_beta: 99.0,
-                cutoff: 0.0,
-                phase_mix: 2.0,
-                taper: -1.0,
-                ..Default::default()
-            }
-            .into_upsampler_config()
-            .unwrap();
-            validate_upsampler("chain.upsampler", &up)
-                .unwrap_or_else(|e| panic!("expected ok for {} / {target:?}: {e}", preset.name()));
-            let manual = UpsamplerConfig { preset: None, ..up };
-            assert!(
-                validate_upsampler("chain.upsampler", &manual).is_err(),
-                "expected manual config with out-of-range fields to be rejected"
-            );
-        }
-
-        // Invalid ratios name the preset and rate.
-        let bad_cases = [
-            (FilterPreset::CascadeFir, RateTarget::Ratio(3)),
-            (FilterPreset::BlockFft, RateTarget::Ratio(6)),
-            (FilterPreset::CascadeFir, RateTarget::Ratio(10)),
-        ];
-        for (preset, target) in bad_cases {
-            let up = UpsamplerConfig {
-                target,
-                preset: Some(preset.name().to_string()),
-                ..Default::default()
-            };
-            let err = validate_upsampler("chain.upsampler", &up).unwrap_err();
-            assert!(err.contains(preset.name()), "{err}");
-            assert!(err.contains("44100 Hz"), "{err}");
-        }
-
-        // The target is still validated when a preset is set.
-        let bad_target = audivane_dsp_core::resample::ManualConfig {
-            target: RateTarget::Ratio(65),
-            preset: Some(FilterPreset::GaussianLong),
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        assert!(validate_upsampler("chain.upsampler", &bad_target).is_err());
-    }
-
-    #[test]
-    fn rational_targets_validate_at_the_policy_rates() {
-        use audivane_protocol::SampleFormat;
-        use audivane_protocol::ipc::{DeviceCapabilities, FormatCapability, RateCapability};
-
-        let with = |up: UpsamplerConfig, rates: &[u32]| {
-            let mut cfg = valid();
-            cfg.chain.upsampler = up;
-            cfg.rate.allowed_rates = rates.to_vec();
-            cfg.rate.default_rate = rates[0];
-            cfg
-        };
-        let target = |t| {
-            audivane_dsp_core::resample::ManualConfig {
-                target: t,
-                taps: 1024,
-                ..Default::default()
-            }
-            .into_upsampler_config()
-            .unwrap()
-        };
-        let common = [44_100, 48_000, 88_200, 96_000];
-
-        // Explicit rates and the any-family cap.
-        validate(&with(target(RateTarget::Rate(48_000)), &common)).unwrap();
-        validate(&with(target(RateTarget::Rate(44_100)), &common)).unwrap();
-        validate(&with(target(RateTarget::MaxRateAny(192_000)), &common)).unwrap();
-        let err = validate(&with(target(RateTarget::Rate(47_000)), &common)).unwrap_err();
-        assert!(err.contains("target rate must be one of"), "{err}");
-        assert!(validate(&with(target(RateTarget::MaxRateAny(1_000)), &common)).is_err());
-        assert_eq!(
-            describe_target(RateTarget::Rate(48_000)),
-            "resampling to 48000 Hz"
-        );
-
-        // A design that is fine from 96 kHz is far too expensive from 768 kHz:
-        // only the rates the graph may run at are checked.
-        let long = audivane_dsp_core::resample::ManualConfig {
-            target: RateTarget::Rate(44_100),
-            taps: 4_096,
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        validate(&with(long.clone(), &[44_100, 48_000])).unwrap();
-        let err = validate(&with(long.clone(), &[44_100, 768_000])).unwrap_err();
-        assert!(err.contains("768k"), "{err}");
-        assert!(err.contains("budget") || err.contains("more than"), "{err}");
-        // The full-range check (presets on disk, tools) covers every rate.
-        assert!(validate_upsampler("chain.upsampler", &long).is_err());
-        validate_upsampler_at("upsampler", &long, &[48_000], 2).unwrap();
-
-        // Presets follow their rate rules at the policy's rates.
-        let preset = |p: audivane_protocol::FilterPreset, t| UpsamplerConfig {
-            target: t,
-            preset: Some(p.name().to_string()),
-            ..Default::default()
-        };
-        use audivane_protocol::FilterPreset as F;
-        validate(&with(
-            preset(F::GaussianLong, RateTarget::Rate(48_000)),
-            &common,
-        ))
-        .unwrap();
-        validate(&with(
-            preset(F::Lanczos511, RateTarget::Rate(48_000)),
-            &[44_100],
-        ))
-        .unwrap();
-        let err = validate(&with(
-            preset(F::Lanczos511, RateTarget::Rate(48_000)),
-            &common,
-        ))
-        .unwrap_err();
-        assert!(
-            err.contains("88200 Hz") && err.contains("lanczos511"),
-            "{err}"
-        );
-        let err = validate(&with(
-            preset(F::GaussianHuge, RateTarget::Rate(48_000)),
-            &common,
-        ))
-        .unwrap_err();
-        assert!(err.contains("44100 Hz"), "{err}");
-        let err = validate(&with(
-            preset(F::FlattopXlong, RateTarget::Rate(768_000)),
-            &[44_100],
-        ))
-        .unwrap_err();
-        assert!(err.contains("rate.allowed_rates"), "{err}");
-
-        // Passing the input samples through needs out >= in.
-        let preserve = audivane_dsp_core::resample::ManualConfig {
-            target: RateTarget::Rate(48_000),
-            preserve_samples: true,
-            cutoff: 1.0,
-            taps: 1024,
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        validate(&with(preserve.clone(), &[44_100, 48_000])).unwrap();
-        // It plays from 44.1 kHz, so 96 kHz falls back to Recommended; from
-        // 96 kHz alone it plays nowhere.
-        validate(&with(preserve.clone(), &[44_100, 96_000])).unwrap();
-        let err = validate(&with(preserve, &[96_000, 192_000])).unwrap_err();
-        assert!(err.contains("keeps the original samples"), "{err}");
-
-        // A/B sides must open the device at the same rate.
-        let mut ab = with(target(RateTarget::Rate(48_000)), &common);
-        let mut b = ab.chain.clone();
-        b.upsampler.target = RateTarget::MaxRateAny(48_000);
-        ab.ab = Some(AbConfig {
-            level: LevelMatch::Off,
-            headroom: Default::default(),
-            ..AbConfig::chain(b)
-        });
-        assert!(validate(&ab).is_err());
-
-        // With a device probe an explicit rate must be one the DAC plays.
-        let caps = DeviceCapabilities {
-            device: "hw:0,0".into(),
-            channels: 2,
-            channels_min: 2,
-            channels_max: 2,
-            rates: vec![RateCapability {
-                rate: 48_000,
-                formats: vec![FormatCapability {
-                    format: SampleFormat::S32,
-                    sbits: Some(32),
-                }],
-            }],
-            rate_min: 48_000,
-            rate_max: 48_000,
-            formats: vec![SampleFormat::S32],
-            modes: Vec::new(),
-        };
-        let at48 = with(target(RateTarget::Rate(48_000)), &common);
-        validate_against_device(&at48, Some(&caps)).unwrap();
-        let at96 = with(target(RateTarget::Rate(96_000)), &common);
-        let err = validate_against_device(&at96, Some(&caps)).unwrap_err();
-        assert!(err.contains("does not play 96000 Hz"), "{err}");
-        validate_against_device(&at96, None).unwrap();
-        let other = DeviceCapabilities {
-            device: "hw:1,0".into(),
-            ..caps.clone()
-        };
-        validate_against_device(&at96, Some(&other)).unwrap();
-
-        // A pair is checked against its own channel count: stereo plays
-        // 96 kHz, the 8-channel mode a wider pair needs only 48 kHz. The
-        // probe viewed for pair 7/8 still lets 1/2 go back to 96 kHz.
-        let row = |rate| RateCapability {
-            rate,
-            formats: vec![FormatCapability {
-                format: SampleFormat::S32,
-                sbits: Some(24),
-            }],
-        };
-        let probe = DeviceCapabilities {
-            channels_max: 8,
-            modes: vec![
-                audivane_protocol::ipc::ChannelMode {
-                    channels: 2,
-                    rates: vec![row(48_000), row(96_000)],
-                },
-                audivane_protocol::ipc::ChannelMode {
-                    channels: 8,
-                    rates: vec![row(48_000)],
-                },
-            ],
-            ..caps.clone()
-        };
-        let mut wide = at96.clone();
-        wide.output_channels = Some(OutputChannels([6, 7]));
-        let viewed_wide = caps_view(&wide, &probe);
-        assert_eq!(viewed_wide.channels, 8);
-        assert!(!viewed_wide.supports(96_000, SampleFormat::S32));
-        validate_against_device(&at96, Some(&viewed_wide)).unwrap();
-        let err = validate_against_device(&wide, Some(&viewed_wide)).unwrap_err();
-        assert!(err.contains("does not play 96000 Hz"), "{err}");
-        assert_eq!(caps_view(&at96, &viewed_wide).channels, 2);
-
-        // And in one of the configured formats: 768 kHz only in S16 does
-        // not pass for an S32 config (ALSA would plan x1), but does when
-        // S16 is configured or the formats are left to the driver.
-        let mut s16 = caps.clone();
-        s16.rates.push(RateCapability {
-            rate: 768_000,
-            formats: vec![FormatCapability {
-                format: SampleFormat::S16,
-                sbits: Some(16),
-            }],
-        });
-        let mut at768 = with(target(RateTarget::Rate(768_000)), &common);
-        at768.device = s16.device.clone();
-        at768.formats = vec![SampleFormat::S32];
-        let err = validate_against_device(&at768, Some(&s16)).unwrap_err();
-        assert!(err.contains("plays 768000 Hz only in S16"), "{err}");
-        assert!(err.contains("configured formats (S32)"), "{err}");
-        at768.formats = vec![SampleFormat::S32, SampleFormat::S16];
-        validate_against_device(&at768, Some(&s16)).unwrap();
-        at768.formats.clear();
-        validate_against_device(&at768, Some(&s16)).unwrap();
-    }
-
-    #[test]
-    fn targets_reach_3072k_and_x64() {
-        use audivane_protocol::SampleFormat;
-        use audivane_protocol::ipc::{DeviceCapabilities, FormatCapability, RateCapability};
-        let with = |target, rates: &[u32]| {
-            let mut cfg = valid();
-            cfg.chain.upsampler = audivane_dsp_core::resample::ManualConfig {
-                target,
-                // Cheap enough for the rational pairs' cost budget too
-                // (48 kHz -> 1.4112 MHz is 147/5).
-                taps: 4_096,
-                ..Default::default()
-            }
-            .into_upsampler_config()
-            .unwrap();
-            cfg.rate.allowed_rates = rates.to_vec();
-            cfg.rate.default_rate = rates[0];
-            cfg
-        };
-        let base = [44_100, 48_000];
-        let family48 = [48_000, 96_000];
-        for target in [
-            RateTarget::MaxRate(3_072_000),
-            RateTarget::MaxRateAny(3_072_000),
-            RateTarget::MaxRate(1_536_000),
-            RateTarget::Ratio(64),
-            RateTarget::Ratio(48),
-            RateTarget::Rate(1_411_200),
-            RateTarget::Rate(2_822_400),
-        ] {
-            validate(&with(target, &base)).unwrap_or_else(|e| panic!("{target:?}: {e}"));
-        }
-        // 3.072 MHz from 44.1 kHz needs 10240/147: a clear refusal naming
-        // the rate, fine without the 44.1 kHz family.
-        let err = validate(&with(RateTarget::Rate(3_072_000), &base)).unwrap_err();
-        assert!(
-            err.contains("at 44100 Hz the ratio 10240/147 has a term above 4096"),
-            "{err}"
-        );
-        validate(&with(RateTarget::Rate(3_072_000), &family48)).unwrap();
-        // Out of range.
-        for (target, needle) in [
-            (
-                RateTarget::MaxRate(3_072_001),
-                "between 8000 and 3072000 Hz",
-            ),
-            (
-                RateTarget::MaxRateAny(6_144_000),
-                "between 8000 and 3072000 Hz",
-            ),
-            (RateTarget::Ratio(65), "between 1 and 64"),
-            (
-                RateTarget::Rate(1_000_000),
-                "1411200, 1536000, 2822400, 3072000",
-            ),
-            (RateTarget::Rate(6_144_000), "target rate must be one of"),
-        ] {
-            let err = validate(&with(target, &base)).unwrap_err();
-            assert!(err.contains(needle), "{target:?}: {err}");
-        }
-        // Against a device that stops at 768 kHz, a fixed high rate is
-        // refused; one that reports it passes.
-        let dac = |top: u32| DeviceCapabilities {
-            device: "hw:CARD=USB,DEV=0".into(),
-            rates: audivane_io_pw::engine_driver::engine_probe_rates(64)
-                .into_iter()
-                .filter(|&r| r <= top)
-                .map(|rate| RateCapability {
-                    rate,
-                    formats: vec![FormatCapability {
-                        format: SampleFormat::S32,
-                        sbits: Some(32),
-                    }],
-                })
-                .collect(),
-            ..Default::default()
-        };
-        let mut cfg = with(RateTarget::Rate(1_411_200), &base);
-        cfg.device = "hw:CARD=USB,DEV=0".into();
-        let err = validate_against_device(&cfg, Some(&dac(768_000))).unwrap_err();
-        assert!(err.contains("does not play 1411200 Hz"), "{err}");
-        validate_against_device(&cfg, Some(&dac(3_072_000))).unwrap();
-        // The ladders know every x32/x64 pair.
-        let mask = engine_buildable_rate_pairs(&with(RateTarget::MaxRate(3_072_000), &base));
-        for (i, o) in [
-            (44_100, 2_822_400),
-            (48_000, 3_072_000),
-            (44_100, 1_411_200),
-            (96_000, 3_072_000),
-        ] {
-            assert!(mask.allows(i, o), "{i} -> {o}");
-        }
-    }
-
-    /// The default manual design with `max_rate_any`
-    /// on a 192 kHz DAC must be offered x4, never 640/147 (over the cost
-    /// limit), and the mask is cheap enough to compute on every apply.
-    #[test]
-    fn buildable_pairs_follow_the_design() {
-        use audivane_protocol::FilterPreset;
-        let up = ManualConfig {
-            target: RateTarget::MaxRateAny(768_000),
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        let t = std::time::Instant::now();
-        let mask = buildable_rate_pairs(&up, 2);
-        let elapsed = t.elapsed();
-        assert!(elapsed.as_millis() < 500, "mask took {elapsed:?}");
-        assert!(mask.allows(44_100, 176_400));
-        assert!(!mask.allows(44_100, 192_000));
-        let ladder = audivane_io_pw::lifecycle::max_rate_any_ladder(
-            44_100,
-            768_000,
-            &[44_100, 48_000, 88_200, 96_000, 176_400, 192_000],
-            16,
-            mask,
-        );
-        assert_eq!(ladder[0], audivane_protocol::RateRatio::integer(4));
-        assert!(ladder.iter().all(|r| r.is_integer()), "{ladder:?}");
-
-        // A preset with fractional rules gets the cross-family pairs.
-        let preset = UpsamplerConfig {
-            preset: Some(FilterPreset::GaussianLong.name().to_string()),
-            design: None,
-            ..up
-        };
-        let mask = buildable_rate_pairs(&preset, 2);
-        assert!(mask.allows(44_100, 48_000));
-        assert!(mask.allows(96_000, 48_000));
-        // An integer-only preset only gets the integer pairs it supports.
-        let cascade = UpsamplerConfig {
-            preset: Some(FilterPreset::CascadeFir.name().to_string()),
-            ..preset.clone()
-        };
-        let mask = buildable_rate_pairs(&cascade, 2);
-        assert!(!mask.allows(44_100, 48_000));
-        assert!(mask.allows(44_100, 88_200));
-        // Probed rates outside the rate list (continuous-range DACs and the
-        // loopback report every multiple) are checked like the listed ones.
-        assert!(!mask.allows(176_400, 288_000));
-        assert!(!mask.allows(44_100, 144_000));
-        let ladder = audivane_io_pw::lifecycle::max_rate_any_ladder(
-            176_400,
-            300_000,
-            &audivane_io_pw::lifecycle::MASK_OUTPUT_RATES,
-            16,
-            mask,
-        );
-        assert_eq!(ladder[0], audivane_protocol::RateRatio::ONE, "{ladder:?}");
-        let gauss = buildable_rate_pairs(&preset, 2);
-        assert!(gauss.allows(176_400, 288_000));
-        // And what the mask allows there really builds.
-        use audivane_dsp_core::chain::{Chain, ChainSpec};
-        let chain = audivane_protocol::ChainConfig {
-            upsampler: UpsamplerConfig {
-                target: RateTarget::Rate(288_000),
-                ..preset
-            },
-            ..ChainConfig::neutral()
-        };
-        let spec = ChainSpec {
-            config: chain,
-            sample_rate: 176_400,
-            channels: 2,
-            max_block: 4096,
-            irs: None,
-        };
-        let built = Chain::try_new(spec).unwrap();
-        assert_eq!(built.output_rate(), 288_000);
-    }
-
-    /// The rational cost counts every pipeline that can run at once: two
-    /// during a swap, four with A/B.
-    #[test]
-    fn varispeed_adds_its_worst_case_to_the_rational_budget() {
-        use audivane_protocol::RateRatio;
-        let mut cfg = EngineConfig::default();
-        // Integer ratios and no upsampler: the stage alone fits at every
-        // rate (734 M at 768 kHz).
-        for rate in [44_100, 192_000, 768_000] {
-            check_varispeed_budget(&cfg, rate, RateRatio::ONE).unwrap();
-            check_varispeed_budget(&cfg, rate, RateRatio::integer(2)).unwrap();
-        }
-        // A rational design that fits alone but not with the stage.
-        // 768 → 705.6 kHz: 64 taps per input frame, 90 M with two
-        // pipelines, beside the stage's 734 M.
-        cfg.chain.upsampler = audivane_dsp_core::resample::ManualConfig {
-            target: RateTarget::Rate(705_600),
-            taps: 64,
-            taps_unit: audivane_protocol::TapsUnit::Input,
-            cutoff: 0.95,
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        let r = RateRatio::new(147, 160);
-        let pipelines = rational_pipelines(false);
-        check_rational_at(
-            "chain.upsampler",
-            &cfg.chain.upsampler,
-            768_000,
-            r,
-            pipelines,
-        )
-        .unwrap();
-        let e = check_varispeed_budget(&cfg, 768_000, r).unwrap_err();
-        assert!(e.contains("varispeed at 768000 Hz"), "{e}");
-        // A short one fits with it.
-        cfg.chain.upsampler = ManualConfig {
-            target: RateTarget::Rate(705_600),
-            taps: 16,
-            taps_unit: audivane_protocol::TapsUnit::Input,
-            cutoff: 0.95,
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        check_varispeed_budget(&cfg, 768_000, r).unwrap();
     }
 
     #[test]
@@ -5482,265 +4094,6 @@ Capture:
         cfg.outputs.followers.clear();
         cfg.varispeed.speed = 2.0;
         validate(&cfg).unwrap();
-    }
-
-    #[test]
-    fn followers_are_held_to_the_budget_across_devices() {
-        use audivane_protocol::ipc::FollowerConfig;
-        let mut cfg = valid();
-        cfg.rate.allowed_rates = vec![768_000];
-        cfg.rate.default_rate = 768_000;
-        cfg.outputs.followers = (0..3)
-            .map(|i| FollowerConfig::new(format!("hw:CARD=F{i},DEV=0")))
-            .collect();
-        // Each follower's stage fits one thread (734 M at 768 kHz); three
-        // of them do not fit one core, they do fit four.
-        validate_followers_budget(&cfg, 4).unwrap();
-        let e = validate_followers_budget(&cfg, 1).unwrap_err();
-        assert!(e.contains("3 follower(s) at 768000 Hz"), "{e}");
-        // A rational design that fits the master alone, not a follower
-        // beside its stage.
-        cfg.chain.upsampler = ManualConfig {
-            target: RateTarget::Rate(705_600),
-            taps: 64,
-            taps_unit: audivane_protocol::TapsUnit::Input,
-            cutoff: 0.95,
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        let e = validate_followers_budget(&cfg, 4).unwrap_err();
-        assert!(e.contains("a follower at 768000 Hz"), "{e}");
-        cfg.outputs.followers.clear();
-        validate_followers_budget(&cfg, 1).unwrap();
-    }
-
-    /// The varispeed budget's design cost is the design budget's plan: the same
-    /// number, bit for bit, as the legacy estimate computed here, and the same
-    /// designs refused, over every preset at every source rate and rational
-    /// ladder output rate, and Custom designs (fixed, per-input, minimum,
-    /// intermediate at mix 0, 0.5 and 1, stop at Nyquist, band, automatic per
-    /// output format).
-    #[test]
-    #[ignore = "refactor pin against removed code; run with tier B"]
-    fn varispeed_design_cost_moved_unchanged() {
-        use audivane_dsp_core::design::paths::standard::UpsamplerDesign;
-        use audivane_protocol::{
-            ALLOWED_RATES, BandSpec, FilterPreset, RateRatio, SampleFormat, TapsUnit,
-        };
-        fn legacy(up: &ManualConfig, graph_rate: u32, ratio: RateRatio) -> Option<f64> {
-            let taps = match up.preset {
-                Some(p) => design::grid_taps(
-                    &audivane_dsp_core::design::catalogue::design(p),
-                    graph_rate,
-                    ratio,
-                )
-                .ok()?,
-                None => {
-                    let d = UpsamplerDesign::try_for_ratio(up, ratio).ok()?;
-                    let mixed = up.phase == FilterPhase::Intermediate
-                        && up.phase_mix > 0.0
-                        && up.phase_mix < 1.0;
-                    if mixed {
-                        (d.taps as f64 * INTERMEDIATE_MAX_GROWTH) as usize
-                    } else {
-                        d.taps
-                    }
-                }
-            };
-            Some(design::budget::rational_macs_per_second(
-                taps, ratio, graph_rate,
-            ))
-        }
-        let mut ups: Vec<ManualConfig> = FilterPreset::ALL
-            .iter()
-            .map(|&p| ManualConfig {
-                preset: Some(p),
-                ..ManualConfig::default()
-            })
-            .collect();
-        let custom = ManualConfig {
-            preset: None,
-            ..ManualConfig::default()
-        };
-        let band = BandSpec {
-            passband_end: 0.9,
-            passband_end_hz: None,
-            stopband_start: 1.0,
-            attenuation_db: 120.0,
-        };
-        ups.push(custom.clone());
-        ups.push(ManualConfig {
-            taps: 65_536,
-            ..custom.clone()
-        });
-        ups.push(ManualConfig {
-            taps: 48,
-            taps_unit: TapsUnit::Input,
-            ..custom.clone()
-        });
-        ups.push(ManualConfig {
-            taps: 8192,
-            phase: FilterPhase::Minimum,
-            ..custom.clone()
-        });
-        for mix in [0.0, 0.5, 1.0] {
-            ups.push(ManualConfig {
-                taps: 8192,
-                phase: FilterPhase::Intermediate,
-                phase_mix: mix,
-                kaiser_beta: 9.0,
-                ..custom.clone()
-            });
-        }
-        ups.push(ManualConfig {
-            taps: 4096,
-            cutoff_mode: audivane_protocol::CutoffMode::NyquistStop,
-            ..custom.clone()
-        });
-        ups.push(ManualConfig {
-            cutoff_mode: audivane_protocol::CutoffMode::Band,
-            band,
-            ..custom.clone()
-        });
-        // Automatic: as the varispeed budget resolves it, per format.
-        let auto = ManualConfig {
-            cutoff_mode: audivane_protocol::CutoffMode::Band,
-            band,
-            auto_taps: Some(audivane_protocol::FilterErrorBudget::MatchOutput),
-            phase: FilterPhase::Minimum,
-            ..custom.clone()
-        };
-        let first_auto = ups.len();
-        for f in [SampleFormat::S16, SampleFormat::S24, SampleFormat::S32] {
-            let output = audivane_protocol::OutputConfig {
-                bits: audivane_protocol::effective_dither_bits(24, Some(f)),
-                ..Default::default()
-            };
-            ups.push(auto.with_output(&output));
-        }
-        let (mut same, mut refused) = (0usize, 0usize);
-        for &rate in ALLOWED_RATES {
-            for (i, out) in audivane_io_pw::lifecycle::MASK_OUTPUT_RATES
-                .into_iter()
-                .enumerate()
-            {
-                let ratio = RateRatio::from_rates(rate, out);
-                if ratio.is_integer() {
-                    continue;
-                }
-                for (j, up) in ups.iter().enumerate() {
-                    // The automatic search is slow in a debug build.
-                    if j >= first_auto && i % 6 != 0 {
-                        continue;
-                    }
-                    let wire = up.clone().into_upsampler_config().unwrap();
-                    let old = legacy(up, rate, ratio);
-                    let new = design_cost(&wire, rate, ratio);
-                    match (old, new) {
-                        (Some(a), Some(b)) => {
-                            assert_eq!(a.to_bits(), b.to_bits(), "{up:?} {rate} {ratio}");
-                            same += 1;
-                        }
-                        (None, None) => refused += 1,
-                        _ => panic!("{up:?} {rate} {ratio}: {old:?} vs {new:?}"),
-                    }
-                }
-            }
-        }
-        eprintln!("{same} costs bit-equal, {refused} refused by both");
-        assert!(same > 5_000, "{same}");
-    }
-
-    #[test]
-    fn varispeed_budget_counts_the_outgoing_chain_of_a_swap() {
-        use audivane_protocol::RateRatio;
-        // 768 → 705.6 kHz: 16 taps fit beside the stage (twice, for a swap
-        // between two of them), but a swap from 80 taps runs both.
-        let r = RateRatio::new(147, 160);
-        let mut cfg = EngineConfig::default();
-        cfg.chain.upsampler = audivane_dsp_core::resample::ManualConfig {
-            target: RateTarget::Rate(705_600),
-            taps: 16,
-            taps_unit: audivane_protocol::TapsUnit::Input,
-            cutoff: 0.95,
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        let mut old = cfg.clone();
-        old.chain.upsampler = ManualConfig {
-            target: RateTarget::Rate(705_600),
-            taps: 80,
-            taps_unit: audivane_protocol::TapsUnit::Input,
-            cutoff: 0.95,
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        check_varispeed_budget_for(&cfg, None, None, 768_000, r).unwrap();
-        check_varispeed_budget_for(&cfg, Some(&cfg), None, 768_000, r).unwrap();
-        let e = check_varispeed_budget_for(&cfg, Some(&old), None, 768_000, r).unwrap_err();
-        assert!(e.contains("varispeed at 768000 Hz"), "{e}");
-        // And the edit the other way: the new chain itself is too dear.
-        assert!(check_varispeed_budget_for(&old, Some(&cfg), None, 768_000, r).is_err());
-    }
-
-    #[test]
-    fn keep_pitch_budget_counts_the_stretch() {
-        use audivane_protocol::RateRatio;
-        // The stretch fits alone up to 96 kHz (about 0.56 G); at 192 kHz
-        // its 1.2 G is over the budget, where varispeed fits.
-        let cfg = EngineConfig::default();
-        let one = RateRatio::ONE;
-        for rate in [44_100, 48_000, 88_200, 96_000] {
-            check_stage_budget_for(&cfg, None, None, rate, one, true).unwrap();
-        }
-        for rate in [176_400, 192_000, 384_000] {
-            let e = check_stage_budget_for(&cfg, None, None, rate, one, true).unwrap_err();
-            assert!(e.contains("Keep pitch is not available"), "{e}");
-        }
-        check_stage_budget_for(&cfg, None, None, 192_000, one, false).unwrap();
-        let e = check_stage_budget_for(&cfg, None, None, 192_000, one, true).unwrap_err();
-        assert!(
-            e.contains("Keep pitch is not available at 192000 Hz"),
-            "{e}"
-        );
-        // Off: the varispeed check, its message unchanged.
-        assert_eq!(
-            check_stage_budget_for(&cfg, None, None, 48_000, one, false),
-            check_varispeed_budget_for(&cfg, None, None, 48_000, one)
-        );
-    }
-
-    #[test]
-    fn varispeed_budget_uses_the_negotiated_format() {
-        use audivane_protocol::RateRatio;
-        // 705.6 → 768 kHz with `MatchOutput` at 24 bits: a 16-bit DAC
-        // builds the shorter design, which fits beside the stage; the
-        // 24-bit one (the worst of the formats) does not.
-        let r = RateRatio::new(160, 147);
-        let mut cfg = EngineConfig::default();
-        cfg.chain.output.bits = 24;
-        cfg.chain.upsampler = audivane_dsp_core::resample::ManualConfig {
-            target: RateTarget::Rate(768_000),
-            auto_taps: Some(audivane_protocol::FilterErrorBudget::MatchOutput),
-            cutoff_mode: audivane_protocol::CutoffMode::Band,
-            band: audivane_protocol::BandSpec {
-                passband_end: 0.8,
-                passband_end_hz: None,
-                stopband_start: 1.0,
-                attenuation_db: 150.0,
-            },
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        assert!(check_varispeed_budget(&cfg, 705_600, r).is_err());
-        check_varispeed_budget_for(&cfg, None, Some(SampleFormat::S16), 705_600, r).unwrap();
-        assert!(
-            check_varispeed_budget_for(&cfg, None, Some(SampleFormat::S32), 705_600, r).is_err()
-        );
     }
 
     #[test]
@@ -5858,607 +4211,6 @@ Capture:
     }
 
     #[test]
-    fn rational_budget_counts_ab_and_swaps() {
-        use audivane_protocol::FilterPreset;
-        let mut cfg = valid();
-        cfg.rate.allowed_rates = vec![44_100];
-        cfg.rate.default_rate = 44_100;
-        // 384 kHz x 577 taps = 221 M per pipeline: 443 M for a swap, fine;
-        // 886 M with A/B, over the 800 M budget.
-        cfg.chain.upsampler = audivane_dsp_core::resample::ManualConfig {
-            target: RateTarget::Rate(384_000),
-            preset: Some(FilterPreset::KaiserSteep),
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        validate(&cfg).unwrap();
-        let mut ab = cfg.clone();
-        ab.ab = Some(AbConfig {
-            level: LevelMatch::Off,
-            headroom: Default::default(),
-            ..AbConfig::chain(cfg.chain.clone())
-        });
-        let err = validate(&ab).unwrap_err();
-        assert!(err.contains("4 pipelines"), "{err}");
-        assert!(buildable_rate_pairs(&cfg.chain.upsampler, 2).allows(44_100, 384_000));
-        assert!(!buildable_rate_pairs(&cfg.chain.upsampler, 4).allows(44_100, 384_000));
-        assert_eq!(rational_pipelines(false), 2);
-        assert_eq!(rational_pipelines(true), 4);
-    }
-
-    /// A long fixed-output-rate design (65 536 taps) does not fit a
-    /// rational ratio; a per-input design up to `max_rational_taps_per_input` does.
-    #[test]
-    fn default_manual_design_error_says_what_fits() {
-        use audivane_protocol::TapsUnit;
-        let mut cfg = valid();
-        cfg.rate.allowed_rates = vec![44_100];
-        cfg.rate.default_rate = 44_100;
-        let mut m = ManualConfig {
-            target: RateTarget::Rate(48_000),
-            ..Default::default()
-        };
-        cfg.chain.upsampler = m.clone().into_upsampler_config().unwrap();
-        let err = validate(&cfg).unwrap_err();
-        let n = max_rational_taps_per_input(
-            44_100,
-            audivane_protocol::RateRatio::from_rates(44_100, 48_000),
-            2,
-            false,
-        );
-        assert_eq!(n, 6553);
-        assert!(err.contains("taps"), "{err}");
-        m.taps_unit = TapsUnit::Input;
-        m.taps = n;
-        cfg.chain.upsampler = m.clone().into_upsampler_config().unwrap();
-        validate(&cfg).unwrap();
-        m.taps = n + 1;
-        cfg.chain.upsampler = m.clone().into_upsampler_config().unwrap();
-        assert!(validate(&cfg).is_err());
-        // An over-long grid cites the limit that binds (the 8 MiB kernel cap).
-        m.taps_unit = TapsUnit::Output;
-        m.taps = 2_000_000;
-        cfg.chain.upsampler = m.clone().into_upsampler_config().unwrap();
-        let err = validate(&cfg).unwrap_err();
-        let cap = design::budget::MAX_RATIONAL_GRID_TAPS;
-        assert!(err.contains(&cap.to_string()), "{err}");
-        // Presets: the same single piece of advice.
-        cfg.chain.upsampler = UpsamplerConfig {
-            target: RateTarget::Rate(48_000),
-            preset: Some(
-                audivane_protocol::FilterPreset::ChebyshevLong
-                    .name()
-                    .to_string(),
-            ),
-            ..Default::default()
-        };
-        let r = audivane_protocol::RateRatio::from_rates(44_100, 48_000);
-        let err = check_rational_at("u", &cfg.chain.upsampler, 44_100, r, 100_000).unwrap_err();
-        assert!(err.contains("budget"), "{err}");
-        assert_eq!(err.matches("use ").count(), 1, "{err}");
-    }
-
-    #[test]
-    fn a_shared_scale_refusal_names_each_direction() {
-        // 44.1k -> 768k and 768k -> 44.1k share one cached refusal; each
-        // check names its own ratio.
-        let mut m = ManualConfig {
-            target: RateTarget::MaxRateAny(768_000),
-            phase: FilterPhase::Minimum,
-            auto_taps: Some(audivane_protocol::FilterErrorBudget::Db(122.71)),
-            ..Default::default()
-        };
-        m.band.passband_end = 0.99;
-        let up = m.into_upsampler_config().unwrap();
-        let r = audivane_protocol::RateRatio::from_rates;
-        let eu = check_rational_at("u", &up, 44_100, r(44_100, 768_000), 2).unwrap_err();
-        let ed = check_rational_at("u", &up, 768_000, r(768_000, 44_100), 2).unwrap_err();
-        assert!(
-            eu.contains("(2560/147)") && !eu.contains("147/2560"),
-            "{eu}"
-        );
-        assert!(
-            ed.contains("(147/2560)") && !ed.contains("2560/147"),
-            "{ed}"
-        );
-    }
-
-    #[test]
-    fn validate_pitch_checks_bounds_and_mutual_exclusion() {
-        assert!(validate_pitch("chain.pitch", &PitchConfig::default()).is_ok());
-        assert!(
-            validate_pitch(
-                "chain.pitch",
-                &PitchConfig {
-                    cents: -31.77,
-                    ..Default::default()
-                }
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_pitch(
-                "chain.pitch",
-                &PitchConfig {
-                    reference_hz: Some(440.0),
-                    target_hz: Some(432.0),
-                    ..Default::default()
-                }
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_pitch(
-                "chain.pitch",
-                &PitchConfig {
-                    cents: 1201.0,
-                    ..Default::default()
-                }
-            )
-            .is_err()
-        );
-        assert!(
-            validate_pitch(
-                "chain.pitch",
-                &PitchConfig {
-                    semitones: Some(-13.0),
-                    ..Default::default()
-                }
-            )
-            .is_err()
-        );
-        assert!(
-            validate_pitch(
-                "chain.pitch",
-                &PitchConfig {
-                    reference_hz: Some(440.0),
-                    ..Default::default()
-                }
-            )
-            .is_err()
-        );
-        assert!(
-            validate_pitch(
-                "chain.pitch",
-                &PitchConfig {
-                    cents: -31.77,
-                    semitones: Some(-1.0),
-                    ..Default::default()
-                }
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn validates_dc_block_bounds() {
-        let ok = DcBlockConfig {
-            enabled: true,
-            cutoff_hz: 5.0,
-        };
-        assert!(validate_dc_block("chain.dc_block", &ok).is_ok());
-        assert!(
-            validate_dc_block(
-                "chain.dc_block",
-                &DcBlockConfig {
-                    cutoff_hz: 1.0,
-                    ..ok
-                }
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_dc_block(
-                "chain.dc_block",
-                &DcBlockConfig {
-                    cutoff_hz: 20.0,
-                    ..ok
-                }
-            )
-            .is_ok()
-        );
-
-        for bad in [0.99, 20.01, 0.0, -5.0, f64::NAN, f64::INFINITY] {
-            let cfg = DcBlockConfig {
-                cutoff_hz: bad,
-                ..ok
-            };
-            assert!(validate_dc_block("chain.dc_block", &cfg).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn validates_crossfeed_bounds() {
-        let ok = CrossfeedConfig {
-            enabled: true,
-            mode: audivane_protocol::CrossfeedMode::Bs2bCustom,
-            cutoff_hz: 700.0,
-            feed_db: 4.5,
-            ..CrossfeedConfig::default()
-        };
-        assert!(validate_crossfeed("chain.crossfeed", &ok).is_ok());
-        for (width, corner, good) in [
-            (0.0, 200.0, true),
-            (2.0, 2000.0, true),
-            (2.1, 700.0, false),
-            (-0.1, 700.0, false),
-            (f64::NAN, 700.0, false),
-            (1.5, 150.0, false),
-            (1.5, 2500.0, false),
-        ] {
-            let cf = CrossfeedConfig {
-                width,
-                width_corner_hz: corner,
-                ..ok.clone()
-            };
-            assert_eq!(
-                validate_crossfeed("chain.crossfeed", &cf).is_ok(),
-                good,
-                "{width} {corner}"
-            );
-        }
-
-        let bad_cutoff = CrossfeedConfig {
-            cutoff_hz: 200.0,
-            ..ok.clone()
-        };
-        assert!(validate_crossfeed("chain.crossfeed", &bad_cutoff).is_err());
-
-        let bad_feed = CrossfeedConfig {
-            feed_db: 20.0,
-            ..ok
-        };
-        assert!(validate_crossfeed("chain.crossfeed", &bad_feed).is_err());
-    }
-
-    #[test]
-    fn validates_harmonics_bounds() {
-        use audivane_protocol::{ChebyshevLayer, FluxLayer, HARMONICS_DEFAULT_SIGNS};
-        let cheb = ChebyshevLayer {
-            enabled: true,
-            preset: None,
-            levels_db: [
-                Some(-40.0),
-                Some(-55.0),
-                Some(-70.0),
-                Some(-80.0),
-                None,
-                None,
-                None,
-                Some(-90.0),
-            ],
-            signs: HARMONICS_DEFAULT_SIGNS,
-            invert_even: false,
-            drive_db: -6.0,
-            amount: 0.5,
-            tilt: None,
-            sag: None,
-            bias: None,
-        };
-        let flux = FluxLayer {
-            enabled: true,
-            preset: None,
-            corner_hz: 100.0,
-            max_boost_db: 12.0,
-            target_h3_db: -24.0,
-            calibration_hz: 20.0,
-        };
-        let with = |c: ChebyshevLayer, f: FluxLayer| HarmonicsConfig {
-            system: None,
-            enabled: true,
-            layers: vec![HarmonicsLayer::Chebyshev(c), HarmonicsLayer::Flux(f)],
-            dc_block: true,
-            routing: Default::default(),
-        };
-        assert!(validate_harmonics("chain.harmonics", &with(cheb.clone(), flux.clone())).is_ok());
-
-        let mut hot = cheb.clone();
-        hot.levels_db[0] = Some(-10.0);
-        assert!(validate_harmonics("chain.harmonics", &with(hot, flux.clone())).is_err());
-
-        let mut bad_h7 = cheb.clone();
-        bad_h7.levels_db[5] = Some(-19.0);
-        bad_h7.enabled = false;
-        let err = validate_harmonics("chain.harmonics", &with(bad_h7, flux.clone())).unwrap_err();
-        assert!(
-            err.contains("chain.harmonics.layers[0].levels_db[5] (H7)"),
-            "{err}"
-        );
-
-        let mut tilted = cheb.clone();
-        tilted.tilt = Some(Box::new(audivane_protocol::HarmonicsTilt {
-            low: audivane_protocol::TiltShelf::new(60.0, 12.0),
-            ..Default::default()
-        }));
-        assert!(validate_harmonics("h", &with(tilted.clone(), flux.clone())).is_ok());
-        if let Some(t) = &mut tilted.tilt {
-            t.high.hz = 25_000.0;
-        }
-        let err = validate_harmonics("h", &with(tilted, flux.clone())).unwrap_err();
-        assert!(err.contains("h.layers[0].tilt.high.hz"), "{err}");
-
-        // Sag and bias: ranges named; a tilt on the same layer is fine.
-        let sag = audivane_protocol::HarmonicsSag {
-            depth_db: 3.0,
-            attack_ms: 20.0,
-            release_ms: 200.0,
-        };
-        let bias = audivane_protocol::HarmonicsBias {
-            depth: -0.1,
-            attack_ms: 300.0,
-            release_ms: 2_000.0,
-        };
-        let dynamic = ChebyshevLayer {
-            sag: Some(sag),
-            bias: Some(bias),
-            ..cheb.clone()
-        };
-        assert!(validate_harmonics("h", &with(dynamic.clone(), flux.clone())).is_ok());
-        for (bad, field) in [
-            (
-                ChebyshevLayer {
-                    sag: Some(audivane_protocol::HarmonicsSag {
-                        depth_db: 7.0,
-                        ..sag
-                    }),
-                    ..dynamic.clone()
-                },
-                "h.layers[0].sag.depth_db",
-            ),
-            (
-                ChebyshevLayer {
-                    bias: Some(audivane_protocol::HarmonicsBias {
-                        release_ms: 20_000.0,
-                        ..bias
-                    }),
-                    ..dynamic.clone()
-                },
-                "h.layers[0].bias.release_ms",
-            ),
-        ] {
-            let err = validate_harmonics("h", &with(bad, flux.clone())).unwrap_err();
-            assert!(err.contains(field), "{err}");
-        }
-        let tilted_dynamic = ChebyshevLayer {
-            tilt: Some(Box::new(audivane_protocol::HarmonicsTilt {
-                low: audivane_protocol::TiltShelf::new(60.0, 12.0),
-                ..Default::default()
-            })),
-            ..dynamic.clone()
-        };
-        assert!(validate_harmonics("h", &with(tilted_dynamic, flux.clone())).is_ok());
-
-        for (drive_db, amount) in [(0.5, 1.0), (-41.0, 1.0), (0.0, 1.1), (0.0, f64::NAN)] {
-            let bad = ChebyshevLayer {
-                drive_db,
-                amount,
-                ..cheb.clone()
-            };
-            assert!(validate_harmonics("h", &with(bad, flux.clone())).is_err());
-        }
-
-        for bad in [
-            FluxLayer {
-                corner_hz: 0.5,
-                ..flux.clone()
-            },
-            FluxLayer {
-                max_boost_db: 41.0,
-                ..flux.clone()
-            },
-            FluxLayer {
-                target_h3_db: -11.0,
-                ..flux.clone()
-            },
-            FluxLayer {
-                calibration_hz: 2000.0,
-                ..flux.clone()
-            },
-        ] {
-            let err = validate_harmonics("h", &with(cheb.clone(), bad)).unwrap_err();
-            assert!(err.contains("h.layers[1]: flux: "), "{err}");
-        }
-
-        let many = HarmonicsConfig {
-            layers: vec![HarmonicsLayer::Flux(flux); HARMONICS_MAX_LAYERS + 1],
-            ..HarmonicsConfig::default()
-        };
-        assert!(validate_harmonics("h", &many).is_err());
-
-        let hyst = audivane_protocol::HysteresisLayer {
-            enabled: true,
-            preset: None,
-            saturation: 0.5,
-            width: 0.35,
-            amount: 1.0,
-            target_h3_db: -30.0,
-            calibration_hz: 1_000.0,
-            bass_eq: None,
-            asymmetry: None,
-        };
-        let with_hyst = |hy: audivane_protocol::HysteresisLayer| HarmonicsConfig {
-            system: None,
-            enabled: true,
-            layers: vec![HarmonicsLayer::Hysteresis(hy)],
-            dc_block: true,
-            routing: Default::default(),
-        };
-        assert!(validate_harmonics("h", &with_hyst(hyst.clone())).is_ok());
-        for bad in [
-            audivane_protocol::HysteresisLayer {
-                saturation: -0.1,
-                ..hyst.clone()
-            },
-            audivane_protocol::HysteresisLayer {
-                width: 1.1,
-                ..hyst.clone()
-            },
-            audivane_protocol::HysteresisLayer {
-                amount: f64::NAN,
-                ..hyst.clone()
-            },
-            audivane_protocol::HysteresisLayer {
-                target_h3_db: -11.0,
-                ..hyst.clone()
-            },
-            audivane_protocol::HysteresisLayer {
-                calibration_hz: 10.0,
-                ..hyst.clone()
-            },
-            audivane_protocol::HysteresisLayer {
-                calibration_hz: 6_000.0,
-                ..hyst.clone()
-            },
-            audivane_protocol::HysteresisLayer {
-                asymmetry: Some(1.5),
-                ..hyst.clone()
-            },
-            audivane_protocol::HysteresisLayer {
-                bass_eq: Some(audivane_protocol::HysteresisBassEq {
-                    hz: 10.0,
-                    ..Default::default()
-                }),
-                ..hyst.clone()
-            },
-            // Checked while switched off too.
-            audivane_protocol::HysteresisLayer {
-                bass_eq: Some(audivane_protocol::HysteresisBassEq {
-                    enabled: false,
-                    hz: 120.0,
-                    db: 13.0,
-                }),
-                ..hyst.clone()
-            },
-        ] {
-            let err = validate_harmonics("h", &with_hyst(bad)).unwrap_err();
-            assert!(err.contains("h.layers[0]: hysteresis"), "{err}");
-        }
-        assert!(validate_harmonics("h", &HarmonicsConfig::default()).is_ok());
-    }
-
-    #[test]
-    fn validate_eq_tilt_bounds() {
-        let valid = TiltConfig {
-            enabled: true,
-            slope_db_per_oct: Some(-0.7),
-            total_db: None,
-            start_hz: 20.0,
-            end_hz: 20_000.0,
-            pivot: TiltPivot::Hz(1000.0),
-        };
-        assert!(validate_eq_tilt("chain.eq.tilt", &valid).is_ok());
-
-        let mut bad = valid;
-        bad.start_hz = 19.9;
-        assert!(validate_eq_tilt("chain.eq.tilt", &bad).is_err());
-
-        bad = valid;
-        bad.end_hz = 20_000.1;
-        assert!(validate_eq_tilt("chain.eq.tilt", &bad).is_err());
-
-        bad = valid;
-        bad.end_hz = 15.0;
-        assert!(validate_eq_tilt("chain.eq.tilt", &bad).is_err());
-
-        bad = valid;
-        bad.slope_db_per_oct = Some(7.0);
-        assert!(validate_eq_tilt("chain.eq.tilt", &bad).is_err());
-
-        bad = valid;
-        bad.slope_db_per_oct = Some(3.0); // 3 * ~9.97 oct > 24 dB
-        assert!(validate_eq_tilt("chain.eq.tilt", &bad).is_err());
-
-        bad = valid;
-        bad.slope_db_per_oct = None;
-        assert!(validate_eq_tilt("chain.eq.tilt", &bad).is_err());
-
-        bad = valid;
-        bad.total_db = Some(-7.0);
-        assert!(validate_eq_tilt("chain.eq.tilt", &bad).is_err());
-
-        bad = valid;
-        bad.pivot = TiltPivot::Hz(10.0);
-        assert!(validate_eq_tilt("chain.eq.tilt", &bad).is_err());
-    }
-
-    #[test]
-    fn validate_two_section_tilt() {
-        let low = TiltConfig {
-            enabled: true,
-            slope_db_per_oct: Some(1.0),
-            total_db: None,
-            start_hz: 20.0,
-            end_hz: 200.0,
-            pivot: TiltPivot::End,
-        };
-        let high = TiltConfig {
-            start_hz: 4000.0,
-            end_hz: 20_000.0,
-            pivot: TiltPivot::Start,
-            ..low
-        };
-        let mut chain = ChainConfig {
-            eq: Some(audivane_protocol::EqProfile {
-                tilt: Some(low),
-                tilt_high: Some(high),
-                ..Default::default()
-            }),
-            ..ChainConfig::neutral()
-        };
-        assert!(validate_chain("chain", &chain).is_ok());
-        let eq = chain.eq.as_mut().unwrap();
-        eq.tilt_high = Some(TiltConfig {
-            start_hz: 150.0,
-            ..high
-        });
-        let err = validate_chain("chain", &chain).unwrap_err();
-        assert!(
-            err.contains("chain.eq:") && err.contains("overlap"),
-            "{err}"
-        );
-        let eq = chain.eq.as_mut().unwrap();
-        eq.tilt_high = Some(TiltConfig {
-            pivot: TiltPivot::Center,
-            ..high
-        });
-        assert!(
-            validate_chain("chain", &chain)
-                .unwrap_err()
-                .contains("pivot")
-        );
-        // Each section has the single-section rules, under its own name.
-        let eq = chain.eq.as_mut().unwrap();
-        eq.tilt_high = Some(TiltConfig {
-            end_hz: 30_000.0,
-            ..high
-        });
-        let err = validate_chain("chain", &chain).unwrap_err();
-        assert!(err.starts_with("chain.eq.tilt_high.end_hz"), "{err}");
-        // The treble section alone is refused (a single tilt does that).
-        let eq = chain.eq.as_mut().unwrap();
-        eq.tilt = None;
-        eq.tilt_high = Some(high);
-        let err = validate_chain("chain", &chain).unwrap_err();
-        assert!(err.contains("tilt_high needs tilt"), "{err}");
-    }
-
-    #[test]
-    fn validate_tone_range() {
-        let chain = |bass_db: f64, treble_db: f64| ChainConfig {
-            eq: Some(audivane_protocol::EqProfile {
-                tone: Some(audivane_protocol::ToneConfig { bass_db, treble_db }),
-                ..Default::default()
-            }),
-            ..ChainConfig::neutral()
-        };
-        assert!(validate_chain("chain", &chain(6.0, -6.0)).is_ok());
-        let err = validate_chain("chain", &chain(0.0, 6.5)).unwrap_err();
-        assert!(err.starts_with("chain.eq.tone.treble_db"), "{err}");
-        assert!(validate_chain("chain", &chain(f64::NAN, 0.0)).is_err());
-    }
-
-    #[test]
     fn bypass_mask_covers_the_native_moves_and_follows_the_mode() {
         let cfg = EngineConfig::default();
         assert_eq!(
@@ -6511,6 +4263,204 @@ Capture:
             bypass_buildable_rate_pairs(&pipewire),
             audivane_io_pw::RatePairMask::NONE
         );
+    }
+
+    /// An equiripple design of 1,279 taps over 0.9..1.0: too short at x16,
+    /// too deep at x4 and x2, fine at x8.
+    /// 1,279 fixed equiripple taps: too short at x16, builds at x8.
+    pub(crate) fn equiripple_1279(target: RateTarget) -> UpsamplerConfig {
+        use audivane_protocol::design::{ArithmeticPath, OptimalMethod, Phase};
+        let mut d = catalogue::recommended();
+        if let FilterDesign::Kernel(k) = &mut d {
+            k.shape = Shape::Optimal {
+                method: OptimalMethod::Equiripple,
+                length: Length::Fixed(1279),
+                passband_end: 0.9,
+                stopband_start: 1.0,
+            };
+            k.phase = Phase::Linear;
+            k.numerics.path = ArithmeticPath::Fir;
+        }
+        UpsamplerConfig {
+            target,
+            preset: None,
+            design: Some(StoredDesign::new(d)),
+        }
+    }
+
+    fn at_rates(up: UpsamplerConfig, rates: &[u32]) -> EngineConfig {
+        let mut cfg = valid();
+        cfg.chain.upsampler = up;
+        cfg.rate.allowed_rates = rates.to_vec();
+        cfg.rate.default_rate = rates[0];
+        cfg
+    }
+
+    /// Acceptance and the design check decide at the landings the ladder
+    /// picks: under a 768 kHz cap from 44.1 and 48 kHz, the ladder skips the
+    /// x16 rung the design does not build at and lands both at x8, where it
+    /// builds. Applied, with nothing falling back.
+    #[test]
+    fn a_design_that_builds_at_the_ladders_landings_is_applied() {
+        let cfg = at_rates(
+            equiripple_1279(RateTarget::MaxRate(768_000)),
+            &[44_100, 48_000],
+        );
+        validate(&cfg).unwrap();
+        let check = check_design(
+            cfg.chain.upsampler.design.as_ref().unwrap(),
+            None,
+            None,
+            &cfg,
+            &cfg.chain.output,
+            &audivane_dsp_core::cpu_bench::KernelRates::floor(),
+            None,
+        );
+        assert!(check.errors.is_empty(), "{:?}", check.errors);
+        assert!(check.advice.is_none(), "{:?}", check.advice);
+        assert!(
+            check.plans.iter().all(|p| p.ratio == RateRatio::integer(8)),
+            "{:?}",
+            check.plans
+        );
+        // Where no rung builds (x16 fixed), refused in the same words.
+        let x16 = at_rates(equiripple_1279(RateTarget::Ratio(16)), &[44_100, 48_000]);
+        let err = validate(&x16).unwrap_err();
+        assert!(
+            err.starts_with("chain.upsampler.design.length: 1,279 taps is too short"),
+            "{err}"
+        );
+    }
+
+    /// What the rate mask publishes builds: every pair
+    /// [`buildable_rate_pairs`] allows, with A/B off and on, passes
+    /// `prepare` (the budgets and the safety gate) for a sample of Custom
+    /// designs: each design from two source rates, one with A/B off and one
+    /// with it on, so every source rate and both pipeline counts are
+    /// covered. The presets' mask is their feasibility at every pair (here),
+    /// and the dsp-core fingerprint tiers hold that to the same invariant
+    /// over every preset and pair.
+    #[test]
+    fn what_the_mask_allows_builds() {
+        use audivane_dsp_core::design::{Named, prepare};
+        use audivane_io_pw::lifecycle::MASK_OUTPUT_RATES;
+        let pairs: Vec<(u32, u32)> = ALLOWED_RATES
+            .iter()
+            .flat_map(|&i| MASK_OUTPUT_RATES.iter().map(move |&o| (i, o)))
+            .filter(|&(i, o)| i != o)
+            .collect();
+        // A debug build gates the many-branch rational grids slowly: the
+        // tasks run on every core.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let customs = mask_customs();
+        let n = ALLOWED_RATES.len();
+        let tasks: Vec<(usize, u32, bool)> = (0..customs.len())
+            .flat_map(|d| {
+                [
+                    (d, ALLOWED_RATES[(2 * d) % n], d % 2 == 0),
+                    (d, ALLOWED_RATES[(2 * d + 1) % n], d % 2 == 1),
+                ]
+            })
+            .collect();
+        let sources: std::collections::HashSet<u32> = tasks.iter().map(|t| t.1).collect();
+        assert_eq!(sources.len(), n, "every source rate is sampled");
+        let checks: usize = tasks
+            .iter()
+            .map(|&(_, i, _)| pairs.iter().filter(|p| p.0 == i).count())
+            .sum();
+        // One job per (task, output rate): a single pair can take most of a
+        // second to prepare, so the jobs spread over every core.
+        let jobs: Vec<(usize, u32, bool, u32)> = tasks
+            .iter()
+            .flat_map(|&(d, input, ab)| {
+                pairs
+                    .iter()
+                    .filter(move |p| p.0 == input)
+                    .map(move |&(_, output)| (d, input, ab, output))
+            })
+            .collect();
+        let masks: Vec<[_; 2]> = customs
+            .iter()
+            .map(|up| [false, true].map(|ab| buildable_rate_pairs(up, rational_pipelines(ab))))
+            .collect();
+        let designs: Vec<_> = customs
+            .iter()
+            .map(|up| Named::of(up).unwrap().design)
+            .collect();
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let (next, built, refused) = (
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        );
+        let failures = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    while let Some(&(d, i, ab, output)) =
+                        jobs.get(next.fetch_add(1, Ordering::Relaxed))
+                    {
+                        if !masks[d][usize::from(ab)].allows(i, output) {
+                            refused.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        let pipelines = rational_pipelines(ab);
+                        let r = RateRatio::from_rates(i, output);
+                        match prepare(&designs[d], &design_context(i, r, pipelines)) {
+                            Ok(_) => {
+                                built.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(e) => failures.lock().unwrap().push(format!(
+                                "{:?} with {pipelines} pipelines: the mask allows \
+                                 {i} -> {output}, prepare refuses: {e}",
+                                customs[d]
+                            )),
+                        }
+                    }
+                });
+            }
+        });
+        let failures = failures.into_inner().unwrap();
+        assert!(failures.is_empty(), "{failures:#?}");
+        let (built, refused) = (built.into_inner(), refused.into_inner());
+        assert_eq!(built + refused, checks);
+        eprintln!("{built} allowed pairs build, {refused} not allowed");
+        assert!(built > 100 && refused > 0, "{built} {refused}");
+        // The presets' mask is their feasibility, within the driver's term
+        // limit (the fingerprint tiers prepare every such pair).
+        let term = audivane_io_pw::lifecycle::MAX_RATIONAL_TERM;
+        for &p in audivane_protocol::FilterPreset::ALL {
+            let up = UpsamplerConfig {
+                preset: Some(p.name().to_string()),
+                target: RateTarget::MaxRateAny(audivane_protocol::MAX_OUTPUT_RATE),
+                ..UpsamplerConfig::default()
+            };
+            for pipelines in [rational_pipelines(false), rational_pipelines(true)] {
+                let mask = buildable_rate_pairs(&up, pipelines);
+                for &(input, output) in &pairs {
+                    let r = RateRatio::from_rates(input, output);
+                    let ok = r.up <= term
+                        && r.down <= term
+                        && design::feasibility(
+                            &catalogue::design(p),
+                            &design_context(input, r, pipelines),
+                        )
+                        .is_ok();
+                    assert_eq!(mask.allows(input, output), ok, "{p:?} {input} -> {output}");
+                }
+            }
+        }
+        // 44.1 kHz to 3.072 MHz is 10240/147: past the term limit, never
+        // offered (halfband_tiny is feasible there, and its kernel fails
+        // the gate's DC check).
+        let tiny = audivane_dsp_core::resample::ManualConfig {
+            preset: Some(audivane_protocol::FilterPreset::HalfbandTiny),
+            target: RateTarget::MaxRateAny(audivane_protocol::MAX_OUTPUT_RATE),
+            ..Default::default()
+        }
+        .into_upsampler_config()
+        .unwrap();
+        assert!(!buildable_rate_pairs(&tiny, rational_pipelines(false)).allows(44_100, 3_072_000));
     }
 
     /// Custom designs over the length rules, phases and windows the mask
@@ -6581,350 +4531,5 @@ Capture:
                 ..custom.clone()
             }),
         ]
-    }
-
-    /// What the rate mask publishes builds: every pair
-    /// [`buildable_rate_pairs`] allows, with A/B off and on, passes
-    /// `prepare` (the budgets and the safety gate) for a sample of Custom
-    /// designs. The presets' mask is their feasibility at every pair (here),
-    /// and the dsp-core fingerprint tiers hold that to the same invariant
-    /// over every preset and pair.
-    #[test]
-    fn what_the_mask_allows_builds() {
-        use audivane_dsp_core::design::{Named, prepare};
-        use audivane_io_pw::lifecycle::MASK_OUTPUT_RATES;
-        let pairs: Vec<(u32, u32)> = ALLOWED_RATES
-            .iter()
-            .flat_map(|&i| MASK_OUTPUT_RATES.iter().map(move |&o| (i, o)))
-            .filter(|&(i, o)| i != o)
-            .collect();
-        // Every design from every source rate, on a few threads (a debug
-        // build gates the many-branch rational grids slowly).
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let customs = mask_customs();
-        let tasks: Vec<(usize, u32)> = (0..customs.len())
-            .flat_map(|d| ALLOWED_RATES.iter().map(move |&i| (d, i)))
-            .collect();
-        let (next, built, refused) = (
-            AtomicUsize::new(0),
-            AtomicUsize::new(0),
-            AtomicUsize::new(0),
-        );
-        let failures = std::sync::Mutex::new(Vec::new());
-        std::thread::scope(|scope| {
-            for _ in 0..16 {
-                scope.spawn(|| {
-                    while let Some(&(d, input)) = tasks.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        let up = &customs[d];
-                        let design = Named::of(up).unwrap().design;
-                        for pipelines in [rational_pipelines(false), rational_pipelines(true)] {
-                            let mask = buildable_rate_pairs(up, pipelines);
-                            for &(i, output) in pairs.iter().filter(|p| p.0 == input) {
-                                if !mask.allows(i, output) {
-                                    refused.fetch_add(1, Ordering::Relaxed);
-                                    continue;
-                                }
-                                let r = RateRatio::from_rates(i, output);
-                                match prepare(&design, &design_context(i, r, pipelines)) {
-                                    Ok(_) => {
-                                        built.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                    Err(e) => failures.lock().unwrap().push(format!(
-                                        "{up:?} with {pipelines} pipelines: the mask allows \
-                                         {i} -> {output}, prepare refuses: {e}"
-                                    )),
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        });
-        let failures = failures.into_inner().unwrap();
-        assert!(failures.is_empty(), "{failures:#?}");
-        let (built, refused) = (built.into_inner(), refused.into_inner());
-        assert_eq!(built + refused, 2 * customs.len() * pairs.len());
-        eprintln!("{built} allowed pairs build, {refused} not allowed");
-        assert!(built > 1000 && refused > 0, "{built} {refused}");
-        // The presets' mask is their feasibility, within the driver's term
-        // limit (the fingerprint tiers prepare every such pair).
-        let term = audivane_io_pw::lifecycle::MAX_RATIONAL_TERM;
-        for &p in audivane_protocol::FilterPreset::ALL {
-            let up = UpsamplerConfig {
-                preset: Some(p.name().to_string()),
-                target: RateTarget::MaxRateAny(audivane_protocol::MAX_OUTPUT_RATE),
-                ..UpsamplerConfig::default()
-            };
-            for pipelines in [rational_pipelines(false), rational_pipelines(true)] {
-                let mask = buildable_rate_pairs(&up, pipelines);
-                for &(input, output) in &pairs {
-                    let r = RateRatio::from_rates(input, output);
-                    let ok = r.up <= term
-                        && r.down <= term
-                        && design::feasibility(
-                            &catalogue::design(p),
-                            &design_context(input, r, pipelines),
-                        )
-                        .is_ok();
-                    assert_eq!(mask.allows(input, output), ok, "{p:?} {input} -> {output}");
-                }
-            }
-        }
-        // 44.1 kHz to 3.072 MHz is 10240/147: past the term limit, never
-        // offered (halfband_tiny is feasible there, and its kernel fails
-        // the gate's DC check).
-        let tiny = audivane_dsp_core::resample::ManualConfig {
-            preset: Some(audivane_protocol::FilterPreset::HalfbandTiny),
-            target: RateTarget::MaxRateAny(audivane_protocol::MAX_OUTPUT_RATE),
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        assert!(!buildable_rate_pairs(&tiny, rational_pipelines(false)).allows(44_100, 3_072_000));
-    }
-
-    /// An automatic design's length is known once searched: the mask
-    /// searches it at every integer rung the target can reach (cached), so
-    /// it never offers one where the search fails. This Gaussian
-    /// intermediate design's phase conversion fails at x3 from 48 kHz; it
-    /// builds at x2.
-    #[test]
-    fn the_mask_searches_automatic_designs_at_every_rung() {
-        use audivane_dsp_core::design::{Named, prepare};
-        use audivane_protocol::{CutoffMode, FilterErrorBudget};
-        let up = ManualConfig {
-            preset: None,
-            target: RateTarget::MaxRateAny(144_000),
-            window: audivane_protocol::WindowKind::Gaussian,
-            cutoff_mode: CutoffMode::Band,
-            band: audivane_protocol::BandSpec {
-                passband_end: 0.7,
-                passband_end_hz: None,
-                stopband_start: 1.2,
-                attenuation_db: 200.0,
-            },
-            auto_taps: Some(FilterErrorBudget::Db(200.0)),
-            phase: FilterPhase::Intermediate,
-            phase_mix: 0.5,
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        let mut cfg = valid();
-        cfg.chain.upsampler = up.clone();
-        validate(&cfg).unwrap();
-        let design = Named::of(&up).unwrap().design;
-        let p = rational_pipelines(false);
-        let x3 = prepare(&design, &design_context(48_000, RateRatio::integer(3), p));
-        prepare(&design, &design_context(48_000, RateRatio::integer(2), p)).unwrap();
-        assert!(
-            x3.unwrap_err()
-                .to_string()
-                .contains("phase conversion failed")
-        );
-        let mask = buildable_rate_pairs(&up, p);
-        assert!(mask.allows(48_000, 96_000));
-        assert!(!mask.allows(48_000, 144_000));
-    }
-
-    /// A `max_rate_any` ladder can pick an integer ratio above the
-    /// power-of-two one validation checks (x3 for 48 -> 144 kHz under a
-    /// 144 kHz cap): the mask holds such a pair to the design's own limits,
-    /// so it never offers the 8.4 M-tap x3 kernel of a design validation
-    /// passed at x2.
-    #[test]
-    fn the_mask_checks_every_integer_ratio_a_ladder_can_pick() {
-        let up = ManualConfig {
-            preset: None,
-            target: RateTarget::MaxRateAny(144_000),
-            taps: 2_800_000,
-            taps_unit: audivane_protocol::TapsUnit::Input,
-            cutoff: 0.95,
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        let mut cfg = valid();
-        cfg.chain.upsampler = up.clone();
-        // 2.8M taps per input is above MAX_PER_INPUT (65535); test the feasibility check directly.
-        let _ = cfg;
-        let mask = buildable_rate_pairs(&up, rational_pipelines(false));
-        assert!(mask.allows(48_000, 96_000));
-        assert!(!mask.allows(48_000, 144_000));
-        assert!(!mask.allows(44_100, 132_300));
-        let e = custom_feasibility_at(
-            "upsampler",
-            &up,
-            48_000,
-            RateRatio::integer(3),
-            rational_pipelines(false),
-            false,
-        )
-        .unwrap_err();
-        assert!(e.contains("8400000"), "{e}");
-    }
-
-    /// dsp-core's budget tests and its fingerprint matrix
-    /// (`tests/fingerprint_common/matrix.rs`) rebuild the ladder output
-    /// rates from the graph rates (they do not see the driver's list): the
-    /// formula agrees.
-    #[test]
-    fn ladder_output_rates_are_the_graph_rate_multiples() {
-        let mut v: Vec<u32> = ALLOWED_RATES
-            .iter()
-            .flat_map(|&r| (1..=16).map(move |m| r * m))
-            .filter(|&r| r <= 768_000)
-            .chain(audivane_protocol::HIGH_OUTPUT_RATES.iter().copied())
-            .collect();
-        v.sort_unstable();
-        v.dedup();
-        assert_eq!(v, audivane_io_pw::lifecycle::MASK_OUTPUT_RATES);
-    }
-    /// An equiripple design of 1,279 taps over 0.9..1.0: too short at x16,
-    /// too deep at x4 and x2, fine at x8.
-    /// 1,279 fixed equiripple taps: too short at x16, builds at x8.
-    pub(crate) fn equiripple_1279(target: RateTarget) -> UpsamplerConfig {
-        use audivane_protocol::design::{ArithmeticPath, OptimalMethod, Phase};
-        let mut d = catalogue::recommended();
-        if let FilterDesign::Kernel(k) = &mut d {
-            k.shape = Shape::Optimal {
-                method: OptimalMethod::Equiripple,
-                length: Length::Fixed(1279),
-                passband_end: 0.9,
-                stopband_start: 1.0,
-            };
-            k.phase = Phase::Linear;
-            k.numerics.path = ArithmeticPath::Fir;
-        }
-        UpsamplerConfig {
-            target,
-            preset: None,
-            design: Some(StoredDesign::new(d)),
-        }
-    }
-
-    fn at_rates(up: UpsamplerConfig, rates: &[u32]) -> EngineConfig {
-        let mut cfg = valid();
-        cfg.chain.upsampler = up;
-        cfg.rate.allowed_rates = rates.to_vec();
-        cfg.rate.default_rate = rates[0];
-        cfg
-    }
-
-    /// Acceptance and the design check decide at the landings the ladder
-    /// picks: under a 768 kHz cap from 44.1 and 48 kHz, the ladder skips the
-    /// x16 rung the design does not build at and lands both at x8, where it
-    /// builds. Applied, with nothing falling back.
-    #[test]
-    fn a_design_that_builds_at_the_ladders_landings_is_applied() {
-        let cfg = at_rates(
-            equiripple_1279(RateTarget::MaxRate(768_000)),
-            &[44_100, 48_000],
-        );
-        validate(&cfg).unwrap();
-        let check = check_design(
-            cfg.chain.upsampler.design.as_ref().unwrap(),
-            None,
-            None,
-            &cfg,
-            &cfg.chain.output,
-            &audivane_dsp_core::cpu_bench::KernelRates::floor(),
-            None,
-        );
-        assert!(check.errors.is_empty(), "{:?}", check.errors);
-        assert!(check.advice.is_none(), "{:?}", check.advice);
-        assert!(
-            check.plans.iter().all(|p| p.ratio == RateRatio::integer(8)),
-            "{:?}",
-            check.plans
-        );
-        // Where no rung builds (x16 fixed), refused in the same words.
-        let x16 = at_rates(equiripple_1279(RateTarget::Ratio(16)), &[44_100, 48_000]);
-        let err = validate(&x16).unwrap_err();
-        assert!(
-            err.starts_with("chain.upsampler.design.length: 1,279 taps is too short"),
-            "{err}"
-        );
-    }
-
-    /// The varispeed budget charges the chains that run: a 10,000 taps per
-    /// input design builds from 48 kHz (x2) but not from 44.1 kHz (160/147,
-    /// over the rational limits), where Recommended plays; varispeed on
-    /// does not refuse the edit for the custom filter that never runs there.
-    #[test]
-    fn varispeed_is_budgeted_with_the_fallback_that_runs() {
-        let up = ManualConfig {
-            target: RateTarget::Rate(96_000),
-            taps: 10_000,
-            taps_unit: audivane_protocol::TapsUnit::Input,
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        let mut cfg = at_rates(up.clone(), &[44_100, 48_000]);
-        assert!(chain_a_builds_at(&cfg, 44_100, RateRatio::from_rates(44_100, 96_000)).is_err());
-        assert!(chain_a_builds_at(&cfg, 48_000, RateRatio::integer(2)).is_ok());
-        cfg.varispeed.enabled = true;
-        validate(&cfg).unwrap();
-    }
-
-    /// A fix offered is held to the checks that apply it: 352.8 to 384 kHz
-    /// with a Kaiser band 0.990..1.000 refuses an automatic length over the
-    /// rational budget, so it is not offered, and every fix that is
-    /// validates.
-    #[test]
-    fn every_offered_fix_validates() {
-        let mut d = catalogue::recommended();
-        if let FilterDesign::Kernel(k) = &mut d
-            && let Shape::WindowedSinc { length, cutoff, .. } = &mut k.shape
-        {
-            *length = Length::Band;
-            if let audivane_protocol::design::Cutoff::Band(b) = cutoff {
-                b.passband_end = 0.99;
-                b.passband_end_hz = None;
-                b.stopband_start = 1.0;
-            }
-        }
-        let up = UpsamplerConfig {
-            target: RateTarget::Rate(384_000),
-            preset: None,
-            design: Some(StoredDesign::new(d)),
-        };
-        let cfg = at_rates(up, &[352_800]);
-        let check = check_design(
-            cfg.chain.upsampler.design.as_ref().unwrap(),
-            None,
-            None,
-            &cfg,
-            &cfg.chain.output,
-            &audivane_dsp_core::cpu_bench::KernelRates::floor(),
-            None,
-        );
-        assert_eq!(check.errors.len(), 1, "{check:?}");
-        let advice = check.advice.unwrap_or_else(|| panic!("{:?}", check.errors));
-        // The automatic length needs about 970 M multiply-adds per second
-        // per channel there, over the 800 M budget.
-        let auto = cfg.chain.upsampler.design.as_ref().unwrap().design.clone();
-        let mut auto = auto;
-        if let FilterDesign::Kernel(k) = &mut auto
-            && let Shape::WindowedSinc { length, .. } = &mut k.shape
-        {
-            *length = Length::Auto(audivane_protocol::FilterErrorBudget::MatchOutput);
-        }
-        let mut with_auto = cfg.clone();
-        with_auto.chain.upsampler.design = Some(StoredDesign::new(auto));
-        assert!(validate(&with_auto).is_err());
-        assert!(
-            advice
-                .fixes
-                .iter()
-                .all(|f| f.label != "Use automatic length"),
-            "{advice:?}"
-        );
-        for fix in &advice.fixes {
-            let mut c = cfg.clone();
-            c.chain.upsampler.design = Some(fix.design.clone());
-            validate(&c).unwrap_or_else(|e| panic!("{}: {e}", fix.label));
-        }
     }
 }

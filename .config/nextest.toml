@@ -1,9 +1,0 @@
-# Tests that measure wall-clock timing fail when the machine is busy (other
-# builds, parallel test binaries). Run them one at a time and retry them.
-[test-groups]
-timing = { max-threads = 1 }
-
-[[profile.default.overrides]]
-filter = 'test(the_estimate_does_not_under_estimate_measured_callbacks) | test(measures_plausible_rates_quickly) | test(synchronized_io_stress_poison_and_free_under_preemption) | test(synchronized_io_quiesces_before_freeing_old_mapping) | test(spectrum_subscription_yields_events) | test(a_registered_helper_is_demoted_when_another_thread_takes_the_signal)'
-test-group = 'timing'
-retries = 2

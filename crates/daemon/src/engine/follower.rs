@@ -3544,6 +3544,16 @@ pub fn follow_offset_db(f: &FollowerConfig, master: &EngineConfig) -> Option<f64
     })
 }
 
+/// The follower's part of a loaded room calibration that is switched off
+/// (`bundle_enable`): it is muted however its own `enabled` is set (that
+/// field is kept: turning the calibration back on restores it).
+pub fn muted_by_calibration(master: &EngineConfig, device: &str) -> bool {
+    master
+        .calibration
+        .as_ref()
+        .is_some_and(|c| !c.enabled && c.followers.iter().any(|p| p.device == device))
+}
+
 /// The level follower `f` plays at while the master's level is
 /// `master_db` (the master's effective, played volume, as the follower
 /// tracks it): its `volume_db`, moved by the master's change since
@@ -4507,7 +4517,7 @@ impl FollowerHost {
                     c.retrim(f.trim_ms);
                 }
                 c.set_level(f.volume_db, follow_offset_db(f, master));
-                c.set_enabled(f.enabled);
+                c.set_enabled(f.enabled && !muted_by_calibration(master, &f.device));
                 if c.set_period_ms(f.period_ms) {
                     log::info!("follower {}: its period changed, it reopens", f.device);
                     c.request_reopen();
@@ -4526,7 +4536,7 @@ impl FollowerHost {
                     log::info!("followers: {} added", f.device);
                     self.failed.remove(&f.device);
                     if let Some(c) = self.controls(&f.device) {
-                        c.set_enabled(f.enabled);
+                        c.set_enabled(f.enabled && !muted_by_calibration(master, &f.device));
                     }
                 }
                 Err(e) => {

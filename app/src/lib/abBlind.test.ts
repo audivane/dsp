@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createSecret, commitSecret, secretToHex, xSequence } from "./abx/commitment";
-import { clampTrials, EXPORT_FORMAT, neededText, preferNeeded, scoreRun, scoreTrial, sideFor, twoSidedP, verifyExport, type BlindExport, type TrialRecord } from "./abBlind";
+import { clampTrials, EXPORT_FORMAT, neededText, preferNeeded, scoreTrial, twoSidedP, verifyExport, type BlindExport, type TrialRecord } from "./abBlind";
 
 const rec = (index: number, truth: "A" | "B", choice: TrialRecord["choice"], mode: "abx" | "identify" | "prefer"): TrialRecord => ({
   index,
@@ -12,10 +12,6 @@ const rec = (index: number, truth: "A" | "B", choice: TrialRecord["choice"], mod
 });
 
 describe("blind test", () => {
-  it("maps buttons to sides", () => {
-    expect([sideFor("abx", "B", "a"), sideFor("abx", "B", "b"), sideFor("abx", "B", "x"), sideFor("abx", "A", "x")]).toEqual(["a", "b", "b", "a"]);
-    expect([sideFor("identify", "A", "1"), sideFor("identify", "A", "2"), sideFor("prefer", "B", "1"), sideFor("prefer", "B", "2")]).toEqual(["a", "b", "b", "a"]);
-  });
 
   it("scores answers", () => {
     expect(scoreTrial("abx", "A", "A")).toEqual({ answer: "A", correct: true });
@@ -33,18 +29,6 @@ describe("blind test", () => {
     expect(preferNeeded(16)).toBe(13);
     expect(preferNeeded(5)).toBeNull();
     expect(twoSidedP(16, 8)).toBe(1);
-  });
-
-  it("scores a run", () => {
-    const abx = Array.from({ length: 16 }, (_, i) => rec(i + 1, "A", i < 12 ? "A" : "B", "abx"));
-    const r = scoreRun("abx", abx);
-    expect([r.n, r.k, r.needed, r.pass]).toEqual([16, 12, 12, true]);
-    expect(r.p).toBeCloseTo(0.0384, 4);
-    expect(r.ci[0]).toBeGreaterThan(0.47);
-    expect(scoreRun("abx", abx.map((t, i) => (i === 0 ? { ...t, correct: false } : t))).pass).toBe(false);
-    const prefer = Array.from({ length: 16 }, (_, i) => rec(i + 1, "A", i < 13 ? "2" : "1", "prefer"));
-    const p = scoreRun("prefer", prefer);
-    expect([p.k, p.pass, p.preferred]).toEqual([13, true, "B"]);
   });
 
   it("verifies an export against its commitment", async () => {

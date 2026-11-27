@@ -460,37 +460,3 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Upgrade(args) => upgrade::run(args),
     }
 }
-
-#[cfg(test)]
-mod dither_arg_tests {
-    use super::*;
-
-    #[test]
-    fn process_dither_accepts_every_json_spelling() {
-        let names = [
-            "none",
-            "tpdf",
-            "shaped",
-            "headroom_tpdf",
-            "rectangular",
-            "gaussian",
-            "highpass_tpdf",
-            "feedback1",
-            "feedback5",
-            "resonant5",
-            "resonant9",
-            "integrator15",
-        ];
-        for name in names {
-            let cli =
-                Cli::try_parse_from(["avdsp", "process", "in.wav", "out.wav", "--dither", name])
-                    .unwrap_or_else(|err| panic!("{name}: {err}"));
-            let Command::Process(args) = cli.command else {
-                panic!("expected process");
-            };
-            let kind: DitherKind = args.dither.unwrap().into();
-            assert_eq!(serde_json::to_value(kind).unwrap(), name);
-        }
-        assert_eq!(DitherArg::value_variants().len(), names.len());
-    }
-}

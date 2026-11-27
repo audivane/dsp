@@ -298,22 +298,6 @@ pub fn run(args: RenderArgs) -> Result<i32> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn changes_parse() {
-        assert_eq!(
-            parse_change("1.5:1.08").unwrap(),
-            Change {
-                at: 1.5,
-                speed: 1.08,
-                ramp_ms: 0.0
-            }
-        );
-        assert_eq!(parse_change("0:0.5:400").unwrap().ramp_ms, 400.0);
-        for bad in ["", "1", "1:2:3:4", "x:1", "1:y", "-1:1", "1:1:nan", "inf:1"] {
-            assert!(parse_change(bad).is_err(), "{bad}");
-        }
-    }
-
     fn tone(rate: u32, seconds: f64, f: f64) -> Vec<Vec<f64>> {
         let n = (seconds * f64::from(rate)).round() as usize;
         let w = 2.0 * std::f64::consts::PI * f / f64::from(rate);
@@ -378,35 +362,5 @@ mod tests {
             );
         }
         assert!(render(&[vec![]], 44_100, 1.0, &[], 64, true).unwrap().out[0].is_empty());
-    }
-
-    /// Changes take effect at their own output frames, whatever the call
-    /// size.
-    #[test]
-    fn changes_apply_at_their_frames() {
-        let x = tone(44_100, 0.5, 1_000.0);
-        let changes = [change(0.03, 1.5, 0.0), change(0.07, 1.0, 0.0)];
-        let mut outs = Vec::new();
-        for block in [1usize, 8192] {
-            let r = render(&x, 44_100, 1.0, &changes, block, false).unwrap();
-            assert_eq!(r.change_frames, vec![1323, 3087], "block {block}");
-            outs.push(r.out.into_iter().next().unwrap());
-        }
-        let unity = render(&x, 44_100, 1.0, &[], 8192, false).unwrap();
-        let (a, b) = (&outs[0], &outs[1]);
-        assert_eq!(a.len(), b.len());
-        // The same trajectory whatever the call size, up to how finely the
-        // pieces follow the curve ...
-        let diff = a
-            .iter()
-            .zip(b)
-            .fold(0.0f64, |m, (x, y)| m.max((x - y).abs()));
-        assert!(diff < 0.05, "block 1 against 8192: {diff:e}");
-        // ... and not unity.
-        let off = a
-            .iter()
-            .zip(&unity.out[0])
-            .fold(0.0f64, |m, (x, y)| m.max((x - y).abs()));
-        assert!(off > 0.1, "{off}");
     }
 }

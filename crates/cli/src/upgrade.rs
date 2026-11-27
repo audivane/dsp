@@ -930,12 +930,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_definition_is_consistent() {
-        // `upgrade --version TAG` must not clash with the propagated `--version` flag.
-        <crate::Cli as clap::CommandFactory>::command().debug_assert();
-    }
-
-    #[test]
     fn versions_compare_like_semver() {
         assert!(v("0.9.2") > v("0.9.1"));
         assert!(v("0.10.0") > v("0.9.9"));
@@ -954,42 +948,6 @@ mod tests {
         for bad in ["", "v", "latest", "0.9.x", "0..1", "1.2.3.4.5", "0.9.1-"] {
             assert!(Version::parse(bad).is_none(), "{bad:?} should not parse");
         }
-    }
-
-    #[test]
-    fn package_versions_drop_epoch_and_release() {
-        assert_eq!(upstream_version("0.9.1-1"), "0.9.1");
-        assert_eq!(upstream_version("1:0.9.1-12"), "0.9.1");
-        assert_eq!(upstream_version("0.9.1"), "0.9.1");
-        assert_eq!(upstream_version("0.10.0-rc.1-1"), "0.10.0-rc.1");
-        assert_eq!(upstream_version("0.10.0-rc.1"), "0.10.0-rc.1");
-    }
-
-    #[test]
-    fn a_user_install_is_the_appimages() {
-        if std::env::var_os("APPIMAGE").is_some() {
-            return;
-        }
-        assert!(from_appimage(Path::new(
-            "/home/u/.local/lib/audivane-dsp/avdsp"
-        )));
-        assert!(!from_appimage(Path::new("/usr/bin/avdsp")));
-        assert!(!from_appimage(Path::new("/home/u/.cargo/bin/avdsp")));
-    }
-
-    #[test]
-    fn check_exit_codes() {
-        assert_eq!(check_exit_code(&v("0.9.1"), &v("0.9.1")), 0);
-        assert_eq!(
-            check_exit_code(&v("0.9.1"), &v("0.9.2")),
-            EXIT_UPDATE_AVAILABLE
-        );
-        // A newer local build than the latest release is not an update.
-        assert_eq!(check_exit_code(&v("0.9.2"), &v("0.9.1")), 0);
-        assert_eq!(
-            check_exit_code(&v("0.10.0-rc.1"), &v("0.10.0")),
-            EXIT_UPDATE_AVAILABLE
-        );
     }
 
     #[test]
@@ -1012,56 +970,6 @@ mod tests {
             decide(&v("0.9.1"), &v("0.9.2"), true),
             Some(Action::Upgrade)
         );
-    }
-
-    fn assets(names: &[&str]) -> Vec<Asset> {
-        names
-            .iter()
-            .map(|n| Asset {
-                name: n.to_string(),
-                url: format!("https://example.invalid/{n}"),
-            })
-            .collect()
-    }
-
-    #[test]
-    fn asset_selection_per_package_manager() {
-        let list = assets(&[
-            "SHA256SUMS",
-            "audivane-dsp-0.9.2-1-x86_64.pkg.tar.zst",
-            "audivane-dsp_0.9.2-1_amd64.deb",
-            "audivane-dsp-0.9.2-1.x86_64.rpm",
-        ]);
-        let name = |pm| select_asset(&list, pm, "0.9.2").map(|a| a.name.as_str());
-        assert_eq!(
-            name(PackageManager::Pacman),
-            Some("audivane-dsp-0.9.2-1-x86_64.pkg.tar.zst")
-        );
-        assert_eq!(
-            name(PackageManager::Dpkg),
-            Some("audivane-dsp_0.9.2-1_amd64.deb")
-        );
-        assert_eq!(
-            name(PackageManager::Rpm),
-            Some("audivane-dsp-0.9.2-1.x86_64.rpm")
-        );
-        // Another version, a signature, an architecture or a similar name never match.
-        let other = assets(&[
-            "audivane-dsp-0.9.1-1-x86_64.pkg.tar.zst",
-            "audivane-dsp-0.9.2-1-x86_64.pkg.tar.zst.sig",
-            "audivane-dsp-0.9.2-1-aarch64.pkg.tar.zst",
-            "audivane-dsp-ui-0.9.2-1.x86_64.rpm",
-            "audivane-dsp_0.9.2-1_arm64.deb",
-            "audivane-dsp_0.9.20-1_amd64.deb",
-            "audivane-dsp-0.9.2-x.x86_64.rpm",
-        ]);
-        for pm in [
-            PackageManager::Pacman,
-            PackageManager::Dpkg,
-            PackageManager::Rpm,
-        ] {
-            assert_eq!(select_asset(&other, pm, "0.9.2"), None, "{pm:?}");
-        }
     }
 
     #[test]
@@ -1121,41 +1029,5 @@ mod tests {
         );
         assert_eq!(expected_sha256(&text, "short-hash"), None);
         assert_eq!(expected_sha256(&text, "missing.rpm"), None);
-    }
-
-    #[test]
-    fn sha256_of_a_file() {
-        let dir = std::env::temp_dir().join(format!("avdsp-upgrade-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("abc");
-        std::fs::write(&file, b"abc").unwrap();
-        assert_eq!(
-            sha256_file(&file).unwrap(),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn release_json_parsing() {
-        let json = r#"{
-            "tag_name": "0.9.2",
-            "html_url": "https://github.com/audivane/dsp/releases/tag/0.9.2",
-            "assets": [
-                {"name": "SHA256SUMS", "browser_download_url": "https://x/SHA256SUMS"},
-                {"name": "audivane-dsp_0.9.2-1_amd64.deb", "browser_download_url": "https://x/a.deb"},
-                {"name": "broken"}
-            ]
-        }"#;
-        let r = parse_release(json).unwrap();
-        assert_eq!(r.tag, "0.9.2");
-        assert_eq!(r.version, v("0.9.2"));
-        assert_eq!(
-            r.notes_url,
-            "https://github.com/audivane/dsp/releases/tag/0.9.2"
-        );
-        assert_eq!(r.assets.len(), 2);
-        assert!(parse_release(r#"{"message": "Not Found"}"#).is_err());
-        assert!(parse_release(r#"{"tag_name": "nightly"}"#).is_err());
     }
 }

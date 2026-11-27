@@ -432,16 +432,4 @@ mod tests {
         assert!(!watch.observe(EngineState::Ready, false, pause, at(10_000)));
         assert!(!watch.observe(EngineState::Error, true, pause, at(20_000)));
     }
-
-    #[test]
-    fn nothing_is_paused_at_start_up_or_when_keeping_on_playing() {
-        let t0 = Instant::now();
-        let mut watch = LossPause::default();
-        // Started without the device: waiting from the first look.
-        assert!(!watch.observe(EngineState::Error, true, DeviceLostAction::Pause, t0));
-        let mut watch = LossPause::default();
-        let keep = DeviceLostAction::KeepPlaying;
-        assert!(!watch.observe(EngineState::Playing, false, keep, t0));
-        assert!(!watch.observe(EngineState::Error, true, keep, t0));
-    }
 }

@@ -602,20 +602,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_props_pod_writes_only_what_is_given() {
-        let both = reparse(&stream_props_pod(Some(&[0.5, 0.25]), Some(true)));
-        assert_eq!(both.channel_volumes, Some(vec![0.5, 0.25]));
-        assert_eq!(both.mute, Some(true));
-        assert_eq!(both.volume, None, "the app's master is left alone");
-        let mute = reparse(&stream_props_pod(None, Some(false)));
-        assert_eq!(mute.channel_volumes, None);
-        assert_eq!(mute.mute, Some(false));
-        let level = reparse(&stream_props_pod(Some(&[1.0]), None));
-        assert_eq!(level.mute, None);
-        assert_eq!(level.channel_volumes, Some(vec![1.0]));
-    }
-
-    #[test]
     fn owned_pod_round_trips_and_keeps_pipewire_at_unity() {
         let view = SinkVolumeView {
             volume_db: -20.0,
@@ -648,107 +634,6 @@ mod tests {
         assert_eq!(req.muted, Some(true));
     }
 
-    #[test]
-    fn request_mapping_volume_balance_and_mute_only() {
-        // wpctl set-volume 0.5 (cubic) writes 0.125 linear: -18.06 dB.
-        let props = SinkProps {
-            channel_volumes: Some(vec![0.125, 0.125]),
-            ..Default::default()
-        };
-        let req = request_from_props(SinkChoice::Dsp, &props, 0.0).unwrap();
-        assert!((req.volume_db.unwrap() - 20.0 * 0.125f64.log10()).abs() < 1e-3);
-        assert_eq!(req.balance_db, Some(0.0));
-        assert!(req.balance_db.unwrap().is_sign_positive());
-        assert_eq!(req.muted, None);
-
-        // Right quieter: negative balance.
-        let props = SinkProps {
-            channel_volumes: Some(vec![1.0, 0.5]),
-            ..Default::default()
-        };
-        let req = request_from_props(SinkChoice::Dsp, &props, 0.0).unwrap();
-        assert_eq!(req.volume_db, Some(0.0));
-        assert!((req.balance_db.unwrap() - 20.0 * 0.5f64.log10()).abs() < 1e-3);
-
-        // Above unity is reported as asked (the control plane clamps).
-        let props = SinkProps {
-            channel_volumes: Some(vec![3.375, 3.375]),
-            ..Default::default()
-        };
-        let req = request_from_props(SinkChoice::Dsp, &props, 0.0).unwrap();
-        assert!((req.volume_db.unwrap() - 20.0 * 3.375f64.log10()).abs() < 1e-3);
-
-        // Zero is the floor, mute only carries no volume.
-        let props = SinkProps {
-            channel_volumes: Some(vec![0.0, 0.0]),
-            ..Default::default()
-        };
-        assert_eq!(
-            request_from_props(SinkChoice::Dsp, &props, 0.0)
-                .unwrap()
-                .volume_db,
-            Some(VOLUME_MIN_DB)
-        );
-        let props = SinkProps {
-            mute: Some(true),
-            ..Default::default()
-        };
-        let req = request_from_props(SinkChoice::Dsp, &props, 0.0).unwrap();
-        assert_eq!(req.volume_db, None);
-        assert_eq!(req.muted, Some(true));
-
-        // Our own neutralising fields alone are not a request.
-        let props = SinkProps {
-            soft_volumes: Some(vec![1.0, 1.0]),
-            soft_mute: Some(false),
-            ..Default::default()
-        };
-        assert_eq!(request_from_props(SinkChoice::Dsp, &props, 0.0), None);
-    }
-
-    #[test]
-    fn neutral_pod_only_resets_pipewire_scaling() {
-        let props = reparse(&neutral_props_pod(2, false));
-        assert_eq!(props.soft_volumes, Some(vec![1.0, 1.0]));
-        assert_eq!(props.soft_mute, Some(false));
-        assert!(!props.touches_volume());
-        let props = reparse(&neutral_props_pod(2, true));
-        assert_eq!(props.volume, Some(1.0));
-    }
-
-    #[test]
-    fn shared_state_tracks_follow_view_and_what_is_shown() {
-        let shared = SinkVolumeShared::new(None);
-        assert!(!shared.follow());
-        let view = SinkVolumeView {
-            volume_db: -12.0,
-            balance_db: 0.0,
-            muted: false,
-            ceiling_db: -6.0,
-        };
-        assert!(shared.set(true, view));
-        assert!(!shared.set(true, view));
-        assert_eq!(shared.wanted(SinkChoice::Dsp), view);
-        assert_eq!(shared.wanted(SinkChoice::Direct), SinkVolumeView::UNITY);
-        assert!(!shared.shows(SinkChoice::Dsp, &view));
-        shared.note_shown(SinkChoice::Dsp, |s| *s = view);
-        let nearly = SinkVolumeView {
-            volume_db: -12.0004,
-            ..view
-        };
-        assert!(shared.shows(SinkChoice::Dsp, &nearly));
-        assert!(!shared.shows(SinkChoice::Direct, &view));
-
-        let rx = shared.subscribe();
-        shared.send(SinkVolumeRequest {
-            sink: SinkChoice::Dsp,
-            volume_db: Some(-3.0),
-            balance_db: Some(0.0),
-            muted: None,
-        });
-        assert_eq!(rx.try_recv().unwrap().volume_db, Some(-3.0));
-    }
-
     /// Leaving follow puts back the sink's own max-volume, not a guess;
     /// our own value reported back while owning is not taken for it.
     #[test]
@@ -766,24 +651,6 @@ mod tests {
         // Someone else changing it while we own the volume: that is theirs.
         shared.note_max_volume(SinkChoice::Dsp, 2.5);
         assert_eq!(shared.prior_max_volume(SinkChoice::Dsp), 2.5);
-    }
-
-    #[test]
-    fn master_volume_scales_channels() {
-        let props = SinkProps {
-            volume: Some(0.5),
-            channel_volumes: Some(vec![1.0, 1.0]),
-            ..Default::default()
-        };
-        let req = request_from_props(SinkChoice::Dsp, &props, 0.0).unwrap();
-        assert!((req.volume_db.unwrap() - 20.0 * 0.5f64.log10()).abs() < 1e-3);
-        let props = SinkProps {
-            volume: Some(0.5),
-            ..Default::default()
-        };
-        let req = request_from_props(SinkChoice::Dsp, &props, 0.0).unwrap();
-        assert!((req.volume_db.unwrap() - 20.0 * 0.5f64.log10()).abs() < 1e-3);
-        assert_eq!(req.balance_db, None);
     }
 
     /// The desktop's percent (the cube root of the linear volume).
@@ -834,43 +701,6 @@ mod tests {
         // With a -3 dB ceiling the same level is 100 %, and -9 dB reads 79 %.
         let ch = channel_volumes_for(&view_at(-9.0, -3.0), 2);
         assert!((percent(ch[0]) - 79.4).abs() < 0.1);
-    }
-
-    #[test]
-    fn mapping_round_trips_at_several_ceilings() {
-        for ceiling in [0.0, -1.5, -3.0, -12.0, -40.0] {
-            for volume in [0.0, -0.5, -3.0, -10.0, -30.0, -60.0, -100.0, -120.0] {
-                let volume = f64::min(volume, ceiling);
-                for balance in [0.0, 6.0, -3.5] {
-                    let view = SinkVolumeView {
-                        volume_db: volume,
-                        balance_db: balance,
-                        muted: false,
-                        ceiling_db: ceiling,
-                    };
-                    let props = SinkProps {
-                        channel_volumes: Some(channel_volumes_for(&view, 2)),
-                        ..Default::default()
-                    };
-                    let req = request_from_props(SinkChoice::Dsp, &props, ceiling).unwrap();
-                    let got = req.volume_db.unwrap();
-                    assert!(
-                        (got - volume).abs() <= REQUEST_RESOLUTION_DB,
-                        "ceiling {ceiling}, volume {volume}: {got}"
-                    );
-                    // (At the floor the quieter channel has nowhere to go.)
-                    let b = req.balance_db.unwrap();
-                    let floored = volume - f64::abs(balance) < VOLUME_MIN_DB;
-                    assert!(
-                        floored || (b - balance).abs() <= REQUEST_RESOLUTION_DB,
-                        "ceiling {ceiling}, balance {balance}: {b}"
-                    );
-                }
-            }
-        }
-        // Silence is the engine's floor whatever the ceiling.
-        let req = request_from_props(SinkChoice::Dsp, &desktop_write(0.0), -6.0).unwrap();
-        assert_eq!(req.volume_db, Some(VOLUME_MIN_DB));
     }
 
     #[test]

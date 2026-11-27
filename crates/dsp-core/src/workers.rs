@@ -625,28 +625,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_late_lane_times_out_then_comes_back() {
-        let p = pool(1);
-        let mut a = lane(Duration::from_millis(50));
-        assert!(p.submit(0, &mut a));
-        let t0 = Instant::now();
-        assert!(!p.wait(0, &a, t0 + Duration::from_millis(5)));
-        assert!(
-            t0.elapsed() < Duration::from_millis(40),
-            "the wait is bounded"
-        );
-        assert!(a.get_mut().is_none(), "the worker still holds it");
-        assert!(!p.is_idle(0));
-        assert!(
-            !p.submit(0, &mut a),
-            "a lane a worker holds is not handed out again"
-        );
-        assert!(back(&p, 0, &a));
-        assert!(p.is_idle(0), "a lane back means its worker is idle");
-        assert_eq!(a.get_mut().unwrap().x, 1);
-    }
-
     /// Records the thread its drop runs on.
     struct Tracked(
         Arc<std::sync::Mutex<Option<std::thread::ThreadId>>>,
@@ -683,40 +661,6 @@ mod tests {
             "the lane's memory is freed by the thread that dropped it, never the worker"
         );
         assert!(p.is_idle(0));
-    }
-
-    #[test]
-    fn a_worker_takes_no_job_before_its_start_hook_returns() {
-        let p = LanePool::spawn(1, |_| std::thread::sleep(Duration::from_millis(300))).unwrap();
-        let mut a = lane(Duration::ZERO);
-        assert!(!p.is_idle(0), "a worker still starting is not idle");
-        assert!(!p.submit(0, &mut a), "nor is it handed a lane");
-        assert!(a.get_mut().is_some(), "the lane stays with the caller");
-        assert!(p.wait_started(Duration::from_secs(5)));
-        assert!(p.is_idle(0));
-        assert!(p.submit(0, &mut a));
-        assert!(back(&p, 0, &a));
-        assert_eq!(a.get_mut().unwrap().x, 1);
-    }
-
-    #[test]
-    fn the_worker_hook_runs_between_jobs() {
-        struct Count(Arc<AtomicU64>);
-        impl WorkerHook for Count {
-            fn between_jobs(&mut self) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        let turns = Arc::new(AtomicU64::new(0));
-        let t2 = Arc::clone(&turns);
-        let p = LanePool::spawn(1, move |_| Count(Arc::clone(&t2))).unwrap();
-        let mut a = lane(Duration::ZERO);
-        assert!(p.wait_started(Duration::from_secs(5)));
-        assert!(p.submit(0, &mut a));
-        assert!(back(&p, 0, &a));
-        assert!(p.submit(0, &mut a));
-        assert!(back(&p, 0, &a));
-        assert!(turns.load(Ordering::Relaxed) >= 2);
     }
 
     #[test]

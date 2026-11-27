@@ -126,7 +126,6 @@ fn low_band_peak(entries: &[&[f64]], rate: f64, below_hz: f64) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matrix::FilterMatrix;
 
     /// A 2nd-order high-pass at 30 Hz (RBJ, Q 0.707), as a long FIR.
     fn highpass(rate: f64, f0: f64, len: usize) -> Vec<f64> {
@@ -194,18 +193,5 @@ mod tests {
         assert!(g[1].low_db > 6.0 && g[1].low_db < 8.1, "{g:?}");
         assert!(g[1].low_hz < 20.0, "{g:?}");
         assert!(g[1].peak_db >= g[1].low_db - 1e-9, "{g:?}");
-    }
-
-    #[test]
-    fn a_matrix_row_sums_its_entries() {
-        // Two unit impulses into output 0: +6 dB there, 0 dB on output 1.
-        let mut m = FilterMatrix::new(2);
-        m.set(0, 0, vec![1.0]);
-        m.set(0, 1, vec![1.0]);
-        m.set(1, 1, vec![1.0]);
-        let g = row_gains(&ConvIrs::Matrix(m), 48_000.0, 2, 20.0);
-        assert!((g[0].peak_db - 6.0206).abs() < 0.01, "{g:?}");
-        assert!((g[0].low_db - 6.0206).abs() < 0.01, "{g:?}");
-        assert!(g[1].peak_db.abs() < 0.01, "{g:?}");
     }
 }

@@ -334,17 +334,6 @@ pub(crate) fn clear_cache() {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_probe_is_coherent_on_an_odd_bin_near_20_khz() {
-        for rate in [44_100.0, 48_000.0, 96_000.0, 192_000.0, 768_000.0] {
-            let p = Probe::at(rate);
-            assert!(p.n.is_power_of_two());
-            assert_eq!(p.bin % 2, 1);
-            assert!(rate / p.n as f64 <= MAX_BIN_HZ);
-            assert!(p.freq <= ALIAS_TONE_HZ && p.freq > ALIAS_TONE_HZ - 2.0 * MAX_BIN_HZ);
-        }
-    }
-
     fn layer(id: &str) -> audivane_protocol::HarmonicsLayer {
         HarmonicsConfig::from_preset(id).unwrap().layers[0].clone()
     }

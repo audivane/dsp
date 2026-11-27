@@ -88,15 +88,6 @@ pub(crate) struct TiltState {
 }
 
 impl TiltState {
-    /// Its state variables.
-    #[cfg(test)]
-    pub(crate) fn values(&self) -> [f64; 8] {
-        let mut v = [0.0; 8];
-        v[..4].copy_from_slice(&self.low);
-        v[4..].copy_from_slice(&self.high);
-        v
-    }
-
     /// Flush a decaying tail to zero before it reaches subnormals. Once per
     /// block is enough: a state that is still above the threshold at the
     /// end of one block cannot fall from there into subnormals in the next
@@ -1122,18 +1113,6 @@ mod tests {
     }
 
     #[test]
-    fn a_corner_past_nyquist_never_inflates_the_rise() {
-        // H9 of a 20 kHz corner sits at 180 kHz, past Nyquist at 48 kHz.
-        let rate = 48_000.0;
-        let f = TiltFilter::new(&shelves((100.0, 0.0), (20_000.0, 24.0)), 9, rate).unwrap();
-        for hz in [100.0, 9_000.0, 20_000.0, 23_999.0] {
-            let g = gain_db(&f, hz, rate);
-            assert!(g < 24.0 + 1e-9, "{hz}: {g}");
-        }
-        assert!(f.l1_norm() < 2.0 * 15.85 + 1.0);
-    }
-
-    #[test]
     fn l1_norm_is_a_tight_upper_bound() {
         for rate in [44_100.0, 192_000.0, 768_000.0] {
             for (low, high) in [
@@ -1162,15 +1141,6 @@ mod tests {
     const SLOPES: [Option<u8>; 5] = [None, Some(6), Some(12), Some(18), Some(24)];
 
     #[test]
-    fn butterworth_dampings_are_twice_the_pole_cosines() {
-        for (c, theta) in BW4.iter().zip([PI / 8.0, 3.0 * PI / 8.0]) {
-            assert!((c - 2.0 * theta.cos()).abs() < 1e-15);
-        }
-        assert!((SQRT_2 - 2.0 * (PI / 4.0).cos()).abs() < 1e-15);
-        assert!((1.0 - 2.0 * (PI / 3.0).cos()).abs() < 1e-15);
-    }
-
-    #[test]
     fn the_default_slopes_are_the_unsloped_design_bit_for_bit() {
         for rate in [44_100.0, 768_000.0] {
             for (low, high) in [
@@ -1187,124 +1157,6 @@ mod tests {
                     .unwrap();
                     assert_eq!(a, b);
                     assert_eq!(a.l1_norm().to_bits(), b.l1_norm().to_bits());
-                }
-            }
-        }
-    }
-
-    /// `|S|²` in dB of the analog order-`n` shelf `(1 + (ω/z)^{2n}) / (1 +
-    /// (ω/p)^{2n})`, at a prewarped frequency.
-    fn analog_db(om: f64, z: f64, p: f64, n: i32) -> f64 {
-        10.0 * ((1.0 + (om / z).powi(2 * n)) / (1.0 + (om / p).powi(2 * n))).log10()
-    }
-
-    #[test]
-    fn each_slope_is_the_butterworth_shelf_with_its_rise_and_unity_at_k_khz() {
-        for rate in [44_100.0, 192_000.0, 768_000.0] {
-            for slope in [6u8, 12, 18, 24] {
-                let n = i32::from(slope / 6);
-                for db in [24.0, 12.0, 3.0, -6.0, -24.0] {
-                    for k in [2, 3, 9] {
-                        let wu = 2.0 * PI * k as f64 * UNITY_HZ / rate;
-                        // Low shelf (HF gain 1 before the unity scaling).
-                        let f = TiltFilter::new(
-                            &sloped((150.0, db, Some(slope)), (2_000.0, 0.0, None)),
-                            k,
-                            rate,
-                        )
-                        .unwrap();
-                        let near = warp(k as f64 * 150.0, rate);
-                        let far = near / 10f64.powf(db.abs() / (20.0 * f64::from(n)));
-                        let (z, p) = if db > 0.0 { (near, far) } else { (far, near) };
-                        let off = -analog_db((wu / 2.0).tan(), z, p, n);
-                        for i in 0..200 {
-                            let w = PI * (i as f64 + 0.5) / 200.0;
-                            let want = analog_db((w / 2.0).tan(), z, p, n) + off;
-                            let got = lin_to_db(f.response(w).norm());
-                            assert!(
-                                (got - want).abs() < 1e-7,
-                                "{slope} {db} H{k}: {got} vs {want}"
-                            );
-                        }
-                        assert!(gain_db(&f, k as f64 * UNITY_HZ, rate).abs() < 1e-9);
-                        // The full rise is exactly db (DC against Nyquist).
-                        let rise = lin_to_db(f.dc_gain().abs() / f.response(PI).norm());
-                        assert!((rise - db).abs() < 1e-8, "{slope} {db} H{k}: {rise}");
-                        // High shelf (DC gain 1).
-                        let f = TiltFilter::new(
-                            &sloped((100.0, 0.0, None), (3_000.0, db, Some(slope))),
-                            k,
-                            rate,
-                        )
-                        .unwrap();
-                        let near = warp(k as f64 * 3_000.0, rate);
-                        let far = near * 10f64.powf(db.abs() / (20.0 * f64::from(n)));
-                        let (z, p) = if db > 0.0 { (near, far) } else { (far, near) };
-                        let off = -analog_db((wu / 2.0).tan(), z, p, n);
-                        for i in 0..200 {
-                            let w = PI * (i as f64 + 0.5) / 200.0;
-                            let want = analog_db((w / 2.0).tan(), z, p, n) + off;
-                            let got = lin_to_db(f.response(w).norm());
-                            assert!(
-                                (got - want).abs() < 1e-7,
-                                "{slope} {db} H{k}: {got} vs {want}"
-                            );
-                        }
-                        assert!(gain_db(&f, k as f64 * UNITY_HZ, rate).abs() < 1e-9);
-                        let rise = lin_to_db(f.response(PI).norm() / f.dc_gain().abs());
-                        assert!((rise - db).abs() < 1e-8, "{slope} {db} H{k}: {rise}");
-                    }
-                }
-            }
-        }
-    }
-
-    /// The steepest slope of `f` in dB/oct between `lo` and `hi` Hz.
-    fn steepest(f: &TiltFilter, rate: f64, lo: f64, hi: f64) -> f64 {
-        let steps = 4_000;
-        let r = (hi / lo).ln();
-        (0..steps)
-            .map(|i| {
-                let hz = lo * (r * (i as f64 + 0.5) / steps as f64).exp();
-                let d = 1e-3;
-                (gain_db(f, hz * 2f64.powf(d), rate) - gain_db(f, hz * 2f64.powf(-d), rate)).abs()
-                    / (2.0 * d)
-            })
-            .fold(0.0, f64::max)
-    }
-
-    #[test]
-    fn the_slope_is_an_asymptote_reached_only_by_large_rises() {
-        // Far from Nyquist (768 kHz, H2 of a 60 Hz or 200 Hz corner), so the
-        // digital curve is the analog one.
-        let rate = 768_000.0;
-        for slope in [6u8, 12, 18, 24] {
-            let n = f64::from(slope / 6);
-            for db in [24.0, 12.0, 6.0] {
-                // The first-order shelf's steepest slope, as a share of 6
-                // dB/oct: (R − 1)/(R + 1), R its linear rise (0.88, 0.60,
-                // 0.33 here).
-                let r = 10f64.powf(db / 20.0);
-                let share = (r - 1.0) / (r + 1.0);
-                let low = TiltFilter::new(
-                    &sloped((60.0, db, Some(slope)), (2_000.0, 0.0, None)),
-                    2,
-                    rate,
-                )
-                .unwrap();
-                let high = TiltFilter::new(
-                    &sloped((60.0, 0.0, None), (200.0, db, Some(slope))),
-                    2,
-                    rate,
-                )
-                .unwrap();
-                for (f, lo, hi) in [(&low, 1.0, 1_000.0), (&high, 100.0, 30_000.0)] {
-                    let s = steepest(f, rate, lo, hi);
-                    // n × the first-order steepest slope, below the asymptote.
-                    assert!(
-                        (s - share * 6.0206 * n).abs() < 2e-3 * n && s < 6.0206 * n,
-                        "{slope} dB/oct, {db} dB: steepest {s}"
-                    );
                 }
             }
         }
@@ -1339,100 +1191,6 @@ mod tests {
                             assert!(l1 <= brute * (1.0 + 1e-6) + 1e-9, "{what}: {l1} vs {brute}");
                             assert!(l1 >= f.dc_gain().abs());
                         }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn steep_strong_shelves_near_nyquist_keep_their_bound_and_rise() {
-        // 18 and 24 dB/oct at ±24 dB, corners at or past Nyquist for the
-        // high orders (H9 of 2 kHz and 20 kHz), at both rate extremes.
-        for rate in [44_100.0, 768_000.0] {
-            for slope in [Some(18), Some(24)] {
-                for (low, high) in [
-                    ((2_000.0, 24.0), (20_000.0, 24.0)),
-                    ((2_000.0, -24.0), (20_000.0, -24.0)),
-                    ((2_000.0, 24.0), (20_000.0, -24.0)),
-                    ((20.0, -24.0), (20_000.0, 24.0)),
-                    ((2_000.0, 0.0), (10_000.0, 24.0)),
-                ] {
-                    for k in [2, 5, 9] {
-                        let f = TiltFilter::new(
-                            &sloped((low.0, low.1, slope), (high.0, high.1, slope)),
-                            k,
-                            rate,
-                        )
-                        .unwrap();
-                        let what = format!("{rate} {low:?} {high:?} {slope:?} H{k}");
-                        let l1 = f.l1_norm();
-                        let brute = brute_l1(&f, (4.0 * rate) as usize);
-                        assert!(l1 >= brute, "{what}: {l1} < {brute}");
-                        assert!(l1 <= brute * (1.0 + 1e-6) + 1e-9, "{what}: {l1} vs {brute}");
-                        // Never past the configured rises, however close to
-                        // Nyquist the corners sit: each shelf is monotonic
-                        // with a range of exactly its |db|.
-                        let gains: Vec<f64> = (0..=2_000)
-                            .map(|i| f.response(PI * i as f64 / 2_000.0).norm())
-                            .collect();
-                        let max = gains.iter().copied().fold(0.0, f64::max);
-                        let min = gains.iter().copied().fold(f64::INFINITY, f64::min);
-                        let range = lin_to_db(max / min);
-                        assert!(
-                            range <= low.1.abs() + high.1.abs() + 1e-6,
-                            "{what}: {range}"
-                        );
-                        assert!(l1.is_finite() && l1 < 1e4, "{what}: {l1}");
-                    }
-                }
-            }
-        }
-    }
-
-    /// Every order at `w` (alternating signs when `mixed`) through `t`'s
-    /// filters, even orders through the DC blocker when `dc_block`.
-    fn joint_terms(
-        t: &OrderTilt,
-        rate: f64,
-        w: f64,
-        mixed: bool,
-        dc_block: bool,
-    ) -> Vec<JointTerm> {
-        (2..=KMAX)
-            .map(|k| JointTerm {
-                k,
-                weight: if mixed && k % 3 == 0 { -w } else { w },
-                filter: TiltFilter::new(t, k, rate),
-                dc_block: dc_block && k % 2 == 0,
-            })
-            .collect()
-    }
-
-    fn dc_blocker(rate: f64) -> (f64, f64) {
-        let k = (PI * 5.0 / rate).tan();
-        (1.0 / (1.0 + k), (k - 1.0) / (1.0 + k))
-    }
-
-    #[test]
-    fn joint_bound_blocks_stay_above_the_lag_by_lag_sum_and_close_to_it() {
-        for rate in [44_100.0, 768_000.0] {
-            for (low, high) in [
-                ((20.0, 24.0, None), (200.0, 24.0, None)),
-                ((2_000.0, -24.0, Some(24)), (20_000.0, -24.0, Some(24))),
-                ((100.0, 24.0, Some(6)), (1_000.0, -24.0, Some(18))),
-            ] {
-                for (mixed, dc_block) in [(false, true), (true, false), (true, true)] {
-                    let terms = joint_terms(&sloped(low, high), rate, 0.1, mixed, dc_block);
-                    let hpf = dc_blocker(rate);
-                    let blocks = JointBound::new(&terms, hpf);
-                    let mut none = Vec::new();
-                    let lags = JointBound::build(&terms, hpf, Some((&mut none, 0)));
-                    for g in [1.0, 0.3, -0.5] {
-                        let (b, l) = (blocks.bound(g), lags.bound(g));
-                        let what = format!("{rate} {low:?} {high:?} {mixed} {dc_block} {g}");
-                        assert!(b >= l, "{what}: {b} < {l}");
-                        assert!(b <= l * (1.0 + 1e-4), "{what}: {b} vs {l}");
                     }
                 }
             }

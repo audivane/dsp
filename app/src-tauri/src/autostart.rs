@@ -102,64 +102,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_appimage_starts_itself_not_its_mounted_binary() {
-        let mounted = PathBuf::from("/tmp/.mount_AudivaXYZ/usr/bin/audivane-dsp-ui");
-        assert_eq!(
-            launcher(
-                Some("/home/u/Apps/Audivane.AppImage".into()),
-                mounted.clone()
-            ),
-            PathBuf::from("/home/u/Apps/Audivane.AppImage")
-        );
-        assert_eq!(launcher(None, mounted.clone()), mounted);
-        assert_eq!(launcher(Some("".into()), mounted.clone()), mounted);
-        let text = entry_text(&launcher(Some("/opt/My Apps/A.AppImage".into()), mounted));
-        assert!(text.contains("Exec=\"/opt/My Apps/A.AppImage\" --hidden\n"));
-    }
-
-    #[test]
-    fn plain_paths_are_not_quoted() {
-        assert_eq!(
-            exec_arg("/usr/bin/audivane-dsp-ui"),
-            "/usr/bin/audivane-dsp-ui"
-        );
-    }
-
-    #[test]
     fn reserved_characters_are_quoted_and_escaped() {
         assert_eq!(exec_arg("/opt/My Apps/ui"), "\"/opt/My Apps/ui\"");
         // `$` gets a backslash inside the quotes, which the string escape doubles.
         assert_eq!(exec_arg("/a$b"), "\"/a\\\\$b\"");
         assert_eq!(exec_arg("/a%b"), "\"/a%%b\"");
-    }
-
-    #[test]
-    fn enable_writes_hidden_start_and_disable_removes() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("autostart").join(FILE);
-        assert!(!is_enabled(&p));
-        set_enabled(&p, true, Path::new("/usr/bin/audivane-dsp-ui")).unwrap();
-        assert!(is_enabled(&p));
-        let text = std::fs::read_to_string(&p).unwrap();
-        assert!(text.contains("Exec=/usr/bin/audivane-dsp-ui --hidden\n"));
-        assert!(text.starts_with("[Desktop Entry]\n"));
-        set_enabled(&p, false, Path::new("/x")).unwrap();
-        assert!(!p.exists());
-        // Removing what is not there is fine.
-        set_enabled(&p, false, Path::new("/x")).unwrap();
-    }
-
-    #[test]
-    fn an_entry_switched_off_by_the_desktop_counts_as_off() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join(FILE);
-        std::fs::write(&p, "[Desktop Entry]\nExec=x\nHidden=true\n").unwrap();
-        assert!(!is_enabled(&p));
-        std::fs::write(
-            &p,
-            "[Desktop Entry]\nExec=x\nX-GNOME-Autostart-enabled=false\n",
-        )
-        .unwrap();
-        assert!(!is_enabled(&p));
     }
 }

@@ -162,16 +162,18 @@ export function OutputView() {
         </div>
         <div className="row">
           <span className="k" />
-          <span className="dither-desc">
-            {dither ? `${dither.label}: ${dither.text}` : out.dither}
-            {dither?.rateNote && !rateWarning ? ` ${dither.rateNote}` : ""}
-            {explicit ? " Turns the quantizer on even when no other stage runs, so the output is not bit-perfect." : ""}
-          </span>
-          {rateWarning && (
-            <span className="dither-desc warn" role="status">
-              {rateWarning}
+          <div className="dither-notes">
+            <span className="dither-desc">
+              {dither ? `${dither.label}: ${dither.text}` : out.dither}
+              {dither?.rateNote && !rateWarning ? ` ${dither.rateNote}` : ""}
+              {explicit ? " Turns the quantizer on even when no other stage runs, so the output is not bit-perfect." : ""}
             </span>
-          )}
+            {rateWarning && (
+              <span className="dither-desc warn" role="status">
+                {rateWarning}
+              </span>
+            )}
+          </div>
         </div>
         <div className="row">
           <span className="k" title="Compare A with side B using another bit depth or dither mode. Both quantizers run at once.">

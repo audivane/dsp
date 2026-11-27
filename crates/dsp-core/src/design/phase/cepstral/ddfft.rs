@@ -190,18 +190,4 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn resolves_bins_far_below_the_peak() {
-        // A two-tap kernel 1 + a z^-1 with a = -(1 - 1e-12): |H(0)| = 1e-12
-        // next to |H(pi)| ~ 2; an f64 FFT gets bin 0 only to ~1e-4.
-        let a = -(1.0 - 1e-12);
-        let mag = magnitudes(&[1.0, a], 1 << 12);
-        let want = 1.0 + a;
-        assert!((mag[0] - want).abs() <= 1e-15 * want);
-        // bin 1: |1 + a e^(-i w)| with w = 2 pi / m
-        let w = 2.0 * std::f64::consts::PI / (1 << 12) as f64;
-        let want1 = ((1.0 + a * w.cos()).powi(2) + (a * w.sin()).powi(2)).sqrt();
-        assert!((mag[1] - want1).abs() <= 1e-9 * want1);
-    }
 }

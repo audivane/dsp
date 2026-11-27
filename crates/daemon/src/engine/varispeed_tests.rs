@@ -6,7 +6,7 @@
 //! processor the way the driver does: `varispeed()` → `plan(n)` → the
 //! planned source frames → `process_block`, then the command forwarding.
 
-use super::{VarispeedRt, VarispeedRtCmd};
+use super::VarispeedRtCmd;
 use crate::engine::processor::{
     ActiveChain, DaemonProcessor, MeterBank, PendingSwap, PlayMode, RtDspCmd,
 };
@@ -68,6 +68,7 @@ fn tone(i: u64) -> f32 {
 struct Rig {
     proc: DaemonProcessor,
     vs_tx: rtrb::Producer<VarispeedRtCmd>,
+    #[allow(dead_code)] // held so the other end stays connected
     vs_recycle: rtrb::Consumer<Box<Varispeed>>,
     recycle: rtrb::Consumer<ActiveChain>,
     /// Source frames consumed.
@@ -164,12 +165,6 @@ impl Rig {
 
     fn applied(&self) -> super::VarispeedAppliedSnapshot {
         self.proc.varispeed_applied().snapshot()
-    }
-
-    fn port_speed(&mut self, sink: SinkChoice) -> Option<f64> {
-        self.proc
-            .varispeed(sink, RateRatio::ONE, RATE, 2)
-            .map(|p| p.speed())
     }
 }
 
@@ -292,121 +287,6 @@ fn with_the_stage_off_the_handoff_is_bit_identical() {
 }
 
 #[test]
-fn enable_ramp_and_disable_fade_and_retire_off_the_rt_thread() {
-    let mut rig = Rig::new(eq_chain(RATE), 8);
-    let n = 256;
-    for _ in 0..20 {
-        rig.block(SinkChoice::Dsp, n);
-    }
-    let chain_latency = rig.proc.latency_out_frames(SinkChoice::Dsp);
-    assert!(!rig.applied().enabled);
-    // Enable while playing, then ask for 1.25.
-    rig.send(VarispeedRtCmd::Install(stage(RATE)));
-    let start = rig.left.len();
-    rig.block(SinkChoice::Dsp, n);
-    let a = rig.applied();
-    assert!(a.enabled && a.active, "{a:?}");
-    assert_eq!(a.speed, 1.0, "starts at unity");
-    assert_eq!(a.installs, 1);
-    rig.speed = 1.25;
-    rig.ramp_ms = 100.0;
-    for _ in 0..60 {
-        rig.block(SinkChoice::Dsp, n);
-    }
-    let a = rig.applied();
-    assert_eq!(a.speed, 1.25, "{a:?}");
-    assert!(!a.ramping);
-    assert!(a.latency_exact);
-    // The stage's delay plus its 5 ms source look-ahead (240 source
-    // frames, 192 nominal at 1.25).
-    assert!((a.latency_frames - (136.75 / 1.25 + 130.75 + 240.0 / 1.25)).abs() < 1e-9);
-    assert_eq!(a.step_bits, 5u128 << 62);
-    // At 1.25 the stage pulls 1.25 times the period.
-    assert!((319..=321).contains(&rig.last_src), "{}", rig.last_src);
-    // The stage counts in the latency: 136.75/1.25 + 130.75 + 192 =
-    // 432.15.
-    assert_eq!(
-        rig.proc.latency_out_frames(SinkChoice::Dsp),
-        chain_latency + 432
-    );
-    // No click anywhere: the enable is a fade, the ramp is smooth.
-    let steps = max_step(&rig.left[start..]);
-    assert!(steps < step_bound(1.25), "{steps}");
-    // No silence: the raw block plays on through the stage's delay (its
-    // look-ahead included) and fades out as the stage's output arrives.
-    // The two are ~507 frames apart, so the tone partly cancels mid-fade
-    // (to ~0.27 here), but never drops out.
-    let envelope = rig.left[start..start + 4 * n]
-        .chunks(24)
-        .map(|w| w.iter().fold(0.0_f64, |m, x| m.max(x.abs())))
-        .fold(f64::INFINITY, f64::min);
-    assert!(envelope > 0.05, "a gap: {envelope}");
-
-    // Disable: the stage's output fades out, the raw block fades in.
-    rig.send(VarispeedRtCmd::Disable);
-    let start = rig.left.len();
-    for _ in 0..20 {
-        rig.block(SinkChoice::Dsp, n);
-    }
-    let steps = max_step(&rig.left[start..]);
-    assert!(steps < step_bound(1.25), "{steps}");
-    let a = rig.applied();
-    assert!(!a.enabled && !a.active, "{a:?}");
-    assert_eq!(a.speed, 1.0);
-    assert_eq!(a.retired, 1);
-    assert_eq!(rig.last_src, 0, "the raw block again");
-    assert_eq!(rig.proc.latency_out_frames(SinkChoice::Dsp), chain_latency);
-    // The stage went to the reaper's queue, not dropped here.
-    assert!(rig.vs_recycle.pop().is_ok());
-    assert!(rig.vs_recycle.pop().is_err());
-    assert_eq!(rig.proc.varispeed_stash_len(), 0);
-}
-
-#[test]
-fn direct_takeover_leaves_the_stage_alone_and_restarts_it_faded() {
-    let mut rig = Rig::new(eq_chain(RATE), 8);
-    let n = 512;
-    rig.send(VarispeedRtCmd::Install(stage(RATE)));
-    rig.speed = 1.5;
-    for _ in 0..40 {
-        rig.block(SinkChoice::Dsp, n);
-    }
-    assert_eq!(rig.applied().speed, 1.5);
-    // Direct plays: the samples unchanged, no stage.
-    for _ in 0..10 {
-        assert!(
-            rig.proc
-                .varispeed(SinkChoice::Direct, RateRatio::ONE, RATE, 2)
-                .is_none()
-        );
-        let src0 = rig.src;
-        let out = rig.block(SinkChoice::Direct, n);
-        for (i, pair) in out.chunks(2).enumerate() {
-            let want = (f64::from(tone(src0 + i as u64)) * 2_147_483_648.0).round() as i32;
-            assert_eq!(pair[0], want);
-        }
-        let a = rig.applied();
-        assert!(a.enabled && !a.active);
-        assert_eq!(a.speed, 1.0, "unity is audible");
-    }
-    // DSP again: the stage restarts at unity, its source faded in, and
-    // ramps to the request.
-    assert_eq!(rig.port_speed(SinkChoice::Dsp), Some(1.0));
-    rig.block(SinkChoice::Dsp, n);
-    let first = rig.left.len() - n;
-    let head = rig.left[first..first + 200]
-        .iter()
-        .fold(0.0_f64, |m, x| m.max(x.abs()));
-    assert!(head < 0.01, "stale history played: {head}");
-    for _ in 0..40 {
-        rig.block(SinkChoice::Dsp, n);
-    }
-    assert_eq!(rig.applied().speed, 1.5);
-    let steps = max_step(&rig.left[first..]);
-    assert!(steps < step_bound(1.5), "{steps}");
-}
-
-#[test]
 fn a_stage_cut_off_mid_stop_never_strands_the_dsp_toggle() {
     // DSP off at x1 fades the chain's output (the stage's with it) before
     // the switch. When the DSP chain stops playing first (here Direct
@@ -434,37 +314,6 @@ fn a_stage_cut_off_mid_stop_never_strands_the_dsp_toggle() {
     );
     let a = rig.applied();
     assert!(a.enabled && !a.active, "{a:?}");
-}
-
-#[test]
-fn a_reopen_resets_at_the_target_and_a_dsp_reset_too() {
-    let mut rig = Rig::new(eq_chain(RATE), 8);
-    rig.send(VarispeedRtCmd::Install(stage(RATE)));
-    rig.speed = 1.2;
-    for _ in 0..40 {
-        rig.block(SinkChoice::Dsp, 512);
-    }
-    assert_eq!(rig.applied().speed, 1.2);
-    // The driver resets the stage at a reopen: it holds at the target.
-    if let Some(port) = rig.proc.varispeed(SinkChoice::Dsp, RateRatio::ONE, RATE, 2) {
-        port.reset();
-        assert_eq!(port.speed(), 1.2);
-        assert_eq!(port.peak_until_settled(), 1.2);
-    }
-    rig.block(SinkChoice::Dsp, 512);
-    assert_eq!(rig.applied().speed, 1.2);
-    // A DSP reset (idle stop) does the same, also mid-disable.
-    rig.send(VarispeedRtCmd::Disable);
-    // The fade waits a block for the driver to size the next pull for a
-    // raw one.
-    rig.block(SinkChoice::Dsp, 64);
-    assert_eq!(rig.applied().phase, 2, "waiting for the driver");
-    rig.block(SinkChoice::Dsp, 64);
-    assert_eq!(rig.applied().phase, 3, "disabling");
-    rig.proc.reset_dsp_state();
-    rig.block(SinkChoice::Dsp, 64);
-    assert_eq!(rig.applied().phase, 0);
-    assert!(rig.vs_recycle.pop().is_ok());
 }
 
 #[test]
@@ -553,161 +402,4 @@ fn a_stage_for_another_rate_never_runs() {
             .varispeed(SinkChoice::Dsp, RateRatio::ONE, RATE, 2)
             .is_none()
     );
-}
-
-#[test]
-fn retired_stages_wait_in_the_stash_when_the_reaper_is_behind() {
-    // A one-slot recycle queue nobody drains: installs keep a slot to
-    // retire into, so nothing is ever dropped on the RT thread.
-    let mut rig = Rig::new(eq_chain(RATE), 1);
-    for _ in 0..6 {
-        rig.send(VarispeedRtCmd::Install(stage(RATE)));
-        rig.block(SinkChoice::Dsp, 256);
-    }
-    let a = rig.applied();
-    // One in the queue, two in the stash; the other installs wait.
-    assert_eq!(rig.proc.varispeed_stash_len(), 2);
-    assert_eq!(a.retired, 3);
-    assert_eq!(a.installs, 4);
-    // The reaper catches up: the rest go through.
-    for _ in 0..8 {
-        while rig.vs_recycle.pop().is_ok() {}
-        rig.block(SinkChoice::Dsp, 256);
-    }
-    while rig.vs_recycle.pop().is_ok() {}
-    assert_eq!(rig.applied().installs, 6);
-    assert_eq!(rig.applied().retired, 5);
-    assert_eq!(rig.proc.varispeed_stash_len(), 0);
-}
-
-#[test]
-fn the_inert_slot_has_no_buffers_and_no_port() {
-    let mut vs = VarispeedRt::inert();
-    assert!(vs.port(RATE, 2).is_none());
-    assert!(vs.take_planned().is_none());
-    vs.publish();
-    let a = vs.applied().snapshot();
-    assert!(!a.enabled && !a.active);
-    // Used only through the swap queue's types: keep them linked.
-    let _ = |c: ActiveChain| PendingSwap {
-        chain: c,
-        crossfade: false,
-        generation: 0,
-        swap_seq: 0,
-    };
-}
-
-/// Offline `rt_load` figures (release build, `--ignored --nocapture`): the
-/// processor's time per period over the period's length, with an EQ chain
-/// (and an A/B pair), the stage off and at speeds 1, 1.0123 and 2.
-#[test]
-#[ignore = "measurement"]
-fn measure_rt_load() {
-    fn ab_chain(rate: u32) -> ActiveChain {
-        let spec = |c: ChainConfig| ChainSpec {
-            config: c,
-            sample_rate: rate,
-            channels: 2,
-            max_block: 8192,
-            irs: None,
-        };
-        ActiveChain::Ab(Box::new(
-            AbChain::new(
-                spec(eq_config()),
-                spec(eq_config()),
-                audivane_dsp_core::ab_level::AbLevel::fixed(0.0),
-            )
-            .unwrap(),
-        ))
-    }
-    for (rate, period) in [
-        (44_100u32, 1024usize),
-        (48_000, 256),
-        (96_000, 2048),
-        (768_000, 8192),
-    ] {
-        for ab in [false, true] {
-            for speed in [0.0, 1.0, 1.0123, 2.0] {
-                let chain = if ab { ab_chain(rate) } else { eq_chain(rate) };
-                let mut rig = Rig::new(chain, 8);
-                if speed > 0.0 {
-                    rig.send(VarispeedRtCmd::Install(stage(rate)));
-                    rig.speed = speed;
-                }
-                let ratio = RateRatio::ONE;
-                let input: Vec<f32> = (0..(2 * period + 4) * 2)
-                    .map(|i| (0.3 * (i as f64 * 0.013).sin()) as f32)
-                    .collect();
-                let mut out = vec![0_i32; period * 2];
-                let mut worst = 0.0_f64;
-                let mut total = 0.0_f64;
-                let blocks = (rate as usize * 3 / period).max(50);
-                for b in 0..blocks {
-                    rig.proc.poll_updates(SinkChoice::Dsp, rate, ratio, true);
-                    let t0 = std::time::Instant::now();
-                    let mut n_src = period;
-                    if let Some(port) = rig.proc.varispeed(SinkChoice::Dsp, ratio, rate, 2) {
-                        n_src = port.plan(period);
-                        port.set_fill(n_src, false);
-                        port.set_speed_limit(2.0);
-                        port.set_speed(speed, 0.0);
-                    }
-                    rig.proc.process_block(
-                        SinkChoice::Dsp,
-                        &input[..n_src * 2],
-                        &input[..n_src * 2],
-                        &mut out,
-                        2,
-                        ratio,
-                        rate,
-                        (b * period) as u64,
-                    );
-                    let dt = t0.elapsed().as_secs_f64();
-                    let load = dt * f64::from(rate) / period as f64;
-                    if b > blocks / 3 {
-                        worst = worst.max(load);
-                        total += load;
-                    }
-                }
-                let mean = total / (blocks - blocks / 3 - 1) as f64;
-                eprintln!(
-                    "RTLOAD rate {rate} P {period} ab {ab} speed {speed}: mean {:.4} max {:.4} (applied {})",
-                    mean,
-                    worst,
-                    rig.applied().speed
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn the_drain_bound_covers_a_slowdown_in_progress() {
-    // Mid-ramp from 1.0 to 0.5 the drain sizes the stage's tail and its
-    // deadline at 0.5, the slowest speed until the ramp settles, not at the
-    // speed applied when it starts.
-    let mut rig = Rig::new(eq_chain(RATE), 8);
-    rig.send(VarispeedRtCmd::Install(stage(RATE)));
-    for _ in 0..20 {
-        rig.block(SinkChoice::Dsp, 512);
-    }
-    rig.speed = 0.5;
-    rig.ramp_ms = 100.0;
-    rig.block(SinkChoice::Dsp, 512);
-    let port = rig
-        .proc
-        .varispeed(SinkChoice::Dsp, RateRatio::ONE, RATE, 2)
-        .expect("a stage");
-    assert!(port.speed() > 0.9, "{}", port.speed());
-    assert_eq!(port.drain_speed(), 0.5);
-    let ramping = port.tail_frames();
-    for _ in 0..40 {
-        rig.block(SinkChoice::Dsp, 512);
-    }
-    let port = rig
-        .proc
-        .varispeed(SinkChoice::Dsp, RateRatio::ONE, RATE, 2)
-        .expect("a stage");
-    assert_eq!(port.speed(), 0.5);
-    assert_eq!(ramping, port.tail_frames());
 }

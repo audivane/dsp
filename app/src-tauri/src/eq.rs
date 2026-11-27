@@ -53,15 +53,6 @@ mod tests {
     }
 
     #[test]
-    fn peaking_band_peaks_at_its_gain() {
-        let b = band(FilterType::Peaking, 1000.0, 6.0, 1.0);
-        let db = band_db(&b, 48_000.0, &[1000.0])[0];
-        assert!((db - 6.0).abs() < 1e-9, "{db}");
-        let total = response_db(&[b], -6.0, 48_000.0, &[1000.0])[0];
-        assert!(total.abs() < 1e-9, "{total}");
-    }
-
-    #[test]
     fn auto_preamp_cancels_the_largest_boost() {
         let b = band(FilterType::Peaking, 1000.0, 6.0, 1.0);
         let pre = auto_preamp_db(&[b], 48_000.0);

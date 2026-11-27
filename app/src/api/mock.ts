@@ -2059,6 +2059,7 @@ export class MockDaemon {
       label: c.label,
       path: c.path,
       design_rate_hz: c.design_rate_hz,
+      enabled: c.enabled ?? true,
       devices: [
         ...(c.master ? [{ role: "master", device: this.config.device, entries: c.master.matrix?.length ?? 0, gain_db: c.master.gain_db, manifest_gain_db: c.master_manifest_gain_db ?? c.master.gain_db, trim_ms: 0, installed: true }] : []),
         ...c.followers.map((f) => ({ role: "follower", device: f.device, entries: f.item.matrix?.length ?? 0, gain_db: f.item.gain_db, manifest_gain_db: f.manifest_gain_db ?? f.item.gain_db, trim_ms: f.trim_ms, installed: true })),
@@ -2453,6 +2454,16 @@ export class MockDaemon {
             cfg.chain.convolution = convList(cfg.chain).map((x) => (x.calibration ? { ...x, gain_db: item.gain_db } : x));
           } else if (keep === undefined) delete f!.manifest_gain_db;
           else f!.manifest_gain_db = keep;
+        });
+        return this.calibrationStatus();
+      case "bundle_enable":
+        mutate(() => {
+          const c = cfg.calibration;
+          if (!c) this.bad("bundle_enable: nothing changed: no room calibration is loaded");
+          const on = Boolean((params as { on?: unknown } | null)?.on);
+          c.enabled = on;
+          // As the daemon: off, the placed copies are disabled; on, they play.
+          cfg.chain.convolution = convList(cfg.chain).map((x) => (x.calibration ? { ...x, enabled: on } : x));
         });
         return this.calibrationStatus();
       case "bundle_show":

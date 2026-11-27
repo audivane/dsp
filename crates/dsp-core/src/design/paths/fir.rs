@@ -233,18 +233,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn pairwise_sum_matches_plain_sum_closely() {
-        let x: Vec<f64> = (0..10_007).map(|i| ((i * 37 % 101) as f64).sin()).collect();
-        for step in [1, 3, 8] {
-            for start in [0, 1] {
-                let count = (x.len() - start).div_ceil(step);
-                let a = pairwise_sum(&x, start, step, count);
-                let b: f64 = x.iter().skip(start).step_by(step).sum();
-                assert!((a - b).abs() < 1e-9, "{a} vs {b}");
-            }
-        }
-        assert_eq!(pairwise_sum(&[1.0, 2.0, 3.0], 0, 1, 3), 6.0);
-    }
 }

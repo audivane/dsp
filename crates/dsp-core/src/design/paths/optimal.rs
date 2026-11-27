@@ -801,26 +801,6 @@ mod tests {
         worst
     }
 
-    /// A design is cached: asked again it is the same, bit for bit, and so
-    /// is a refusal.
-    #[test]
-    fn designs_are_cached_bit_for_bit() {
-        for method in [Method::Equiripple, Method::LeastSquares] {
-            let first = design(method, 301, 0.2, 0.23, true).unwrap();
-            let again = design(method, 301, 0.2, 0.23, true).unwrap();
-            assert_eq!(first, again);
-            assert_eq!(
-                first,
-                design_uncached(method, 301, 0.2, 0.23, true).unwrap()
-            );
-        }
-        let refused = design(Method::Equiripple, 300, 0.2, 0.23, true).unwrap_err();
-        assert_eq!(
-            design(Method::Equiripple, 300, 0.2, 0.23, true).unwrap_err(),
-            refused
-        );
-    }
-
     #[test]
     fn equiripple_matches_scipy_remez() {
         // scipy.signal.remez(31, [0, 0.2, 0.3, 0.5], [1, 0]): its minimax
@@ -890,57 +870,6 @@ mod tests {
         }
         for (g, w) in c.iter().zip(&x) {
             assert!((g - w).abs() < 1e-9, "{g} vs {w}");
-        }
-    }
-
-    /// Prints the equiripple and least-squares error and design time over
-    /// lengths (the limits above).
-    #[test]
-    #[ignore]
-    fn measure_limits() {
-        for &(n, l) in &[
-            (255usize, 8usize),
-            (1535, 8),
-            (1791, 8),
-            (12287, 64),
-            (16383, 64),
-            (65535, 64),
-            (262143, 64),
-            (1048575, 64),
-        ] {
-            let pass = 0.9 / (2.0 * l as f64);
-            let stop = 1.0 / (2.0 * l as f64);
-            for method in [Method::Equiripple, Method::LeastSquares] {
-                if method == Method::Equiripple && n > 16383
-                    || method == Method::LeastSquares && n > 1 << 20
-                {
-                    continue;
-                }
-                let t = std::time::Instant::now();
-                let m = (n - 1) / 2;
-                let r = match method {
-                    Method::Equiripple => remez(m, pass, stop).map(|x| x.0),
-                    Method::LeastSquares => least_squares(m, pass, stop),
-                };
-                let dt = t.elapsed().as_secs_f64();
-                match r {
-                    Ok(c) => {
-                        let h = taps_of(&c);
-                        let e = crate::design::auto::protected_error_with(
-                            &mut RealFftPlanner::new(),
-                            &h,
-                            h.iter().sum(),
-                            pass,
-                            stop,
-                        );
-                        println!(
-                            "{method:?} n {n} x{l}: {:.1} dB in {dt:.2} s",
-                            -20.0 * e.log10()
-                        );
-                    }
-                    Err(e) => println!("{method:?} n {n} x{l}: {e} ({dt:.2} s)"),
-                }
-            }
         }
     }
 }

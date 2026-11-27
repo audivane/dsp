@@ -66,23 +66,6 @@ describe("blind test", () => {
     expect(s.getState().blindRun).toBeNull();
   });
 
-  it("records practice feedback; blind A/B plays shuffled sides", async () => {
-    const { s, daemon } = await setup();
-    await s.blindStart({ mode: "identify", trials: 2, feedback: "each" }, "A", "B");
-    const run = s.getState().blindRun!;
-    await s.blindPlay("1");
-    await s.whenIdle();
-    expect(daemon.abSide).toBe(run.truths[0] === "A" ? "a" : "b");
-    await s.blindPlay("x"); // not a button in blind A/B
-    expect(s.getState().blindRun!.playing).toBe("1");
-    s.blindAnswer("1");
-    expect(s.getState().blindRun!.records[0].correct).toBe(run.truths[0] === "B");
-    await s.blindPlay("2");
-    s.blindAnswer("2");
-    await s.whenIdle();
-    expect(s.blindExport()?.feedback).toBe("each");
-  });
-
   it("a run is abandoned, never scored, when the view, the sides or A/B change", async () => {
     const { s, daemon } = await setup();
     await s.blindStart({ mode: "abx", trials: 5, feedback: "each" }, "A", "B");

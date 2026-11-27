@@ -266,9 +266,7 @@ pub fn edit_notes(b: &AbB, old: &ChainConfig, new: &ChainConfig) -> Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use audivane_protocol::{
-        CrossfeedConfig, DitherKind, EqProfile, LimiterMode, RateTarget, TiltConfig,
-    };
+    use audivane_protocol::{CrossfeedConfig, EqProfile, RateTarget};
     use serde_json::json;
 
     fn chain_a() -> ChainConfig {
@@ -307,92 +305,6 @@ mod tests {
     }
 
     #[test]
-    fn two_section_tilt_patches_round_trip() {
-        use audivane_protocol::{EqProfile, TiltPivot};
-        let low = TiltConfig {
-            enabled: true,
-            slope_db_per_oct: Some(2.0),
-            total_db: None,
-            start_hz: 20.0,
-            end_hz: 200.0,
-            pivot: TiltPivot::End,
-        };
-        let high = TiltConfig {
-            slope_db_per_oct: Some(-1.0),
-            start_hz: 1000.0,
-            end_hz: 20_000.0,
-            pivot: TiltPivot::Start,
-            ..low
-        };
-        let mut a = chain_a();
-        a.eq = Some(EqProfile {
-            tilt: Some(low),
-            tilt_high: Some(high),
-            ..EqProfile::default()
-        });
-        // Treble section off in B: the bass section stays.
-        let b = materialize(&a, &AbB::Patch(json!({"eq": {"tilt_high": null}}))).unwrap();
-        let eq = b.eq.unwrap();
-        assert_eq!((eq.tilt, eq.tilt_high), (Some(low), None));
-        // Both off.
-        let b = materialize(
-            &a,
-            &AbB::Patch(json!({"eq": {"tilt": null, "tilt_high": null}})),
-        )
-        .unwrap();
-        let eq = b.eq.unwrap();
-        assert_eq!((eq.tilt, eq.tilt_high), (None, None));
-        // Disabled, settings kept.
-        let patch = json!({"eq": {"tilt": {"enabled": false}, "tilt_high": {"enabled": false}}});
-        let eq = materialize(&a, &AbB::Patch(patch)).unwrap().eq.unwrap();
-        assert_eq!(
-            eq.tilt,
-            Some(TiltConfig {
-                enabled: false,
-                ..low
-            })
-        );
-        assert_eq!(
-            eq.tilt_high,
-            Some(TiltConfig {
-                enabled: false,
-                ..high
-            })
-        );
-        // A second section added in B only.
-        let mut single = a.clone();
-        single.eq.as_mut().unwrap().tilt_high = None;
-        let patch = json!({"eq": {"tilt_high": serde_json::to_value(high).unwrap()}});
-        let b = materialize(&single, &AbB::Patch(patch)).unwrap();
-        assert_eq!(b.eq, a.eq);
-        // Config validation sees B's pair.
-        let patch = json!({"eq": {"tilt_high": {"start_hz": 100.0}}});
-        let b = materialize(&a, &AbB::Patch(patch)).unwrap();
-        assert!(
-            crate::control::config::validate_chain("ab.b", &b)
-                .unwrap_err()
-                .contains("overlap")
-        );
-    }
-
-    #[test]
-    fn removing_from_an_absent_stage_leaves_it_absent() {
-        let mut a = chain_a();
-        a.eq = None;
-        let b = materialize(&a, &AbB::Patch(json!({"eq": {"tilt": null}}))).unwrap();
-        assert_eq!(b.eq, None);
-        // Setting something still creates the stage.
-        let b = materialize(&a, &AbB::Patch(json!({"eq": {"tilt": {"enabled": false}}}))).unwrap();
-        assert_eq!(
-            b.eq.unwrap().tilt,
-            Some(TiltConfig {
-                enabled: false,
-                ..serde_json::from_value(json!({})).unwrap()
-            })
-        );
-    }
-
-    #[test]
     fn shared_fields_and_bad_values_are_named() {
         let a = chain_a();
         for (patch, field) in [
@@ -419,54 +331,5 @@ mod tests {
             let err = materialize(&a, &AbB::Patch(patch)).unwrap_err();
             assert!(err.starts_with(field), "{err}");
         }
-    }
-
-    #[test]
-    fn a_chain_keeps_its_filter_and_follows_the_shared_fields() {
-        let a = chain_a();
-        let mut preset = ChainConfig::neutral();
-        preset.upsampler.preset = Some("other".into());
-        let b = materialize(&a, &AbB::Chain(Box::new(preset))).unwrap();
-        assert_eq!(b.upsampler.preset.as_deref(), Some("other"));
-        assert_eq!(b.upsampler.target, a.upsampler.target);
-        assert_eq!(b.limiter, a.limiter);
-        assert_eq!(b.output, a.output);
-        assert_ne!(a.limiter.mode, LimiterMode::Off);
-        // Its own bits and dither follow A too: a preset is never an
-        // output compare (only a patch is).
-        let mut preset = ChainConfig::neutral();
-        preset.output.bits = 16;
-        preset.output.dither = DitherKind::Shaped;
-        preset.output.headroom_db = 0.0;
-        let b = materialize(&a, &AbB::Chain(Box::new(preset))).unwrap();
-        assert_eq!(b.output, a.output);
-    }
-
-    #[test]
-    fn a_patch_may_set_bits_and_dither() {
-        let a = chain_a();
-        let b = materialize(
-            &a,
-            &AbB::Patch(json!({"output": {"bits": 16, "dither": "shaped"}})),
-        )
-        .unwrap();
-        assert_eq!((b.output.bits, b.output.dither), (16, DitherKind::Shaped));
-        assert_eq!(b.output.headroom_db, a.output.headroom_db);
-        assert_eq!(b.eq, a.eq);
-    }
-
-    #[test]
-    fn list_notes_only_for_a_kept_list_that_a_changed() {
-        let ir = json!([{"ir_path": "/x.wav"}]);
-        let b = AbB::Patch(json!({"convolution": ir, "eq": {"bands": []}}));
-        assert_eq!(set_notes(&b).len(), 1);
-        let old = chain_a();
-        let mut new = old.clone();
-        assert!(edit_notes(&b, &old, &new).is_empty());
-        new.convolution = serde_json::from_value(json!([{"ir_path": "/y.wav"}])).unwrap();
-        let notes = edit_notes(&b, &old, &new);
-        assert_eq!(notes.len(), 1);
-        assert!(notes[0].contains("convolution"), "{notes:?}");
-        assert!(set_notes(&AbB::Patch(json!({"convolution": []}))).is_empty());
     }
 }

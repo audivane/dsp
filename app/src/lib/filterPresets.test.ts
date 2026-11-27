@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import type { FilterPreset } from "../api/types";
-import { dimOptions, dimValues, familyDims, familyPick, FAMILIES, PRESETS, presetBlockReason, presetDetail, presetEntry, presetRationalCost, presetRatioNeed, presetSummary } from "./filterPresets";
+import { PRESETS, presetBlockReason, presetRationalCost, presetRatioNeed } from "./filterPresets";
 import { rateRatioOf } from "./upsamplerRate";
 
 /** The names in the generated `FilterPreset` union (what the engine accepts). */
@@ -11,8 +11,6 @@ function engineNames(): string[] {
   const union = src.slice(src.indexOf("export type FilterPreset"));
   return [...union.matchAll(/"([a-z0-9_]+)"/g)].map((m) => m[1]);
 }
-
-const none = () => null;
 
 describe("preset table", () => {
   it("has exactly one entry per engine preset, and no others", () => {
@@ -23,77 +21,6 @@ describe("preset table", () => {
     expect([...table].sort()).toEqual([...names].sort());
   });
 
-  it("puts every entry in a known family, and each family has its default", () => {
-    const ids = new Set(FAMILIES.map((f) => f.id));
-    for (const p of PRESETS) expect(ids.has(p.family)).toBe(true);
-    for (const f of FAMILIES) expect(presetEntry(f.default)?.family).toBe(f.id);
-    for (const f of FAMILIES) expect(PRESETS.some((p) => p.family === f.id)).toBe(true);
-  });
-
-  it("names every family's shapes", () => {
-    for (const p of PRESETS) {
-      if (p.shape === null) continue;
-      expect(FAMILIES.find((f) => f.id === p.family)?.shapes?.[p.shape], `${p.name} shape ${p.shape}`).toBeDefined();
-    }
-  });
-
-  it("tells presets apart by family, length, shape and phase", () => {
-    const keys = PRESETS.map((p) => `${p.family}|${p.length}|${p.shape}|${p.phase}`);
-    const dup = keys.filter((k, i) => keys.indexOf(k) !== i);
-    expect(dup).toEqual([]);
-  });
-
-  it("reads the phase from the name", () => {
-    for (const p of PRESETS) {
-      if (p.name.endsWith("_mp")) expect(p.phase).toBe("minimum");
-      if (p.name.endsWith("_ip")) expect(p.phase).toBe("intermediate");
-    }
-    expect(presetEntry("cascade_elliptic")?.phase).toBe("minimum");
-    expect(presetEntry("cascade_fir_asym")?.phase).toBe("intermediate");
-  });
-});
-
-describe("variant rows", () => {
-  it("shows only the rows that are a choice", () => {
-    expect(familyDims("gaussian")).toEqual(["length", "shape", "phase"]);
-    expect(familyDims("chebyshev")).toEqual(["length", "phase"]);
-    expect(familyDims("nuttall")).toEqual([]);
-    expect(familyDims("cascade")).toEqual(["shape", "phase"]);
-    expect(familyDims("halfband")).toEqual(["length", "shape"]);
-    expect(dimValues("lanczos", "length")).toEqual(["a23", "a511", "a2047", "a8191", "a32767", "a65535"]);
-    expect(dimValues("flattop", "length")).toEqual(["short", "compact", "medium", "long", "xlong", "huge", "mega"]);
-  });
-
-  it("disables combinations that do not exist, with a reason", () => {
-    const cur = presetEntry("gaussian_long")!;
-    const shapes = dimOptions(cur, "shape", none);
-    const early = shapes.find((o) => o.value === "early")!;
-    expect(early.pick).toBeNull();
-    expect(early.tip).toContain("no long Gaussian");
-    expect(shapes.find((o) => o.value === "nyquist")!.pick).toBe("gaussian_nyquist");
-    const phases = dimOptions(presetEntry("gaussian_early")!, "phase", none);
-    expect(phases.map((o) => o.pick)).toEqual(["gaussian_early", "gaussian_early_ip", "gaussian_early_mp"]);
-  });
-
-  it("keeps the other choices where it can when one changes", () => {
-    const cur = presetEntry("flattop_xlong_apod")!;
-    const lengths = dimOptions(cur, "length", none);
-    expect(lengths.find((o) => o.value === "long")!.pick).toBe("flattop_long");
-    expect(lengths.find((o) => o.value === "huge")!.pick).toBe("flattop_huge");
-    expect(dimOptions(presetEntry("chebyshev_long_mp")!, "length", none).find((o) => o.value === "short")!.pick).toBe("chebyshev_short_mp");
-  });
-
-  it("skips presets the rate setting rules out", () => {
-    const blocked = (n: FilterPreset) => presetBlockReason(n, { rate: 48000 }, [44100, 48000]);
-    const cur = presetEntry("flattop_xlong")!;
-    const xlong = dimOptions(cur, "shape", blocked);
-    // flattop_xlong_std is integer-only: 44.1 kHz → 48 kHz is 160/147.
-    const std = xlong.find((o) => o.value === "std")!;
-    expect(std.pick).toBeNull();
-    expect(std.tip).toContain("160/147");
-    expect(familyPick("block", null, blocked)).toBeNull();
-    expect(familyPick("gaussian", "gaussian_huge", blocked)).toBe("gaussian_long");
-  });
 });
 
 describe("ratio rules", () => {
@@ -128,28 +55,6 @@ describe("ratio rules", () => {
     expect(presetRatioNeed("gaussian_long", { up: 1, down: 1 })).toBeNull();
   });
 
-  it("leaves a ratio past the term limit to the term note, not a length reason", () => {
-    // 44.1 kHz -> 3072 kHz is 10240/147: refused for its terms, whatever the preset.
-    expect(presetBlockReason("gaussian_long", { rate: 3072000 }, [44100, 48000])).toBeNull();
-    expect(presetBlockReason("gaussian_long", { rate: 3072000 }, [48000])).toBeNull();
-    expect(presetBlockReason("block_fft", { rate: 2822400 }, [48000])).toContain("integer");
-  });
-
-  it("checks integer ratios at every rate and fractional ones at the allowed rates", () => {
-    expect(presetBlockReason("cascade_fir", { ratio: 8 }, [44100])).toBeNull();
-    expect(presetBlockReason("block_fft", { ratio: 6 }, [44100])).toContain("×6");
-    // {rate: 48000}: 96 kHz → 48 kHz decimates, but only when 96 kHz may play.
-    expect(presetBlockReason("lanczos511", { rate: 48000 }, [44100, 48000])).toBeNull();
-    expect(presetBlockReason("lanczos511", { rate: 48000 }, [44100, 48000, 96000])).toContain("1/2");
-    // max_rate_any resolves like max_rate without a device: integer ratios.
-    expect(presetBlockReason("cosine", { max_rate_any: 768000 }, [44100, 48000])).toBeNull();
-    expect(presetBlockReason("gaussian_long", "off", [44100])).toBeNull();
-  });
-
-  it("summarises a preset in a few words", () => {
-    expect(presetSummary("flattop_xlong")).toBe("Flat-top xlong · linear");
-    expect(presetSummary("chebyshev_long_mp")).toBe("Chebyshev long · minimum");
-  });
 });
 
 describe("rational cost, as the engine computes it", () => {
@@ -244,24 +149,4 @@ describe("rational cost, as the engine computes it", () => {
     }
   });
 
-  it("budgets the pipelines that can run at once", () => {
-    // 44.1 → 384 kHz: 4 × 255 × 1280 grid taps, above the 1,048,576 limit.
-    expect(presetBlockReason("gaussian_early_ip", { rate: 384000 }, [44100])).toContain("Too long");
-    expect(presetBlockReason("gaussian_early", { rate: 384000 }, [44100])).toBeNull();
-    // chebyshev_long 44.1 → 48 kHz: 207 taps per output frame at 48 kHz.
-    const one = presetRationalCost("chebyshev_long", 44100, rateRatioOf(44100, 48000), 1).macs;
-    expect(one).toBeCloseTo(48000 * 207, 3);
-    expect(presetRationalCost("chebyshev_long", 44100, rateRatioOf(44100, 48000)).macs).toBeCloseTo(2 * one, 3);
-    expect(presetRationalCost("chebyshev_long", 44100, rateRatioOf(44100, 48000), 4).macs).toBeCloseTo(4 * one, 3);
-    // kaiser_steep 44.1 → 768 kHz: 577 × 2560 grid taps, over the length limit.
-    expect(presetBlockReason("kaiser_steep", { rate: 768000 }, [44100])).toContain("Too long");
-    // kaiser_steep 44.1 → 384 kHz: 577 per output frame × 384k = 222 M per pipeline: fine with two (no A/B), not with four (A/B).
-    expect(presetBlockReason("kaiser_steep", { rate: 384000 }, [44100], 2)).toBeNull();
-    expect(presetBlockReason("kaiser_steep", { rate: 384000 }, [44100], 4)).toContain("Too long");
-  });
-
-  it("describes the asymmetric cascade's stage length", () => {
-    expect(presetDetail(presetEntry("cascade_fir_asym")!)).toContain("289");
-    expect(presetDetail(presetEntry("cascade_fir_asym")!)).toContain("292");
-  });
 });

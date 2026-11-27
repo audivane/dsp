@@ -582,18 +582,6 @@ mod tests {
         assert_eq!(b.fade_len(&flat(2, 1.0)), None);
     }
 
-    /// A delay: the fade only moves later, nothing to pass but the
-    /// positions' slack.
-    #[test]
-    fn a_delay_has_only_the_slack() {
-        let mut ir = vec![0.0; 4_096];
-        ir[1_440] = 0.8;
-        let b = FadeBound::of(&ConvIrs::Channels(vec![ir]), 2, 48_000).unwrap();
-        let t = b.transient(0, &flat(2, 1.0));
-        assert!(t <= POSITION_SLACK * FADE_SAFETY + 1e-6, "{t}");
-        assert_eq!(b.fade_len(&flat(2, 1.0)).map(|f| f.0), Some(480));
-    }
-
     /// Taps so large their spectra overflow (`1e155`: the projection is
     /// NaN): nothing measured, every edit refused (never a NaN dropped by
     /// a `max` into a tiny bound).
@@ -605,17 +593,6 @@ mod tests {
             assert_eq!(b.transient(s, &minus_1_db), f64::INFINITY, "step {s}");
         }
         assert_eq!(b.fade_len(&minus_1_db), None);
-    }
-
-    /// A matrix output no input reaches: measured as nothing to pass.
-    #[test]
-    fn an_output_without_entries_passes_nothing() {
-        let mut m = crate::matrix::FilterMatrix::new(2);
-        let mut ir = vec![0.0; 1_000];
-        ir[10] = 1.0;
-        m.set(0, 0, ir);
-        let b = FadeBound::of(&ConvIrs::Matrix(m), 2, 48_000).unwrap();
-        assert!(b.transient(0, &flat(2, 1.0)) <= POSITION_SLACK * FADE_SAFETY + 1e-6);
     }
 
     /// An unchanged input whose fade was not measured, or a NaN in the

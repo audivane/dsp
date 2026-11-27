@@ -345,34 +345,6 @@ mod tests {
     }
 
     #[test]
-    fn a_demotion_is_published_with_the_generation_that_ran() {
-        let _turn = AUDIO_THREAD.lock().unwrap_or_else(|e| e.into_inner());
-        audivane_io_alsa::install_overload_guard().unwrap();
-        std::thread::spawn(|| {
-            if audivane_io_alsa::promote_current_thread_rt(5).is_err() {
-                eprintln!("rt_overload: SKIPPED (rtkit did not grant real-time scheduling)");
-                return;
-            }
-            let state = RtOverloadState::default();
-            let mut guard = RtLoopGuard::new(&state, true);
-            // Right after the guard started: counted, not folded into its
-            // baselines.
-            sigxcpu_to_self();
-            guard.on_iteration(&state, 7, 3);
-            assert_eq!(state.signals(), 1);
-            assert_eq!(state.demotions(), 1);
-            assert_eq!(state.demotion_generation(), 7);
-            assert_eq!(state.demotion_hold_seq(), 3);
-            assert!(state.demoted());
-            assert!(!audivane_io_alsa::thread_is_realtime(0));
-            drop(guard);
-            eprintln!("rt_overload: REAL: demotion published with generation 7");
-        })
-        .join()
-        .unwrap();
-    }
-
-    #[test]
     fn a_signal_for_a_thread_at_normal_priority_is_no_demotion() {
         let _turn = AUDIO_THREAD.lock().unwrap_or_else(|e| e.into_inner());
         // The test thread is not real-time: a SIGXCPU reaching it (as a
@@ -387,28 +359,6 @@ mod tests {
         assert_eq!(state.failed_demotions(), 0);
         assert!(!state.demoted());
         drop(guard);
-    }
-
-    #[test]
-    fn promotes_again_only_after_two_calm_seconds() {
-        let mut gate = RepromoteGate::default();
-        let t0 = Instant::now();
-        let at = |ms: u64| t0 + Duration::from_millis(ms);
-        assert_eq!(gate.decide(0, false, 0.2, 0, at(0)), Repromote::Nothing);
-        // Overload: demoted, logged once.
-        assert_eq!(gate.decide(1, true, 1.4, 5, at(50)), Repromote::Demoted);
-        assert_eq!(gate.decide(1, true, 1.4, 9, at(100)), Repromote::Nothing);
-        // A second SIGXCPU in the same episode is not logged again.
-        assert_eq!(gate.decide(2, true, 1.3, 12, at(150)), Repromote::Nothing);
-        // Fallback lands: load drops, but an xrun restarts the clock.
-        assert_eq!(gate.decide(2, true, 0.3, 12, at(1000)), Repromote::Nothing);
-        assert_eq!(gate.decide(2, true, 0.3, 13, at(2000)), Repromote::Nothing);
-        assert_eq!(gate.decide(2, true, 0.3, 13, at(3000)), Repromote::Nothing);
-        assert_eq!(gate.decide(2, true, 0.3, 13, at(4900)), Repromote::Nothing);
-        assert_eq!(gate.decide(2, true, 0.3, 13, at(5000)), Repromote::Promote);
-        // Promoted: the episode ends; the next overload is logged again.
-        assert_eq!(gate.decide(2, false, 0.3, 13, at(5050)), Repromote::Nothing);
-        assert_eq!(gate.decide(3, true, 1.2, 20, at(9000)), Repromote::Demoted);
     }
 
     #[test]

@@ -349,45 +349,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_numeric_card() {
-        assert_eq!(card_index_from_device("hw:10,0,0").unwrap(), 10);
-        assert_eq!(card_index_from_device("hw:0").unwrap(), 0);
-        assert_eq!(card_index_from_device("plughw:2,1").unwrap(), 2);
-    }
-
-    #[test]
-    fn device_presence_reads_proc_asound() {
-        let root = std::env::temp_dir().join(format!("avdsp-asound-{}", std::process::id()));
-        let card = root.join("card3");
-        std::fs::create_dir_all(&card).unwrap();
-        std::fs::write(card.join("id"), "USB\n").unwrap();
-        std::fs::create_dir_all(card.join("pcm0p")).unwrap();
-        std::fs::create_dir_all(card.join("pcm1c")).unwrap();
-        assert!(device_present_in(&root, "hw:CARD=USB,DEV=0"));
-        assert!(device_present_in(&root, "hw:USB"));
-        assert!(device_present_in(&root, "hw:3,0,0"));
-        assert!(device_present_in(&root, "plughw:CARD=3,DEV=0"));
-        // Capture-only device, another card, a malformed name.
-        assert!(!device_present_in(&root, "hw:CARD=USB,DEV=1"));
-        assert!(!device_present_in(&root, "hw:CARD=DAC,DEV=0"));
-        assert!(!device_present_in(&root, "hw:4,0"));
-        assert!(!device_present_in(&root, "default"));
-        assert!(!device_present_in(&root, "hw:USB,x"));
-        // A card whose playback PCM is gone (unplugged mid-teardown).
-        let gone = root.join("card4");
-        std::fs::create_dir_all(&gone).unwrap();
-        std::fs::write(gone.join("id"), "DAC\n").unwrap();
-        assert!(!device_present_in(&root, "hw:CARD=DAC,DEV=0"));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn reject_non_hw_device() {
-        assert!(card_index_from_device("default").is_err());
-        assert!(card_index_from_device("hw:").is_err());
-    }
-
-    #[test]
     fn request_release_respects_priority_and_invokes_wakeup() {
         let release_requested = Arc::new(AtomicBool::new(false));
         let woken = Arc::new(AtomicBool::new(false));

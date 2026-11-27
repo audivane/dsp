@@ -136,7 +136,7 @@ export function PitchView() {
                   {label}
                 </button>
               ))}
-              <button className="btn small" disabled={missing} title="Back to the original pitch" onClick={() => setCents(0)}>
+              <button className="btn small" disabled={missing || p.reference_hz === p.target_hz} title="Back to the original pitch" onClick={() => edit((c) => pitchWithTuning(c, c.reference_hz ?? 440, c.reference_hz ?? 440))}>
                 Reset to 0
               </button>
             </div>

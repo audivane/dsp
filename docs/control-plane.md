@@ -1486,8 +1486,9 @@ chain. Volume, the output format and dither are always part of it.
   added_pct, added_peak_db, level_change_db, linear_gain_db, music_rms_dbfs,
   music_level_dbfs, music_peak_dbfs, centroid_hz, layers, split,
   split_note?, parts, analysis_ms }`: what the harmonics stage of the
-  side playing (A, or B during an A/B comparison) does to the music playing
-  now, the latest analysis frame (cheap, latest wins: clients poll it a few
+  side playing (A, or B during an A/B comparison; when only the side not
+  heard has a stage, that side's, since both sides run) does to the music
+  playing now, the latest analysis frame (cheap, latest wins: clients poll it a few
   times a second; compare `seq` to see a new one). Each block taps one side
   only, and a side switch restarts the analysis window, so no frame mixes
   the two. Each call keeps the analysis on for 3 s
@@ -1497,7 +1498,7 @@ chain. Volume, the output format and dither are always part of it.
   queued block's header carries where its frames start in the sample
   stream, and the analyser resyncs on any mismatch). `state` is `waiting`
   (gathering the first window), `idle` (no audio reaches the stage:
-  nothing playing, DSP off, bypass), `off` (the side playing has no active
+  nothing playing, DSP off, bypass), `off` (neither side has an active
   stage), `silent` (music below −90 dBFS: levels only), `hidden` (a blind
   test runs, `ab_blind`: a live readout would give the side away, so the
   engine is not asked and nothing is analysed; setting or clearing the
@@ -3084,7 +3085,9 @@ by default):
     (Room calibration bundles), one added by hand is off; unloading the
     bundle leaves it as it is. A config from before this field follows
     exactly when its room calibration calibrates that follower (the file
-    is written back in the new format on that start).
+    is written back in the new format on that start). While the loaded
+    calibration is switched off (`bundle_enable`) each follower it
+    calibrates is muted at runtime; its `enabled` is kept.
   Off, the follower's volume is independent: `volume_db` alone, no master
   volume, balance or mute. Either way its limiter and the volume guards
   apply.
@@ -3551,9 +3554,9 @@ removed exactly.
   the installed parts on any config edit: `set_convolution` (a list without
   the item gets it back, so the app sends only the user's items),
   `set_follower` (a new patch keeps its convolution the calibration's), a
-  preset load, `set_config`. Switching it off is therefore not possible;
-  unload it, or compare without it (A/B below). Its **level** is set per
-  part with `bundle_gain` (below).
+  preset load, `set_config`. `bundle_enable` (below) switches it off without
+  unloading it; A/B compares without it. Its **level** is set per part with
+  `bundle_gain` (below).
 - **The master's item stays on the master.** The chain A a follower inherits
   leaves the tagged item out (before the follower's own patch), so a
   master-only calibration never reaches another output; a calibrated
@@ -3580,6 +3583,24 @@ record keeps the manifest's beside it (`master_manifest_gain_db`,
 preset load and `set_config` as the calibration does, and a new
 `bundle_load` (the same bundle again too) or an unload drops it. The reply
 is the `CalibrationStatus`, the convolution guards' warnings in `notes`.
+
+**Switch.** `bundle_enable { on }` switches the loaded calibration on or
+off as one config edit. Off, chain A's tagged item (and a side B that
+keeps A's calibration) is placed disabled, the parts the record holds
+staying as they were: the main speakers play the user's own chain, without
+the calibration's crossover. Each calibrated follower is muted at runtime
+instead (its own `enabled` is kept, so turning the calibration back on
+restores it); its patch item keeps playing, so its chain never changes and
+a sub never plays without its low-pass, not even while a chain is rebuilt.
+On, everything plays again. A side B with its own bundle
+(`calibration_b`) is not affected. The guards hold the edit: a level raised
+while off is over the cap on, and then nothing changes
+(`bundle_enable: nothing changed: ...`); off always applies. A new
+`bundle_load` (the same bundle again too) starts it on, an unload drops it
+with the record, and a preset load or `set_config` keep it as they keep the
+calibration. The reply is the `CalibrationStatus`, the guards' warnings in
+`notes`; without a calibration `BAD_STATE` (`bundle_enable: nothing changed:
+no room calibration is loaded`).
 
 **Atomic.** `bundle_load` first reads the manifest and checks its shape and
 every IR file (present, a WAV, the channel it names); then it installs the
@@ -3649,13 +3670,14 @@ varispeed), which is new audio-thread work.
 | `bundle_show` | `CalibrationStatus` or `null` |
 | `bundle_ab { path \| null }` | `AbStatus` plus `notes` (as `set_ab`) |
 | `bundle_gain { device?, gain_db \| null }` | `CalibrationStatus` plus `notes` (the guards' warnings) |
+| `bundle_enable { on }` | `CalibrationStatus` plus `notes` (the guards' warnings) |
 
 **Status (`Status.calibration: CalibrationStatus | null`):** `label`,
-`path`, `design_rate_hz`, `notes`, `devices[]` (the master first: `role`,
-`device`, `entries` (filters), `gain_db` (as it plays now),
-`manifest_gain_db` (the manifest's), `trim_ms` (a follower's as it is
-now), `installed` (`false`: the follower was removed since)), and
-`warnings[]` (the rates, above, while the engine plays).
+`path`, `design_rate_hz`, `enabled` (whether it plays), `notes`,
+`devices[]` (the master first: `role`, `device`, `entries` (filters),
+`gain_db` (as it plays now), `manifest_gain_db` (the manifest's), `trim_ms`
+(a follower's as it is now), `installed` (`false`: the follower was removed
+since)), and `warnings[]` (the rates, above, while the engine plays).
 
 **CLI:**
 
@@ -3663,6 +3685,8 @@ now), `installed` (`false`: the follower was removed since)), and
 avdsp ctl bundle load desk/bundle.json    # prints the devices and warnings
 avdsp ctl bundle show
 avdsp ctl bundle unload
+avdsp ctl bundle enable off               # off: mains without it, its followers muted
+avdsp ctl bundle enable on
 avdsp ctl bundle ab other/bundle.json     # A/B: B with that calibration (master only)
 avdsp ctl bundle ab --none                # A/B: B without a calibration
 avdsp ctl bundle gain -2                  # the master part's level, dB

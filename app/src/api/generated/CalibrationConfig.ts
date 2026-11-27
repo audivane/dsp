@@ -11,7 +11,11 @@ export type CalibrationConfig = {
 /**
  * The manifest, absolute.
  */
-path: string, label: string, design_rate_hz: number, notes?: string, 
+path: string, label: string, design_rate_hz: number, 
+/**
+ * Whether the calibration plays (`bundle_enable`). Left out when on.
+ */
+enabled?: boolean, notes?: string, 
 /**
  * The master's part: chain A's item tagged `calibration`.
  */

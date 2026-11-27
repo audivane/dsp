@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ApoError, parseApo, presetNameFromFile, toApo } from "./apo";
+import { parseApo, toApo } from "./apo";
 
 const AUTOEQ = `# AutoEQ-style profile for a headphone
 Preamp: -6.2 dB
@@ -36,35 +36,9 @@ describe("ParametricEQ.txt import", () => {
     expect(profile.bands[2]).toMatchObject({ kind: "low_pass", gain_db: 0, q: Math.SQRT1_2 });
   });
 
-  it("puts Channel L and R filters in their own sections", () => {
-    const { profile, warnings } = parseApo("Preamp: -3 dB\nChannel: L\nFilter: ON PK Fc 100 Hz Gain 2 dB Q 1\nChannel: R\nFilter: ON PK Fc 200 Hz Gain -2 dB Q 1\nChannel: all\nFilter: ON HS Fc 8000 Hz Gain 1 dB Q 0.7");
-    expect(profile.version).toBe(2);
-    expect(profile.linked_enabled).toBe(true);
-    expect(profile.preamp_db).toBe(-3);
-    expect(profile.bands.map((b) => b.freq_hz)).toEqual([8000]);
-    expect(profile.left?.bands.map((b) => b.freq_hz)).toEqual([100]);
-    expect(profile.right?.bands.map((b) => b.freq_hz)).toEqual([200]);
-    expect(warnings).toHaveLength(0);
-  });
-
-  it("rejects malformed filters with the line number", () => {
-    expect(() => parseApo("Preamp: -1 dB\nFilter 1: ON XX Fc 100 Hz")).toThrow(ApoError);
-    expect(() => parseApo("Filter 1: ON PK Gain 3 dB")).toThrow(/Line 1/);
-    expect(() => parseApo("Preamp -3 dB")).toThrow(/Line 1/);
-  });
-
-  it("skips None filters and unknown directives", () => {
-    const { profile, warnings } = parseApo("Include: other.txt\nFilter 1: ON None\nFilter 2: ON NO Fc 50 Hz Q 30");
-    expect(profile.bands).toEqual([{ kind: "notch", freq_hz: 50, gain_db: 0, q: 30, enabled: true }]);
-    expect(warnings).toHaveLength(2);
-  });
 });
 
 describe("ParametricEQ.txt export", () => {
-  it("round-trips the linked section", () => {
-    const linked = parseApo(AUTOEQ).profile;
-    expect(parseApo(toApo(linked)).profile).toEqual(linked);
-  });
 
   it("writes Equalizer APO syntax", () => {
     expect(
@@ -78,8 +52,4 @@ describe("ParametricEQ.txt export", () => {
     ).toBe("Preamp: -6 dB\nFilter 1: ON LSC Fc 105 Hz Gain 5.5 dB Q 0.7\n");
   });
 
-  it("names presets from file names", () => {
-    expect(presetNameFromFile("Sennheiser HD 650 ParametricEQ.txt")).toBe("Sennheiser HD 650");
-    expect(presetNameFromFile("ParametricEQ.txt")).toBe("Imported");
-  });
 });

@@ -3,9 +3,8 @@
 /**
  * A device's DAC position (frames written minus the queue, as ALSA
  * reports it) against `CLOCK_MONOTONIC_RAW` through a run, from its first
- * touched frame until it drained, against the device's clock as the host
- * sees it. A step in the timeline the host can
- * see (a lost or repeated USB packet the driver counts) shows as a jump; a
+ * touched frame until it drained. A step in the timeline the host can see
+ * (a lost or repeated USB packet the driver counts) shows as a jump; a
  * drop inside the DAC, after what the driver reports, does not. The fit
  * takes out the clocks' offset and a slow drift, and a lone reading off
  * its neighbours is a stray, not a step.

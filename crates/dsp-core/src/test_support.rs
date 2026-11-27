@@ -61,32 +61,3 @@ pub(crate) fn words(head: &[u64], values: &[f64]) -> Vec<u64> {
         .chain(values.iter().map(|v| v.to_bits()))
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn records_only_inside_a_capture() {
-        record("outside", || panic!("not evaluated outside a capture"));
-        let ((), recs) = capture(|| {
-            record("a", || vec![1, 2]);
-            let ((), inner) = capture(|| record("inner", || vec![3]));
-            assert_eq!(inner.len(), 1);
-            record("b", || words(&[7], &[1.0]));
-        });
-        assert_eq!(
-            recs,
-            vec![
-                Record {
-                    tag: "a",
-                    words: vec![1, 2]
-                },
-                Record {
-                    tag: "b",
-                    words: vec![7, 1.0f64.to_bits()]
-                },
-            ]
-        );
-    }
-}

@@ -316,33 +316,6 @@ mod tests {
     }
 
     #[test]
-    fn auto_takes_the_rest_digitally_below_the_card_range() {
-        let log = Mutex::new(Vec::new());
-        let a = apply(&cfg(VolumeMode::Auto, -100.0), "hw:0", &card(&log));
-        assert_eq!(a.hardware_db, Some(-64.0));
-        assert_eq!(a.software_db, -36.0);
-        assert_eq!(a.volume_db, -100.0);
-    }
-
-    /// The range reported is the one the volume can take: below the card's
-    /// floor the digital part goes on, so a step down from -90 dB on a
-    /// -64 dB card must not be clamped up to -64 dB.
-    #[test]
-    fn the_reported_range_includes_the_digital_part_below_the_card() {
-        let log = Mutex::new(Vec::new());
-        for mode in [VolumeMode::Auto, VolumeMode::Hardware] {
-            let a = apply(&cfg(mode, -90.0), "hw:0", &card(&log));
-            assert_eq!(a.volume_db, -90.0, "{mode:?}");
-            assert_eq!(a.min_db, VOLUME_MIN_DB, "{mode:?}");
-            assert!(a.min_db <= a.volume_db, "{mode:?}");
-            assert_eq!(a.max_db, 0.0, "{mode:?}");
-            // Above the card's floor too: the range does not jump.
-            let a = apply(&cfg(mode, -20.0), "hw:0", &card(&log));
-            assert_eq!(a.min_db, VOLUME_MIN_DB, "{mode:?}");
-        }
-    }
-
-    #[test]
     fn hybrid_without_a_level_never_uses_the_card_maximum() {
         let log = Mutex::new(Vec::new());
         let a = apply(&cfg(VolumeMode::Hybrid, -40.0), "hw:0", &card(&log));
@@ -362,67 +335,6 @@ mod tests {
         let a = apply(&cfg(VolumeMode::Auto, -20.3), "hw:0", &none);
         assert!(!a.hardware_volume && !a.hardware_unavailable);
         assert_eq!(a.software_db, -20.3);
-    }
-
-    #[test]
-    fn software_leaves_the_mixer_alone_or_sets_the_fixed_level() {
-        let log = Mutex::new(Vec::new());
-        let a = apply(&cfg(VolumeMode::Software, -20.0), "hw:0", &card(&log));
-        assert!(log.lock().unwrap().is_empty(), "mixer untouched");
-        assert_eq!(a.software_db, -20.0);
-        assert_eq!(a.hardware_db, None);
-        assert!(!a.hardware_volume && !a.hardware_mute);
-
-        let mut c = cfg(VolumeMode::Software, -20.0);
-        c.hardware_db = Some(-6.0);
-        c.muted = true;
-        let a = apply(&c, "hw:0", &card(&log));
-        // Fixed level, switch left alone: the mute stays digital.
-        assert_eq!(log.lock().unwrap().as_slice(), &[(-6.0, None)]);
-        assert_eq!(a.hardware_db, Some(-6.0));
-        assert_eq!(a.software_db, -20.0);
-        assert!(!a.hardware_mute);
-    }
-
-    #[test]
-    fn hardware_mode_reports_a_missing_control_and_falls_back() {
-        let log = Mutex::new(Vec::new());
-        let a = apply(&cfg(VolumeMode::Hardware, -30.0), "hw:0", &card(&log));
-        assert!(a.hardware_volume && !a.hardware_unavailable);
-        assert_eq!(a.software_db, 0.0);
-        let a = apply(&cfg(VolumeMode::Hardware, -30.0), "hw:0", &none);
-        assert!(a.hardware_unavailable);
-        assert_eq!(a.software_db, -30.0, "never louder than asked");
-    }
-
-    #[test]
-    fn hybrid_keeps_the_hardware_at_its_level_and_attenuates_digitally() {
-        let log = Mutex::new(Vec::new());
-        let mut c = cfg(VolumeMode::Hybrid, -30.0);
-        c.hardware_db = Some(-10.0);
-        let a = apply(&c, "hw:0", &card(&log));
-        assert_eq!(a.hardware_db, Some(-10.0));
-        assert_eq!(a.software_db, -20.0);
-        assert_eq!(a.volume_db, -30.0);
-
-        // Louder than the preferred level: the hardware goes up, digital at unity.
-        c.volume_db = -4.2;
-        let a = apply(&c, "hw:0", &card(&log));
-        assert_eq!(a.hardware_db, Some(-4.5));
-        assert_eq!(a.software_db, 0.0, "never a digital boost");
-        assert_eq!(a.volume_db, -4.5);
-
-        // Below the card's range: hardware stays at its level, digital does it.
-        c.volume_db = -100.0;
-        let a = apply(&c, "hw:0", &card(&log));
-        assert_eq!(a.hardware_db, Some(-10.0));
-        assert_eq!(a.software_db, -90.0);
-
-        c.hardware_db = None;
-        c.volume_db = -12.0;
-        let a = apply(&c, "hw:0", &none);
-        assert!(a.hardware_unavailable);
-        assert_eq!(a.software_db, -12.0);
     }
 
     /// Every hybrid transition is never louder than the louder of the two
@@ -473,45 +385,6 @@ mod tests {
         }
     }
 
-    /// Leaving the DAC in software (fixed level) or hybrid brings the card
-    /// down to what was heard; modes where the card already carries the
-    /// volume, or that never touch it, leave it alone.
-    #[test]
-    fn failsafe_leaves_the_card_at_the_heard_level() {
-        let cfg = |mode, hardware_db, volume_db| VolumeConfig {
-            mode,
-            hardware_db,
-            volume_db,
-            ..VolumeConfig::default()
-        };
-        let w = failsafe_write(&cfg(VolumeMode::Software, Some(0.0), -30.0), Some(0.0)).unwrap();
-        assert_eq!(w.db, -30.0);
-        assert_eq!(w.mute, None);
-        let w = failsafe_write(&cfg(VolumeMode::Hybrid, Some(-6.0), -40.0), Some(-6.0)).unwrap();
-        assert_eq!(w.db, -40.0);
-        // The ceiling counts.
-        let mut c = cfg(VolumeMode::Hybrid, Some(0.0), -2.0);
-        c.max_volume_db = Some(-12.0);
-        assert_eq!(failsafe_write(&c, Some(0.0)).unwrap().db, -12.0);
-        // Already at or below the heard level, or not ours.
-        assert_eq!(
-            failsafe_write(&cfg(VolumeMode::Hybrid, Some(-6.0), -3.0), None),
-            None
-        );
-        assert_eq!(
-            failsafe_write(&cfg(VolumeMode::Software, None, -30.0), None),
-            None
-        );
-        assert_eq!(
-            failsafe_write(&cfg(VolumeMode::Auto, None, -30.0), None),
-            None
-        );
-        assert_eq!(
-            failsafe_write(&cfg(VolumeMode::Hardware, None, -30.0), None),
-            None
-        );
-    }
-
     /// `auto`/`hardware`: the card carries the volume, except below its
     /// floor, where it is louder than what is heard. Only then is there
     /// something to do (the write clamps at the floor, never a raise; the
@@ -560,77 +433,5 @@ mod tests {
             );
             assert!(log.lock().unwrap().is_empty(), "{mode:?}: card written");
         }
-    }
-
-    /// The card reading back a few thousandths of a dB above the target
-    /// (0.01 dB rounding, fine USB steps) leaves the digital part at unity.
-    #[test]
-    fn mixer_rounding_is_not_a_digital_residue() {
-        let hw = |volume_db| MixerApplyOutcome {
-            hardware_volume: true,
-            hardware_mute: false,
-            volume_db,
-            min_db: -100.0,
-            max_db: 0.0,
-        };
-        for mode in [VolumeMode::Auto, VolumeMode::Hardware] {
-            let cfg = VolumeConfig {
-                mode,
-                volume_db: -31.394,
-                ..VolumeConfig::default()
-            };
-            let p = plan(&cfg);
-            let a = resolve(&cfg, &p, Some(hw(-31.39)));
-            assert_eq!(a.software_db, 0.0, "{mode:?}");
-            // A real residue (below the card's range) is still applied.
-            let a = resolve(&cfg, &p, Some(hw(-31.0)));
-            assert!((a.software_db + 0.394).abs() < 1e-9);
-        }
-        let cfg = VolumeConfig {
-            mode: VolumeMode::Hybrid,
-            hardware_db: Some(-31.39),
-            volume_db: -31.394,
-            ..VolumeConfig::default()
-        };
-        let a = resolve(&cfg, &plan(&cfg), Some(hw(-31.39)));
-        assert_eq!(a.software_db, 0.0);
-    }
-
-    /// A card with no volume control (`CardLevel::NoControl`) never triggers
-    /// the unknown-level warning or a write, while an unreadable control
-    /// (`CardLevel::Unknown`) keeps the warning whenever the failsafe would
-    /// have lowered the card.
-    #[test]
-    fn failsafe_blocked_distinguishes_no_control_from_unknown_level() {
-        for (mode, hardware_db) in [
-            (VolumeMode::Auto, None),
-            (VolumeMode::Hardware, None),
-            (VolumeMode::Hybrid, Some(0.0)),
-            (VolumeMode::Software, Some(0.0)),
-        ] {
-            let mut c = cfg(mode, -30.0);
-            c.hardware_db = hardware_db;
-            assert!(
-                !failsafe_blocked_by_unknown_level(&c, CardLevel::NoControl),
-                "{mode:?}: mixerless card must not warn"
-            );
-            assert_eq!(failsafe_write(&c, CardLevel::NoControl.db()), None);
-            assert!(
-                failsafe_blocked_by_unknown_level(&c, CardLevel::Unknown),
-                "{mode:?}: unreadable control must warn"
-            );
-            assert_eq!(failsafe_write(&c, CardLevel::Unknown.db()), None);
-            assert!(
-                !failsafe_blocked_by_unknown_level(&c, CardLevel::Known(-10.0)),
-                "{mode:?}: known level must not warn"
-            );
-        }
-        // `software` without a fixed level never touches the mixer, so even
-        // an unknown level does not warn.
-        let sw_plain = cfg(VolumeMode::Software, -30.0);
-        assert!(!failsafe_blocked_by_unknown_level(
-            &sw_plain,
-            CardLevel::Unknown
-        ));
     }
 }

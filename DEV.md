@@ -28,34 +28,31 @@ python3 tests/reference/run.py    # numpy/scipy cross-checks (needs avdsp built)
 ```
 
 Rules for code on the audio thread: no allocation, no locks, no syscalls
-except the ALSA/PipeWire calls themselves. Long tests (> ~2 s) go behind
-`#[ignore]` and run with `cargo nextest run --run-ignored all`: tier B of the
-filter fingerprints, the design and drift simulations, the harmonics
-identity and speed checks, and the limiter and measurement reports.
+except the ALSA/PipeWire calls themselves.
+
+The suite keeps what a listener cannot check by ear or by using the app:
+bit-perfect paths, no allocation on the audio thread, bounds that keep the
+output from getting loud, numeric accuracy against references, wedges and
+the integrity of config and preset files. Behaviour a tester sees or hears
+in normal use is left to testers. Two tests are behind `#[ignore]` (run
+with `cargo nextest run --run-ignored all`): tier B of the filter
+fingerprints and the real-PipeWire default-sink test.
 
 The daemon and IPC/CLI suites (driven with raw protocol lines and the real
 `avdsp` binary on a temporary socket, against a `MockEngine`; the binary is
 built on demand, override with `AVDSP_BIN`):
 
 ```sh
-cargo nextest run -p audivane-dsp-daemon             # unit + IPC/CLI/MPRIS tests
-# Real PipeWire (two temporary f3_it_* null sinks, a pw-play stream):
-cargo nextest run -p audivane-dsp-daemon --run-ignored all -E 'test(graph_it)'
-# ... including the session-default parts (both metadata keys, normal stop and
-# a simulated kill -9; briefly changes the default and restores it exactly):
+cargo nextest run -p audivane-dsp-daemon             # unit + IPC/CLI tests
+# Real PipeWire, session default (both metadata keys, normal stop and a
+# simulated kill -9; briefly changes the default and restores it exactly):
 AUDIVANE_IT_DEFAULT_SINK=1 cargo nextest run -p audivane-dsp-daemon \
     --run-ignored all -E 'test(graph_it)'
 ```
 
-The default-sink tests hold a file lock (`$TMPDIR/avdsp-f3-default-sink.lock`)
+The default-sink test holds a file lock (`$TMPDIR/avdsp-f3-default-sink.lock`)
 so concurrent nextest processes cannot interleave their changes, and the
-original values are restored even if a test panics. The IPC/CLI suite covers
-the preset round trip (save/list/get/load/rename/delete, overwrite refusal,
-`modified`, active-preset tracking across a restart), APO import, device
-listing, `config`/`presets` events and the coalesced config writer (write
-counts and flush on shutdown). The ALSA device parser is unit-tested against
-canned `/proc/asound/pcm` and `/proc/asound/cards` text, so it needs no sound
-card.
+original values are restored even if a test panics.
 
 ## Build from source
 

@@ -25,7 +25,7 @@
   </picture>
 </p>
 
-Version 0.11.1. Packages for Arch, Debian / Ubuntu and Fedora, and an
+Version 0.11.2. Packages for Arch, Debian / Ubuntu and Fedora, and an
 AppImage. Free and open source.
 
 ## Upsampling
@@ -248,8 +248,8 @@ The AppImage runs on any distribution, without root (it needs WebKitGTK 4.1
 from your distribution, which most desktops already have):
 
 ```sh
-curl -fLO https://github.com/audivane/dsp/releases/download/0.11.1/Audivane-DSP-0.11.1-x86_64.AppImage
-chmod +x Audivane-DSP-0.11.1-x86_64.AppImage && ./Audivane-DSP-0.11.1-x86_64.AppImage
+curl -fLO https://github.com/audivane/dsp/releases/download/0.11.2/Audivane-DSP-0.11.2-x86_64.AppImage
+chmod +x Audivane-DSP-0.11.2-x86_64.AppImage && ./Audivane-DSP-0.11.2-x86_64.AppImage
 ```
 
 The app opens and offers **Set up and start**: it installs the engine, the app
@@ -262,15 +262,15 @@ Or install the package for your distribution:
 
 ```sh
 # Arch Linux
-curl -fLO https://github.com/audivane/dsp/releases/download/0.11.1/audivane-dsp-0.11.1-1-x86_64.pkg.tar.zst
-sudo pacman -U ./audivane-dsp-0.11.1-1-x86_64.pkg.tar.zst
+curl -fLO https://github.com/audivane/dsp/releases/download/0.11.2/audivane-dsp-0.11.2-1-x86_64.pkg.tar.zst
+sudo pacman -U ./audivane-dsp-0.11.2-1-x86_64.pkg.tar.zst
 
 # Ubuntu 24.04+ / Debian 13+
-curl -fLO https://github.com/audivane/dsp/releases/download/0.11.1/audivane-dsp_0.11.1-1_amd64.deb
-sudo apt install ./audivane-dsp_0.11.1-1_amd64.deb
+curl -fLO https://github.com/audivane/dsp/releases/download/0.11.2/audivane-dsp_0.11.2-1_amd64.deb
+sudo apt install ./audivane-dsp_0.11.2-1_amd64.deb
 
 # Fedora 40+
-sudo dnf install https://github.com/audivane/dsp/releases/download/0.11.1/audivane-dsp-0.11.1-1.x86_64.rpm
+sudo dnf install https://github.com/audivane/dsp/releases/download/0.11.2/audivane-dsp-0.11.2-1.x86_64.rpm
 ```
 
 With a package, start the engine for your user and open **Audivane DSP** from your app menu:

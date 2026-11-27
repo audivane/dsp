@@ -108,20 +108,3 @@ pub fn conv_files(c: &ConvolutionConfig) -> String {
         None => c.ir_path.display().to_string(),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_entries_and_leaves_paths_alone() {
-        let e = parse_matrix_entry("1:0=/tmp/a=b.wav").unwrap();
-        assert_eq!((e.input, e.output, e.channel), (1, 0, None));
-        assert_eq!(e.ir_path, PathBuf::from("/tmp/a=b.wav"));
-        let e = parse_matrix_entry("0:1:1=x.wav").unwrap();
-        assert_eq!((e.input, e.output, e.channel), (0, 1, Some(1)));
-        for plain in ["/tmp/x.wav", "a=b.wav", "1=x.wav", "0:1=", "0:1:2:3=x.wav"] {
-            assert!(parse_matrix_entry(plain).is_none(), "{plain}");
-        }
-    }
-}

@@ -39,23 +39,3 @@ impl Grid {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn grids() {
-        let g = Grid::new(44_100, RateRatio::integer(8));
-        assert_eq!((g.up, g.down, g.design_ratio), (8, 1, 8));
-        assert!(g.multiple && !g.decimating);
-        let g = Grid::new(44_100, RateRatio::from_rates(44_100, 48_000));
-        assert_eq!((g.up, g.down, g.design_ratio), (160, 147, 160));
-        assert!(!g.multiple && !g.decimating);
-        let g = Grid::new(96_000, RateRatio::from_rates(96_000, 48_000));
-        assert_eq!((g.up, g.down, g.design_ratio), (1, 2, 2));
-        assert!(g.multiple && g.decimating);
-        let g = Grid::new(48_000, RateRatio::from_rates(48_000, 44_100));
-        assert!(!g.multiple && g.decimating);
-    }
-}

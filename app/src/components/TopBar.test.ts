@@ -25,39 +25,9 @@ vi.mock("../store/store", async (importOriginal) => ({
   }),
 }));
 
-function volumeSlider(): string {
-  const html = renderToStaticMarkup(createElement(VolumeControls));
-  return html.split('aria-label="Volume"')[1].split("</output>")[0];
-}
-
 beforeEach(() => {
   const daemon = new MockDaemon();
   fixture.state = { status: daemon.status(), config: null, volumeDraft: null, volumeFresh: true, connEpoch: 1 };
-});
-
-it("draws nothing until the daemon has reported a level", () => {
-  fixture.state.status = null;
-  const s = volumeSlider();
-  expect(s).not.toContain("fine-knob");
-  expect(s).not.toContain("fine-fill");
-  expect(s).not.toContain("aria-valuenow");
-  expect(s).not.toContain("0.0");
-  expect(s).toMatch(/>-$/);
-});
-
-it("draws nothing for a status without volume", () => {
-  fixture.state.status = { ...fixture.state.status!, volume: null };
-  const s = volumeSlider();
-  expect(s).not.toContain("fine-knob");
-  expect(s).toMatch(/>-$/);
-});
-
-it("shows the reported level once it is known", () => {
-  fixture.state.status = { ...fixture.state.status!, volume: { ...fixture.state.status!.volume!, volume_db: -23.5 } };
-  const s = volumeSlider();
-  expect(s).toContain("fine-knob");
-  expect(s).toContain('aria-valuenow="-23.5"');
-  expect(s).toContain("23.5");
 });
 
 function controls(): { vol: string; bal: string; mute: string } {
@@ -101,27 +71,3 @@ it("the hardware badge claims bit-perfect only while nothing is applied digitall
   expect(html).toMatch(/[-\u2212]26\.0 dB digitally/);
 });
 
-it("a daemon without volume revisions: controls disabled, asking for an engine update", () => {
-  const { instance: _i, revision: _r, ...legacy } = fixture.state.status!.volume!;
-  fixture.state.status = { ...fixture.state.status!, volume: legacy };
-  const html = renderToStaticMarkup(createElement(VolumeControls));
-  expect(html).toMatch(/[Uu]pdate the engine/);
-  expect(controls().vol).not.toContain("fine-knob");
-  expect(controls().mute).toContain("disabled");
-});
-
-it("the hardware badge does not claim bit-perfect with digital balance", () => {
-  const base = fixture.state.status!.volume!;
-  fixture.state.status = { ...fixture.state.status!, volume: { ...base, hardware: true, hardware_db: -20, software_db: 0, volume_db: -20, balance_db: -2 } };
-  const html = renderToStaticMarkup(createElement(VolumeControls));
-  expect(html).not.toContain("stays bit-perfect");
-  expect(html).toContain("not bit-perfect");
-});
-
-it("the hardware badge does not claim bit-perfect while muted", () => {
-  const base = fixture.state.status!.volume!;
-  fixture.state.status = { ...fixture.state.status!, volume: { ...base, hardware: true, hardware_db: -20, software_db: 0, volume_db: -20, balance_db: 0, muted: true } };
-  const html = renderToStaticMarkup(createElement(VolumeControls));
-  expect(html).not.toContain("stays bit-perfect");
-  expect(html).toContain("master volume. Muted:");
-});

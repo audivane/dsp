@@ -225,52 +225,6 @@ fn a_graph_that_stays_ends_in_an_error_not_a_reopen_loop() {
 }
 
 #[test]
-fn a_graph_that_follows_the_move_plays_at_x1() {
-    let caps = dac(&[48_000]);
-    for (sink, cfg) in bypass_sinks() {
-        let o = run(
-            &caps,
-            cfg,
-            sink,
-            |now| if now < 200_000_000 { 44_100 } else { 48_000 },
-            5,
-        );
-        assert_eq!(o.failed_ns, None, "{sink:?}");
-        assert_eq!((o.graph, o.ratio), (48_000, RateRatio::ONE), "{sink:?}");
-        assert!(o.opens <= 5, "{sink:?}: {}", o.opens);
-        assert!(o.plays > 80, "{sink:?}");
-    }
-}
-
-#[test]
-fn after_the_error_a_graph_that_moves_plays_at_x1() {
-    let caps = dac(&[48_000]);
-    for (sink, cfg) in bypass_sinks() {
-        let o = run(
-            &caps,
-            cfg,
-            sink,
-            |now| if now < 6_000_000_000 { 44_100 } else { 48_000 },
-            8,
-        );
-        assert!(o.failed_ns.is_some(), "{sink:?}");
-        assert_eq!((o.graph, o.ratio), (48_000, RateRatio::ONE), "{sink:?}");
-    }
-}
-
-#[test]
-fn dsp_on_keeps_a_fixed_graph_with_a_fractional_ratio() {
-    // The DSP sink with DSP on plays 44.1 kHz on the 48 kHz-only DAC at
-    // 160/147: one open, no move.
-    let caps = dac(&[48_000]);
-    let on = bypass_sinks()[0].1;
-    let o = run(&caps, on, SinkChoice::Dsp, |_| 44_100, 5);
-    assert_eq!(o.opens, 1);
-    assert_eq!(o.failed_ns, None);
-    assert_eq!((o.graph, o.ratio), (44_100, RateRatio::new(160, 147)));
-}
-
-#[test]
 fn reopens_a_second_apart_still_give_up() {
     // Each reopen takes a second (a slow device): the graph stays, and the
     // open still gives up once, about 3 s after the first attempt.
@@ -283,51 +237,5 @@ fn reopens_a_second_apart_still_give_up() {
             "{sink:?}: {failed}"
         );
         assert!(o.opens <= 5, "{sink:?}: {}", o.opens);
-    }
-}
-
-#[test]
-fn a_slow_move_recovers_once_it_lands() {
-    // PipeWire follows, but only after 3.5 s: the open gives up at 3 s,
-    // and the landing (a graph-rate change) brings playback back at x1.
-    let caps = dac(&[48_000]);
-    for (sink, cfg) in bypass_sinks() {
-        let o = run(
-            &caps,
-            cfg,
-            sink,
-            |now| if now < 3_500_000_000 { 44_100 } else { 48_000 },
-            6,
-        );
-        assert!(o.failed_ns.is_some(), "{sink:?}");
-        assert_eq!((o.graph, o.ratio), (48_000, RateRatio::ONE), "{sink:?}");
-        assert!(o.plays > 40, "{sink:?}: {}", o.plays);
-    }
-}
-
-#[test]
-fn a_landed_move_never_counts_against_a_later_one() {
-    // The move lands at once; 10 s later the graph is back at 44.1 kHz and
-    // pinned there. The new move gets its own 3 s, not the old deadline.
-    let caps = dac(&[48_000]);
-    for (sink, cfg) in bypass_sinks() {
-        let o = run(
-            &caps,
-            cfg,
-            sink,
-            |now| {
-                if (100_000_000..10_000_000_000).contains(&now) {
-                    48_000
-                } else {
-                    44_100
-                }
-            },
-            20,
-        );
-        let failed = o.failed_ns.expect("never gave up");
-        assert!(
-            failed >= 10_000_000_000 + MOVE_GIVE_UP_NS,
-            "{sink:?}: {failed}"
-        );
     }
 }

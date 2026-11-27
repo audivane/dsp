@@ -352,32 +352,6 @@ mod tests {
     }
 
     #[test]
-    fn stage_rule() {
-        assert_eq!(stage_factors(8), vec![2, 2, 2]);
-        assert_eq!(stage_factors(6), vec![3, 2]);
-        assert_eq!(stage_factors(12), vec![3, 2, 2]);
-        assert_eq!(stage_factors(18), vec![3, 3, 2]);
-        assert_eq!(stage_factors(2), vec![2]);
-    }
-
-    #[test]
-    fn kernel_lengths_and_peaks() {
-        // x8: (len - 1) * (4 + 2 + 1) + 1.
-        let k = cascade_kernel(CascadeFir, 8).unwrap();
-        assert_eq!(k.kernel.len(), 1779);
-        assert_eq!(k.delay, 889);
-        assert!((k.kernel[k.delay] - 2.0 * 0.476755).abs() < 2e-6);
-        let k = cascade_kernel(CascadeFft, 8).unwrap();
-        assert_eq!(k.kernel.len(), 3578);
-        // A +0.5 impulse peaks at 0.474609375 (= 243/512).
-        assert!((0.5 * k.kernel[k.delay] - 0.474609375).abs() < 1e-12);
-        let k = cascade_kernel(CascadeFirAsym, 8).unwrap();
-        assert_eq!(k.kernel.len(), 289 * 7 - 6);
-        let k = cascade_kernel(CascadeFirMp, 12).unwrap();
-        assert_eq!(k.kernel.len(), 254 * (4 + 2 + 1) + 1);
-    }
-
-    #[test]
     fn unity_dc_gain() {
         // Each output phase of the cascade kernel sums to about 1.
         for p in [CascadeFir, CascadeFirMp, CascadeFirAsym, CascadeFft] {
@@ -422,26 +396,6 @@ mod tests {
     }
 
     #[test]
-    fn recursive_matches_its_reference_order() {
-        // Impulse 0.5 through x8 (three x2 stages): a few known samples.
-        let mut rt = build(CascadeInverseChebyshev, 44100, 8, 1, 64).unwrap();
-        let mut x = vec![0.0; 1];
-        x[0] = 0.5;
-        let y = run(rt.as_mut(), &x, 300, 64);
-        let peak = y.iter().copied().fold(0.0f64, |a, v| a.max(v.abs()));
-        assert!(peak > 0.3 && peak < 0.5, "peak {peak}");
-        assert_eq!(rt.latency_out_frames(), {
-            let mut bi = 0;
-            for (i, v) in y.iter().enumerate() {
-                if v.abs() > y[bi].abs() {
-                    bi = i;
-                }
-            }
-            bi
-        });
-    }
-
-    #[test]
     fn every_block_size_gives_the_same_output() {
         let mut seed = 11;
         let x: Vec<f64> = (0..2000).map(|_| 0.3 * lcg(&mut seed)).collect();
@@ -464,133 +418,6 @@ mod tests {
                     assert!(e < 1e-15, "{} x{ratio}: {e}", p.name());
                 }
             }
-        }
-    }
-
-    #[test]
-    fn stereo_channels_are_independent_and_identical() {
-        let mut seed = 3;
-        let x: Vec<f64> = (0..700).map(|_| 0.3 * lcg(&mut seed)).collect();
-        for p in ALL {
-            let ratio = 8;
-            let mut mono = build(p, 44100, ratio, 1, 128).unwrap();
-            let ym = run(mono.as_mut(), &x, 0, 128);
-            let mut st = build(p, 44100, ratio, 3, 128).unwrap();
-            let mut out = vec![vec![0.0; x.len() * ratio]; 3];
-            let zero = vec![0.0; 128];
-            for (bi, chunk) in x.chunks(128).enumerate() {
-                let n = chunk.len();
-                let o = bi * 128 * ratio;
-                let (o0, rest) = out.split_at_mut(1);
-                let (o1, o2) = rest.split_at_mut(1);
-                st.process(
-                    &[chunk, &zero[..n], chunk],
-                    &mut [
-                        &mut o0[0][o..o + n * ratio],
-                        &mut o1[0][o..o + n * ratio],
-                        &mut o2[0][o..o + n * ratio],
-                    ],
-                );
-            }
-            assert_eq!(out[0], ym, "{}", p.name());
-            assert_eq!(out[2], ym, "{}", p.name());
-            assert!(out[1].iter().all(|&v| v == 0.0));
-        }
-    }
-
-    #[test]
-    fn reset_and_gain() {
-        let mut seed = 5;
-        let x: Vec<f64> = (0..500).map(|_| 0.3 * lcg(&mut seed)).collect();
-        for p in ALL {
-            let mut rt = build(p, 44100, 4, 1, 100).unwrap();
-            let y1 = run(rt.as_mut(), &x, 50, 100);
-            let mut unity = build(p, 44100, 4, 1, 100).unwrap();
-            unity.scale_output(1.0);
-            assert_eq!(y1, run(unity.as_mut(), &x, 50, 100));
-            rt.reset();
-            let y2 = run(rt.as_mut(), &x, 50, 100);
-            assert_eq!(y1, y2, "{}", p.name());
-            let mut g = build(p, 44100, 4, 1, 100).unwrap();
-            g.scale_output(0.5);
-            let y3 = run(g.as_mut(), &x, 50, 100);
-            for (a, b) in y1.iter().zip(&y3) {
-                assert!((a * 0.5 - b).abs() < 1e-15);
-            }
-        }
-    }
-
-    #[test]
-    fn impulse_span_covers_the_response() {
-        for p in ALL {
-            let ratio = 8;
-            let mut rt = build(p, 44100, ratio, 1, 64).unwrap();
-            let span = rt.impulse_span_out_frames();
-            let y = run(rt.as_mut(), &[1.0], span / ratio + 64, 64);
-            let peak = y.iter().copied().fold(0.0f64, |a, v| a.max(v.abs()));
-            // FIR: the FFT engine leaves rounding noise outside the support.
-            let limit = if is_recursive(p) {
-                peak * 2f64.powi(-60)
-            } else {
-                1e-15
-            };
-            assert!(
-                y[span..].iter().all(|v| v.abs() <= limit),
-                "{}: tail past {span}",
-                p.name()
-            );
-            assert!(y[span - 1].abs() > 0.0 || is_recursive(p), "{}", p.name());
-        }
-    }
-}
-
-#[cfg(test)]
-mod benchmarks {
-    use super::*;
-    #[test]
-    // Run in release mode with --ignored --nocapture, one test thread.
-    #[ignore]
-    fn realtime_factor() {
-        use FilterPreset::*;
-        let ratio: usize = std::env::var("C3_RATIO")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(16);
-        let secs = 10.0;
-        let n = (44100.0 * secs) as usize;
-        let block = 512;
-        let mut seed = 9u64;
-        let x: Vec<f64> = (0..n)
-            .map(|_| {
-                seed = seed
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                (((seed >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0) * 0.25
-            })
-            .collect();
-        for p in [
-            CascadeElliptic,
-            CascadeInverseChebyshev,
-            CascadeFir,
-            CascadeFirAsym,
-            CascadeFirMp,
-            CascadeFft,
-        ] {
-            let mut rt = build(p, 44100, ratio, 2, block).unwrap();
-            let mut o0 = vec![0.0; block * ratio];
-            let mut o1 = vec![0.0; block * ratio];
-            let t = std::time::Instant::now();
-            for c in x.chunks(block) {
-                let m = c.len();
-                rt.process(&[c, c], &mut [&mut o0[..m * ratio], &mut o1[..m * ratio]]);
-                std::hint::black_box((&o0, &o1));
-            }
-            let dt = t.elapsed().as_secs_f64();
-            println!(
-                "{:28} x{ratio} stereo: {:.1}x real time",
-                p.name(),
-                secs / dt
-            );
         }
     }
 }

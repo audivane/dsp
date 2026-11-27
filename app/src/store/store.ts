@@ -1423,6 +1423,11 @@ export class AppStore {
     return this.mutate(() => this.call("bundle_gain", { ...(device ? { device } : {}), gain_db }));
   }
 
+  /** Switch the loaded room calibration on or off: off, the main speakers play unfiltered and its followers are muted. */
+  setCalibrationEnabled(on: boolean) {
+    return this.mutate(() => this.call("bundle_enable", { on }), on ? "Room calibration on" : "Room calibration off");
+  }
+
   /** Index of the IR shown at `i` (by `irKey`) in `list`, which may have changed since. */
   private irIndex(list: ConvolutionConfig[], i: number, key: string | undefined): number {
     if (key === undefined) return -1;

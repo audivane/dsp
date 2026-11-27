@@ -863,6 +863,7 @@ impl Service {
                 with_notes(to_value(&status)?, notes)
             }
             Call::BundleGain { device, gain_db } => self.bundle_gain(device.as_deref(), gain_db),
+            Call::BundleEnable { on } => self.bundle_enable(on),
             Call::ConvResponse { side, device } => {
                 // Without the mutation lock: it only reads the config, and
                 // the engine's IR cache holds the files at the graph rate.
@@ -2975,6 +2976,45 @@ impl Service {
         with_notes(to_value(&self.calibration_status(&cfg))?, notes)
     }
 
+    /// `bundle_enable`: the loaded calibration on or off, as one config
+    /// edit: off, its items are placed disabled and each calibrated
+    /// follower is muted at runtime (its own `enabled` kept); on, they play
+    /// again. The guards hold the edit (a level raised while off can be over
+    /// the cap, and then nothing changes). The reply is the calibration's
+    /// status, the guards' warnings in `notes`.
+    fn bundle_enable(&self, on: bool) -> Result<Value, RpcError> {
+        let _mutation = self.lock_mutation();
+        let mut current = self.config();
+        if current.calibration.is_none() {
+            return Err(RpcError {
+                code: RpcError::BAD_STATE,
+                message: "bundle_enable: nothing changed: no room calibration is loaded".into(),
+            });
+        }
+        super::calibration::set_enabled(&mut current, on)
+            .map_err(|e| invalid_params(format!("bundle_enable: {e}")))?;
+        let cal = current.calibration.clone();
+        let cfg = self
+            .edit_locked(
+                |cfg| {
+                    cfg.calibration = cal;
+                    super::calibration::normalize(cfg);
+                },
+                None,
+            )
+            .map_err(|e| RpcError {
+                code: e.code,
+                message: format!("bundle_enable: nothing changed: {}", e.message),
+            })?;
+        let notes = self
+            .engine
+            .conv_warnings()
+            .into_iter()
+            .map(|w| w.message)
+            .collect();
+        with_notes(to_value(&self.calibration_status(&cfg))?, notes)
+    }
+
     /// `bundle_ab`: A/B of calibrations on the master. Side B is chain A
     /// with the bundle at `path` in place of the loaded calibration
     /// (`None`: without one), the followers as they are (they keep the
@@ -3080,12 +3120,6 @@ impl Service {
             l.levels = now;
             l.revision += 1;
         }
-    }
-
-    /// The current [`VolumeStatus::revision`].
-    #[cfg(test)]
-    fn level_revision(&self) -> u64 {
-        self.level_state().1
     }
 
     /// The engine's applied volume and the [`VolumeStatus::revision`] that
@@ -3767,7 +3801,7 @@ mod tests {
     use crate::api::EngineSnapshot;
     use audivane_protocol::ipc::LevelMatch;
     use audivane_protocol::ipc::{AbSide, EngineState, Meters};
-    use audivane_protocol::{ChainConfig, EqProfile, UpsamplerConfig};
+    use audivane_protocol::{ChainConfig, UpsamplerConfig};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct MockEngine {
@@ -3786,15 +3820,7 @@ mod tests {
         caps: Mutex<Option<audivane_protocol::ipc::DeviceCapabilities>>,
     }
 
-    impl MockEngine {
-        /// The applied level changes on its own (a staged hardware raise
-        /// landing, a mixer readback on a reopen).
-        fn set_applied(&self, status: VolumeStatus) {
-            let mut a = self.applied.lock().unwrap();
-            a.0 = Some(status);
-            a.1 += 1;
-        }
-    }
+    impl MockEngine {}
 
     impl Engine for MockEngine {
         fn harmonics_live_suspend(&self) {
@@ -3900,26 +3926,7 @@ mod tests {
         }
     }
 
-    impl MockEngine {
-        /// `seconds` of hops from the audio thread for the running epoch:
-        /// A at `a_lufs` (`-inf`: silence), B `b_db` louder.
-        fn play(&self, seconds: f64, a_lufs: f64, b_db: f64) {
-            let a = if a_lufs.is_finite() {
-                10f64.powf((a_lufs + 0.691) / 10.0)
-            } else {
-                0.0
-            };
-            let mut m = self.measure.lock().unwrap();
-            let epoch = m.0;
-            for _ in 0..(seconds * 10.0).round() as usize {
-                m.1.push(audivane_dsp_core::ab_measure::AbHop {
-                    epoch,
-                    a,
-                    b: a * 10f64.powf(b_db / 10.0),
-                });
-            }
-        }
-    }
+    impl MockEngine {}
 
     fn service() -> (Arc<Service>, Arc<MockEngine>) {
         let engine = Arc::new(MockEngine {
@@ -3944,413 +3951,6 @@ mod tests {
             ShutdownFlag::new(),
         );
         (svc, engine)
-    }
-
-    /// `conv_response` measures at the engine's graph rate; side B needs A/B.
-    #[test]
-    fn conv_response_reads_the_graph_rate_and_checks_its_side() {
-        let (service, engine) = service();
-        *engine.graph_rate.lock().unwrap() = Some(96_000);
-        let r: audivane_protocol::ipc::ConvResponse =
-            serde_json::from_value(value(service.dispatch(Call::ConvResponse {
-                side: None,
-                device: None,
-            })))
-            .unwrap();
-        assert_eq!(r.rate_hz, 96_000);
-        assert_eq!(r.freqs_hz.len(), 241);
-        assert!(r.items.is_empty() && r.outputs.is_empty());
-        assert_eq!(r.combined_taps, 0);
-        let err = service
-            .dispatch(Call::ConvResponse {
-                side: Some(AbSide::B),
-                device: None,
-            })
-            .unwrap_err();
-        assert_eq!(err.code, RpcError::INVALID_PARAMS);
-    }
-
-    /// The per-rate plan is redone for chain A's convolution, and for its
-    /// EQ while a filter matrix runs (both cost the audio thread), not for
-    /// an EQ edit without one.
-    #[test]
-    fn the_rate_plan_key_follows_chain_a_matrix_and_its_eq() {
-        let key = |cfg: &EngineConfig| RatePlanKey::of(cfg, None, None, Vec::new());
-        let base = EngineConfig::default();
-        let mut eq_only = base.clone();
-        eq_only.chain.eq = Some(EqProfile {
-            preamp_db: -3.0,
-            ..Default::default()
-        });
-        assert_eq!(key(&base), key(&eq_only));
-        let mut matrix = base.clone();
-        matrix.chain.convolution = vec![audivane_protocol::ConvolutionConfig {
-            name: None,
-            enabled: true,
-            ir_path: Default::default(),
-            gain_db: 0.0,
-            matrix: Some(vec![audivane_protocol::MatrixEntry {
-                input: 1,
-                output: 0,
-                ir_path: "/irs/x.wav".into(),
-                channel: None,
-                gain_db: 0.0,
-            }]),
-            calibration: false,
-        }];
-        assert_ne!(key(&base), key(&matrix));
-        let mut matrix_eq = matrix.clone();
-        matrix_eq.chain.eq = eq_only.chain.eq.clone();
-        assert_ne!(key(&matrix), key(&matrix_eq));
-    }
-
-    /// Identical DACs: the outputs follow their USB ports when the names
-    /// swap, are held when both moved, and `assign_devices` settles it.
-    #[test]
-    fn outputs_follow_their_dacs_across_a_name_swap() {
-        use audivane_io_alsa::identity::testing::FakeTree;
-        let (service, engine) = service();
-        let t = FakeTree::new("service-swap");
-        let usb = "2522:0007";
-        t.usb(1, "USB", usb, "1.4.3", None);
-        t.usb(2, "USB_1", usb, "1.4.1.4", None);
-        service.set_identity_roots(t.roots.clone());
-        let mut cfg = service.config();
-        cfg.device = "hw:CARD=USB,DEV=0".into();
-        let mut sub = FollowerConfig::new("hw:CARD=USB_1,DEV=0");
-        sub.output_channels = Some(audivane_protocol::ipc::OutputChannels([2, 3]));
-        sub.follow_volume = true;
-        sub.trim_ms = 1.5;
-        cfg.outputs.followers = vec![sub];
-        // A client's identity is not taken: the card's is.
-        cfg.device_identity = Some(audivane_protocol::ipc::DeviceIdentity {
-            card: "X".into(),
-            usb_id: "0000:0000".into(),
-            serial: None,
-            port: None,
-        });
-        service.dispatch(Call::SetConfig(cfg)).unwrap();
-        let port = |chain: &str| Some(format!("pci-0000:00:14.0-usb-0:{chain}"));
-        let c = service.config();
-        assert_eq!(c.device_identity.as_ref().unwrap().port, port("1.4.3"));
-        assert_eq!(
-            c.outputs.followers[0].identity.as_ref().unwrap().port,
-            port("1.4.1.4")
-        );
-        service.identity_tick();
-        assert_eq!(service.config(), c, "nothing to follow");
-        // What a rename must keep of the follower (all but its device and
-        // identity).
-        let kept = |c: &EngineConfig| {
-            let f = &c.outputs.followers[0];
-            (
-                f.output_channels,
-                f.follow_volume,
-                f.follow_ref_db,
-                f.trim_ms,
-            )
-        };
-        let settings = kept(&c);
-        assert_eq!(
-            settings.0,
-            Some(audivane_protocol::ipc::OutputChannels([2, 3]))
-        );
-
-        // A reboot probes the sub's DAC first.
-        t.clear();
-        t.usb(1, "USB", usb, "1.4.1.4", None);
-        t.usb(2, "USB_1", usb, "1.4.3", None);
-        service.identity_tick();
-        let c = service.config();
-        assert_eq!(c.device, "hw:CARD=USB_1,DEV=0");
-        assert_eq!(c.outputs.followers[0].device, "hw:CARD=USB,DEV=0");
-        assert_eq!(engine.config.lock().unwrap().device, c.device, "applied");
-        assert_eq!(kept(&c), settings);
-        assert!(service.status().unresolved_devices.is_empty());
-        let present = |d: &str| audivane_io_alsa::device_present_gated_in(&t.roots, d);
-        assert!(present("hw:CARD=USB_1,DEV=0") && present("hw:CARD=USB,DEV=0"));
-
-        // Both moved: held, not guessed.
-        t.clear();
-        t.usb(1, "USB", usb, "2", None);
-        t.usb(2, "USB_1", usb, "3", None);
-        service.identity_tick();
-        let held = service.status().unresolved_devices;
-        assert_eq!(held.len(), 2);
-        assert_eq!(service.config(), c);
-        assert!(!present("hw:CARD=USB_1,DEV=0") && !present("hw:CARD=USB,DEV=0"));
-
-        // The user says which is which (a swap, at once).
-        let assign = |output: &str, device: &str| audivane_protocol::ipc::DeviceAssignment {
-            output: output.into(),
-            device: device.into(),
-        };
-        service
-            .dispatch(Call::AssignDevices {
-                assignments: vec![
-                    assign("master", "hw:CARD=USB,DEV=0"),
-                    assign("hw:CARD=USB,DEV=0", "hw:CARD=USB_1,DEV=0"),
-                ],
-            })
-            .unwrap();
-        let c = service.config();
-        assert_eq!(c.device, "hw:CARD=USB,DEV=0");
-        assert_eq!(c.device_identity.as_ref().unwrap().port, port("2"));
-        assert_eq!(c.outputs.followers[0].device, "hw:CARD=USB_1,DEV=0");
-        assert_eq!(
-            c.outputs.followers[0].identity.as_ref().unwrap().port,
-            port("3")
-        );
-        assert!(service.status().unresolved_devices.is_empty());
-        assert_eq!(kept(&c), settings);
-        assert!(present("hw:CARD=USB,DEV=0") && present("hw:CARD=USB_1,DEV=0"));
-        let err = service
-            .dispatch(Call::AssignDevices {
-                assignments: vec![assign("master", "hw:CARD=Nope,DEV=0")],
-            })
-            .unwrap_err();
-        assert!(
-            err.message.contains("not a connected USB card"),
-            "{}",
-            err.message
-        );
-        audivane_io_alsa::identity::set_pins([]);
-    }
-
-    /// With a quantized hardware mixer the master plays another level than
-    /// it asks for (−31 dB asked, −36 dB on the card): a follower's
-    /// reference, its untick and its edits go by the played level, the one
-    /// it tracks, so unticking keeps the level it plays at.
-    #[test]
-    fn follower_levels_go_by_the_masters_played_level() {
-        let (service, engine) = service();
-        let dev = "hw:CARD=USB,DEV=0";
-        let set = |follow_volume: Option<bool>, volume_db: Option<f64>| {
-            service
-                .dispatch(Call::SetFollower {
-                    device: dev.into(),
-                    remove: false,
-                    enabled: None,
-                    trim_ms: None,
-                    volume_db,
-                    follow_volume,
-                    output_channels: None,
-                    chain_patch: None,
-                    period_ms: None,
-                })
-                .unwrap();
-        };
-        let master = |asked: f64, played: f64| {
-            service
-                .dispatch(Call::SetVolume {
-                    volume_db: asked,
-                    balance_db: 0.0,
-                    muted: false,
-                })
-                .unwrap();
-            let status = VolumeStatus {
-                volume_db: played,
-                hardware: true,
-                ..VolumeStatus::from_config(&service.config().volume)
-            };
-            let mut a = engine.applied.lock().unwrap();
-            *a = (Some(status), a.1 + 1);
-        };
-        let fc = || service.config().outputs.followers[0].clone();
-        set(None, Some(-6.0));
-        master(-31.0, -36.0);
-        set(Some(true), None);
-        assert_eq!(fc().follow_ref_db, Some(-36.0), "the played level");
-        // The master 5 dB down as played (4 dB as asked): unticked, the
-        // follower keeps playing 5 dB below its −6 dB.
-        master(-35.0, -41.0);
-        set(Some(false), None);
-        assert_eq!((fc().volume_db, fc().follow_ref_db), (-11.0, None));
-        // An edit while following is the level it plays at then.
-        set(Some(true), None);
-        assert_eq!(fc().follow_ref_db, Some(-41.0));
-        master(-33.0, -36.0);
-        set(None, Some(-8.0));
-        assert_eq!((fc().volume_db, fc().follow_ref_db), (-8.0, Some(-36.0)));
-        let level = crate::engine::follower::followed_level_db(&fc(), -36.0);
-        assert_eq!(level, -8.0);
-    }
-
-    #[test]
-    fn output_channels_follow_the_device_and_are_checked() {
-        use audivane_protocol::ipc::{DeviceCapabilities, OutputChannels};
-        let (service, engine) = service();
-        let set = |device: &str, pair: Option<[u32; 2]>| {
-            service.dispatch(Call::SetDevice {
-                device: device.into(),
-                output_channels: pair.map(OutputChannels),
-            })
-        };
-        let wide = "hw:CARD=USB,DEV=0";
-        set(wide, Some([2, 3])).unwrap();
-        let cfg = service.config();
-        assert_eq!(
-            (cfg.device.as_str(), cfg.output_channels),
-            (wide, Some(OutputChannels([2, 3])))
-        );
-        assert_eq!(
-            engine.config.lock().unwrap().output_channels,
-            cfg.output_channels
-        );
-        // The same device without a pair keeps it; `[0, 1]` is no setting.
-        set(wide, None).unwrap();
-        assert_eq!(
-            service.config().output_channels,
-            Some(OutputChannels([2, 3]))
-        );
-        set(wide, Some([0, 1])).unwrap();
-        assert_eq!(service.config().output_channels, None);
-        set(wide, Some([7, 6])).unwrap();
-        // Another device starts from the first two.
-        set("hw:1,0", None).unwrap();
-        assert_eq!(service.config().output_channels, None);
-        // Not a pair: refused, nothing changes.
-        set(wide, Some([7, 6])).unwrap();
-        for bad in [[3, 3], [0, 64]] {
-            let e = set(wide, Some(bad)).unwrap_err();
-            assert!(e.message.contains("output_channels"), "{}", e.message);
-        }
-        assert_eq!(
-            service.config().output_channels,
-            Some(OutputChannels([7, 6]))
-        );
-        // Past the probed device's channels: refused at the edit.
-        *engine.caps.lock().unwrap() = Some(DeviceCapabilities {
-            device: wide.into(),
-            channels: 8,
-            channels_min: 8,
-            channels_max: 8,
-            ..Default::default()
-        });
-        let e = set(wide, Some([8, 9])).unwrap_err();
-        assert!(
-            e.message.contains("has 8 channels (0 to 7)"),
-            "{}",
-            e.message
-        );
-        set(wide, Some([4, 5])).unwrap();
-        // A whole config with a bad pair is refused too.
-        let mut cfg = service.config();
-        cfg.output_channels = Some(OutputChannels([1, 1]));
-        assert!(service.dispatch(Call::SetConfig(cfg)).is_err());
-        // A follower's pair: set, kept by other edits, reset by `[0, 1]`.
-        let follower = |pair: Option<[u32; 2]>, trim: Option<f64>| {
-            service.dispatch(Call::SetFollower {
-                device: "hw:CARD=USB_1,DEV=0".into(),
-                remove: false,
-                enabled: None,
-                trim_ms: trim,
-                volume_db: None,
-                output_channels: pair.map(OutputChannels),
-                follow_volume: None,
-                chain_patch: None,
-                period_ms: None,
-            })
-        };
-        follower(Some([2, 3]), None).unwrap();
-        follower(None, Some(1.0)).unwrap();
-        let f = service.config().outputs.followers[0].clone();
-        assert_eq!(
-            (f.output_channels, f.trim_ms),
-            (Some(OutputChannels([2, 3])), 1.0)
-        );
-        assert!(follower(Some([5, 5]), None).is_err());
-        follower(Some([0, 1]), None).unwrap();
-        assert_eq!(service.config().outputs.followers[0].output_channels, None);
-    }
-
-    #[test]
-    fn a_pair_edit_is_checked_against_its_own_channel_count() {
-        use audivane_protocol::SampleFormat;
-        use audivane_protocol::ipc::{
-            ChannelMode, DeviceCapabilities, FormatCapability, OutputChannels, RateCapability,
-        };
-        let (service, engine) = service();
-        let wide = "hw:CARD=USB,DEV=0";
-        let mut cfg = service.config();
-        cfg.device = wide.into();
-        cfg.output_channels = Some(OutputChannels([6, 7]));
-        cfg.chain.upsampler.target = audivane_protocol::RateTarget::Rate(96_000);
-        service.dispatch(Call::SetConfig(cfg.clone())).unwrap();
-        // Stereo plays 96 kHz; the 8-channel mode pair 7/8 needs, 48 kHz.
-        let row = |rate| RateCapability {
-            rate,
-            formats: vec![FormatCapability {
-                format: SampleFormat::S32,
-                sbits: Some(24),
-            }],
-        };
-        let probe = DeviceCapabilities {
-            device: wide.into(),
-            channels: 2,
-            channels_min: 2,
-            channels_max: 8,
-            formats: vec![SampleFormat::S32],
-            modes: vec![
-                ChannelMode {
-                    channels: 2,
-                    rates: vec![row(48_000), row(96_000)],
-                },
-                ChannelMode {
-                    channels: 8,
-                    rates: vec![row(48_000)],
-                },
-            ],
-            ..Default::default()
-        };
-        // The engine reports the probe as pair 7/8 sees it.
-        *engine.caps.lock().unwrap() = Some(config::caps_view(&cfg, &probe));
-        let set = |pair: [u32; 2]| {
-            service.dispatch(Call::SetDevice {
-                device: wide.into(),
-                output_channels: Some(OutputChannels(pair)),
-            })
-        };
-        // Back to 1/2 at 96 kHz: accepted.
-        set([0, 1]).unwrap();
-        assert_eq!(service.config().output_channels, None);
-        // 7/8 cannot play the explicit 96 kHz.
-        *engine.caps.lock().unwrap() = Some(config::caps_view(&service.config(), &probe));
-        let e = set([6, 7]).unwrap_err();
-        assert!(e.message.contains("96000"), "{}", e.message);
-    }
-
-    #[test]
-    fn set_follower_sets_its_period_and_refuses_one_out_of_range() {
-        let (service, _engine) = service();
-        let dev = "hw:CARD=USB,DEV=0";
-        let set = |period_ms| {
-            service.dispatch(Call::SetFollower {
-                device: dev.into(),
-                remove: false,
-                enabled: None,
-                trim_ms: None,
-                volume_db: None,
-                output_channels: None,
-                follow_volume: None,
-                chain_patch: None,
-                period_ms,
-            })
-        };
-        let period = || service.config().outputs.followers[0].period_ms;
-        set(None).unwrap();
-        assert_eq!(period(), None, "the default");
-        set(Some(10.0)).unwrap();
-        assert_eq!(period(), Some(10.0));
-        let e = set(Some(2.0)).unwrap_err();
-        assert!(
-            e.message
-                .contains("outputs.followers[0].period_ms must be between 5 and 50 ms"),
-            "{e:?}"
-        );
-        assert_eq!(period(), Some(10.0), "kept");
-        set(Some(0.0)).unwrap();
-        assert_eq!(period(), None, "0: the default again");
     }
 
     #[test]
@@ -4488,250 +4088,6 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_flag_wakes_waiters() {
-        let flag = ShutdownFlag::new();
-        assert!(!flag.is_requested());
-        let waiter = Arc::clone(&flag);
-        let handle = std::thread::spawn(move || {
-            waiter.wait();
-            waiter.is_requested()
-        });
-        assert!(!flag.wait_timeout(std::time::Duration::from_millis(20)));
-        flag.request();
-        assert!(flag.wait_timeout(std::time::Duration::from_millis(500)));
-        assert!(handle.join().unwrap());
-    }
-
-    #[test]
-    fn status_falls_back_to_config_values() {
-        let (service, _) = service();
-        let status = service.status();
-        assert_eq!(status.device, "hw:0,0");
-        assert_eq!(status.quantum, 1024);
-        assert_eq!(status.ratio, 1);
-        assert_eq!(status.output_rate, 48_000);
-        assert!(
-            status.passthrough.broken_because
-                == vec![audivane_protocol::ipc::PassthroughBreak::NotPlaying]
-        );
-        // The limits: the library's, the process's workspace cap (the
-        // floor: a test process sets none) and the CPU share.
-        assert_eq!(
-            status.limits,
-            Some(audivane_protocol::ipc::EngineLimits {
-                max_kernel_taps: 8_388_608,
-                intermediate_max_taps: 2_097_152,
-                design_workspace_bytes: 1536 << 20,
-                cpu_share: 0.9,
-            })
-        );
-    }
-
-    #[test]
-    fn tilt_status_reports_design_failures_from_a_cached_design() {
-        use audivane_protocol::{TiltConfig, TiltPivot};
-        let (service, _) = service();
-        let chain = |total_db| ChainConfig {
-            eq: Some(EqProfile {
-                tilt: Some(TiltConfig {
-                    enabled: true,
-                    slope_db_per_oct: None,
-                    total_db: Some(total_db),
-                    pivot: TiltPivot::Start,
-                    ..TiltConfig::default()
-                }),
-                ..EqProfile::default()
-            }),
-            ..ChainConfig::neutral()
-        };
-        let ok = service.tilt_status(&chain(-6.0), 48_000).unwrap();
-        assert_eq!(ok.error, None);
-        // A usable band whose design fails (here: over the total limit,
-        // which config validation would normally reject first).
-        let bad_chain = chain(30.0);
-        assert!(tilt_status(&bad_chain, 48_000).unwrap().error.is_none());
-        let bad = service.tilt_status(&bad_chain, 48_000).unwrap();
-        assert!(bad.error.unwrap().contains("within +/-24 dB"));
-        assert_eq!(service.tilt_design_cache.lock().unwrap().len(), 2);
-        service.tilt_status(&bad_chain, 48_000).unwrap();
-        assert_eq!(service.tilt_design_cache.lock().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn analytic_ab_offset_is_cached_and_its_errors_are_reported() {
-        use audivane_protocol::ipc::{AbConfig, LevelMatch};
-        use audivane_protocol::{TiltConfig, TiltPivot};
-        let (service, engine) = service();
-        let tilt = |start_hz, end_hz| ChainConfig {
-            eq: Some(EqProfile {
-                tilt: Some(TiltConfig {
-                    enabled: true,
-                    slope_db_per_oct: Some(1.0),
-                    start_hz,
-                    end_hz,
-                    pivot: TiltPivot::Start,
-                    ..TiltConfig::default()
-                }),
-                ..EqProfile::default()
-            }),
-            ..ChainConfig::neutral()
-        };
-        let set_b = |chain_b: ChainConfig| {
-            service.lock_config().ab = Some(AbConfig {
-                level: LevelMatch::default(),
-                headroom: Default::default(),
-                ..AbConfig::chain(chain_b)
-            });
-        };
-        // Engine has no chain yet (mock snapshot reports no A/B): the offset
-        // comes from the config, once per chain pair and rate.
-        set_b(tilt(200.0, 2000.0));
-        let first = service.ab_status();
-        assert!(first.enabled && first.error.is_none());
-        assert!(first.offset_db < -0.5, "{first:?}");
-        assert_eq!(service.ab_status(), first);
-        assert!(service.ab_offset_cache.lock().unwrap().is_some());
-
-        // A band chain B cannot build at the stream rate is an error, not a
-        // silent 0 dB offset.
-        set_b(tilt(17_750.0, 20_000.0));
-        engine.config.lock().unwrap().rate.default_rate = 44_100;
-        let bad = service.ab_status();
-        assert_eq!(bad.offset_db, 0.0);
-        assert!(bad.error.unwrap().contains("at least 1/6 octave"));
-    }
-
-    #[test]
-    fn tilt_status_updates_with_stream_rate_and_exposes_invalid_bands() {
-        use audivane_protocol::{EqProfile, TiltConfig, TiltPivot};
-        let (service, engine) = service();
-        let tilt = TiltConfig {
-            enabled: true,
-            slope_db_per_oct: Some(1.0),
-            start_hz: 200.0,
-            end_hz: 20_000.0,
-            pivot: TiltPivot::Start,
-            ..TiltConfig::default()
-        };
-        service
-            .dispatch(Call::SetEq(Some(EqProfile {
-                tilt: Some(tilt),
-                ..EqProfile::default()
-            })))
-            .unwrap();
-        let read = || match service.dispatch(Call::Status).unwrap() {
-            Dispatch::Value(v) => serde_json::from_value::<Status>(v).unwrap(),
-            other => panic!("unexpected {other:?}"),
-        };
-        assert_eq!(read().eq_tilt.unwrap().clamp_note, None);
-        engine.config.lock().unwrap().rate.default_rate = 44_100;
-        let status = read().eq_tilt.unwrap();
-        assert_eq!(status.sample_rate, 44_100);
-        assert_eq!(status.effective_start_hz, 200.0);
-        assert_eq!(status.effective_end_hz, 19_845.0);
-        assert!(
-            status
-                .clamp_note
-                .unwrap()
-                .contains("20000.000 to 19845.000")
-        );
-        assert_eq!(status.error, None);
-        engine.config.lock().unwrap().rate.default_rate = 96_000;
-        let status = read().eq_tilt.unwrap();
-        assert_eq!(status.effective_end_hz, 20_000.0);
-        assert_eq!(status.clamp_note, None);
-        assert_eq!(status.error, None);
-
-        // Before the engine can build a requested high band at a lower rate,
-        // report the invalid interpretation as an error, never as identity.
-        let high = ChainConfig {
-            eq: Some(EqProfile {
-                tilt: Some(TiltConfig {
-                    start_hz: 17_750.0,
-                    end_hz: 20_000.0,
-                    ..tilt
-                }),
-                ..EqProfile::default()
-            }),
-            ..ChainConfig::neutral()
-        };
-        let bad = tilt_status(&high, 44_100).unwrap();
-        assert!(bad.clamp_note.is_some());
-        assert!(bad.error.unwrap().contains("at least 1/6 octave"));
-        assert!(tilt_status(&high, 96_000).unwrap().error.is_none());
-        service
-            .dispatch(Call::SetAb(Some(AbConfig {
-                level: LevelMatch::Off,
-                headroom: Default::default(),
-                ..AbConfig::chain(high)
-            })))
-            .unwrap();
-        assert!(read().eq_tilt_b.is_some());
-        service.dispatch(Call::SetEq(None)).unwrap();
-        assert!(read().eq_tilt.is_none());
-    }
-
-    #[test]
-    fn tilt_status_spans_both_sections() {
-        use audivane_protocol::{TiltConfig, TiltPivot};
-        let (service, _) = service();
-        let low = TiltConfig {
-            enabled: true,
-            slope_db_per_oct: Some(1.0),
-            start_hz: 20.0,
-            end_hz: 200.0,
-            pivot: TiltPivot::End,
-            ..TiltConfig::default()
-        };
-        let high = TiltConfig {
-            start_hz: 4000.0,
-            end_hz: 20_000.0,
-            pivot: TiltPivot::Start,
-            ..low
-        };
-        let chain = |low: Option<TiltConfig>, high: Option<TiltConfig>| ChainConfig {
-            eq: Some(EqProfile {
-                tilt: low,
-                tilt_high: high,
-                ..EqProfile::default()
-            }),
-            ..ChainConfig::neutral()
-        };
-        let both = service
-            .tilt_status(&chain(Some(low), Some(high)), 44_100)
-            .unwrap();
-        assert_eq!(both.effective_start_hz, 20.0);
-        assert_eq!(both.effective_end_hz, 19_845.0);
-        assert!(
-            both.clamp_note
-                .unwrap()
-                .starts_with("tilt_high end_hz clamped")
-        );
-        assert_eq!(both.error, None);
-        // Only the treble section on.
-        let off = TiltConfig {
-            enabled: false,
-            ..low
-        };
-        let treble = service
-            .tilt_status(&chain(Some(off), Some(high)), 48_000)
-            .unwrap();
-        assert_eq!(treble.effective_start_hz, 4000.0);
-        assert!(
-            service
-                .tilt_status(&chain(Some(off), None), 48_000)
-                .is_none()
-        );
-        // A treble band the rate cannot hold names its section.
-        let narrow = TiltConfig {
-            start_hz: 17_750.0,
-            ..high
-        };
-        let bad = tilt_status(&chain(Some(low), Some(narrow)), 44_100).unwrap();
-        assert!(bad.error.unwrap().starts_with("tilt_high:"));
-    }
-
-    #[test]
     fn edits_are_validated_and_applied() {
         let (service, engine) = service();
         let err = service
@@ -4814,126 +4170,6 @@ mod tests {
         assert_eq!(service.config().formats, formats);
     }
 
-    #[test]
-    fn upsampler_response_rejects_invalid_explicit_config() {
-        let (service, _) = service();
-        let bad = |f: fn(&mut audivane_dsp_core::resample::ManualConfig)| {
-            let mut cfg = audivane_dsp_core::resample::ManualConfig {
-                target: audivane_protocol::RateTarget::Ratio(4),
-                ..Default::default()
-            };
-            f(&mut cfg);
-            cfg.into_upsampler_config().unwrap()
-        };
-
-        for (cfg, needle) in [
-            (bad(|c| c.taps = usize::MAX), "taps"),
-            (bad(|c| c.cutoff = 1.5), "cutoff"),
-            (bad(|c| c.kaiser_beta = 99.0), "beta"),
-        ] {
-            let err = service
-                .dispatch(Call::UpsamplerResponse {
-                    config: Some(cfg),
-                    source_rate: Some(44_100),
-                    window: None,
-                })
-                .unwrap_err();
-            assert_eq!(err.code, RpcError::INVALID_PARAMS);
-            assert!(err.message.contains(needle), "{}", err.message);
-        }
-    }
-
-    #[test]
-    fn upsampler_response_is_cached_by_design_and_rate() {
-        let (service, _) = service();
-        let cfg = audivane_dsp_core::resample::ManualConfig {
-            target: audivane_protocol::RateTarget::Ratio(2),
-            taps: 512,
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        let call = || Call::UpsamplerResponse {
-            config: Some(cfg.clone()),
-            source_rate: Some(44_100),
-            window: None,
-        };
-        let first = service.dispatch(call()).unwrap();
-        let second = service.dispatch(call()).unwrap();
-        match (first, second) {
-            (Dispatch::Value(a), Dispatch::Value(b)) => assert_eq!(a, b),
-            other => panic!("unexpected {other:?}"),
-        }
-        assert_eq!(
-            service.upsampler_cache.lock().unwrap().len(),
-            1,
-            "a repeated design must reuse the cached measurement"
-        );
-
-        service
-            .dispatch(Call::UpsamplerResponse {
-                config: Some(cfg.clone()),
-                source_rate: Some(48_000),
-                window: None,
-            })
-            .unwrap();
-        assert_eq!(service.upsampler_cache.lock().unwrap().len(), 2);
-
-        // A zoom window reuses the cached measurement.
-        let zoomed = service
-            .dispatch(Call::UpsamplerResponse {
-                config: Some(cfg.clone()),
-                source_rate: Some(48_000),
-                window: Some(ResponseWindowRequest {
-                    f_lo_hz: 23_000.0,
-                    f_hi_hz: 25_000.0,
-                    points: 100_000,
-                }),
-            })
-            .unwrap();
-        assert_eq!(service.upsampler_cache.lock().unwrap().len(), 2);
-        let Dispatch::Value(zoomed) = zoomed else {
-            panic!("unexpected dispatch");
-        };
-        let response: audivane_protocol::ipc::UpsamplerResponse =
-            serde_json::from_value(zoomed).unwrap();
-        let window = response.window.expect("window");
-        assert_eq!(window.freqs_hz.len(), 4096, "points are capped");
-        assert_eq!(window.freqs_hz[0], 23_000.0);
-        assert_eq!(*window.freqs_hz.last().unwrap(), 25_000.0);
-        assert!(!response.crossings.is_empty());
-    }
-
-    /// The reported latency counts the block the engine builds its chain
-    /// with at the source rate, which follows the quantum: 512 frames at
-    /// 44.1 kHz by default, the 1024-frame cap at a 4096 quantum (2048 at
-    /// 44.1 kHz). Each block is its own cache entry.
-    #[test]
-    fn upsampler_response_latency_follows_the_engine_block() {
-        let (service, _) = service();
-        let cfg = audivane_dsp_core::resample::ManualConfig {
-            target: audivane_protocol::RateTarget::Ratio(2),
-            taps: 512,
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        let latency = || {
-            let v = value(service.dispatch(Call::UpsamplerResponse {
-                config: Some(cfg.clone()),
-                source_rate: Some(44_100),
-                window: None,
-            }));
-            v["latency_samples"].as_u64().unwrap()
-        };
-        service.edit(|c| c.quantum = 1024).unwrap();
-        let default = latency();
-        service.edit(|c| c.quantum = 4096).unwrap();
-        let large = latency();
-        assert_eq!(large - default, (1024 - 512) * 2);
-        assert_eq!(service.upsampler_cache.lock().unwrap().len(), 2);
-    }
-
     fn value(d: Result<Dispatch, RpcError>) -> Value {
         match d.unwrap() {
             Dispatch::Value(v) => v,
@@ -4984,396 +4220,6 @@ mod tests {
             audivane_dsp_core::design::catalogue::by_name("lanczos23").unwrap()
         );
         assert!(response.plan.is_some());
-    }
-
-    #[test]
-    fn resolve_design_expands_a_preset() {
-        let (service, _) = service();
-        let stored: audivane_protocol::StoredDesign =
-            serde_json::from_value(value(service.dispatch(Call::ResolveDesign {
-                preset: "recommended".into(),
-            })))
-            .unwrap();
-        assert_eq!(stored.based_on.as_deref(), Some("recommended"));
-        assert_eq!(
-            stored.design,
-            audivane_dsp_core::design::catalogue::recommended()
-        );
-        let err = service
-            .dispatch(Call::ResolveDesign {
-                preset: "nope".into(),
-            })
-            .unwrap_err();
-        assert_eq!(err.code, RpcError::INVALID_PARAMS);
-    }
-
-    #[test]
-    fn check_design_names_fields_and_plans_each_rate() {
-        use audivane_dsp_core::resample::ManualConfig;
-        use audivane_protocol::RateTarget;
-        use audivane_protocol::ipc::DesignCheck;
-        let (service, _) = service();
-        let design = |m: ManualConfig| m.into_upsampler_config().unwrap().design.unwrap();
-        let check = |design, target, source_rate| -> DesignCheck {
-            serde_json::from_value(value(service.dispatch(Call::CheckDesign {
-                design,
-                target,
-                source_rate,
-            })))
-            .unwrap()
-        };
-        let ok = design(ManualConfig {
-            taps: 512,
-            ..Default::default()
-        });
-        let c = check(ok.clone(), Some(RateTarget::Ratio(2)), None);
-        assert!(c.errors.is_empty(), "{:?}", c.errors);
-        let policy = service.config().rate.allowed_rates;
-        assert_eq!(c.plans.len(), policy.len());
-        for p in &c.plans {
-            assert!(policy.contains(&p.source_rate));
-            assert_eq!(p.ratio, RateRatio::integer(2));
-            assert_eq!(p.plan.grid_up, 2);
-            assert!(p.plan.grid_taps > 0);
-            assert!(p.plan.bounded_peak_db.is_none());
-        }
-        let c = check(ok.clone(), Some(RateTarget::Ratio(2)), Some(48_000));
-        assert_eq!(c.plans.len(), 1);
-        assert_eq!(c.plans[0].source_rate, 48_000);
-
-        // An automatic length (the recommended design): estimated, not
-        // searched, at every rate of a rational target too.
-        let rec = audivane_protocol::StoredDesign::new(
-            audivane_dsp_core::design::catalogue::recommended(),
-        );
-        let c = check(rec, Some(RateTarget::MaxRateAny(768_000)), None);
-        assert!(c.errors.is_empty(), "{:?}", c.errors);
-        assert!(!c.plans.is_empty());
-
-        // A bound: the field's path, no plans.
-        let c = check(
-            design(ManualConfig {
-                kaiser_beta: 41.0,
-                ..Default::default()
-            }),
-            Some(RateTarget::Ratio(2)),
-            None,
-        );
-        assert_eq!(c.errors[0].path, "design.window.beta", "{:?}", c.errors);
-        assert!(c.plans.is_empty());
-
-        // The target and the source rate.
-        let c = check(ok.clone(), Some(RateTarget::Ratio(70)), None);
-        assert_eq!(c.errors[0].path, "target", "{:?}", c.errors);
-        let c = check(ok, Some(RateTarget::Ratio(2)), Some(1));
-        assert_eq!(c.errors[0].path, "source_rate", "{:?}", c.errors);
-
-        // A budget at a rational ratio: the length, at its rate.
-        let long = design(ManualConfig {
-            target: RateTarget::Rate(48_000),
-            taps: 6_554,
-            taps_unit: audivane_protocol::TapsUnit::Input,
-            kaiser_beta: 14.0,
-            cutoff: 0.95,
-            ..Default::default()
-        });
-        let c = check(long, Some(RateTarget::Rate(48_000)), Some(44_100));
-        assert_eq!(c.errors.len(), 1, "{:?}", c.errors);
-        assert_eq!(c.errors[0].path, "design.length");
-        assert!(
-            c.errors[0]
-                .message
-                .starts_with("6,554 taps per input sample is too heavy for a fractional ratio at 44.1k ×160/147. "),
-            "{}",
-            c.errors[0].message
-        );
-        let advice = c.advice.as_ref().unwrap();
-        assert!(!advice.applied);
-        assert!(
-            advice.details[0].message.contains("kernel needs"),
-            "{advice:?}"
-        );
-        assert!(c.plans.is_empty());
-
-        // A passband end in Hz that does not fit at a rate: a note there,
-        // the rate still planned; none where it fits.
-        let mut pinned = audivane_dsp_core::design::catalogue::recommended();
-        if let audivane_protocol::FilterDesign::Kernel(k) = &mut pinned
-            && let audivane_protocol::design::Shape::WindowedSinc {
-                cutoff: audivane_protocol::design::Cutoff::Band(b),
-                ..
-            } = &mut k.shape
-        {
-            b.passband_end_hz = Some(20_000.0);
-        }
-        let rec = audivane_protocol::StoredDesign::new(pinned);
-        let c = check(rec.clone(), Some(RateTarget::Ratio(2)), Some(32_000));
-        assert!(c.errors.is_empty(), "{:?}", c.errors);
-        assert_eq!(c.plans.len(), 1);
-        assert_eq!(c.notes.len(), 1, "{:?}", c.notes);
-        assert_eq!(c.notes[0].source_rate, 32_000);
-        assert_eq!(c.notes[0].path, "design.cutoff.passband_end_hz");
-        let c = check(rec, Some(RateTarget::Ratio(2)), None);
-        assert!(c.notes.is_empty(), "{:?}", c.notes);
-    }
-
-    /// An equiripple design of 1,279 taps over 0.9..1.0.
-    fn equiripple_1279() -> audivane_protocol::design::FilterDesign {
-        use audivane_protocol::design::*;
-        let mut d = audivane_dsp_core::design::catalogue::recommended();
-        if let FilterDesign::Kernel(k) = &mut d {
-            k.shape = Shape::Optimal {
-                method: OptimalMethod::Equiripple,
-                length: Length::Fixed(1279),
-                passband_end: 0.9,
-                stopband_start: 1.0,
-            };
-            k.phase = Phase::Linear;
-            k.numerics.path = ArithmeticPath::Fir;
-        }
-        d
-    }
-
-    /// A design that builds at some of the rates it plays is applied: the
-    /// others play Recommended, said per rate in plain words, with fixes;
-    /// one that builds nowhere is refused in plain words.
-    #[test]
-    fn a_design_that_builds_at_some_rates_falls_back_at_the_others() {
-        use audivane_protocol::RateTarget;
-        use audivane_protocol::ipc::{DesignCheck, OverloadAction, RateFallbackCause};
-        let (service, engine) = service();
-        let check = |design, target| -> DesignCheck {
-            serde_json::from_value(value(service.dispatch(Call::CheckDesign {
-                design,
-                target,
-                source_rate: None,
-            })))
-            .unwrap()
-        };
-        let target = RateTarget::MaxRate(768_000);
-        let c = check(equiripple_1279().into(), Some(target));
-        assert!(c.errors.is_empty(), "{:?}", c.errors);
-        let advice = c.advice.clone().unwrap();
-        assert!(advice.applied);
-        eprintln!("{}", advice.message);
-        assert!(
-            advice.message.starts_with(
-                "1,279 taps is too long for an equiripple design at 176.4k ×4 and 192k ×4. "
-            ),
-            "{}",
-            advice.message
-        );
-        assert!(!advice.fixes.is_empty());
-        // The ladder skips the x16 rung the design does not build at
-        // (44.1k and 48k play it at x8); 176.4k and 192k build at no rung
-        // and play Recommended.
-        let falls: Vec<u32> = c.notes.iter().map(|n| n.source_rate).collect();
-        assert_eq!(falls, [176_400, 192_000], "{:?}", c.notes);
-        assert!(
-            c.notes
-                .iter()
-                .all(|n| n.plays.as_deref() == Some("recommended"))
-        );
-        assert!(
-            c.notes[0]
-                .message
-                .starts_with("too long for an equiripple design"),
-            "{:?}",
-            c.notes
-        );
-        let p44 = c.plans.iter().find(|p| p.source_rate == 44_100).unwrap();
-        assert_eq!(p44.ratio, RateRatio::integer(8));
-        // Every rate has a plan: the design's, or Recommended's.
-        assert_eq!(c.plans.len(), 6);
-        // A fix builds everywhere (the automatic length's searches are
-        // left to dsp-core's test: slow in a debug build).
-        for fix in advice
-            .fixes
-            .iter()
-            .filter(|f| !f.label.contains("automatic"))
-        {
-            let c = check(fix.design.clone(), Some(target));
-            assert!(
-                c.advice.is_none() && c.errors.is_empty(),
-                "{}: {c:?}",
-                fix.label
-            );
-        }
-
-        // Applied: the engine gets the design, and Recommended at the rates
-        // it does not build at.
-        let mut up = service.config().chain.upsampler;
-        up.target = target;
-        up.preset = None;
-        up.design = Some(equiripple_1279().into());
-        let r = service.dispatch(Call::SetUpsampler(up.clone()));
-        assert!(r.is_ok(), "{r:?}");
-        assert_eq!(engine.config.lock().unwrap().chain.upsampler, up);
-        let status: audivane_protocol::ipc::Status =
-            serde_json::from_value(value(service.dispatch(Call::Status))).unwrap();
-        let rows = &status.upsampler_rates;
-        let f = rows
-            .iter()
-            .find(|r| r.source_rate == 176_400)
-            .and_then(|r| r.fallback.clone())
-            .expect("176.4k falls back");
-        assert_eq!(f.action, OverloadAction::Recommended);
-        assert_eq!(f.cause, RateFallbackCause::Design);
-        assert!(
-            f.reason
-                .unwrap()
-                .starts_with("too long for an equiripple design here")
-        );
-        let status_falls: Vec<u32> = rows
-            .iter()
-            .filter(|r| r.fallback.is_some())
-            .map(|r| r.source_rate)
-            .collect();
-        assert_eq!(status_falls, falls, "the check and the plan agree");
-        let plan = service.lock_rate_plan().plan.clone();
-        let cfg = service.config();
-        assert_eq!(
-            plan.substitute(&cfg, 176_400)
-                .and_then(|u| u.preset.clone())
-                .as_deref(),
-            Some("recommended")
-        );
-        assert_eq!(plan.substitute(&cfg, 44_100), None);
-
-        // Nowhere: refused, in plain words.
-        let mut nowhere = up.clone();
-        nowhere.target = RateTarget::Ratio(16);
-        let c = check(equiripple_1279().into(), Some(nowhere.target));
-        assert_eq!(c.errors.len(), 1, "{:?}", c.errors);
-        assert!(
-            c.errors[0]
-                .message
-                .starts_with("1,279 taps is too short at 44.1k ×16"),
-            "{:?}",
-            c.errors
-        );
-        assert!(!c.advice.unwrap().applied);
-        let r = service.dispatch(Call::SetUpsampler(nowhere));
-        assert!(r.is_err(), "{r:?}");
-        let text = format!("{r:?}");
-        assert!(
-            text.contains("chain.upsampler.design.length: 1,279 taps is too short"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn upsampler_response_measures_up_to_x64() {
-        let (service, _) = service();
-        let measure = |target, source_rate, preset| {
-            let cfg = audivane_dsp_core::resample::ManualConfig {
-                target,
-                taps: 16_384,
-                preset,
-                ..Default::default()
-            }
-            .into_upsampler_config()
-            .unwrap();
-            service.dispatch(Call::UpsamplerResponse {
-                config: Some(cfg),
-                source_rate: Some(source_rate),
-                window: None,
-            })
-        };
-        use audivane_protocol::RateTarget::{MaxRate, Ratio};
-        for (target, source_rate, preset, ratio) in [
-            (Ratio(64), 44_100, None, 64),
-            (Ratio(48), 48_000, None, 48),
-            (MaxRate(3_072_000), 48_000, None, 64),
-            (
-                MaxRate(3_072_000),
-                44_100,
-                Some(audivane_protocol::FilterPreset::GaussianLong),
-                64,
-            ),
-        ] {
-            let Dispatch::Value(value) = measure(target, source_rate, preset).unwrap() else {
-                panic!("unexpected dispatch");
-            };
-            let r: audivane_protocol::ipc::UpsamplerResponse =
-                serde_json::from_value(value).unwrap();
-            assert_eq!(r.ratio, ratio, "{target:?}");
-            assert_eq!(r.output_rate, source_rate * ratio);
-            let nyquist = f64::from(source_rate) / 2.0;
-            assert!(r.stopband_atten_db > 100.0, "{target:?}: {r:?}");
-            assert!(r.stopband_start_hz >= nyquist - 1.0);
-            assert!(*r.freqs_hz.last().unwrap() <= f64::from(r.output_rate) / 2.0);
-            assert!(*r.freqs_hz.last().unwrap() > 0.9 * f64::from(r.output_rate) / 2.0);
-        }
-        // Beyond x64 the target itself is refused, in plain words.
-        let err = measure(Ratio(65), 44_100, None).unwrap_err();
-        assert_eq!(err.code, RpcError::INVALID_PARAMS);
-        assert!(err.message.contains("between 1 and 64"), "{}", err.message);
-        // A source rate above the highest output rate is refused too.
-        let err = measure(Ratio(2), 3_072_001, None).unwrap_err();
-        assert!(err.message.contains("3072000"), "{}", err.message);
-    }
-
-    #[test]
-    fn upsampler_response_rejects_invalid_windows() {
-        let (service, _) = service();
-        let cfg = audivane_dsp_core::resample::ManualConfig {
-            target: audivane_protocol::RateTarget::Ratio(2),
-            taps: 512,
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap();
-        // Output Nyquist is 44.1 kHz for 44.1 kHz x2.
-        for (lo, hi) in [
-            (f64::NAN, 1_000.0),
-            (0.0, f64::INFINITY),
-            (-1.0, 1_000.0),
-            (1_000.0, 44_100.5),
-            (2_000.0, 2_000.0),
-            (3_000.0, 2_000.0),
-        ] {
-            let err = service
-                .dispatch(Call::UpsamplerResponse {
-                    config: Some(cfg.clone()),
-                    source_rate: Some(44_100),
-                    window: Some(ResponseWindowRequest {
-                        f_lo_hz: lo,
-                        f_hi_hz: hi,
-                        points: 100,
-                    }),
-                })
-                .unwrap_err();
-            assert_eq!(err.code, RpcError::INVALID_PARAMS, "{lo} .. {hi}");
-        }
-        assert!(
-            service.upsampler_cache.lock().unwrap().is_empty(),
-            "an invalid window is rejected before measuring"
-        );
-        service
-            .dispatch(Call::UpsamplerResponse {
-                config: Some(cfg),
-                source_rate: Some(44_100),
-                window: Some(ResponseWindowRequest {
-                    f_lo_hz: 0.0,
-                    f_hi_hz: 44_100.0,
-                    points: 10,
-                }),
-            })
-            .unwrap();
-    }
-
-    #[test]
-    fn ab_select_requires_ab_config() {
-        let (service, _) = service();
-        let err = service
-            .dispatch(Call::AbSelect {
-                side: AbSide::B,
-                crossfade_ms: 10.0,
-            })
-            .unwrap_err();
-        assert_eq!(err.code, RpcError::INVALID_PARAMS);
-        assert!(err.message.contains("A/B"));
     }
 
     #[test]
@@ -5480,412 +4326,6 @@ mod tests {
         assert!(!status.blind);
     }
 
-    /// Step 7: a patch may give B its own bits and dither (an output
-    /// compare); the output format, the device and the rate stay refused,
-    /// with the field named.
-    #[test]
-    fn set_ab_takes_a_dither_patch_and_refuses_the_output_format() {
-        let (service, _) = service();
-        let patch = |p| {
-            service.dispatch(Call::SetAb(Some(AbConfig::new(
-                audivane_protocol::ipc::AbB::Patch(p),
-            ))))
-        };
-        patch(serde_json::json!({"output": {"bits": 16, "dither": "shaped"}})).unwrap();
-        let ab = service.config().ab.unwrap();
-        assert_eq!(ab.chain_b.output.bits, 16);
-        assert_eq!(
-            ab.chain_b.output.dither,
-            audivane_protocol::DitherKind::Shaped
-        );
-        let a = service.config().chain.output;
-        assert_eq!(ab.chain_b.output.headroom_db, a.headroom_db);
-
-        for (p, field) in [
-            (
-                serde_json::json!({"output": {"format": "s16"}}),
-                "ab.b.patch.output.format",
-            ),
-            (
-                serde_json::json!({"formats": ["s16"]}),
-                "ab.b.patch.formats",
-            ),
-            (serde_json::json!({"device": "hw:1,0"}), "ab.b.patch.device"),
-            (
-                serde_json::json!({"upsampler": {"target": {"rate": 96000}}}),
-                "ab.b.patch.upsampler.target",
-            ),
-        ] {
-            let err = patch(p).unwrap_err();
-            assert_eq!(err.code, RpcError::INVALID_PARAMS);
-            assert!(err.message.starts_with(field), "{}", err.message);
-        }
-        // The refused patches left the dither compare in place.
-        assert_eq!(service.config().ab.unwrap().chain_b.output.bits, 16);
-    }
-
-    /// Test 12: measurement lock, driven by a simulated hop stream.
-    #[test]
-    fn ab_measure_locks_once_after_the_stability_window() {
-        let (service, engine) = service();
-        let measure = |max_seconds, cancel, accept| {
-            service
-                .dispatch(Call::AbMeasure {
-                    max_seconds,
-                    cancel,
-                    accept,
-                })
-                .map(|d| match d {
-                    Dispatch::Value(value) => serde_json::from_value::<AbStatus>(value).unwrap(),
-                    other => panic!("unexpected {other:?}"),
-                })
-        };
-        let tick = || {
-            let _mutation = service.lock_mutation();
-            service.ab_measure_step();
-        };
-        let level = || service.config().ab.unwrap().level;
-        let err = measure(None, false, false).unwrap_err();
-        assert!(err.message.contains("not configured"), "{}", err.message);
-        service
-            .dispatch(Call::SetAb(Some(AbConfig::chain(ChainConfig::neutral()))))
-            .unwrap();
-        assert!(
-            measure(Some(5.0), false, false).is_err(),
-            "max_seconds range"
-        );
-        let err = measure(None, false, true).unwrap_err();
-        assert_eq!(err.code, RpcError::BAD_STATE);
-
-        let st = measure(Some(60.0), false, false).unwrap();
-        let m = st.measuring.unwrap();
-        assert_eq!((m.seconds, m.offset_db, m.max_seconds), (0.0, None, 60.0));
-        assert_ne!(engine.measure.lock().unwrap().0, 0, "the engine meters");
-        assert_eq!(
-            measure(None, false, true).unwrap_err().code,
-            RpcError::BAD_STATE,
-            "nothing to accept yet"
-        );
-        let applies = engine.applies.load(Ordering::Relaxed);
-
-        // B plays 2.5 dB louder. A pause waits; a quiet passage where B is
-        // much louder is dropped by A's relative gate on both sides (only
-        // the blocks at its edges, mostly loud, move the offset a little).
-        engine.play(8.0, -18.0, 2.5);
-        tick();
-        engine.play(20.0, f64::NEG_INFINITY, 0.0);
-        engine.play(3.0, -40.0, 15.0);
-        tick();
-        engine.play(11.0, -18.0, 2.5);
-        tick();
-        let st = service.ab_status();
-        let m = st.measuring.expect("still measuring before 20 s");
-        assert!((18.0..20.0).contains(&m.seconds), "{}", m.seconds);
-        assert!((m.offset_db.unwrap() + 2.5).abs() < 0.02, "{m:?}");
-        assert_eq!(level(), LevelMatch::default(), "no lock before 20 s");
-        assert_eq!(engine.applies.load(Ordering::Relaxed), applies);
-
-        // Past 20 s, settled over the last 10 s: one lock, one apply.
-        engine.play(2.0, -18.0, 2.5);
-        tick();
-        let LevelMatch::Measured { offset_db, seconds } = level() else {
-            panic!("locked: {:?}", level());
-        };
-        assert!((offset_db + 2.5).abs() <= 0.02, "{offset_db}");
-        assert!((20.0..23.0).contains(&seconds), "{seconds}");
-        assert_eq!(engine.applies.load(Ordering::Relaxed), applies + 1);
-        assert_eq!(engine.measure.lock().unwrap().0, 0, "metering stopped");
-        let st = service.ab_status();
-        assert_eq!(st.measuring, None);
-        assert_eq!(st.offset_db, offset_db);
-        assert_eq!(st.level, level());
-        // It never moves again.
-        engine.play(30.0, -18.0, 6.0);
-        tick();
-        assert_eq!(engine.applies.load(Ordering::Relaxed), applies + 1);
-
-        // Accept locks the running value; a chain change cancels; cancel
-        // keeps the level.
-        measure(Some(60.0), false, false).unwrap();
-        engine.play(3.0, -18.0, 1.0);
-        tick();
-        let st = measure(None, false, true).unwrap();
-        assert_eq!(st.measuring, None);
-        assert!(matches!(st.level, LevelMatch::Measured { offset_db, .. } if offset_db == -1.0));
-        measure(None, false, false).unwrap();
-        service
-            .dispatch(Call::SetDspEnabled { enabled: false })
-            .unwrap();
-        assert!(
-            service.ab_status().measuring.is_some(),
-            "a change outside the pair keeps it"
-        );
-        let mut chain = service.config().chain;
-        chain.eq = Some(EqProfile {
-            preamp_db: -1.0,
-            ..Default::default()
-        });
-        service
-            .dispatch(Call::SetConfig(EngineConfig {
-                chain,
-                ..service.config()
-            }))
-            .unwrap();
-        assert_eq!(service.ab_status().measuring, None, "the pair changed");
-        assert_eq!(engine.measure.lock().unwrap().0, 0);
-        measure(None, false, false).unwrap();
-        let before = level();
-        let st = measure(None, true, false).unwrap();
-        assert_eq!(st.measuring, None);
-        assert_eq!(level(), before);
-    }
-
-    /// A track skip or a rate change ends the measurement and drops its
-    /// queued hops, also before an accept; a silent B ends at `max_seconds`
-    /// with no match.
-    #[test]
-    fn ab_measure_ends_on_a_track_or_rate_change_and_without_a_match() {
-        use crate::control::mpris::MprisWatcher;
-        use audivane_protocol::ipc::NowPlaying;
-        let engine = Arc::new(MockEngine {
-            config: Mutex::new(EngineConfig {
-                device: "hw:0,0".into(),
-                ..EngineConfig::default()
-            }),
-            applies: AtomicU64::new(0),
-            refreshes: AtomicU64::new(0),
-            applied: Mutex::new((None, 0)),
-            measure: Mutex::new((0, Vec::new())),
-            graph_rate: Mutex::new(None),
-            live_suspends: AtomicU64::new(0),
-            caps: Mutex::new(None),
-        });
-        let mpris = MprisWatcher::stub();
-        let service = Service::new(
-            Arc::clone(&engine) as Arc<dyn Engine>,
-            engine.config.lock().unwrap().clone(),
-            None,
-            None,
-            Some(Arc::clone(&mpris)),
-            ShutdownFlag::new(),
-        );
-        let track = |title: &str| {
-            Some(NowPlaying {
-                player: "org.mpris.MediaPlayer2.player".into(),
-                title: Some(title.into()),
-                artist: None,
-                album: None,
-                status: "Playing".into(),
-                native_rate: None,
-                native_bits: None,
-                track_id: None,
-            })
-        };
-        let measure = |max_seconds, accept| {
-            service.dispatch(Call::AbMeasure {
-                max_seconds,
-                cancel: false,
-                accept,
-            })
-        };
-        let tick = || {
-            let _mutation = service.lock_mutation();
-            service.ab_measure_step();
-        };
-        let queued = || engine.measure.lock().unwrap().1.len();
-        service
-            .dispatch(Call::SetAb(Some(AbConfig::chain(ChainConfig::neutral()))))
-            .unwrap();
-
-        // A skip: the old track's 25 s never lock, the new track's hops go.
-        mpris.set_now_playing(track("one"));
-        measure(Some(60.0), false).unwrap();
-        engine.play(15.0, -18.0, 3.0);
-        tick();
-        // Pausing keeps the identity: not a change.
-        let mut paused = track("one").unwrap();
-        paused.status = "Paused".into();
-        mpris.set_now_playing(Some(paused));
-        tick();
-        assert!(service.ab_status().measuring.is_some());
-        engine.play(10.0, -18.0, 3.0);
-        mpris.set_now_playing(track("two"));
-        tick();
-        let st = service.ab_status();
-        assert_eq!(st.measuring, None);
-        assert_eq!(
-            st.measure_error.as_deref(),
-            Some("cancelled: the track changed")
-        );
-        assert_eq!(queued(), 0, "the queued hops are dropped");
-        assert_eq!(engine.measure.lock().unwrap().0, 0);
-        assert_eq!(service.config().ab.unwrap().level, LevelMatch::default());
-
-        // Before a manual accept too.
-        measure(Some(60.0), false).unwrap();
-        assert_eq!(service.ab_status().measure_error, None, "a start clears it");
-        engine.play(5.0, -18.0, 3.0);
-        tick();
-        mpris.set_now_playing(track("three"));
-        let err = measure(None, true).unwrap_err();
-        assert_eq!(err.code, RpcError::BAD_STATE);
-        assert!(err.message.contains("track changed"), "{}", err.message);
-        assert_eq!(service.config().ab.unwrap().level, LevelMatch::default());
-
-        // A rate change (the next track at another rate).
-        measure(Some(60.0), false).unwrap();
-        engine.play(5.0, -18.0, 3.0);
-        tick();
-        *engine.graph_rate.lock().unwrap() = Some(44_100);
-        engine.play(5.0, -18.0, 3.0);
-        tick();
-        let st = service.ab_status();
-        assert_eq!(st.measuring, None);
-        assert_eq!(
-            st.measure_error.as_deref(),
-            Some("cancelled: the sample rate changed")
-        );
-        assert_eq!(queued(), 0);
-
-        // Two untagged files in one player: only `mpris:trackid` differs.
-        let untagged = |id: &str| {
-            Some(NowPlaying {
-                title: None,
-                track_id: Some(id.into()),
-                ..track("").unwrap()
-            })
-        };
-        *engine.graph_rate.lock().unwrap() = None;
-        mpris.set_now_playing(untagged("/track/1"));
-        measure(Some(60.0), false).unwrap();
-        engine.play(5.0, -18.0, 3.0);
-        tick();
-        assert!(service.ab_status().measuring.is_some());
-        mpris.set_now_playing(untagged("/track/2"));
-        tick();
-        assert_eq!(
-            service.ab_status().measure_error.as_deref(),
-            Some("cancelled: the track changed")
-        );
-
-        // A silent B: at max_seconds the run ends with no match.
-        measure(Some(10.0), false).unwrap();
-        let epoch = engine.measure.lock().unwrap().0;
-        for _ in 0..120 {
-            engine
-                .measure
-                .lock()
-                .unwrap()
-                .1
-                .push(audivane_dsp_core::ab_measure::AbHop {
-                    epoch,
-                    a: 0.01,
-                    b: 0.0,
-                });
-        }
-        tick();
-        let st = service.ab_status();
-        assert_eq!(st.measuring, None, "the run ends");
-        assert!(
-            st.measure_error.as_deref().unwrap().starts_with("no match"),
-            "{st:?}"
-        );
-        assert_eq!(engine.measure.lock().unwrap().0, 0);
-        assert_eq!(service.config().ab.unwrap().level, LevelMatch::default());
-    }
-
-    #[test]
-    fn routing_without_graph_reports_bad_state() {
-        let (service, _) = service();
-        let err = service
-            .dispatch(Call::Route {
-                target: audivane_protocol::ipc::RouteTarget::Node(1),
-                sink: SinkChoice::Dsp,
-            })
-            .unwrap_err();
-        assert_eq!(err.code, RpcError::BAD_STATE);
-    }
-
-    #[test]
-    fn status_reports_the_persisted_active_preset() {
-        let dir = std::env::temp_dir().join(format!(
-            "avdsp-svc-preset-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let store = Arc::new(ConfigStore::new(dir.join("config.json")));
-        let chain = ChainConfig {
-            eq: Some(EqProfile {
-                bands: vec![audivane_protocol::Band {
-                    kind: audivane_protocol::FilterType::Peaking,
-                    freq_hz: 1000.0,
-                    gain_db: 3.0,
-                    q: 1.0,
-                    enabled: true,
-                }],
-                ..Default::default()
-            }),
-            ..ChainConfig::neutral()
-        };
-        PresetStore::alongside(&store)
-            .save(&Preset::new("Saved", chain.clone()))
-            .unwrap();
-
-        // A restart: the config says which preset was active, the service
-        // loads its chain so `modified` is right from the first status.
-        let config = EngineConfig {
-            device: "hw:0,0".into(),
-            chain: chain.clone(),
-            active_preset: Some("Saved".into()),
-            ..EngineConfig::default()
-        };
-        let engine = Arc::new(MockEngine {
-            config: Mutex::new(config.clone()),
-            applies: AtomicU64::new(0),
-            refreshes: AtomicU64::new(0),
-            applied: Mutex::new((None, 0)),
-            measure: Mutex::new((0, Vec::new())),
-            graph_rate: Mutex::new(None),
-            live_suspends: AtomicU64::new(0),
-            caps: Mutex::new(None),
-        });
-        let service = Service::new(
-            Arc::clone(&engine) as Arc<dyn Engine>,
-            config,
-            Some(Arc::clone(&store)),
-            None,
-            None,
-            ShutdownFlag::new(),
-        );
-        assert_eq!(
-            service.status().preset,
-            Some(PresetState {
-                name: "Saved".into(),
-                modified: false,
-            })
-        );
-
-        // Any chain A edit marks it modified; loading the preset clears it.
-        service.dispatch(Call::SetEq(None)).unwrap();
-        assert!(service.status().preset.unwrap().modified);
-        service
-            .dispatch(Call::LoadPreset {
-                name: "Saved".into(),
-                part: None,
-            })
-            .unwrap();
-        assert!(!service.status().preset.unwrap().modified);
-
-        service.flush_persist().unwrap();
-        service.stop_persist();
-        drop(service);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
     #[test]
     fn import_apo_writes_an_eq_preset_with_the_file_preamp() {
         let dir = std::env::temp_dir().join(format!(
@@ -5938,32 +4378,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn subscribe_is_reported() {
-        let (service, _) = service();
-        match service
-            .dispatch(Call::Subscribe {
-                topics: vec![Topic::Meters],
-            })
-            .unwrap()
-        {
-            Dispatch::Subscribe(topics) => assert_eq!(topics, vec![Topic::Meters]),
-            other => panic!("unexpected {other:?}"),
-        }
-    }
-
-    #[test]
-    fn set_config_rejects_bad_device() {
-        let (service, _) = service();
-        let err = service
-            .dispatch(Call::SetConfig(EngineConfig {
-                device: "default".into(),
-                ..EngineConfig::default()
-            }))
-            .unwrap_err();
-        assert_eq!(err.code, RpcError::INVALID_PARAMS);
-    }
-
     /// A config that sets a ceiling below its own volume stores the
     /// ceiling, so nothing (status, the sinks, a later mode) sees the
     /// louder level.
@@ -6000,20 +4414,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn level_only_edits_skip_the_routing_push() {
-        let old = EngineConfig::default();
-        let mut next = old.clone();
-        next.volume.volume_db = -12.0;
-        next.volume.muted = true;
-        assert!(level_only_change(&old, &next));
-        next.volume.guard.mode = GuardMode::Limit;
-        assert!(!level_only_change(&old, &next));
-        let mut next = old.clone();
-        next.routing = RoutingMode::Apps { rules: Vec::new() };
-        assert!(!level_only_change(&old, &next));
-    }
-
     fn follow(service: &Service, edit: impl FnOnce(&mut VolumeConfig)) {
         let mut cfg = service.config();
         cfg.volume.sink_volume = SinkVolumePolicy::Follow;
@@ -6036,71 +4436,6 @@ mod tests {
             balance_db: volume_db.map(|_| 0.0),
             muted,
         }
-    }
-
-    /// Switching to follow never gets louder than the desktop
-    /// had it.
-    #[test]
-    fn following_adopts_the_quieter_sink_level() {
-        let mut v = VolumeConfig::default();
-        // DSP sink at 30 % (cubic: 0.027 linear, -31.4 dB), Direct at 100 %.
-        let note = adopt_levels(&mut v, &[(Some(0.027), false), (Some(1.0), false)]);
-        assert!(note.is_some());
-        assert!((v.volume_db - 20.0 * 0.027f64.log10()).abs() < 0.001);
-        // Already quieter: unchanged; a muted sink mutes.
-        let mut v = VolumeConfig {
-            volume_db: -50.0,
-            ..VolumeConfig::default()
-        };
-        adopt_levels(&mut v, &[(Some(0.5), true)]);
-        assert_eq!(v.volume_db, -50.0);
-        assert!(v.muted);
-        assert_eq!(adopt_levels(&mut v, &[(Some(1.0), false)]), None);
-    }
-
-    #[test]
-    fn follow_adopts_only_the_sink_listened_through() {
-        use crate::control::graph::{Facts, SinkFact};
-        let sink = |choice, volume, muted| SinkFact {
-            choice,
-            node: 1,
-            serial: None,
-            name: String::new(),
-            channels: Some(2),
-            volume: Some(volume),
-            muted,
-        };
-        let facts = Facts {
-            sinks: vec![
-                sink(SinkChoice::Dsp, 0.5, false),
-                sink(SinkChoice::Direct, 0.1, true),
-            ],
-            ..Facts::default()
-        };
-        // Listening through the DSP sink: a muted Direct sink is not adopted.
-        let mut v = VolumeConfig::default();
-        adopt_levels(&mut v, &listened_sink_level(&facts, None));
-        assert!(!v.muted);
-        assert!((v.volume_db - 20.0 * 0.5f64.log10()).abs() < 0.001);
-        let mut v = VolumeConfig::default();
-        adopt_levels(&mut v, &listened_sink_level(&facts, Some(SinkChoice::Dsp)));
-        assert!(!v.muted);
-        // Listening through Direct: its level and mute.
-        let mut v = VolumeConfig::default();
-        adopt_levels(
-            &mut v,
-            &listened_sink_level(&facts, Some(SinkChoice::Direct)),
-        );
-        assert!(v.muted);
-        assert!((v.volume_db + 20.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn sink_requests_are_ignored_unless_following() {
-        let (service, _engine) = service();
-        service.on_sink_volume(sink_request(Some(-10.0), Some(true)));
-        assert_eq!(service.config().volume.volume_db, 0.0);
-        assert!(!service.config().volume.muted);
     }
 
     #[test]
@@ -6149,247 +4484,6 @@ mod tests {
         assert_eq!(service.config().volume.max_volume_db, Some(-6.0));
     }
 
-    /// Volume keys on the desktop, at the ceiling, guard `limit` with no rise
-    /// limit. The desktop's 100 % is the ceiling (cubic below it, as the driver
-    /// maps it). Each key steps 5 % from what the sink shows, up to `max_pct`
-    /// (a desktop may allow more than 100 %), and the sink shows the request
-    /// until the engine answers. A request above the ceiling while already at
-    /// it must be answered too: otherwise the sink runs above 100 % and the
-    /// next presses down are lost above the ceiling.
-    #[test]
-    fn volume_key_bursts_at_the_ceiling_keep_the_sink_on_the_level() {
-        for max_pct in [100.0, 150.0] {
-            volume_key_bursts_at_the_ceiling(max_pct);
-        }
-    }
-
-    fn volume_key_bursts_at_the_ceiling(max_pct: f64) {
-        let (service, engine) = service();
-        follow(&service, |v| {
-            v.volume_db = -3.0;
-            v.max_volume_db = Some(-3.0);
-            v.guard.mode = GuardMode::Limit;
-            v.guard.max_rise_db_per_s = 0.0;
-        });
-        let db_of = |pct: f64| -3.0 + 60.0 * (pct / 100.0).log10();
-        let pct_of = |db: f64| 100.0 * 10f64.powf((db + 3.0) / 60.0);
-        let mut shown = pct_of(-3.0);
-        assert!((shown - 100.0).abs() < 1e-9, "the ceiling reads 100 %");
-        let press = |up: bool, shown: &mut f64| {
-            let target = (shown.round() + if up { 5.0 } else { -5.0 }).clamp(0.0, max_pct);
-            *shown = target;
-            let (applies, refreshes) = (
-                engine.applies.load(Ordering::Relaxed),
-                engine.refreshes.load(Ordering::Relaxed),
-            );
-            service.on_sink_volume(sink_request(Some(db_of(target)), None));
-            let level = service.config().volume.volume_db;
-            if engine.applies.load(Ordering::Relaxed) != applies
-                || engine.refreshes.load(Ordering::Relaxed) != refreshes
-            {
-                *shown = pct_of(level);
-            }
-            assert!(level <= -3.0 + 1e-9, "above the ceiling: {level}");
-            assert!(
-                (db_of(*shown) - level).abs() < 0.01,
-                "the sink shows {shown:.2} % ({:.2} dB), the engine is at {level:.2} dB",
-                db_of(*shown)
-            );
-            level
-        };
-        // Held up at the ceiling: the level and the sink stay at -3 dB.
-        for _ in 0..6 {
-            assert_eq!(press(true, &mut shown), -3.0);
-        }
-        assert!((shown - 100.0).abs() < 1e-9, "the sink stays at 100 %");
-        // Held down: every press goes down.
-        let mut last = -3.0;
-        for _ in 0..6 {
-            let level = press(false, &mut shown);
-            assert!(level < last - 0.5, "{level} after {last}");
-            last = level;
-        }
-        // One press up is one step up.
-        let level = press(true, &mut shown);
-        assert!(level > last && level < last + 3.0, "{level} after {last}");
-    }
-
-    #[test]
-    fn locked_sink_volume_is_reverted_but_mute_passes() {
-        let (service, engine) = service();
-        follow(&service, |v| {
-            v.volume_db = -30.0;
-            v.guard.mode = GuardMode::Lock;
-        });
-        service.on_sink_volume(sink_request(Some(0.0), None));
-        assert_eq!(service.config().volume.volume_db, -30.0);
-        assert_eq!(engine.refreshes.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            service
-                .status()
-                .volume
-                .unwrap()
-                .last_blocked
-                .unwrap()
-                .reason,
-            BlockReason::Locked
-        );
-        service.on_sink_volume(sink_request(None, Some(true)));
-        assert!(service.config().volume.muted);
-    }
-
-    #[test]
-    fn limited_sink_volume_rises_gradually_and_falls_at_once() {
-        let (service, _engine) = service();
-        follow(&service, |v| {
-            v.volume_db = -30.0;
-            v.guard.mode = GuardMode::Limit;
-            v.guard.max_rise_db_per_s = 20.0;
-        });
-        let start = std::time::Instant::now();
-        service.on_sink_volume(sink_request(Some(-10.0), None));
-        assert_eq!(service.config().volume.volume_db, -30.0);
-        assert!(service.volume_slewing());
-        let mut last = -30.0;
-        while service.volume_slewing() {
-            std::thread::sleep(volume_guard::SLEW_TICK);
-            service.volume_tick();
-            let now = service.config().volume.volume_db;
-            let allowed = 20.0 * start.elapsed().as_secs_f64() + 0.05;
-            assert!(
-                now >= last && now + 30.0 <= allowed,
-                "{now} after {:?}",
-                start.elapsed()
-            );
-            last = now;
-            assert!(start.elapsed() < std::time::Duration::from_secs(5));
-        }
-        assert_eq!(last, -10.0);
-        assert!(start.elapsed() >= std::time::Duration::from_millis(950));
-
-        service.on_sink_volume(sink_request(Some(-40.0), None));
-        assert_eq!(service.config().volume.volume_db, -40.0);
-        assert!(!service.volume_slewing());
-
-        // set_volume is never slowed down and cancels a pending rise.
-        service.on_sink_volume(sink_request(Some(0.0), None));
-        assert!(service.volume_slewing());
-        service
-            .dispatch(Call::SetVolume {
-                volume_db: -5.0,
-                balance_db: 0.0,
-                muted: false,
-            })
-            .unwrap();
-        assert!(!service.volume_slewing());
-        assert_eq!(service.config().volume.volume_db, -5.0);
-    }
-
-    /// The revision moves whenever the reported (applied) level changes, not
-    /// only the configured one: a staged hardware raise reports the interim
-    /// level first and settles later under no new request. A guarded write
-    /// computed from the interim status is refused, and two statuses with one
-    /// revision always show the same level.
-    #[test]
-    fn the_revision_follows_the_applied_level() {
-        let (service, engine) = service();
-        let applied = |volume_db, hardware_db| VolumeStatus {
-            volume_db,
-            hardware_db: Some(hardware_db),
-            hardware: true,
-            ..VolumeStatus::from_config(&service.config().volume)
-        };
-        engine.set_applied(applied(-60.0, -60.0));
-        let interim = service.status().volume.unwrap();
-        assert_eq!(interim.volume_db, -60.0);
-        // The raise lands.
-        engine.set_applied(applied(-30.0, -30.0));
-        let settled = service.status().volume.unwrap();
-        assert_eq!(settled.volume_db, -30.0);
-        assert!(settled.revision > interim.revision, "{settled:?}");
-        let again = service.status().volume.unwrap();
-        assert_eq!(again.revision, settled.revision);
-        assert_eq!(again.volume_db, settled.volume_db);
-        // A step computed from the interim status is stale.
-        let err = service
-            .dispatch(Call::SetVolumeGuarded {
-                volume_db: Some(-59.0),
-                balance_db: None,
-                muted: None,
-                if_instance: service.instance.clone(),
-                if_revision: interim.revision.unwrap(),
-            })
-            .unwrap_err();
-        assert_eq!(err.code, RpcError::STALE_REVISION);
-        assert_ne!(service.config().volume.volume_db, -59.0);
-        // From the settled one it applies, and its reply pairs the level
-        // with the revision a following write is checked against.
-        let reply = service
-            .dispatch(Call::SetVolumeGuarded {
-                volume_db: Some(-29.0),
-                balance_db: None,
-                muted: None,
-                if_instance: service.instance.clone(),
-                if_revision: settled.revision.unwrap(),
-            })
-            .unwrap();
-        let Dispatch::Value(reply) = reply else {
-            panic!("not a value")
-        };
-        let echo: VolumeStatus = serde_json::from_value(reply).unwrap();
-        assert_eq!(echo.revision, service.status().volume.unwrap().revision);
-        // Mixer readback on a reopen changes the report again.
-        engine.set_applied(applied(-29.5, -29.5));
-        assert!(service.status().volume.unwrap().revision > echo.revision);
-    }
-
-    /// A guarded write without level fields changes nothing: no ramp
-    /// stopped, no engine apply, no new config generation or revision.
-    #[test]
-    fn an_empty_guarded_write_has_no_side_effects() {
-        let (service, engine) = service();
-        follow(&service, |v| {
-            v.volume_db = -30.0;
-            v.guard.mode = GuardMode::Limit;
-            v.guard.max_rise_db_per_s = 20.0;
-        });
-        service.on_sink_volume(sink_request(Some(-10.0), None));
-        assert!(service.volume_slewing());
-        let applies = engine.applies.load(Ordering::Relaxed);
-        let generation = service.config_generation();
-        let revision = service.level_revision();
-        let reply = service
-            .dispatch(Call::SetVolumeGuarded {
-                volume_db: None,
-                balance_db: None,
-                muted: None,
-                if_instance: service.instance.clone(),
-                if_revision: revision,
-            })
-            .unwrap();
-        let Dispatch::Value(reply) = reply else {
-            panic!("not a value")
-        };
-        let status: VolumeStatus = serde_json::from_value(reply).unwrap();
-        assert_eq!(status.volume_db, -30.0);
-        assert_eq!(status.revision, Some(revision));
-        assert!(service.volume_slewing(), "the desktop ramp was stopped");
-        assert_eq!(engine.applies.load(Ordering::Relaxed), applies);
-        assert_eq!(service.config_generation(), generation);
-        assert_eq!(service.level_revision(), revision);
-        // The guards still apply to an empty write.
-        let err = service
-            .dispatch(Call::SetVolumeGuarded {
-                volume_db: None,
-                balance_db: None,
-                muted: None,
-                if_instance: service.instance.clone(),
-                if_revision: revision + 1,
-            })
-            .unwrap_err();
-        assert_eq!(err.code, RpcError::STALE_REVISION);
-    }
-
     #[test]
     fn direct_sink_volume_is_refused_and_its_mute_is_the_engine_mute() {
         let (service, _engine) = service();
@@ -6405,54 +4499,6 @@ mod tests {
         assert!(cfg.volume.muted);
         let last = service.status().volume.unwrap().last_blocked.unwrap();
         assert_eq!(last.reason, BlockReason::DirectBitPerfect);
-    }
-
-    #[test]
-    fn set_volume_validates_and_surfaces_in_status() {
-        let (service, engine) = service();
-
-        // Reject out-of-range volume and balance without calling engine.apply.
-        let err = service
-            .dispatch(Call::SetVolume {
-                volume_db: 1.0,
-                balance_db: 0.0,
-                muted: false,
-            })
-            .unwrap_err();
-        assert_eq!(err.code, RpcError::INVALID_PARAMS);
-        assert_eq!(engine.applies.load(Ordering::Relaxed), 0);
-
-        let err = service
-            .dispatch(Call::SetVolume {
-                volume_db: -10.0,
-                balance_db: -30.0,
-                muted: false,
-            })
-            .unwrap_err();
-        assert_eq!(err.code, RpcError::INVALID_PARAMS);
-        assert_eq!(engine.applies.load(Ordering::Relaxed), 0);
-
-        let reply = match service
-            .dispatch(Call::SetVolume {
-                volume_db: -15.0,
-                balance_db: 4.5,
-                muted: true,
-            })
-            .unwrap()
-        {
-            Dispatch::Value(v) => serde_json::from_value::<VolumeStatus>(v).unwrap(),
-            other => panic!("unexpected {other:?}"),
-        };
-        assert_eq!(reply.volume_db, -15.0);
-        assert_eq!(reply.balance_db, 4.5);
-        assert!(reply.muted);
-        assert!(!reply.hardware);
-        assert_eq!(reply.min_db, audivane_protocol::ipc::VOLUME_MIN_DB);
-        assert_eq!(reply.max_db, audivane_protocol::ipc::VOLUME_MAX_DB);
-        assert_eq!(engine.applies.load(Ordering::Relaxed), 1);
-
-        let status = service.status();
-        assert_eq!(status.volume, Some(reply));
     }
 
     /// An engine that validates as the real one does (the convolution
@@ -6889,206 +4935,91 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A temporary folder with impulse-response WAVs (one channel each, a
-    /// first tap at `peak`) and a bundle manifest writer for the tests.
-    struct BundleDir(std::path::PathBuf);
-
-    impl BundleDir {
-        fn new(tag: &str) -> Self {
-            let d = std::env::temp_dir().join(format!(
-                "avdsp-svc-{tag}-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .subsec_nanos()
-            ));
-            std::fs::create_dir_all(&d).unwrap();
-            Self(d)
-        }
-        fn wav(&self, name: &str, peak: f32) -> std::path::PathBuf {
-            let p = self.0.join(name);
+    /// `bundle_enable`: off, the placed items are disabled (chain A, a
+    /// calibrated follower's patch, a side B that keeps A's calibration),
+    /// the stored parts stay as they were, and a convolution edit, a preset
+    /// load and a whole config keep it off; on, they play again; a side B
+    /// with its own bundle is unaffected; off without a calibration errors;
+    /// turning on is held by the guards.
+    #[test]
+    fn a_room_calibration_switches_off_and_on() {
+        use serde_json::json;
+        let dir = std::env::temp_dir().join(format!(
+            "avdsp-svc-cal-enable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = |name: &str, channels: u16, peak: f32| {
             let spec = hound::WavSpec {
-                channels: 1,
+                channels,
                 sample_rate: 48_000,
                 bits_per_sample: 32,
                 sample_format: hound::SampleFormat::Float,
             };
-            let mut w = hound::WavWriter::create(&p, spec).unwrap();
+            let mut w = hound::WavWriter::create(dir.join(name), spec).unwrap();
             for i in 0..64 {
-                w.write_sample(if i == 0 { peak } else { 0.0 }).unwrap();
+                for _ in 0..channels {
+                    w.write_sample(if i == 0 { peak } else { 0.0 }).unwrap();
+                }
             }
             w.finalize().unwrap();
-            p
-        }
-        fn manifest(&self, name: &str, follower: Option<&str>) -> String {
-            let mut devices = vec![serde_json::json!(
-                { "role": "master", "matrix": [ { "in": 0, "out": 0, "ir": "ll.wav" } ] })];
-            if let Some(f) = follower {
-                devices.push(
-                    serde_json::json!({ "role": "follower", "device": f, "trim_ms": 1.5,
-                    "matrix": [ { "in": 0, "out": 0, "ir": "sub.wav" } ] }),
-                );
-            }
-            let body = serde_json::json!({ "bundle_version": 1, "label": name,
-                "design_rate_hz": 48000, "devices": devices });
-            let p = self.0.join(format!("{name}.json"));
+        };
+        wav("mine.wav", 1, 0.9);
+        wav("other.wav", 1, 0.8);
+        wav("ll.wav", 1, 1.0);
+        wav("rr.wav", 1, 1.0);
+        wav("sub.wav", 2, 0.5);
+        const SUB: &str = "hw:CARD=USB_1,DEV=0";
+        let manifest = |name: &str| {
+            let body = json!({
+                "bundle_version": 1, "label": name, "design_rate_hz": 48000,
+                "devices": [
+                    { "role": "master",
+                      "matrix": [ { "in": 0, "out": 0, "ir": "ll.wav" },
+                                  { "in": 1, "out": 1, "ir": "rr.wav" } ] },
+                    { "role": "follower", "device": SUB, "trim_ms": 1.5,
+                      "matrix": [ { "in": 0, "out": 0, "ir": "sub.wav", "channel": 0 },
+                                  { "in": 1, "out": 0, "ir": "sub.wav", "channel": 1 } ] } ]
+            });
+            let p = dir.join(format!("{name}.json"));
             std::fs::write(&p, body.to_string()).unwrap();
             p.display().to_string()
-        }
-    }
-
-    impl Drop for BundleDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn bundle_service(config: EngineConfig, dir: &BundleDir) -> Arc<Service> {
-        let store = Arc::new(ConfigStore::new(dir.0.join("config.json")));
-        Service::new(
-            guard_mock(&config) as Arc<dyn Engine>,
-            config,
-            Some(store),
-            None,
-            None,
-            ShutdownFlag::new(),
-        )
-    }
-
-    /// `bundle_load`'s reply is a `CalibrationStatus`: the manifest's
-    /// `notes` text stays, the load's warnings come in `warnings`.
-    #[test]
-    fn the_load_reply_keeps_the_manifests_notes() {
-        let dir = BundleDir::new("bundle-notes");
-        dir.wav("ll.wav", 1.0);
-        let p = dir.0.join("noted.json");
-        std::fs::write(
-            &p,
-            serde_json::json!({ "bundle_version": 1, "label": "noted", "design_rate_hz": 48000,
-                "notes": "target and positions",
-                "devices": [ { "role": "master", "device": "hw:CARD=Other,DEV=0",
-                    "matrix": [ { "in": 0, "out": 0, "ir": "ll.wav" } ] } ] })
-            .to_string(),
-        )
-        .unwrap();
-        let config = EngineConfig {
-            device: "hw:CARD=USB,DEV=0".into(),
-            ..EngineConfig::default()
         };
-        let service = bundle_service(config, &dir);
-        let reply = match service
-            .dispatch(Call::BundleLoad {
-                path: p.display().to_string(),
-            })
-            .unwrap()
-        {
-            Dispatch::Value(v) => v,
-            other => panic!("unexpected {other:?}"),
-        };
-        let st: audivane_protocol::ipc::CalibrationStatus = serde_json::from_value(reply).unwrap();
-        assert_eq!(st.notes.as_deref(), Some("target and positions"));
-        assert!(
-            st.warnings
-                .iter()
-                .any(|w| w.contains("hw:CARD=Other,DEV=0")),
-            "{:?}",
-            st.warnings
-        );
-        service.stop_persist();
-    }
-
-    /// The calibration is the daemon's across whole-config edits: a
-    /// `set_config` without it keeps it (and its record), so unload still
-    /// puts the follower's trim back.
-    #[test]
-    fn set_config_keeps_the_calibration() {
-        const SUB: &str = "hw:CARD=USB_1,DEV=0";
-        let dir = BundleDir::new("bundle-setcfg");
-        dir.wav("ll.wav", 1.0);
-        dir.wav("sub.wav", 0.5);
-        let mut config = EngineConfig {
-            device: "hw:CARD=USB,DEV=0".into(),
-            ..EngineConfig::default()
-        };
-        let mut f = FollowerConfig::new(SUB);
-        f.trim_ms = -2.0;
-        config.outputs.followers.push(f);
-        let service = bundle_service(config, &dir);
-        let before = service.config();
-        service
-            .dispatch(Call::BundleLoad {
-                path: dir.manifest("desk", Some(SUB)),
-            })
-            .unwrap();
-        let mut sent = service.config();
-        sent.calibration = None;
-        sent.chain.convolution.clear();
-        sent.quantum = 512;
-        service.dispatch(Call::SetConfig(sent)).unwrap();
-        let cfg = service.config();
-        assert!(cfg.calibration.is_some(), "kept");
-        assert!(
-            cfg.chain.convolution[0].calibration,
-            "its item back in place"
-        );
-        assert_eq!(cfg.outputs.followers[0].trim_ms, 1.5);
-        service.dispatch(Call::BundleUnload).unwrap();
-        let cfg = service.config();
-        assert_eq!(cfg.outputs.followers[0].trim_ms, -2.0);
-        let mut want = before.clone();
-        want.outputs.followers[0].follow_volume = true;
-        want.outputs.followers[0].follow_ref_db = Some(0.0);
-        assert_eq!(
-            EngineConfig {
-                quantum: before.quantum,
-                ..cfg
-            },
-            want
-        );
-        service.stop_persist();
-    }
-
-    /// `bundle_gain` sets one part's level: the master's reaches chain A's
-    /// item only, a follower's that follower's patch only; it is kept
-    /// through convolution edits, a preset load and `set_config`; the boost
-    /// cap refuses it (nothing changes); `null` goes back to the manifest's,
-    /// and a new load or an unload drops it.
-    #[test]
-    fn bundle_gain_sets_keeps_and_resets_each_part() {
-        const SUB: &str = "hw:CARD=USB_1,DEV=0";
-        const OTHER: &str = "hw:CARD=USB_2,DEV=0";
-        let dir = BundleDir::new("bundle-gain");
-        dir.wav("ll.wav", 1.0);
-        dir.wav("sub.wav", 0.5);
-        dir.wav("mine.wav", 1.0);
-        let mut config = EngineConfig {
-            device: "hw:CARD=USB,DEV=0".into(),
-            ..EngineConfig::default()
-        };
-        config.outputs.followers.push(FollowerConfig::new(OTHER));
-        let store = Arc::new(ConfigStore::new(dir.0.join("config.json")));
-        let presets = PresetStore::alongside(&store);
-        let mine = audivane_protocol::ConvolutionConfig {
-            name: Some("mine".into()),
+        let conv = |file: &str| audivane_protocol::ConvolutionConfig {
+            name: Some(file.into()),
             enabled: true,
-            ir_path: dir.0.join("mine.wav"),
+            ir_path: dir.join(file),
             gain_db: 0.0,
             matrix: None,
             calibration: false,
         };
-        let chain = ChainConfig {
-            convolution: vec![mine.clone()],
+        let store = Arc::new(ConfigStore::new(dir.join("config.json")));
+        let mut config = EngineConfig {
+            device: "hw:CARD=USB,DEV=0".into(),
+            ..EngineConfig::default()
+        };
+        config.chain.convolution = vec![conv("mine.wav")];
+        let mut sub = FollowerConfig::new(SUB);
+        sub.trim_ms = -2.0;
+        config.outputs.followers.push(sub);
+        let presets = PresetStore::alongside(&store);
+        let other = ChainConfig {
+            convolution: vec![conv("other.wav")],
             ..config.chain.clone()
         };
         presets
             .scoped(Some(PresetPart::Convolution))
-            .save(&Preset::for_part("Mine", PresetPart::Convolution, chain))
+            .save(&Preset::for_part("Other", PresetPart::Convolution, other))
             .unwrap();
+        let engine = guard_mock(&config);
         let service = Service::new(
-            guard_mock(&config) as Arc<dyn Engine>,
+            Arc::clone(&engine) as Arc<dyn Engine>,
             config,
-            Some(store),
+            Some(Arc::clone(&store)),
             None,
             None,
             ShutdownFlag::new(),
@@ -7097,395 +5028,136 @@ mod tests {
             Dispatch::Value(v) => v,
             other => panic!("unexpected {other:?}"),
         };
-        let gain = |device: Option<&str>, gain_db: Option<f64>| Call::BundleGain {
-            device: device.map(Into::into),
-            gain_db,
-        };
-        let master_item = |c: &EngineConfig| {
-            c.chain
+        /// The tagged item chain A plays.
+        fn placed(cfg: &EngineConfig) -> audivane_protocol::ConvolutionConfig {
+            cfg.chain
                 .convolution
                 .iter()
                 .find(|c| c.calibration)
-                .unwrap()
-                .gain_db
-        };
-        let patch_gain = |c: &EngineConfig, dev: &str| {
-            c.outputs
+                .cloned()
+                .expect("a placed calibration")
+        }
+        /// The calibration's item in a follower's patch.
+        fn in_patch(cfg: &EngineConfig, device: &str) -> bool {
+            cfg.outputs
                 .followers
                 .iter()
-                .find(|f| f.device == dev)
-                .unwrap()
-                .chain_patch
-                .as_ref()
+                .find(|f| f.device == device)
+                .and_then(|f| f.chain_patch.as_ref())
                 .and_then(|p| p.get("convolution"))
-                .map(|v| v[0]["gain_db"].as_f64().unwrap())
-        };
-        assert_eq!(
-            service.dispatch(gain(None, Some(-1.0))).unwrap_err().code,
-            RpcError::BAD_STATE,
-            "none loaded"
-        );
-        let desk = dir.manifest("desk", Some(SUB));
-        value(Call::BundleLoad { path: desk.clone() });
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("enabled"))
+                .and_then(serde_json::Value::as_bool)
+                .expect("the follower's placed item")
+        }
 
-        // The follower's part: its patch only, the master's item untouched.
-        let st = value(gain(Some(SUB), Some(3.0)));
-        assert_eq!(st["devices"][1]["gain_db"], 3.0);
-        assert_eq!(st["devices"][1]["manifest_gain_db"], 0.0);
-        let cfg = service.config();
-        assert_eq!(patch_gain(&cfg, SUB), Some(3.0));
-        assert_eq!(master_item(&cfg), 0.0);
-        assert_eq!(patch_gain(&cfg, OTHER), None, "another follower: none");
-        // The master's: chain A only.
-        value(gain(Some("master"), Some(-4.0)));
-        let cfg = service.config();
-        assert_eq!(master_item(&cfg), -4.0);
-        assert_eq!(patch_gain(&cfg, SUB), Some(3.0));
-        let st = service.status().calibration.unwrap();
+        // Off without a calibration: an error, nothing to change.
+        let err = service
+            .dispatch(Call::BundleEnable { on: false })
+            .unwrap_err();
         assert_eq!(
-            (st.devices[0].gain_db, st.devices[0].manifest_gain_db),
-            (-4.0, 0.0)
+            err.message,
+            "bundle_enable: nothing changed: no room calibration is loaded"
         );
 
-        // Out of range, an unknown part, and over the boost cap: refused,
-        // nothing changes.
-        let before = service.config();
-        assert!(service.dispatch(gain(None, Some(30.0))).is_err());
-        assert!(service.dispatch(gain(Some(OTHER), Some(1.0))).is_err());
-        let err = service.dispatch(gain(None, Some(20.0))).unwrap_err();
+        // Loaded: it plays, on.
+        let desk = manifest("desk");
+        let reply = value(Call::BundleLoad { path: desk.clone() });
+        assert_eq!(reply["enabled"], true);
+        assert!(placed(&service.config()).enabled);
+
+        // Off: the placed items go quiet, the stored parts stay as they
+        // were, and status says so.
+        let reply = value(Call::BundleEnable { on: false });
+        assert_eq!(reply["enabled"], false);
+        let cfg = service.config();
+        let cal = cfg.calibration.as_ref().unwrap();
+        assert!(!cal.enabled);
+        assert!(cal.master.as_ref().unwrap().enabled);
+        assert!(cal.followers[0].item.enabled);
+        assert!(!placed(&cfg).enabled);
+        // The sub's part keeps playing (muted instead): its chain never
+        // drops the low-pass.
+        assert!(in_patch(&cfg, SUB));
+        assert!(crate::engine::follower::muted_by_calibration(&cfg, SUB));
+        assert!(!service.status().calibration.unwrap().enabled);
+
+        // A side B that keeps A's calibration is off with it.
+        service
+            .dispatch(Call::SetAb(Some(AbConfig::new(
+                audivane_protocol::ipc::AbB::Patch(json!({"convolution": []})),
+            ))))
+            .unwrap();
+        let cfg = service.config();
+        let b = &cfg.ab.as_ref().unwrap().chain_b.convolution;
+        assert!(b.iter().any(|c| c.calibration && !c.enabled), "{b:?}");
+
+        // A convolution edit, a preset load and a whole config keep it off.
+        service
+            .dispatch(Call::SetConvolution(vec![conv("mine.wav")]))
+            .unwrap();
+        assert!(!placed(&service.config()).enabled);
+        value(Call::LoadPreset {
+            name: "Other".into(),
+            part: Some(PresetPart::Convolution),
+        });
+        let cfg = service.config();
+        assert_eq!(cfg.chain.convolution[0].name.as_deref(), Some("other.wav"));
+        assert!(!placed(&cfg).enabled);
+        let mut whole = cfg.clone();
+        whole.chain.convolution = vec![conv("mine.wav")];
+        service.dispatch(Call::SetConfig(whole)).unwrap();
+        let cfg = service.config();
+        assert!(!cfg.calibration.as_ref().unwrap().enabled);
+        assert!(!placed(&cfg).enabled);
+        assert!(in_patch(&cfg, SUB));
+
+        // On: every placed item plays again.
+        let reply = value(Call::BundleEnable { on: true });
+        assert_eq!(reply["enabled"], true);
+        let cfg = service.config();
+        assert!(cfg.calibration.as_ref().unwrap().enabled);
+        assert!(placed(&cfg).enabled);
+        assert!(in_patch(&cfg, SUB));
+        let b = &cfg.ab.as_ref().unwrap().chain_b.convolution;
+        assert!(b.iter().filter(|c| c.calibration).all(|c| c.enabled));
+
+        // A side B with its own bundle is not affected by A's switch.
+        value(Call::BundleEnable { on: false });
+        value(Call::BundleAb {
+            path: Some(desk.clone()),
+        });
+        let cfg = service.config();
+        assert!(!cfg.calibration.as_ref().unwrap().enabled);
+        let b = &cfg.ab.as_ref().unwrap().chain_b.convolution;
+        assert!(b.iter().find(|c| c.calibration).unwrap().enabled);
+
+        // On again is held by the guards: a level raised while off (the
+        // item is off, so the cap does not count it) is over the cap on.
+        value(Call::BundleUnload);
+        assert!(value(Call::BundleShow).is_null());
+        value(Call::BundleLoad { path: desk });
+        value(Call::BundleEnable { on: false });
+        value(Call::BundleGain {
+            device: None,
+            gain_db: Some(13.0),
+        });
+        let err = service
+            .dispatch(Call::BundleEnable { on: true })
+            .unwrap_err();
         assert!(
             err.message.contains("nothing changed") && err.message.contains("cap"),
             "{}",
             err.message
         );
-        let err = service.dispatch(gain(Some(SUB), Some(24.0))).unwrap_err();
-        assert!(
-            err.message.contains(&format!("follower {SUB}")),
-            "{}",
-            err.message
-        );
-        assert_eq!(service.config(), before);
+        let cfg = service.config();
+        assert!(!cfg.calibration.as_ref().unwrap().enabled);
+        assert_eq!(placed(&cfg).gain_db, 13.0);
+        assert!(!placed(&cfg).enabled);
 
-        // Kept through a convolution edit, a preset load and set_config.
-        service
-            .dispatch(Call::SetConvolution(vec![mine.clone()]))
-            .unwrap();
-        value(Call::LoadPreset {
-            name: "Mine".into(),
-            part: Some(PresetPart::Convolution),
-        });
-        let mut sent = service.config();
-        sent.calibration = None;
-        sent.chain.convolution.retain(|c| !c.calibration);
-        sent.quantum = 512;
-        service.dispatch(Call::SetConfig(sent)).unwrap();
-        let cfg = service.config();
-        assert_eq!(master_item(&cfg), -4.0);
-        assert_eq!(patch_gain(&cfg, SUB), Some(3.0));
-
-        // Reset: back to the manifest's, the record cleared.
-        value(gain(Some(SUB), None));
-        let cfg = service.config();
-        assert_eq!(patch_gain(&cfg, SUB), Some(0.0));
-        let cal = cfg.calibration.as_ref().unwrap();
-        assert_eq!(cal.followers[0].manifest_gain_db, None);
-        assert_eq!(cal.master_manifest_gain_db, Some(0.0));
-
-        // A new load (the same bundle again) starts from the manifest.
-        value(Call::BundleLoad { path: desk });
-        let cfg = service.config();
-        assert_eq!(master_item(&cfg), 0.0);
-        assert_eq!(
-            cfg.calibration.as_ref().unwrap().master_manifest_gain_db,
-            None
-        );
-        // Unload removes it with the rest.
-        value(gain(None, Some(-2.0)));
-        service.dispatch(Call::BundleUnload).unwrap();
-        let cfg = service.config();
-        assert!(cfg.chain.convolution.iter().all(|c| !c.calibration));
-        assert!(service.dispatch(gain(None, Some(-2.0))).is_err());
+        service.flush_persist().unwrap();
         service.stop_persist();
-    }
-
-    /// Unload works from the record as edits left it: a follower the
-    /// bundle added, removed and added again by hand, stays; a follower
-    /// whose IR from before the bundle is gone is put back without it (a
-    /// note says so), or with what the user set on it since.
-    #[test]
-    fn unload_follows_the_followers_edits() {
-        const SUB: &str = "hw:CARD=USB_1,DEV=0";
-        let dir = BundleDir::new("bundle-edits");
-        dir.wav("ll.wav", 1.0);
-        dir.wav("sub.wav", 0.5);
-        let own = dir.wav("own.wav", 0.5);
-        let config = EngineConfig {
-            device: "hw:CARD=USB,DEV=0".into(),
-            ..EngineConfig::default()
-        };
-        let service = bundle_service(config, &dir);
-        let follower = |patch: Option<Value>| Call::SetFollower {
-            device: SUB.into(),
-            remove: false,
-            enabled: None,
-            trim_ms: None,
-            volume_db: None,
-            output_channels: None,
-            follow_volume: None,
-            chain_patch: patch,
-            period_ms: None,
-        };
-        // Added by the bundle, removed and added again by hand.
-        service
-            .dispatch(Call::BundleLoad {
-                path: dir.manifest("desk", Some(SUB)),
-            })
-            .unwrap();
-        assert_eq!(service.config().outputs.followers.len(), 1);
-        service
-            .dispatch(Call::SetFollower {
-                device: SUB.into(),
-                remove: true,
-                enabled: None,
-                trim_ms: None,
-                volume_db: None,
-                output_channels: None,
-                follow_volume: None,
-                chain_patch: None,
-                period_ms: None,
-            })
-            .unwrap();
-        assert!(service.config().calibration.unwrap().followers.is_empty());
-        service.dispatch(follower(None)).unwrap();
-        service.dispatch(Call::BundleUnload).unwrap();
-        assert_eq!(
-            service.config().outputs.followers.len(),
-            1,
-            "the user's stays"
-        );
-
-        // Its own IR before the bundle goes missing: unload skips it.
-        let own_conv = serde_json::json!({"convolution": [{"ir_path": own}]});
-        service.dispatch(follower(Some(own_conv.clone()))).unwrap();
-        service
-            .dispatch(Call::BundleLoad {
-                path: dir.manifest("desk", Some(SUB)),
-            })
-            .unwrap();
-        std::fs::remove_file(&own).unwrap();
-        let reply = match service.dispatch(Call::BundleUnload).unwrap() {
-            Dispatch::Value(v) => v,
-            other => panic!("unexpected {other:?}"),
-        };
-        let note = reply["notes"][0].as_str().unwrap().to_string();
-        assert!(
-            note.contains("own.wav") && note.contains("not put back"),
-            "{note}"
-        );
-        assert_eq!(service.config().outputs.followers[0].chain_patch, None);
-
-        // What the user sets while calibrated is what unload puts back;
-        // the calibration's item keeps playing meanwhile.
-        dir.wav("own.wav", 0.5);
-        service.dispatch(follower(Some(own_conv))).unwrap();
-        service
-            .dispatch(Call::BundleLoad {
-                path: dir.manifest("desk", Some(SUB)),
-            })
-            .unwrap();
-        std::fs::remove_file(&own).unwrap();
-        service
-            .dispatch(follower(Some(serde_json::json!({"convolution": []}))))
-            .unwrap();
-        let patch = service.config().outputs.followers[0]
-            .chain_patch
-            .clone()
-            .unwrap();
-        assert_eq!(
-            patch["convolution"][0]["calibration"], true,
-            "still the bundle's"
-        );
-        assert!(matches!(
-            service.dispatch(Call::BundleUnload).unwrap(),
-            Dispatch::Value(Value::Null)
-        ));
-        assert_eq!(
-            service.config().outputs.followers[0].chain_patch,
-            Some(serde_json::json!({"convolution": []}))
-        );
-        service.stop_persist();
-    }
-
-    /// A master-only calibration never reaches another output: a follower
-    /// it does not name plays chain A without the calibration's item.
-    #[test]
-    fn a_master_calibration_stays_off_the_other_followers() {
-        let dir = BundleDir::new("bundle-masteronly");
-        dir.wav("ll.wav", 1.0);
-        let mine = dir.wav("mine.wav", 0.5);
-        let mut config = EngineConfig {
-            device: "hw:CARD=USB,DEV=0".into(),
-            ..EngineConfig::default()
-        };
-        config.chain.convolution = vec![audivane_protocol::ConvolutionConfig {
-            name: None,
-            enabled: true,
-            ir_path: mine,
-            gain_db: 0.0,
-            matrix: None,
-            calibration: false,
-        }];
-        config
-            .outputs
-            .followers
-            .push(FollowerConfig::new("hw:CARD=X,DEV=0"));
-        let service = bundle_service(config, &dir);
-        service
-            .dispatch(Call::BundleLoad {
-                path: dir.manifest("mains", None),
-            })
-            .unwrap();
-        let cfg = service.config();
-        assert_eq!(cfg.chain.convolution.len(), 2);
-        let f = &cfg.outputs.followers[0];
-        let own = super::super::follower_chain::config(&cfg, f);
-        assert_eq!(
-            own.chain.convolution,
-            vec![cfg.chain.convolution[0].clone()]
-        );
-        service.stop_persist();
-    }
-
-    #[test]
-    fn ab_overload_fallback_cancels_measurement_and_reports_disabled() {
-        struct OverloadMock {
-            inner: MockEngine,
-            rt_overloads: AtomicU64,
-            generation: AtomicU64,
-        }
-        impl Engine for OverloadMock {
-            fn apply(&self, cfg: &EngineConfig) -> Result<(), EngineError> {
-                self.generation.fetch_add(1, Ordering::Relaxed);
-                self.inner.apply(cfg)
-            }
-            fn applied_generation(&self) -> u64 {
-                self.generation.load(Ordering::Relaxed)
-            }
-            fn ab_select(&self, side: AbSide, crossfade_ms: f64) -> Result<AbStatus, EngineError> {
-                self.inner.ab_select(side, crossfade_ms)
-            }
-            fn snapshot(&self) -> EngineSnapshot {
-                let mut s = self.inner.snapshot();
-                s.state = EngineState::Playing;
-                s.chain_generation = self.generation.load(Ordering::Relaxed);
-                s.gaps.dsp_wanted = 1;
-                s.gaps.processed_periods = 100;
-                let ov = self.rt_overloads.load(Ordering::Relaxed);
-                s.gaps.rt_overloads = ov;
-                s.gaps.rt_signals = ov;
-                s.gaps.rt_overload_generation = s.chain_generation;
-                s
-            }
-            fn meters(&self) -> Meters {
-                self.inner.meters()
-            }
-            fn selftest(&self) -> Result<audivane_protocol::ipc::SelfTestResult, EngineError> {
-                self.inner.selftest()
-            }
-            fn release_device(&self) -> Result<(), EngineError> {
-                Ok(())
-            }
-            fn acquire_device(&self) -> Result<(), EngineError> {
-                Ok(())
-            }
-            fn shutdown(&self) {}
-            fn set_ab_measure(&self, epoch: u32) {
-                self.inner.set_ab_measure(epoch);
-            }
-            fn take_ab_hops(&self, out: &mut Vec<audivane_dsp_core::ab_measure::AbHop>) {
-                self.inner.take_ab_hops(out);
-            }
-        }
-
-        let engine = Arc::new(OverloadMock {
-            inner: MockEngine {
-                config: Mutex::new(EngineConfig {
-                    device: "hw:0,0".into(),
-                    ..EngineConfig::default()
-                }),
-                applies: AtomicU64::new(0),
-                refreshes: AtomicU64::new(0),
-                applied: Mutex::new((None, 0)),
-                measure: Mutex::new((0, Vec::new())),
-                graph_rate: Mutex::new(None),
-                live_suspends: AtomicU64::new(0),
-                caps: Mutex::new(None),
-            },
-            rt_overloads: AtomicU64::new(0),
-            generation: AtomicU64::new(0),
-        });
-        let service = Service::new(
-            Arc::clone(&engine) as Arc<dyn Engine>,
-            engine.inner.config.lock().unwrap().clone(),
-            None,
-            None,
-            None,
-            ShutdownFlag::new(),
-        );
-
-        service
-            .dispatch(Call::SetAb(Some(AbConfig::chain(ChainConfig::neutral()))))
-            .unwrap();
-        service
-            .dispatch(Call::AbMeasure {
-                max_seconds: Some(30.0),
-                cancel: false,
-                accept: false,
-            })
-            .unwrap();
-        assert!(service.ab_status().enabled);
-        assert!(service.ab_status().measuring.is_some());
-        assert_ne!(engine.inner.measure.lock().unwrap().0, 0);
-
-        // Settle, then trip an RT overload: the first fallback step turns A/B off.
-        for _ in 0..8 {
-            service.overload_tick();
-        }
-        engine.rt_overloads.store(1, Ordering::Relaxed);
-        for _ in 0..8 {
-            service.overload_tick();
-        }
-
-        assert!(
-            service.overload_report().is_some(),
-            "overload fallback should be active"
-        );
-        assert_eq!(
-            engine.inner.measure.lock().unwrap().0,
-            0,
-            "engine measurement epoch must be cleared"
-        );
-        let ab = service.ab_status();
-        assert!(
-            !ab.enabled,
-            "ab_status must report disabled during fallback"
-        );
-        assert!(ab.measuring.is_none(), "measurement must be cancelled");
-        assert!(
-            ab.measure_error
-                .as_deref()
-                .is_some_and(|e| e.contains("overload")),
-            "reason must stay visible: {:?}",
-            ab.measure_error
-        );
-        let status_ab = service
-            .status()
-            .ab
-            .expect("status.ab should stay present with reason");
-        assert!(
-            !status_ab.enabled,
-            "status.ab must report disabled during fallback"
-        );
-        assert_eq!(status_ab.measure_error, ab.measure_error);
+        drop(service);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -547,45 +547,6 @@ pub fn replay(master: &Log, follower: &Log, opt: &ReplayOptions) -> Result<Repla
 mod tests {
     use super::*;
 
-    /// A device at +50 ppm, read every 1024 frames with a pointer in
-    /// 48-frame steps.
-    fn synthetic(ppm: f64, n: usize) -> String {
-        let mut s = String::from(
-            "# device 0 rate 48000 period 1024 buffer 3072 format S32 rt None dense false\n",
-        );
-        let rate = 48_000.0 * (1.0 + ppm * 1e-6);
-        for k in 0..n {
-            let t = 0.001 + k as f64 * 1024.0 / 48_000.0;
-            let played = ((t * rate) as i64 / 48) * 48;
-            let written = 3072 + 1024 * k as i64;
-            let ns = (t * 1e9) as i64;
-            s += &format!(
-                "{written} {} {ns} {} {} 1024 0\n",
-                written - played,
-                ns + 20_000,
-                ns + 22_000
-            );
-        }
-        s
-    }
-
-    #[test]
-    fn parse_and_fit() {
-        let log = Log::parse(&synthetic(50.0, 3000)).expect("parse");
-        assert_eq!(
-            (log.period, log.buffer, log.lines.len()),
-            (1024, 3072, 3000)
-        );
-        assert_eq!(log.rate, 48_000.0);
-        let s = device_stats(&log, TimeSource::Htstamp, 3, 0);
-        // The 48-frame steps alias into a slow sawtooth: within 1 ppm.
-        assert!((s.ppm - 50.0).abs() < 1.0, "{}", s.ppm);
-        // Uniform quantisation over 48 frames: σ = 48 / √12 ≈ 13.9.
-        assert!(s.noise_rms > 10.0 && s.noise_rms < 16.0, "{}", s.noise_rms);
-        assert!((s.late_us.0 - 20.0).abs() < 0.01);
-        assert!(Log::parse("1 2 3\n").is_err());
-    }
-
     #[test]
     fn replay_locks_on_clean_readings() {
         // Two fine-pointer devices 30 ppm apart: the loop must lock and

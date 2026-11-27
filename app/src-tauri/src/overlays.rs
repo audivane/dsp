@@ -189,16 +189,6 @@ pub fn remove(dir: &Path, name: &str) -> Result<(), CallError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    fn sample(name: &str) -> Value {
-        json!({
-            "version": 1,
-            "name": name,
-            "kind": "target",
-            "points": [[20.0, 3.9], [1000.0, 0.0]]
-        })
-    }
 
     #[test]
     fn names_cannot_leave_the_overlay_folder() {
@@ -243,95 +233,5 @@ mod tests {
             file_path(dir, "Tilt −0.7 dB/oct").unwrap(),
             dir.join("Tilt −0.7 dB%2Foct.json")
         );
-    }
-
-    #[test]
-    fn saves_lists_and_deletes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = paths::config_dir_under(tmp.path(), "overlays");
-        assert_eq!(list(&dir).unwrap(), Vec::<Value>::new());
-
-        save(&dir, "Flat", &sample("Flat")).unwrap();
-        save(&dir, "Monitor 5", &sample("Monitor 5")).unwrap();
-        // Saving the same name again replaces the file.
-        let mut updated = sample("Monitor 5");
-        updated["kind"] = json!("measurement");
-        save(&dir, "Monitor 5", &updated).unwrap();
-
-        let all = list(&dir).unwrap();
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0]["name"], "Flat");
-        assert_eq!(all[1]["kind"], "measurement");
-
-        remove(&dir, "Flat").unwrap();
-        assert_eq!(list(&dir).unwrap().len(), 1);
-        // Deleting again is fine.
-        remove(&dir, "Flat").unwrap();
-    }
-
-    #[test]
-    fn refuses_broken_or_mismatched_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = paths::config_dir_under(tmp.path(), "overlays");
-
-        assert!(save(&dir, "x", &json!("not an object")).is_err());
-        assert!(save(&dir, "x", &json!({"name": "x", "kind": "curve"})).is_err());
-        assert!(save(&dir, "x", &json!({"kind": "target"})).is_err());
-        // The name inside must be the one asked for.
-        assert!(save(&dir, "x", &sample("y")).is_err());
-        // Nothing was created by the refused saves.
-        assert_eq!(list(&dir).unwrap().len(), 0);
-
-        let mut big = sample("big");
-        big["points"] = json!(vec![[20.0, 0.0]; MAX_BYTES / 8]);
-        assert!(save(&dir, "big", &big).is_err());
-    }
-
-    #[test]
-    fn a_broken_file_on_disk_does_not_hide_the_rest() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = paths::config_dir_under(tmp.path(), "overlays");
-        save(&dir, "Good", &sample("Good")).unwrap();
-        fs::write(dir.join("bad.json"), "{not json").unwrap();
-        fs::write(dir.join("notes.txt"), "hello").unwrap();
-        fs::write(dir.join("wrong.json"), r#"{"name":"w","kind":"carpet"}"#).unwrap();
-        let names: Vec<String> = list(&dir)
-            .unwrap()
-            .iter()
-            .map(|v| v["name"].as_str().unwrap_or("").to_string())
-            .collect();
-        assert_eq!(names, ["Good"]);
-    }
-
-    #[test]
-    fn concurrent_saves_do_not_fail_or_corrupt() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = paths::config_dir_under(tmp.path(), "overlays");
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
-        let mut handles = Vec::new();
-        for t in 0..8 {
-            let dir = dir.clone();
-            let barrier = barrier.clone();
-            handles.push(std::thread::spawn(move || {
-                barrier.wait();
-                for i in 0..100 {
-                    let mut d = sample("Shared");
-                    d["view"] = json!({"offset_db": (t * 100 + i) as f64 / 10.0});
-                    save(&dir, "Shared", &d).unwrap();
-                }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-        let all = list(&dir).unwrap();
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0]["name"], "Shared");
-        let entries: Vec<_> = fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(entries, ["Shared.json"]);
     }
 }

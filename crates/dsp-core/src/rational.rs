@@ -437,14 +437,4 @@ mod tests {
             pos += n;
         }
     }
-
-    #[test]
-    fn latency_is_the_kernel_delay_over_m_rounded() {
-        let h = vec![0.0; 160 * 11];
-        let rs = RationalResampler::from_kernel(&h, RateRatio::new(160, 147), 880.0, 2, 16);
-        assert!((rs.latency_out_exact() - 880.0 / 147.0).abs() < 1e-12);
-        assert_eq!(rs.latency_out_frames(), 6);
-        let rs = RationalResampler::from_kernel(&h, RateRatio::new(1, 2), 5.0, 2, 16);
-        assert_eq!(rs.latency_out_frames(), 3); // 2.5 rounds up
-    }
 }

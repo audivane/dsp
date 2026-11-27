@@ -38,6 +38,29 @@ const PT = 8;
 const PB = 20;
 const DECADES = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000];
 
+/** About one character of the 10.5px mono label font. */
+const CHAR_W = 6.4;
+
+/**
+ * Where each marker's label goes: right of its line (left of it near the
+ * right edge), one row down from any label it would overlap.
+ */
+function markLabels(marks: { hz: number; label: string }[], x: (f: number) => number, w: number) {
+  const ends: number[] = [];
+  return [...marks]
+    .sort((a, b) => a.hz - b.hz)
+    .map((m) => {
+      const mx = x(m.hz);
+      const tw = m.label.length * CHAR_W;
+      const flip = mx + 4 + tw > w - PR;
+      const left = flip ? mx - 4 - tw : mx + 4;
+      let row = ends.findIndex((e) => e + 6 <= left);
+      if (row < 0) row = ends.length;
+      ends[row] = left + tw;
+      return { ...m, row, lx: flip ? mx - 4 : mx + 4, anchor: flip ? ("end" as const) : ("start" as const) };
+    });
+}
+
 export function MiniPlot({ label, fMin = 10, fMax = 20000, yMin, yMax, yStep, freqs, curves, marks = [], height = 150 }: MiniPlotProps) {
   const wrap = useRef<HTMLDivElement>(null);
   const [w, setW] = useState(480);
@@ -74,10 +97,10 @@ export function MiniPlot({ label, fMin = 10, fMax = 20000, yMin, yMax, yStep, fr
             </text>
           </g>
         ))}
-        {marks.map((m) => (
-          <g key={"m" + m.hz}>
+        {markLabels(marks, x, w).map((m, i) => (
+          <g key={"m" + i}>
             <line x1={x(m.hz)} x2={x(m.hz)} y1={PT} y2={h - PB} className="mp-mark" />
-            <text x={x(m.hz) + 4} y={PT + 10} className="mp-text">
+            <text x={m.lx} y={PT + 10 + m.row * 12} className="mp-text" textAnchor={m.anchor}>
               {m.label}
             </text>
           </g>

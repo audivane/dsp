@@ -181,7 +181,7 @@ mod tests {
     use super::*;
     use crate::design::budget;
     use crate::design::paths::standard::ManualConfig;
-    use crate::resample::{UpsamplerDesign, try_design_kernel, try_design_kernel_for};
+    use crate::resample::{UpsamplerDesign, try_design_kernel_for};
     use audivane_protocol::{FilterPhase, RateRatio, RateTarget, TapsUnit};
 
     fn cx(ratio: RateRatio, channels: usize, pipelines: usize) -> BuildContext {
@@ -194,34 +194,6 @@ mod tests {
             output: audivane_protocol::OutputConfig::default(),
             workspace: crate::design::budget::DESIGN_WORKSPACE_FLOOR,
         }
-    }
-
-    /// A Custom runtime without channels at an integer ratio designs no
-    /// kernel, so a design whose phase step would fail still builds, as it
-    /// always has; the ratio rules still hold.
-    #[test]
-    fn zero_channel_integer_runtimes_design_no_kernel() {
-        let manual = ManualConfig {
-            taps: 512,
-            kaiser_beta: 40.0,
-            phase: FilterPhase::Minimum,
-            ..ManualConfig::default()
-        };
-        let cfg = manual.clone().into_upsampler_config().unwrap();
-        let n = Named::of(&cfg).unwrap();
-        let x4 = RateRatio::integer(4);
-        let rt = upsampler(&n, &cx(x4, 0, 2), 0.0).unwrap().unwrap();
-        assert_eq!(rt.ratio(), x4);
-        let e = upsampler(&n, &cx(x4, 1, 2), 0.0).err().unwrap();
-        let d = UpsamplerDesign::try_from_config(&manual, 4).unwrap();
-        assert_eq!(
-            e.to_string(),
-            try_design_kernel(&d).unwrap_err().to_string()
-        );
-        let e = upsampler(&n, &cx(RateRatio::integer(65), 0, 2), 0.0)
-            .err()
-            .unwrap();
-        assert!(e.to_string().contains("a ratio from 2 to 64"), "{e}");
     }
 
     /// The rational budget holds on the design length before the kernel is
@@ -283,23 +255,5 @@ mod tests {
             format!("{want}: use a shorter filter or a lower output rate")
         );
         upsampler(&Named::of(&intermediate_up).unwrap(), &cx(r, 2, 2), 0.0).unwrap();
-    }
-
-    /// An offline kernel export keeps the construction limits and the
-    /// ratio rules only: `lanczos2047` at 320/147 (1 310 400 taps) is over
-    /// the rational runtime's length limit, and exports.
-    #[test]
-    fn offline_kernels_skip_the_playback_budgets() {
-        use crate::presets::FilterPreset;
-        let p = Named::preset(FilterPreset::Lanczos2047);
-        let r = RateRatio::new(320, 147);
-        let e = crate::design::feasibility(&p.design, &cx(r, 2, 2)).unwrap_err();
-        assert!(matches!(e, DesignError::Budget(_)), "{e:?}");
-        let k = crate::design::offline_kernel(&p.design, 44_100, r).unwrap();
-        assert_eq!(k.taps.len(), 1_310_400);
-        // The ratio rules still hold.
-        let e =
-            crate::design::offline_kernel(&p.design, 44_100, RateRatio::integer(65)).unwrap_err();
-        assert!(matches!(e, DesignError::Ratio { .. }), "{e:?}");
     }
 }

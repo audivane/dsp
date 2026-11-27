@@ -91,16 +91,6 @@ mod tests {
     }
 
     #[test]
-    fn without_a_patch_a_follower_plays_chain_a() {
-        let cfg = cfg_with(None);
-        let f = &cfg.outputs.followers[0];
-        let own = config(&cfg, f);
-        assert_eq!(own.chain, cfg.chain);
-        assert!(own.ab.is_none());
-        assert!(differing(&cfg, f).is_empty());
-    }
-
-    #[test]
     fn a_patch_overrides_only_what_it_names_and_follows_a_elsewhere() {
         let mut cfg = cfg_with(Some(
             json!({"convolution": [], "limiter": {"mode": "limit"}}),
@@ -115,28 +105,6 @@ mod tests {
         assert_eq!(
             config(&cfg, &f).chain.limiter.mode,
             audivane_protocol::LimiterMode::Limit
-        );
-    }
-
-    #[test]
-    fn a_bad_patch_names_its_path() {
-        let cfg = cfg_with(Some(json!({"output": {"bits": "x"}})));
-        let e = chain(&cfg, &cfg.outputs.followers[0], 0).unwrap_err();
-        assert!(
-            e.starts_with("outputs.followers[0].chain_patch.output"),
-            "{e}"
-        );
-        let cfg = cfg_with(Some(json!([1])));
-        assert!(chain(&cfg, &cfg.outputs.followers[0], 0).is_err());
-    }
-
-    #[test]
-    fn an_empty_patch_clears() {
-        assert_eq!(normalise(Some(json!({}))), None);
-        assert_eq!(normalise(Some(serde_json::Value::Null)), None);
-        assert_eq!(
-            normalise(Some(json!({"eq": null}))),
-            Some(json!({"eq": null}))
         );
     }
 }

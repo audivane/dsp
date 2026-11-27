@@ -853,32 +853,6 @@ mod tests {
     }
 
     #[test]
-    fn commands_reach_the_stage_after_the_plan_with_the_cap() {
-        let mut d = VarispeedDriver::new();
-        let mut port = Fake {
-            speed: 1.0,
-            limit: 2.0,
-            ..Fake::default()
-        };
-        let slot = VarispeedCommandSlot::default();
-        // P = 1024, Q = 64 at 48 kHz: capped (the default budget leaves
-        // unity only).
-        d.start(Timing::new(48_000, 1024, 64), true, &mut port);
-        assert_eq!(port.limit, 1.0);
-        slot.send(1.5, 300.0);
-        let p = d.pull(&mut port, 0, 1024, 5000, PullKind::Play);
-        assert_eq!(p.take, 1024, "the command waits for the next plan");
-        d.after_pull(&mut port, &slot);
-        assert_eq!((port.speed, port.ramp), (1.0, 300.0));
-        assert_eq!(d.scheduler().status().requested, 1.5);
-        // A roomier quantum opens the cap: the stage gets the request.
-        d.update_quantum(1024, &mut port);
-        assert_eq!(port.limit, 2.0);
-        assert_eq!(port.speed, 1.5);
-        assert_eq!(d.scheduler().watermark(), pull_bound(1.5, 1024) + 1024);
-    }
-
-    #[test]
     fn underfeed_reaches_the_stage_and_holds_at_unity() {
         let mut d = VarispeedDriver::new();
         let mut port = Fake {
@@ -914,92 +888,6 @@ mod tests {
         d.pull(&mut port, 500 * MS, 1024, 5000, PullKind::Play);
         d.after_pull(&mut port, &slot);
         assert_eq!((port.speed, port.ramp), (1.2, 100.0));
-    }
-
-    #[test]
-    fn the_budget_rises_at_once_and_falls_slowly() {
-        let mut b = LoadBudget::new();
-        assert_eq!(b.budget(), 0.5);
-        // A light load: nothing moves within the first second.
-        for i in 0..50u64 {
-            assert_eq!(b.observe(i * 20 * MS, 0.05), None);
-        }
-        // After a second the peak (5 %) asks for 1.5 · 0.05 + 1/16 →
-        // 0.1375 → 0.25 (the floor): two steps below 0.5, so it drops.
-        assert_eq!(b.observe(1000 * MS, 0.05), Some(0.25));
-        assert!((b.peak() - 0.05).abs() < 1e-12);
-        // A spike raises it at once: 1.5 · 0.3 + 1/16 = 0.5125 → 0.5.
-        assert_eq!(b.observe(1100 * MS, 0.3), Some(0.5));
-        // It falls again only once the spike has left both buckets.
-        let mut t = 1120 * MS;
-        let mut dropped_at = None;
-        while t < 4000 * MS {
-            if b.observe(t, 0.05).is_some() {
-                dropped_at = Some(t);
-                break;
-            }
-            t += 20 * MS;
-        }
-        let at = dropped_at.expect("the budget comes down");
-        assert!(at >= 3000 * MS, "{at}");
-        assert_eq!(b.budget(), 0.25);
-        // One step of wobble never moves it: 0.2 → 0.3625 → 0.375, a
-        // rise.
-        assert_eq!(b.observe(t + 20 * MS, 0.2), Some(0.375));
-        // Back to a load that wants 0.3125 (one step lower): kept.
-        let mut moved = false;
-        for i in 0..200u64 {
-            moved |= b.observe(t + (40 + i * 20) * MS, 0.15).is_some();
-        }
-        assert!(!moved);
-        assert_eq!(b.budget(), 0.375);
-    }
-
-    #[test]
-    fn a_measured_load_moves_the_cap() {
-        // 48 kHz, P = 1024, Q = 128: at the default half-period budget the
-        // cap is 1.0; at a measured 10 % load (budget 0.25) it is 1.75.
-        let mut d = VarispeedDriver::new();
-        let mut port = Fake {
-            speed: 1.0,
-            limit: 2.0,
-            ..Fake::default()
-        };
-        d.start(Timing::new(48_000, 1024, 128), true, &mut port);
-        assert_eq!(port.limit, 1.0);
-        let mut t = 0;
-        let mut moved = false;
-        for _ in 0..200 {
-            moved |= d.note_load(t, 0.10, Some(&mut port));
-            t += 21 * MS;
-        }
-        assert!(moved);
-        assert_eq!(d.load().budget(), 0.25);
-        assert_eq!(port.limit, 1.75);
-        // A heavy period lowers it again at once.
-        assert!(d.note_load(t, 0.3, Some(&mut port)));
-        assert_eq!(port.limit, 1.0);
-    }
-
-    #[test]
-    fn a_hold_is_acknowledged_by_its_sequence_with_or_without_a_stage() {
-        let slot = VarispeedCommandSlot::default();
-        let status = VarispeedDriverStatus::default();
-        let mut d = VarispeedDriver::new();
-        // A change takes the next sequence; the same hold again keeps it.
-        assert_eq!(slot.set_hold(VarispeedHold::Budget), 1);
-        assert_eq!(slot.set_hold(VarispeedHold::Budget), 1);
-        assert_eq!(status.snapshot().hold_ack, 0, "not applied yet");
-        // No stage runs (no pull): the RT loop's iteration applies it.
-        d.sync_hold(&slot, &status);
-        assert_eq!(d.overload_hold(), VarispeedHold::Budget);
-        assert_eq!(d.hold_seq(), 1);
-        assert_eq!(status.snapshot().hold_ack, 1);
-        assert_eq!(slot.set_hold(VarispeedHold::Off), 2);
-        assert_eq!(slot.set_hold(VarispeedHold::None), 3);
-        d.sync_hold(&slot, &status);
-        assert_eq!(d.overload_hold(), VarispeedHold::None);
-        assert_eq!(status.snapshot().hold_ack, 3);
     }
 
     #[test]

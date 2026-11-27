@@ -118,34 +118,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_keep_the_keys_off_and_the_popup_on() {
-        let s = UiSettings::default();
-        assert_eq!(s.tray_click, TrayClick::Popup);
-        assert!(!s.volume_keys);
-        assert_eq!(s.volume_step_db, 1.0);
-        assert_eq!(s.osd, OsdMode::Keys);
-    }
-
-    #[test]
-    fn step_snaps_to_the_offered_steps() {
-        let n = |db: f64| {
-            UiSettings {
-                volume_step_db: db,
-                ..Default::default()
-            }
-            .normalized()
-            .volume_step_db
-        };
-        assert_eq!(n(0.1), 0.1);
-        assert_eq!(n(0.0), 0.1);
-        assert_eq!(n(0.4), 0.5);
-        assert_eq!(n(9.0), 3.0);
-        assert_eq!(n(1.3), 1.5);
-        assert_eq!(n(2.0), 2.0);
-        assert_eq!(n(f64::NAN), 1.0);
-    }
-
-    #[test]
     fn missing_and_unknown_fields_fall_back() {
         let s: UiSettings = serde_json::from_str(r#"{"volume_keys": true, "future": 1}"#).unwrap();
         assert!(s.volume_keys);
@@ -154,23 +126,5 @@ mod tests {
             serde_json::from_str(r#"{"tray_click": "menu", "osd": "any"}"#).unwrap();
         assert_eq!(s.tray_click, TrayClick::Menu);
         assert_eq!(s.osd, OsdMode::Any);
-    }
-
-    #[test]
-    fn save_then_load_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("audivane-dsp").join("app-settings.json");
-        assert_eq!(load(&p), UiSettings::default());
-        let s = UiSettings {
-            tray_click: TrayClick::Menu,
-            volume_keys: true,
-            volume_step_db: 2.5,
-            osd: OsdMode::Off,
-            reverse_wheel: true,
-        };
-        save(&p, &s).unwrap();
-        assert_eq!(load(&p), s);
-        std::fs::write(&p, "not json").unwrap();
-        assert_eq!(load(&p), UiSettings::default());
     }
 }

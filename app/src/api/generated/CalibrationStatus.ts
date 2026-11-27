@@ -4,7 +4,11 @@ import type { CalibrationDeviceStatus } from "./CalibrationDeviceStatus";
 /**
  * The loaded room calibration (`Status.calibration`, [`Call::BundleShow`]).
  */
-export type CalibrationStatus = { label: string, path: string, design_rate_hz: number, notes?: string, 
+export type CalibrationStatus = { label: string, path: string, design_rate_hz: number, 
+/**
+ * Whether the calibration plays (`bundle_enable`).
+ */
+enabled: boolean, notes?: string, 
 /**
  * The master first, then the followers in the bundle's order.
  */

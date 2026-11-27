@@ -773,26 +773,6 @@ impl DynamicsCore {
         (o, e)
     }
 
-    /// The (unscaled unless [`Self::scaled`]) output with the envelopes
-    /// frozen at drive `d` and operating point `b` (`Some(0.0)` runs the
-    /// shifted evaluation at 0).
-    #[cfg(test)]
-    pub(crate) fn tick_frozen(
-        &self,
-        st: &mut DynamicsState,
-        xc: f64,
-        d: f64,
-        b: Option<f64>,
-    ) -> f64 {
-        let u = d * xc;
-        let (o, e) = if self.tilted {
-            self.parts::<true>(st, u, b)
-        } else {
-            self.parts::<false>(st, u, b)
-        };
-        self.linear * u + o + e
-    }
-
     /// End of a block: the filtered orders' states flush their decaying
     /// tails (nothing to do without tilt).
     #[inline]
@@ -1224,54 +1204,6 @@ fn certify(
     best
 }
 
-/// Harmonic amplitudes `[DC, H1, …, H9]` (signed, cosine phase) of the
-/// power-form polynomial `p` for an input `A cos θ`.
-#[cfg(test)]
-fn power_harmonics(p: &Poly, level: f64) -> [f64; LEN] {
-    let mut out = [0.0; LEN];
-    let mut an = 1.0;
-    for (n, &pn) in p.iter().enumerate() {
-        if n > 0 {
-            an *= level;
-        }
-        if pn == 0.0 {
-            continue;
-        }
-        let w = pn * an / f64::powi(2.0, n as i32);
-        let mut binom = 1.0;
-        for j in 0..=n {
-            let m = n.abs_diff(2 * j);
-            if 2 * j <= n {
-                out[m] += if m == 0 { w * binom } else { 2.0 * w * binom };
-            }
-            binom = binom * (n - j) as f64 / (j + 1) as f64;
-        }
-    }
-    out
-}
-
-/// Exact `[DC, H1, …, H9]` of the (unscaled, unfiltered) output with the
-/// envelopes frozen at drive `d` and operating point `b`, for a sine of peak
-/// `level`: the "under load" curve without the envelopes' ripple.
-#[cfg(test)]
-pub(crate) fn frozen_harmonics(
-    amplitudes: [f64; HARMONICS_ORDERS],
-    d: f64,
-    b: f64,
-    level: f64,
-) -> [f64; LEN] {
-    let mut a: Poly = [0.0; LEN];
-    a[2..].copy_from_slice(&amplitudes);
-    let linear = 1.0
-        + (3..LEN)
-            .step_by(2)
-            .map(|k| a[k] * T_SLOPE_0[k])
-            .sum::<f64>();
-    let (odd, even) = parts_at(&power_form(&a), b, linear, &binomials());
-    let y: Poly = std::array::from_fn(|j| odd[j] + even[j]);
-    power_harmonics(&y, d * level)
-}
-
 /// Sag and bias shift on one Chebyshev curve as a stage:
 /// `y = s · core(x_c) + s · (x − x_c)`.
 #[derive(Clone, Debug)]
@@ -1403,11 +1335,6 @@ impl TubeDynamics {
     pub fn envelopes(&self, channel: usize) -> (f64, f64) {
         let st = &self.state[channel];
         (st.sag, st.bias)
-    }
-
-    #[cfg(test)]
-    fn state_mut(&mut self, channel: usize) -> &mut DynamicsState {
-        &mut self.state[channel]
     }
 }
 
@@ -1607,7 +1534,8 @@ mod tests {
     use super::*;
     use crate::harmonics::Harmonics;
     use audivane_protocol::{
-        HARMONICS_DEFAULT_SIGNS, HarmonicSign, HarmonicsConfig, HarmonicsLayer,
+        HARMONICS_DEFAULT_SIGNS, HarmonicSign, HarmonicsConfig, HarmonicsLayer, OrderTilt,
+        TiltShelf,
     };
 
     const P: HarmonicSign = HarmonicSign::Positive;
@@ -1688,95 +1616,6 @@ mod tests {
         ]
     }
 
-    /// The kind this core becomes in the harmonics stage (module docs,
-    /// "Wiring into the harmonics stage").
-    #[derive(Clone, Copy, Debug)]
-    struct DynamicsLayer(DynamicsCore);
-
-    impl crate::harmonics_layer::LayerKind for DynamicsLayer {
-        type State = DynamicsState;
-
-        fn tick(&self, st: &mut DynamicsState, xc: f64) -> f64 {
-            self.0.tick(st, xc) - xc
-        }
-
-        fn split(&self) -> crate::harmonics_layer::Split {
-            // −1·x + y, |y| <= B (the core's own bound).
-            crate::harmonics_layer::Split::Fixed {
-                linear: 1.0,
-                delayed: 0.0,
-                residual: self.0.peak_bound(),
-            }
-        }
-
-        fn margin(&self) -> f64 {
-            // Already in its own bound.
-            0.0
-        }
-
-        fn steady_tone(
-            &self,
-            _rate: f64,
-            _freq: f64,
-            _amp: f64,
-        ) -> Option<crate::harmonics::ToneSpectrum> {
-            None
-        }
-
-        fn readout_cost(&self, _rate: f64) -> f64 {
-            1.0
-        }
-    }
-
-    #[test]
-    fn plugs_into_the_layer_interface() {
-        use crate::harmonics_layer::{LayerKind, compose_bound};
-        let rate = 96_000.0;
-        let zero: Poly = [0.0; LEN];
-        for l in strong_layers() {
-            for (s, b) in [
-                (off_sag(), off_bias()),
-                (sag(6.0, 1.0, 50.0), off_bias()),
-                (off_sag(), bias(0.25, 1.0, 20.0)),
-                (sag(3.0, 1.0, 30.0), bias(-0.2, 2.0, 40.0)),
-            ] {
-                let core = DynamicsCore::try_new(&config(&l, s, b), rate).unwrap();
-                let kind = DynamicsLayer(core);
-                // The stage with this layer alone: a bank with no terms
-                // (direct gain 1) plus the layer's path.
-                let hpf_b0 = core.hpf_b0;
-                let bound = compose_bound(
-                    1.0,
-                    |g| chebyshev_bound(&zero, g, true, hpf_b0),
-                    0.0,
-                    [kind.split()],
-                ) * (1.0 + kind.margin());
-                let mut st = DynamicsState::default();
-                let mut peak = 0.0_f64;
-                let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
-                for i in 0..96_000 {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 7;
-                    seed ^= seed << 17;
-                    let w = (seed >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0;
-                    // Loud bursts, steps and noise within full scale.
-                    let x = if (i / 4_000) % 2 == 0 {
-                        (i as f64 * 0.013).sin().signum()
-                    } else {
-                        w
-                    };
-                    peak = peak.max((x + kind.tick(&mut st, x)).abs());
-                }
-                assert!(
-                    peak <= bound,
-                    "{s:?} {b:?}: peak {peak} over the composed bound {bound}"
-                );
-                // Alone in the stage, the composed bound is its own.
-                assert_eq!(bound, core.peak_bound(), "{s:?} {b:?}");
-            }
-        }
-    }
-
     /// Process `buf` in odd block sizes.
     fn run(stage: &mut dyn Stage, buf: &mut [f64]) {
         let mut i = 0;
@@ -1793,17 +1632,175 @@ mod tests {
         buf.iter().fold(0.0_f64, |m, x| m.max(x.abs()))
     }
 
-    fn sine(rate: f64, freq: f64, amp: f64, seconds: f64) -> impl Iterator<Item = f64> {
-        let n = (seconds * rate) as usize;
-        (0..n).map(move |i| amp * (2.0 * PI * freq * i as f64 / rate).sin())
+    fn db(v: f64) -> f64 {
+        lin_to_db(v)
     }
 
     fn silence(rate: f64, seconds: f64) -> impl Iterator<Item = f64> {
         std::iter::repeat_n(0.0, (seconds * rate) as usize)
     }
 
-    fn db(v: f64) -> f64 {
-        lin_to_db(v)
+    /// Adversarial inputs for the bound, at `rate`, with envelope times of
+    /// the config.
+    fn adversarial(rate: f64, cfg: &TubeDynamicsConfig) -> Vec<Vec<f64>> {
+        let t = |ms: f64| ms * 1e-3;
+        let (sa, sr) = (t(cfg.sag.attack_ms), t(cfg.sag.release_ms));
+        let (ba, br) = (t(cfg.bias.attack_ms), t(cfg.bias.release_ms));
+        let mut out = Vec::new();
+        // Bursts after silence.
+        let mut v: Vec<f64> = silence(rate, 0.2).collect();
+        for f in [1_000.0, 100.0, 5_000.0] {
+            v.extend(sine(rate, f, 1.0, 0.05));
+            v.extend(silence(rate, 0.1));
+        }
+        out.push(v);
+        // Sustained full scale, then silence, then a full-scale spike and a
+        // full-scale low tone.
+        let hold = (5.0 * ba.max(sa)).min(3.0);
+        let mut v: Vec<f64> = sine(rate, 1_000.0, 1.0, hold).collect();
+        v.extend(silence(rate, (3.0 * sr).min(1.0)));
+        v.extend([1.0, -1.0, 1.0]);
+        v.extend(sine(rate, 40.0, 1.0, 0.1));
+        v.extend(std::iter::repeat_n(-1.0, 200));
+        out.push(v);
+        // Loud and quiet in turn at the envelopes' time scales.
+        for (on, off) in [(sa, sr), (ba, br), (sr, sa)] {
+            let (on, off) = (on.min(0.5), off.min(0.5));
+            let mut v = Vec::new();
+            for _ in 0..4 {
+                v.extend(sine(rate, 700.0, 1.0, on));
+                v.extend(sine(rate, 700.0, 0.03, off));
+            }
+            out.push(v);
+        }
+        // Sines 20 Hz to 20 kHz at full scale.
+        let mut v = Vec::new();
+        for f in [20.0, 50.0, 200.0, 1_000.0, 5_000.0, 12_000.0, 20_000.0] {
+            if f < 0.45 * rate {
+                v.extend(sine(rate, f, 1.0, 0.15));
+            }
+        }
+        out.push(v);
+        out
+    }
+
+    fn shelves(low: (f64, f64), high: (f64, f64), low_even: bool) -> HarmonicsTilt {
+        HarmonicsTilt {
+            low: TiltShelf {
+                hz: low.0,
+                db: low.1,
+                slope: None,
+            },
+            high: TiltShelf {
+                hz: high.0,
+                db: high.1,
+                slope: None,
+            },
+            low_even,
+            ..HarmonicsTilt::default()
+        }
+    }
+
+    /// Tilted curves: the two tilted presets, a hot curve with strong
+    /// shelves on every order, and one with mixed signs and a per-order
+    /// override.
+    fn tilted_layers() -> Vec<ChebyshevLayer> {
+        let mut hot = layer(
+            [
+                Some(-30.0),
+                Some(-36.0),
+                Some(-50.0),
+                Some(-55.0),
+                None,
+                None,
+                None,
+                None,
+            ],
+            HARMONICS_DEFAULT_SIGNS,
+        );
+        hot.tilt = Some(Box::new(shelves((100.0, 12.0), (2_000.0, 12.0), true)));
+        let mut mixed = layer([Some(-26.0); 8], [P, N, N, P, N, P, P, N]);
+        let mut t = shelves((60.0, 24.0), (1_000.0, 24.0), false);
+        t.orders[1] = Some(OrderTilt {
+            low: TiltShelf::new(2_000.0, -24.0),
+            high: TiltShelf::new(200.0, 0.0),
+        });
+        mixed.tilt = Some(Box::new(t));
+        vec![
+            preset_layer("pp_pentode_feedback"),
+            preset_layer("solid_state_feedback"),
+            hot,
+            mixed,
+        ]
+    }
+
+    /// [`adversarial`] plus sign flips after settling (the envelopes up on
+    /// one sign, then the other at full scale).
+    fn tilted_adversarial(rate: f64, cfg: &TubeDynamicsConfig) -> Vec<Vec<f64>> {
+        let mut out = adversarial(rate, cfg);
+        let hold = (5.0 * cfg.bias.attack_ms.max(cfg.sag.attack_ms) * 1e-3).clamp(0.05, 1.0);
+        for (from, to) in [(1.0, -1.0), (-1.0, 1.0), (1.0, 0.0), (0.8, -1.0)] {
+            let mut v = vec![from; (hold * rate) as usize];
+            v.extend(std::iter::repeat_n(to, (0.02 * rate) as usize));
+            v.extend(std::iter::repeat_n(from, 64));
+            out.push(v);
+        }
+        out
+    }
+
+    /// Tilted layers through the envelope range, with and without the DC
+    /// blocker, at both rate extremes: no adversarial input reaches past
+    /// full scale. One thread per layer and envelope pair.
+    #[test]
+    fn tilted_output_stays_within_full_scale_over_the_envelope_range() {
+        let envelopes = [
+            (sag(6.0, 0.1, 1.0), bias(0.25, 0.1, 5.0)),
+            (sag(6.0, 0.1, 1.0), bias(-0.25, 0.1, 5.0)),
+            (sag(3.0, 20.0, 200.0), bias(0.1, 300.0, 2_000.0)),
+            (off_sag(), bias(-0.25, 30.0, 200.0)),
+            (sag(3.0, 10.0, 100.0), off_bias()),
+        ];
+        let layers = tilted_layers();
+        let closest = std::thread::scope(|scope| {
+            let runs: Vec<_> = layers
+                .iter()
+                .flat_map(|l| envelopes.iter().map(move |&e| (l, e)))
+                .map(|(l, (s, b))| {
+                    scope.spawn(move || {
+                        let mut closest: f64 = 0.0;
+                        for dc_block in [true, false] {
+                            let cfg = TubeDynamicsConfig::from_layer(l, dc_block, s, b).unwrap();
+                            for rate in [44_100.0, 768_000.0] {
+                                let st = TubeDynamics::try_new(&cfg, rate, 1).unwrap();
+                                for (i, mut v) in
+                                    tilted_adversarial(rate, &cfg).into_iter().enumerate()
+                                {
+                                    let mut st = st.clone();
+                                    run(&mut st, &mut v);
+                                    let p = peak(&v);
+                                    assert!(
+                                        p <= 1.0,
+                                        "{:?} {s:?} {b:?} {dc_block} {rate}: signal {i} peak {p}",
+                                        l.levels_db
+                                    );
+                                    closest = closest.max(p);
+                                }
+                            }
+                        }
+                        closest
+                    })
+                })
+                .collect();
+            runs.into_iter()
+                .map(|r| r.join().unwrap())
+                .fold(0.0_f64, f64::max)
+        });
+        eprintln!("closest to the bound: {:.2} dB under", -db(closest));
+    }
+
+    fn sine(rate: f64, freq: f64, amp: f64, seconds: f64) -> impl Iterator<Item = f64> {
+        let n = (seconds * rate) as usize;
+        (0..n).map(move |i| amp * (2.0 * PI * freq * i as f64 / rate).sin())
     }
 
     #[test]
@@ -1875,183 +1872,6 @@ mod tests {
     }
 
     #[test]
-    fn sag_compresses_and_tilts_the_balance_as_the_frozen_curve_predicts() {
-        let rate = 96_000.0;
-        let l = layer(
-            [
-                Some(-30.0),
-                Some(-40.0),
-                Some(-50.0),
-                Some(-60.0),
-                None,
-                None,
-                None,
-                None,
-            ],
-            HARMONICS_DEFAULT_SIGNS,
-        );
-        // A long release keeps the envelope's ripple far below the terms.
-        let cfg = config(&l, sag(3.0, 20.0, 5_000.0), off_bias());
-        let stage = TubeDynamics::try_new(&cfg, rate, 1).unwrap();
-        let s = stage.scale();
-        let mut last_change = 0.0;
-        eprintln!("sag 3 dB, 20/5000 ms, 1 kHz: level, drive, H1 change, H2..H5 static -> loaded");
-        for level_db in [-20.0, -12.0, -6.0, 0.0] {
-            let amp = db_to_lin(level_db);
-            let tone = simulate_tone(&stage, rate, 1_000.0, amp, 40.0);
-            let d = tone.mean_drive;
-            let frozen = frozen_harmonics(cfg.amplitudes, d, 0.0, amp);
-            let stat = harmonic_amplitudes(cfg.amplitudes, amp);
-            let h1 = tone.harmonics[1].norm();
-            assert!(
-                (db(h1) - db(s * frozen[1])).abs() < 0.002,
-                "{level_db}: H1 {} vs frozen {}",
-                db(h1),
-                db(s * frozen[1])
-            );
-            let change = db(h1) - db(s * stat[1]);
-            // The level law: the fundamental drops by the drive (and the
-            // curve's own level change), more at higher levels.
-            assert!(change < last_change, "{level_db}: change {change}");
-            last_change = change;
-            let mut line = format!(
-                "  {level_db:5.1} dBFS: d {:6.3} dB, H1 {change:+.3} dB:",
-                db(d)
-            );
-            for k in 2..=5 {
-                let loaded = db(tone.harmonics[k].norm() / h1);
-                let want = db(frozen[k].abs() / frozen[1]);
-                let static_db = db(stat[k].abs() / stat[1]);
-                // Far-down orders: the envelope's ripple and rounding.
-                assert!(
-                    (loaded - want).abs() < 0.05 || want.max(loaded) < -100.0,
-                    "{level_db} H{k}: {loaded} vs frozen {want}"
-                );
-                line += &format!(" H{k} {static_db:.2}->{loaded:.2}");
-            }
-            eprintln!("{line}");
-            // Less distortion under load (the drive moved down the curve).
-            let thd = |h: &[f64]| (2..LEN).map(|k| h[k] * h[k]).sum::<f64>().sqrt();
-            let loaded: Vec<f64> = tone.harmonics.iter().map(|z| z.norm() / h1).collect();
-            let st_rel: Vec<f64> = stat.iter().map(|v| v / stat[1]).collect();
-            assert!(thd(&loaded) < thd(&st_rel), "{level_db}: THD");
-        }
-        // At full scale the envelope of a sine settles near its peak with a
-        // fast attack and slow release: about the full 3 dB.
-        assert!(last_change < -2.5, "{last_change}");
-
-        // With H2 and H3 alone (no cross terms) the balance tilts exactly:
-        // H2 falls as d, H3 as d² relative to the fundamental's own change.
-        let a = [0.03, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let d = db_to_lin(-3.0);
-        let h = frozen_harmonics(a, d, 0.0, 1.0);
-        let h0 = harmonic_amplitudes(a, 1.0);
-        let rel = |h: &[f64; LEN], k: usize| db(h[k].abs() / h[1].abs());
-        // Both shares also move with the fundamental's own cubic part.
-        let h1_shape = db(h[1] / (d * h0[1]));
-        let h2_change = rel(&h, 2) - rel(&h0, 2);
-        let h3_change = rel(&h, 3) - rel(&h0, 3);
-        assert!((h2_change - (db(d) - h1_shape)).abs() < 1e-9, "{h2_change}");
-        assert!(
-            (h3_change - (db(d * d) - h1_shape)).abs() < 1e-9,
-            "{h3_change}"
-        );
-        assert!(h3_change < h2_change);
-    }
-
-    #[test]
-    fn bias_shift_turns_odd_terms_into_even_ones_as_predicted() {
-        let rate = 96_000.0;
-        // An odd curve: no H2 at rest.
-        let l = layer(
-            [None, Some(-30.0), None, Some(-50.0), None, None, None, None],
-            HARMONICS_DEFAULT_SIGNS,
-        );
-        let cfg = config(&l, off_sag(), bias(0.2, 50.0, 8_000.0));
-        let stage = TubeDynamics::try_new(&cfg, rate, 1).unwrap();
-        eprintln!("bias 0.2, 50/8000 ms, odd curve, 1 kHz: level, b, H2..H5 static -> loaded");
-        for level_db in [-12.0, -6.0, 0.0] {
-            let amp = db_to_lin(level_db);
-            let tone = simulate_tone(&stage, rate, 1_000.0, amp, 60.0);
-            let b = tone.mean_bias;
-            assert!(b > 0.15 * amp && b <= 0.2 * amp, "{level_db}: b {b}");
-            let frozen = frozen_harmonics(cfg.amplitudes, 1.0, b, amp);
-            let stat = harmonic_amplitudes(cfg.amplitudes, amp);
-            let h1 = tone.harmonics[1].norm();
-            // The direct path is unchanged by b: the fundamental moves only
-            // by the terms' own contribution at the new operating point.
-            assert!((db(h1) - db(stage.scale() * frozen[1])).abs() < 0.002);
-            let mut line = format!("  {level_db:5.1} dBFS: b {b:.4}:");
-            for k in 2..=5 {
-                let loaded = db(tone.harmonics[k].norm() / h1);
-                let want = db(frozen[k].abs() / frozen[1]);
-                assert!(
-                    (loaded - want).abs() < 0.05,
-                    "{level_db} H{k}: {loaded} vs frozen {want}"
-                );
-                let static_db = db(stat[k].abs() / stat[1]).max(-200.0);
-                line += &format!(" H{k} {static_db:.1}->{loaded:.2}");
-            }
-            eprintln!("{line}");
-            // H2 appears (static: none), within reach of H3.
-            let h2 = db(tone.harmonics[2].norm() / h1);
-            assert!(h2 > -60.0, "{level_db}: H2 {h2}");
-        }
-    }
-
-    #[test]
-    fn the_direct_path_keeps_its_small_signal_gain_at_every_operating_point() {
-        let l = layer(
-            [
-                Some(-20.0),
-                Some(-26.0),
-                Some(-30.0),
-                Some(-34.0),
-                None,
-                None,
-                None,
-                Some(-40.0),
-            ],
-            [P, N, P, N, P, P, P, P],
-        );
-        let cfg = config(&l, off_sag(), bias(-0.25, 10.0, 10_000.0));
-        let mut st = TubeDynamics::try_new(&cfg, 48_000.0, 1).unwrap();
-        let want = st.scale() * st.core.small_signal;
-        let core = st.core;
-        for e in [0.0, 0.3, 1.0] {
-            let eps = 1e-6;
-            let mut s = *st.state_mut(0);
-            s.bias = e;
-            let (mut p, mut m) = (s, s);
-            let core_nb = DynamicsCore {
-                dc_block: false,
-                ..core
-            };
-            let yp = core_nb.tick(&mut p, eps);
-            let ym = core_nb.tick(&mut m, -eps);
-            let slope = (yp - ym) / (2.0 * eps);
-            assert!(
-                (slope - want).abs() < 1e-8,
-                "e {e}: slope {slope} vs {want}"
-            );
-            // Without the tangent term the slope would be c'(b): visibly off.
-            let b = -0.25 * e;
-            let a = cfg.amplitudes;
-            let cprime = 1.0
-                + (2..LEN)
-                    .map(|k| {
-                        let h = 1e-6;
-                        let t = |x: f64| (k as f64 * x.acos()).cos();
-                        a[k - 2] * (t(b + h) - t(b - h)) / (2.0 * h)
-                    })
-                    .sum::<f64>();
-            if e > 0.0 {
-                assert!((cprime * st.scale() - want).abs() > 1e-3, "c'(b) {cprime}");
-            }
-        }
-    }
-
-    #[test]
     fn envelopes_follow_their_time_constants_at_any_rate() {
         let l = preset_layer("se_triode_high_mu");
         let cfg = config(&l, sag(2.0, 10.0, 100.0), bias(0.1, 200.0, 1_000.0));
@@ -2107,127 +1927,6 @@ mod tests {
                 seen.1
             );
         }
-    }
-
-    #[test]
-    fn under_load_behaviour_is_the_same_at_44k_and_768k() {
-        let l = preset_layer("se_triode_high_mu");
-        let cfg = config(&l, sag(2.0, 20.0, 200.0), bias(0.15, 300.0, 2_000.0));
-        let tones: Vec<Tone> = [44_100.0, 768_000.0]
-            .iter()
-            .map(|&rate| {
-                let st = TubeDynamics::try_new(&cfg, rate, 1).unwrap();
-                simulate_tone(&st, rate, 1_000.0, db_to_lin(-6.0), 16.0)
-            })
-            .collect();
-        let (a, b) = (&tones[0], &tones[1]);
-        eprintln!(
-            "44.1k vs 768k: drive {:.4} / {:.4} dB, bias {:.5} / {:.5}",
-            db(a.mean_drive),
-            db(b.mean_drive),
-            a.mean_bias,
-            b.mean_bias
-        );
-        assert!((db(a.mean_drive) - db(b.mean_drive)).abs() < 0.01);
-        assert!((a.mean_bias - b.mean_bias).abs() < 0.01 * b.mean_bias);
-        for k in 1..=5 {
-            let (ha, hb) = (
-                db(a.harmonics[k].norm() / a.harmonics[1].norm()),
-                db(b.harmonics[k].norm() / b.harmonics[1].norm()),
-            );
-            eprintln!("  H{k}: {ha:.3} / {hb:.3} dBc");
-            assert!(
-                (ha - hb).abs() < 0.1 || ha.max(hb) < -100.0,
-                "H{k}: {ha} vs {hb}"
-            );
-        }
-        assert!((db(a.harmonics[1].norm()) - db(b.harmonics[1].norm())).abs() < 0.01);
-
-        // The public readout: static levels next to the loaded ones.
-        let pts = under_load(&cfg, 768_000.0, 1_000.0, &[-18.0, 0.0]).unwrap();
-        for p in &pts {
-            eprintln!("  readout {p:?}");
-            assert!(p.sag_drive_db < 0.0 && p.bias > 0.0);
-            assert!(p.fundamental_change_db < 0.0);
-            assert!(p.static_db[0] > -100.0 && p.loaded_db[0] > -100.0);
-        }
-        assert!(pts[1].fundamental_change_db < pts[0].fundamental_change_db);
-    }
-
-    /// Adversarial inputs for the bound, at `rate`, with envelope times of
-    /// the config.
-    fn adversarial(rate: f64, cfg: &TubeDynamicsConfig) -> Vec<Vec<f64>> {
-        let t = |ms: f64| ms * 1e-3;
-        let (sa, sr) = (t(cfg.sag.attack_ms), t(cfg.sag.release_ms));
-        let (ba, br) = (t(cfg.bias.attack_ms), t(cfg.bias.release_ms));
-        let mut out = Vec::new();
-        // Bursts after silence.
-        let mut v: Vec<f64> = silence(rate, 0.2).collect();
-        for f in [1_000.0, 100.0, 5_000.0] {
-            v.extend(sine(rate, f, 1.0, 0.05));
-            v.extend(silence(rate, 0.1));
-        }
-        out.push(v);
-        // Sustained full scale, then silence, then a full-scale spike and a
-        // full-scale low tone.
-        let hold = (5.0 * ba.max(sa)).min(3.0);
-        let mut v: Vec<f64> = sine(rate, 1_000.0, 1.0, hold).collect();
-        v.extend(silence(rate, (3.0 * sr).min(1.0)));
-        v.extend([1.0, -1.0, 1.0]);
-        v.extend(sine(rate, 40.0, 1.0, 0.1));
-        v.extend(std::iter::repeat_n(-1.0, 200));
-        out.push(v);
-        // Loud and quiet in turn at the envelopes' time scales.
-        for (on, off) in [(sa, sr), (ba, br), (sr, sa)] {
-            let (on, off) = (on.min(0.5), off.min(0.5));
-            let mut v = Vec::new();
-            for _ in 0..4 {
-                v.extend(sine(rate, 700.0, 1.0, on));
-                v.extend(sine(rate, 700.0, 0.03, off));
-            }
-            out.push(v);
-        }
-        // Sines 20 Hz to 20 kHz at full scale.
-        let mut v = Vec::new();
-        for f in [20.0, 50.0, 200.0, 1_000.0, 5_000.0, 12_000.0, 20_000.0] {
-            if f < 0.45 * rate {
-                v.extend(sine(rate, f, 1.0, 0.15));
-            }
-        }
-        out.push(v);
-        out
-    }
-
-    #[test]
-    fn output_stays_within_full_scale_over_the_envelope_range() {
-        let mut worst_trim: f64 = 0.0;
-        for l in strong_layers() {
-            for (s, b) in [
-                (sag(6.0, 0.1, 1.0), bias(0.25, 0.1, 5.0)),
-                (sag(6.0, 0.1, 1.0), bias(-0.25, 0.1, 5.0)),
-                (sag(6.0, 20.0, 200.0), bias(0.25, 300.0, 2_000.0)),
-                (off_sag(), bias(-0.25, 300.0, 2_000.0)),
-                (sag(3.0, 10.0, 100.0), off_bias()),
-            ] {
-                for dc_block in [true, false] {
-                    let cfg = TubeDynamicsConfig::from_layer(&l, dc_block, s, b).unwrap();
-                    for rate in [44_100.0, 768_000.0] {
-                        let st = TubeDynamics::try_new(&cfg, rate, 1).unwrap();
-                        worst_trim = worst_trim.min(st.peak_trim_db());
-                        for (i, mut v) in adversarial(rate, &cfg).into_iter().enumerate() {
-                            let mut st = st.clone();
-                            run(&mut st, &mut v);
-                            let p = peak(&v);
-                            assert!(
-                                p <= 1.0,
-                                "{l:?} {s:?} {b:?} {dc_block} {rate}: signal {i} peak {p}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        eprintln!("worst trim over the strong layers: {worst_trim:.2} dB");
     }
 
     /// Settle on `x0` (both envelopes at `|x0|`), pause `pause` samples of
@@ -2376,307 +2075,5 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_dc_blocker_follows_the_bias_drift() {
-        let rate = 48_000.0;
-        let l = layer(
-            [None, Some(-20.0), None, None, None, None, None, None],
-            HARMONICS_DEFAULT_SIGNS,
-        );
-        let mean_dc = |dc_block: bool| -> Vec<f64> {
-            let cfg =
-                TubeDynamicsConfig::from_layer(&l, dc_block, off_sag(), bias(0.25, 300.0, 2_000.0))
-                    .unwrap();
-            let mut st = TubeDynamics::try_new(&cfg, rate, 1).unwrap();
-            // 100 ms windows of a 1 kHz sine (whole cycles).
-            let mut v: Vec<f64> = sine(rate, 1_000.0, 1.0, 4.0).collect();
-            st.process(&mut [&mut v]);
-            v.chunks(4_800)
-                .map(|c| c.iter().sum::<f64>() / c.len() as f64)
-                .collect()
-        };
-        let (blocked, open) = (mean_dc(true), mean_dc(false));
-        // Without the blocker the DC follows b (about 6 a3 b A²/2 here).
-        let settled = *open.last().unwrap();
-        assert!(settled.abs() > 0.03, "{settled}");
-        for (i, (b, o)) in blocked.iter().zip(&open).enumerate() {
-            // During the ramp: a residual of about 32 ms × d(DC)/dt.
-            assert!(b.abs() < 0.1 * settled.abs(), "window {i}: {b} vs {o}");
-        }
-        assert!(blocked.last().unwrap().abs() < 1e-4, "{:?}", blocked.last());
-    }
-
-    #[test]
-    fn invalid_settings_are_refused() {
-        let l = preset_layer("triode");
-        let ok = config(&l, SagConfig::default(), BiasConfig::default());
-        assert!(TubeDynamics::try_new(&ok, 48_000.0, 2).is_ok());
-        assert!(TubeDynamics::try_new(&ok, 48_000.0, 0).is_err());
-        assert!(TubeDynamics::try_new(&ok, f64::NAN, 1).is_err());
-        let bad = [
-            TubeDynamicsConfig {
-                sag: sag(6.5, 10.0, 100.0),
-                ..ok.clone()
-            },
-            TubeDynamicsConfig {
-                bias: bias(-0.3, 10.0, 100.0),
-                ..ok.clone()
-            },
-            TubeDynamicsConfig {
-                bias: bias(0.1, 0.0, 100.0),
-                ..ok.clone()
-            },
-            TubeDynamicsConfig {
-                sag: sag(1.0, 10.0, f64::INFINITY),
-                ..ok.clone()
-            },
-            TubeDynamicsConfig {
-                amplitudes: [f64::NAN; HARMONICS_ORDERS],
-                ..ok.clone()
-            },
-        ];
-        for cfg in bad {
-            assert!(TubeDynamics::try_new(&cfg, 48_000.0, 1).is_err(), "{cfg:?}");
-        }
-        // Aliasing warning: the curve's own orders, as the static layer.
-        let st = TubeDynamics::try_new(&ok, 44_100.0, 1).unwrap();
-        assert_eq!(st.aliased_orders(44_100.0), vec![2, 3, 4]);
-        assert!(st.aliased_orders(192_000.0).is_empty());
-    }
-
     // ------------------------------------------------------------ tilt
-
-    use audivane_protocol::{OrderTilt, TiltShelf};
-
-    fn shelves(low: (f64, f64), high: (f64, f64), low_even: bool) -> HarmonicsTilt {
-        HarmonicsTilt {
-            low: TiltShelf {
-                hz: low.0,
-                db: low.1,
-                slope: None,
-            },
-            high: TiltShelf {
-                hz: high.0,
-                db: high.1,
-                slope: None,
-            },
-            low_even,
-            ..HarmonicsTilt::default()
-        }
-    }
-
-    /// Tilted curves: the two tilted presets, a hot curve with strong
-    /// shelves on every order, and one with mixed signs and a per-order
-    /// override.
-    fn tilted_layers() -> Vec<ChebyshevLayer> {
-        let mut hot = layer(
-            [
-                Some(-30.0),
-                Some(-36.0),
-                Some(-50.0),
-                Some(-55.0),
-                None,
-                None,
-                None,
-                None,
-            ],
-            HARMONICS_DEFAULT_SIGNS,
-        );
-        hot.tilt = Some(Box::new(shelves((100.0, 12.0), (2_000.0, 12.0), true)));
-        let mut mixed = layer([Some(-26.0); 8], [P, N, N, P, N, P, P, N]);
-        let mut t = shelves((60.0, 24.0), (1_000.0, 24.0), false);
-        t.orders[1] = Some(OrderTilt {
-            low: TiltShelf::new(2_000.0, -24.0),
-            high: TiltShelf::new(200.0, 0.0),
-        });
-        mixed.tilt = Some(Box::new(t));
-        vec![
-            preset_layer("pp_pentode_feedback"),
-            preset_layer("solid_state_feedback"),
-            hot,
-            mixed,
-        ]
-    }
-
-    #[test]
-    fn a_tilted_layer_at_rest_is_the_static_tilted_layer() {
-        // Envelopes frozen at rest (d = 1, b = 0), both evaluations: the
-        // per-order parts reduce to the static stage's filtered `D_k`.
-        let input: Vec<f64> = sine(96_000.0, 300.0, 1.0, 0.3)
-            .zip(sine(96_000.0, 7.0, 1.0, 0.3))
-            .map(|(a, b)| a * b)
-            .chain(sine(96_000.0, 40.0, 1.0, 0.1))
-            .collect();
-        for rate in [44_100.0, 96_000.0, 768_000.0] {
-            for l in tilted_layers() {
-                for dc_block in [true, false] {
-                    let cfg = TubeDynamicsConfig::from_layer(
-                        &l,
-                        dc_block,
-                        sag(3.0, 20.0, 200.0),
-                        bias(0.1, 300.0, 2_000.0),
-                    )
-                    .unwrap();
-                    let core = DynamicsCore::try_new(&cfg, rate).unwrap();
-                    assert!(core.tilted);
-                    let static_cfg = HarmonicsConfig {
-                        system: None,
-                        enabled: true,
-                        layers: vec![HarmonicsLayer::Chebyshev(l.clone())],
-                        dc_block,
-                        routing: Default::default(),
-                    };
-                    let stage = Harmonics::try_new(&static_cfg, rate, 1).unwrap();
-                    assert!(stage.tilted_terms() > 0);
-                    let mut want = input.clone();
-                    stage.clone().process(&mut [&mut want]);
-                    for b in [Some(0.0), None] {
-                        let mut st = DynamicsState::default();
-                        let worst = input
-                            .iter()
-                            .zip(&want)
-                            .map(|(&x, &w)| (core.tick_frozen(&mut st, x, 1.0, b) - w).abs())
-                            .fold(0.0, f64::max);
-                        assert!(worst < 1e-11, "{rate} {:?} {b:?}: {worst}", l.levels_db);
-                    }
-                    // With sag only (no bias reach) the bound is the static
-                    // tilted stage's per-term bound, never below the joint
-                    // one the static stage takes (before its rounding margin).
-                    let sag_only = TubeDynamicsConfig {
-                        bias: off_bias(),
-                        ..cfg.clone()
-                    };
-                    let core = DynamicsCore::try_new(&sag_only, rate).unwrap();
-                    let want = stage.peak_bounds()[0] / (1.0 + 1e-12);
-                    assert!(
-                        core.peak_bound() / want - 1.0 > -1e-12,
-                        "{} vs {want}",
-                        core.peak_bound()
-                    );
-                }
-            }
-        }
-    }
-
-    /// [`adversarial`] plus sign flips after settling (the envelopes up on
-    /// one sign, then the other at full scale).
-    fn tilted_adversarial(rate: f64, cfg: &TubeDynamicsConfig) -> Vec<Vec<f64>> {
-        let mut out = adversarial(rate, cfg);
-        let hold = (5.0 * cfg.bias.attack_ms.max(cfg.sag.attack_ms) * 1e-3).clamp(0.05, 1.0);
-        for (from, to) in [(1.0, -1.0), (-1.0, 1.0), (1.0, 0.0), (0.8, -1.0)] {
-            let mut v = vec![from; (hold * rate) as usize];
-            v.extend(std::iter::repeat_n(to, (0.02 * rate) as usize));
-            v.extend(std::iter::repeat_n(from, 64));
-            out.push(v);
-        }
-        out
-    }
-
-    #[test]
-    fn tilted_output_stays_within_full_scale_over_the_envelope_range() {
-        let mut closest: f64 = 0.0;
-        for l in tilted_layers() {
-            for (s, b) in [
-                (sag(6.0, 0.1, 1.0), bias(0.25, 0.1, 5.0)),
-                (sag(6.0, 0.1, 1.0), bias(-0.25, 0.1, 5.0)),
-                (sag(3.0, 20.0, 200.0), bias(0.1, 300.0, 2_000.0)),
-                (off_sag(), bias(-0.25, 30.0, 200.0)),
-                (sag(3.0, 10.0, 100.0), off_bias()),
-            ] {
-                for dc_block in [true, false] {
-                    let cfg = TubeDynamicsConfig::from_layer(&l, dc_block, s, b).unwrap();
-                    for rate in [44_100.0, 768_000.0] {
-                        let st = TubeDynamics::try_new(&cfg, rate, 1).unwrap();
-                        let mut worst: f64 = 0.0;
-                        for (i, mut v) in tilted_adversarial(rate, &cfg).into_iter().enumerate() {
-                            let mut st = st.clone();
-                            run(&mut st, &mut v);
-                            let p = peak(&v);
-                            assert!(
-                                p <= 1.0,
-                                "{:?} {s:?} {b:?} {dc_block} {rate}: signal {i} peak {p}",
-                                l.levels_db
-                            );
-                            worst = worst.max(p);
-                        }
-                        closest = closest.max(worst);
-                        eprintln!(
-                            "{:?} sag {} bias {} dc {dc_block} {rate}: trim {:.2} dB, reach {:.3}, worst peak {:.2} dB under the bound",
-                            &l.levels_db[..4],
-                            s.depth_db,
-                            b.depth,
-                            st.peak_trim_db(),
-                            st.bias_reach(),
-                            -db(worst)
-                        );
-                    }
-                }
-            }
-        }
-        eprintln!("closest to the bound: {:.2} dB under", -db(closest));
-    }
-
-    #[test]
-    fn tilt_costs_a_little_trim_and_the_reach_is_cut_at_the_budget() {
-        let rate = 48_000.0;
-        for l in tilted_layers() {
-            let mut flat = l.clone();
-            flat.tilt = None;
-            for beta in [0.1, 0.25, -0.1] {
-                let (s, b) = (sag(3.0, 20.0, 200.0), bias(beta, 300.0, 2_000.0));
-                let tilted = TubeDynamics::try_new(&config(&l, s, b), rate, 1).unwrap();
-                let at_rest = TubeDynamics::try_new(&config(&l, s, off_bias()), rate, 1).unwrap();
-                let untilted = TubeDynamics::try_new(&config(&flat, s, b), rate, 1).unwrap();
-                // Never more than the budget over the static tilted bound.
-                let budget = at_rest.peak_bound().max(1.0) * db_to_lin(BIAS_BOUND_BUDGET_DB);
-                assert!(tilted.peak_bound() <= budget * (1.0 + 1e-12));
-                assert!(tilted.peak_bound() >= at_rest.peak_bound());
-                assert!(tilted.bias_reach().abs() <= beta.abs());
-                eprintln!(
-                    "{:?} bias {beta}: static tilted trim {:.3} dB, with sag and bias {:.3} dB (reach {:.3}); untilted {:.3} dB (reach {:.3})",
-                    &l.levels_db[..4],
-                    at_rest.peak_trim_db(),
-                    tilted.peak_trim_db(),
-                    tilted.bias_reach(),
-                    untilted.peak_trim_db(),
-                    untilted.bias_reach()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_tilted_layer_goes_silent_exactly_and_no_filter_state_goes_subnormal() {
-        let rate = 44_100.0;
-        let mut l = tilted_layers().remove(3);
-        // The slowest low shelf (20 Hz, +24 dB) on every order.
-        l.tilt = Some(Box::new(shelves((20.0, 24.0), (1_000.0, 24.0), true)));
-        for dc_block in [false, true] {
-            for b in [bias(0.25, 1.0, 20.0), off_bias()] {
-                let cfg =
-                    TubeDynamicsConfig::from_layer(&l, dc_block, sag(3.0, 1.0, 10.0), b).unwrap();
-                let mut st = TubeDynamics::try_new(&cfg, rate, 1).unwrap();
-                let mut v: Vec<f64> = sine(rate, 50.0, 1.0, 0.3).collect();
-                st.process(&mut [&mut v]);
-                // Blocks of 64: the filter states flush once per block.
-                for i in 0..(20.0 * rate) as usize / 64 {
-                    let mut x = [0.0; 64];
-                    st.process(&mut [&mut x]);
-                    let s = st.state[0];
-                    for v in s
-                        .tilt_dc
-                        .iter()
-                        .copied()
-                        .chain(s.tilt.iter().flat_map(TiltState::values))
-                    {
-                        assert!(!v.is_subnormal(), "block {i}: {v:e}");
-                    }
-                }
-                assert_eq!(st.state[0], DynamicsState::default(), "{dc_block} {b:?}");
-                let mut x = [0.0; 16];
-                st.process(&mut [&mut x]);
-                assert!(x.iter().all(|&y| y == 0.0));
-            }
-        }
-    }
 }

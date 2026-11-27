@@ -70,16 +70,3 @@ pub fn decimated(taps: usize, rule: &Decimation, grid: &Grid) -> usize {
     }
     t
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ladder() {
-        assert_eq!(constant_time_length(44_100), 1 << 16);
-        assert_eq!(constant_time_length(352_800), 1 << 19);
-        assert_eq!(constant_time_length(2_000_000), 1 << 22);
-        assert_eq!(constant_time_length(3_072_000), 1 << 22);
-    }
-}

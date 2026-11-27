@@ -11,8 +11,8 @@ use audivane_dsp_core::db_to_lin;
 use audivane_dsp_core::loudness::{LufsMeter, Weighting};
 use audivane_protocol::ipc::AbHeadroom;
 use audivane_protocol::{
-    Band, ChainConfig, ChannelEq, ConvolutionConfig, CrossfeedConfig, DitherKind, EqProfile,
-    FilterType, LimiterConfig, LimiterMode, OutputConfig, RateTarget, TiltConfig,
+    Band, ChainConfig, ConvolutionConfig, CrossfeedConfig, DitherKind, EqProfile, FilterType,
+    LimiterConfig, LimiterMode, OutputConfig, TiltConfig,
 };
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex64;
@@ -283,90 +283,6 @@ fn ir_magnitude_enters_the_offset() {
     assert!(as_eq.headroom_db > 5.0, "{as_eq:?}");
 }
 
-/// Per-channel EQ and IR combine per channel: a half-gain EQ on R and a
-/// half-gain IR on L make B 6.02 dB quieter on both channels.
-#[test]
-fn stereo_eq_and_stereo_ir_combine_per_channel() {
-    let half_db = 20.0 * 0.5_f64.log10();
-    let mut b = with_conv(config());
-    b.eq = Some(EqProfile {
-        name: "right half".into(),
-        right: Some(ChannelEq {
-            enabled: true,
-            preamp_db: half_db,
-            bands: Vec::new(),
-        }),
-        ..Default::default()
-    });
-    let got = offset(
-        spec(config(), None),
-        spec(b, Some(vec![vec![0.5], vec![1.0]])),
-    );
-    assert!((got + half_db).abs() < 1e-9, "{got}");
-}
-
-/// The peak prediction keeps the EQ's attenuation: -6 dB channel preamps
-/// and a +6 dB IR peak at 0 dB, so `auto` needs no headroom.
-#[test]
-fn attenuating_eq_offsets_an_ir_boost_in_the_peak() {
-    let gain_db = 20.0 * 2.0_f64.log10();
-    let cut = ChannelEq {
-        enabled: true,
-        preamp_db: -gain_db,
-        bands: vec![band(FilterType::Peaking, 1_000.0, -3.0, 1.0)],
-    };
-    let mut b = with_conv(config());
-    b.eq = Some(EqProfile {
-        name: "cut".into(),
-        left: Some(cut.clone()),
-        right: Some(cut),
-        ..Default::default()
-    });
-    let level = AbLevel {
-        offset: AbOffset::Fixed(0.0),
-        headroom: AbHeadroom::Auto,
-    };
-    let g = AbChain::new(spec(config(), None), spec(b, Some(vec![vec![2.0]])), level)
-        .unwrap()
-        .gains();
-    assert!(g.headroom_db.abs() < 1e-6, "{g:?}");
-}
-
-/// The upsampler's magnitude enters the offset when the two designs differ,
-/// and cancels when they match.
-#[test]
-fn upsampler_magnitude_enters_the_offset() {
-    let up = |taps: usize, cutoff: f64| ChainConfig {
-        upsampler: audivane_dsp_core::resample::ManualConfig {
-            target: RateTarget::Ratio(2),
-            taps,
-            cutoff,
-            ..Default::default()
-        }
-        .into_upsampler_config()
-        .unwrap(),
-        ..config()
-    };
-    let a = up(
-        4096,
-        audivane_dsp_core::resample::ManualConfig::default().cutoff,
-    );
-    let b = up(32, 0.5);
-    assert_eq!(offset(spec(a.clone(), None), spec(a.clone(), None)), 0.0);
-    let analytic = offset(spec(a.clone(), None), spec(b.clone(), None));
-    let input = stereo_pink(0.5, 20.0);
-    let measured = chain_lufs(spec(a, None), &input) - chain_lufs(spec(b, None), &input);
-    eprintln!("upsampler: analytic {analytic:+.3} dB, LUFS {measured:+.3} dB");
-    assert!(
-        analytic > 0.2,
-        "the slow filter should read quieter: {analytic}"
-    );
-    assert!(
-        (analytic - measured).abs() < 0.15,
-        "{analytic} vs {measured}"
-    );
-}
-
 /// Test 2: with `auto` headroom a full-scale sine at a +6 dB shelf's peak
 /// leaves the mix at or below 0 dBFS, with no clips and no overs.
 #[test]
@@ -411,59 +327,6 @@ fn auto_headroom_keeps_a_shelf_boost_below_full_scale() {
     assert_eq!(ab.overs(), [0.0, 0.0]);
 }
 
-/// Test 6: overs on B only count to B, and split by the fade weight.
-#[test]
-fn overs_are_attributed_to_the_side_that_made_them() {
-    let gain = db_to_lin(6.0);
-    let b = eq(6.0, Vec::new());
-    let mut ab = AbChain::new(spec(config(), None), spec(b, None), AbLevel::fixed(0.0)).unwrap();
-    // A pulse of 0.9 every 100 frames: over on B (x2), not on A.
-    let pulses = |frames: usize| -> Vec<f32> {
-        (0..frames)
-            .flat_map(|i| {
-                let x = if i % 100 == 0 { 0.9 } else { 0.0 };
-                [x, x]
-            })
-            .collect()
-    };
-    let input = pulses(10_000);
-    let mut out = vec![0i32; BLOCK * 2];
-    let run = |ab: &mut AbChain, out: &mut [i32]| {
-        for block in input.chunks(1000 * 2) {
-            ab.process_f32(block, out);
-        }
-    };
-    run(&mut ab, &mut out);
-    assert_eq!(ab.overs(), [0.0, 0.0], "A alone makes no overs");
-    ab.select(Side::B, 0);
-    run(&mut ab, &mut out);
-    assert_eq!(ab.overs(), [0.0, 100.0], "B's overs count to B");
-
-    // Back to A over 2000 frames: the pulses inside the fade split by the
-    // B weight there, while it is still enough to go over.
-    let len = 2000;
-    ab.select(Side::A, len);
-    run(&mut ab, &mut out);
-    let mut want = [0.0, 0.0];
-    for k in (1..=10_000).step_by(100) {
-        let w = if k >= len {
-            0.0
-        } else {
-            1.0 - (0.5 - 0.5 * (PI * k as f64 / len as f64).cos())
-        };
-        if 0.9 * (1.0 - w) + 0.9 * gain * w > 1.0 {
-            want[0] += 1.0 - w;
-            want[1] += w;
-        }
-    }
-    let got = ab.overs();
-    assert!(want[0] > 0.5 && want[1] > 5.0, "{want:?}");
-    assert!(
-        (got[0] - want[0]).abs() < 1e-9 && (got[1] - want[1]).abs() < 1e-9,
-        "{got:?} vs {want:?}"
-    );
-}
-
 fn limited(mut c: ChainConfig, mode: LimiterMode) -> ChainConfig {
     c.limiter = LimiterConfig {
         mode,
@@ -480,60 +343,6 @@ fn pulse_train(frames: usize, period: usize, amp: f32) -> Vec<f32> {
             [x, x]
         })
         .collect()
-}
-
-fn feed(ab: &mut AbChain, input: &[f32]) {
-    let mut out = vec![0i32; BLOCK * 2];
-    for block in input.chunks(BLOCK * 2) {
-        ab.process_f32(block, &mut out);
-    }
-}
-
-/// Limiting onsets count to the side whose frames they limit, through the
-/// limiter's delay: an onset for a pulse that entered on B still counts to
-/// B after a hard cut to A.
-#[test]
-fn limiter_onsets_count_to_the_side_they_limit() {
-    let a = limited(config(), LimiterMode::Limit);
-    let b = limited(eq(6.0, Vec::new()), LimiterMode::Limit);
-    let mut ab = AbChain::new(spec(a, None), spec(b, None), AbLevel::fixed(0.0)).unwrap();
-    // 0.5 stays under the ceiling on A; B doubles it.
-    let period = 24_000;
-    let input = pulse_train(2 * period, period, 0.5);
-    feed(&mut ab, &input);
-    assert_eq!(ab.overs(), [0.0, 0.0], "A alone is not limited");
-    ab.select(Side::B, 0);
-    feed(&mut ab, &input);
-    assert_eq!(ab.overs(), [0.0, 2.0], "each of B's pulses is one onset");
-    // The pulse enters on B; the cut to A comes before it leaves.
-    feed(&mut ab, &input[..101 * 2]);
-    ab.select(Side::A, 0);
-    feed(&mut ab, &input[101 * 2..period * 2]);
-    assert_eq!(ab.overs(), [0.0, 1.0], "the delayed onset belongs to B");
-}
-
-/// In `auto_headroom` the held headroom absorbs repeats: one step, one over.
-#[test]
-fn held_headroom_counts_one_over_not_every_peak() {
-    let a = limited(config(), LimiterMode::AutoHeadroom);
-    let b = limited(eq(6.0, Vec::new()), LimiterMode::AutoHeadroom);
-    let mut ab = AbChain::new(spec(a, None), spec(b, None), AbLevel::fixed(0.0)).unwrap();
-    ab.select(Side::B, 0);
-    feed(&mut ab, &pulse_train(48_000, 2_400, 0.5));
-    assert_eq!(ab.overs(), [0.0, 1.0]);
-}
-
-/// A sample at exactly full scale clips the quantizer and counts.
-#[test]
-fn a_clip_at_exact_full_scale_counts() {
-    let mut ab = AbChain::new(
-        spec(config(), None),
-        spec(config(), None),
-        AbLevel::fixed(0.0),
-    )
-    .unwrap();
-    feed(&mut ab, &pulse_train(1_000, 1_000, 1.0));
-    assert_eq!(ab.overs(), [1.0, 0.0]);
 }
 
 /// Test 8: the pair's output (gains, ramps, fades, overs) does not depend

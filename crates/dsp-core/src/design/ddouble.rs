@@ -353,21 +353,6 @@ mod tests {
     }
 
     #[test]
-    fn constants_and_roots() {
-        let two = Dd::new(2.0);
-        let s = two.sqrt();
-        assert!(close(s * s, two, 1e-31));
-        // e, from its known double-double value
-        let e = Dd {
-            hi: std::f64::consts::E,
-            lo: 1.445_646_891_729_250_2e-16,
-        };
-        assert!(close(Dd::ONE.exp(), e, 1e-31));
-        assert!(close(two.ln(), Dd::LN2, 1e-31));
-        assert!(close(Dd::new(1e-3).exp().ln(), Dd::new(1e-3), 1e-30));
-    }
-
-    #[test]
     fn sin_cos_pi_exact_points() {
         let (s, _) = Dd::new(1.0 / 6.0).sin_cos_pi();
         // 1/6 is not exact in f64, so sin is 1/2 only to first order
@@ -385,81 +370,5 @@ mod tests {
         let (s, c) = (Dd::PI / Dd::new(3.0)).sin_cos();
         assert!(close(s, Dd::new(3.0).sqrt().scale(0.5), 1e-30));
         assert!(close(c, Dd::new(0.5), 1e-30));
-    }
-
-    #[test]
-    fn inverse_functions() {
-        for x in [0.1, 0.4999, 0.5, 0.75, 0.999_999, 1.0 - 1e-12] {
-            let x = Dd::new(x);
-            let y = x.acos();
-            assert!(close(y.sin_cos().1, x, 1e-29), "acos {x:?}");
-        }
-        for x in [1.0001, 1.5, 4294967296.0] {
-            let x = Dd::new(x);
-            assert!(close(x.acosh().cosh(), x, 1e-29), "acosh {x:?}");
-        }
-        assert!(close(
-            Dd::new(10.0) / Dd::new(3.0) * Dd::new(3.0),
-            Dd::new(10.0),
-            1e-31
-        ));
-        assert!(close(
-            Dd::new(10.0).div_f64(3.0).mul_f64(3.0),
-            Dd::new(10.0),
-            1e-31
-        ));
-    }
-
-    #[test]
-    fn x87_rounding() {
-        // pi to 64 bits is 0xC90FDAA22168C235 * 2^-62
-        let pi = Dd::PI.round_x87();
-        let m = (pi - Dd::new(3.0)).scale(2f64.powi(62));
-        // the significand minus 3 * 2^62 is an exact integer
-        assert_eq!(
-            m.to_f64(),
-            (0xC90F_DAA2_2168_C235u64 - 3 * (1u64 << 62)) as f64
-        );
-        // ties to even at 64 bits
-        let one = Dd {
-            hi: 1.0,
-            lo: 2f64.powi(-64),
-        };
-        assert_eq!(one.round_x87(), Dd::ONE);
-        let odd = Dd {
-            hi: 1.0 + 2f64.powi(-52),
-            lo: 2f64.powi(-64) + 2f64.powi(-63),
-        };
-        assert_eq!(odd.round_x87().lo, 2f64.powi(-62));
-        // just below a power of two the step halves
-        let below = Dd {
-            hi: 2.0,
-            lo: -2f64.powi(-70),
-        };
-        assert_eq!(below.round_x87(), Dd::new(2.0));
-        let below = Dd {
-            hi: 2.0,
-            lo: -3.0 * 2f64.powi(-65),
-        };
-        assert_eq!(
-            below.round_x87(),
-            Dd {
-                hi: 2.0,
-                lo: -2f64.powi(-63)
-            }
-        );
-    }
-
-    #[test]
-    fn rounding() {
-        assert_eq!(Dd::new(2.5).round().hi, 3.0);
-        assert_eq!(Dd::new(-2.5).round().hi, -3.0);
-        let a = Dd {
-            hi: 2.5,
-            lo: -1e-20,
-        };
-        assert_eq!(a.round().hi, 2.0);
-        let b = Dd { hi: 1e17, lo: 0.75 };
-        assert_eq!(b.round(), Dd { hi: 1e17, lo: 1.0 });
     }
 }

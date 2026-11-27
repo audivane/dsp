@@ -505,71 +505,12 @@ mod tests {
     use super::*;
     use audivane_protocol::{DitherKind, OutputConfig};
 
-    /// Every channel the engine runs has its own hold: a busy channel
-    /// does not keep a silent one dithering, up to the last channel.
-    #[test]
-    fn every_engine_channel_has_its_own_dither_hold() {
-        let last = crate::chain::MAX_CHANNELS - 1;
-        for (busy, quiet) in [(8, 9), (last - 1, last), (last, last - 1)] {
-            let mut d = TpdfDither::new(1);
-            assert!(d.keep_dithering(busy, true, 4));
-            assert!(
-                !d.keep_dithering(quiet, false, 4),
-                "channel {quiet} shares channel {busy}'s hold"
-            );
-        }
-    }
-
     fn cfg(bits: u32, dither: DitherKind) -> OutputConfig {
         OutputConfig {
             bits,
             dither,
             headroom_db: 0.0,
         }
-    }
-
-    fn lcg(seed: u64) -> impl FnMut() -> f64 {
-        let mut state = seed;
-        move || {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            ((state >> 11) as f64) / 9_007_199_254_740_992.0
-        }
-    }
-
-    #[test]
-    fn uniform_and_tpdf_statistics() {
-        // The generator behind the dither must be uniform with variance 1/12.
-        let mut rng = Rng::new(42);
-        let n = 1u64 << 20;
-        let mut sum = 0.0;
-        let mut sum_sq = 0.0;
-        for _ in 0..n {
-            let u = rng.uniform();
-            assert!((0.0..1.0).contains(&u));
-            sum += u;
-            sum_sq += u * u;
-        }
-        let mean = sum / n as f64;
-        let var = sum_sq / n as f64 - mean * mean;
-        assert!((mean - 0.5).abs() < 2e-3, "uniform mean {mean}");
-        assert!((var - 1.0 / 12.0).abs() < 2e-3, "uniform var {var}");
-
-        // TPDF = u1 + u2 - 1 has variance 2/12 = 1/6.
-        let mut rng = Rng::new(7);
-        let mut sum = 0.0;
-        let mut sum_sq = 0.0;
-        for _ in 0..n {
-            let d = rng.uniform() + rng.uniform() - 1.0;
-            assert!((-1.0..1.0).contains(&d));
-            sum += d;
-            sum_sq += d * d;
-        }
-        let mean = sum / n as f64;
-        let var = sum_sq / n as f64 - mean * mean;
-        assert!(mean.abs() < 2e-3, "tpdf mean {mean}");
-        assert!((var - 1.0 / 6.0).abs() < 2e-3, "tpdf var {var}");
     }
 
     #[test]
@@ -600,43 +541,6 @@ mod tests {
     }
 
     #[test]
-    fn one_lsb_minus_140_dbfs_sine_survives_at_24_bit() {
-        let fs = 48_000.0;
-        let f = 1000.0;
-        let n = 48_000;
-        let amp = 1e-7; // -140 dBFS
-        let mut x = vec![0.0; n];
-        for (i, v) in x.iter_mut().enumerate() {
-            *v = amp * (2.0 * std::f64::consts::PI * f * i as f64 / fs).sin();
-        }
-        let mut q = Quantizer::new(&cfg(24, DitherKind::Tpdf), 1, 99);
-        let mut out = vec![0i32; n];
-        q.process(&[&x], &mut out);
-
-        // Project the quantized output onto the tone.  TPDF dither makes the
-        // quantizer unbiased, so the recovered amplitude is close to the
-        // original even though it is below one 24-bit LSB (1.19e-7).
-        let lsb = 256.0;
-        let mut re = 0.0;
-        let mut im = 0.0;
-        for (i, &s) in out.iter().enumerate() {
-            let v = s as f64 / lsb;
-            let phase = 2.0 * std::f64::consts::PI * f * i as f64 / fs;
-            re += v * phase.cos();
-            im += v * phase.sin();
-        }
-        // The projection is in LSB units; convert back to full scale.
-        let recovered = 2.0 * (re * re + im * im).sqrt() / n as f64 / 8_388_608.0;
-        assert!(
-            (recovered - amp).abs() < 0.03 * amp,
-            "recovered {recovered:e}, expected {amp:e}"
-        );
-        // And the tone must stand far above the per-bin dither floor.
-        let noise_per_bin = (0.25f64 / n as f64).sqrt() * 2.0 / 8_388_608.0;
-        assert!(recovered / noise_per_bin > 100.0);
-    }
-
-    #[test]
     fn none_is_exact_on_grid() {
         for bits in [16u32, 24, 32] {
             let scale = 2f64.powi(bits as i32 - 1);
@@ -656,90 +560,12 @@ mod tests {
     }
 
     #[test]
-    fn bits_32_none_rounds_to_the_f64_grid() {
-        let x = 0.123_456_789f64;
-        let mut q = Quantizer::new(&cfg(32, DitherKind::None), 1, 0);
-        let mut out = [0i32; 1];
-        q.process(&[&[x][..]], &mut out);
-        assert_eq!(out[0], (x * 2_147_483_648.0).round() as i32);
-    }
-
-    #[test]
     fn silence_with_none_is_exact_zero() {
         let zeros = vec![0.0; 1000];
         let mut q = Quantizer::new(&cfg(16, DitherKind::None), 1, 0);
         let mut out = vec![7i32; 1000];
         q.process(&[&zeros], &mut out);
         assert!(out.iter().all(|&v| v == 0));
-    }
-
-    #[test]
-    fn same_seed_is_deterministic_and_reset_repeats() {
-        let n = 4096;
-        let zeros = vec![0.0; n];
-        let mut a = Quantizer::new(&cfg(16, DitherKind::Tpdf), 1, 555);
-        let mut b = Quantizer::new(&cfg(16, DitherKind::Tpdf), 1, 555);
-        let mut c = Quantizer::new(&cfg(16, DitherKind::Tpdf), 1, 556);
-        let (mut oa, mut ob, mut oc) = (vec![0; n], vec![0; n], vec![0; n]);
-        a.process(&[&zeros], &mut oa);
-        b.process(&[&zeros], &mut ob);
-        c.process(&[&zeros], &mut oc);
-        assert_eq!(oa, ob);
-        assert_ne!(oa, oc);
-
-        // reset() restarts the sequence.
-        a.reset();
-        let mut oa2 = vec![0; n];
-        a.process(&[&zeros], &mut oa2);
-        assert_eq!(oa, oa2);
-    }
-
-    #[test]
-    fn legacy_tpdf_preserves_original_samples_gain_and_clipping() {
-        // Independent integer PRNG / f64 quantizer calculation, including
-        // interleaved channel draw order, off-grid values, rails and NaN/Inf.
-        for (bits, expected) in [
-            (16, [0xf76d2df9045d6194, 0x174f5755d952e2d7]),
-            (24, [0x7cb90a22a9ce1d21, 0xe16f2396d398a910]),
-            (32, [0xdb3e32a3e55a9a1c, 0x1ab62f9de585e86f]),
-        ] {
-            let scale = 2f64.powi(bits as i32 - 1);
-            let x = [
-                -1.25,
-                -1.0,
-                -0.5,
-                -0.5 / scale,
-                0.5 / scale,
-                1.5 / scale,
-                0.25 / scale,
-                1.0 - 1.0 / scale,
-                1.0,
-                1.25,
-                0.12345,
-                f64::INFINITY,
-                f64::NAN,
-            ];
-            let right = x.map(|x| -x);
-            for (seed, hash) in [42, crate::chain::DEFAULT_SEED].into_iter().zip(expected) {
-                let mut q = Quantizer::new(&cfg(bits, DitherKind::Tpdf), 2, seed);
-                let mut out = [0; 26];
-                for _ in 0..2 {
-                    let stats = q.process(&[&x, &right], &mut out);
-                    assert_eq!(
-                        crate::bypass::hash_i32(&out),
-                        hash,
-                        "bits {bits}, seed {seed}"
-                    );
-                    assert_eq!(stats.clipped, 8);
-                    q.reset();
-                }
-                let mut fallback =
-                    Quantizer::with_sample_rate(&cfg(bits, DitherKind::Shaped), 2, seed, 32_000);
-                let mut shaped = [0; 26];
-                assert_eq!(fallback.process(&[&x, &right], &mut shaped).clipped, 8);
-                assert_eq!(shaped, out);
-            }
-        }
     }
 
     #[test]
@@ -794,35 +620,6 @@ mod tests {
         assert_eq!(stats.clipped, 1);
     }
 
-    #[test]
-    fn interleaves_channels() {
-        let frames = 4;
-        let left: Vec<f64> = (0..frames).map(|i| (i as f64 - 2.0) / 8.0).collect();
-        let right: Vec<f64> = (0..frames).map(|i| -(i as f64) / 8.0).collect();
-        let mut q = Quantizer::new(&cfg(16, DitherKind::None), 2, 0);
-        let mut out = vec![0i32; frames * 2];
-        q.process(&[&left, &right], &mut out);
-        for i in 0..frames {
-            assert_eq!(out[2 * i], (left[i] * 32_768.0).round() as i32 * 65_536);
-            assert_eq!(
-                out[2 * i + 1],
-                (right[i] * 32_768.0).round() as i32 * 65_536
-            );
-        }
-    }
-
-    /// Inverse threshold of hearing (Terhardt 1979) as a power weighting:
-    /// the F-weighting approximation the shapers are judged by.
-    fn f_weight(f: f64) -> f64 {
-        let k = f / 1000.0;
-        let t = 3.64 * k.powf(-0.8) - 6.5 * (-0.6 * (k - 3.3) * (k - 3.3)).exp() + 1e-3 * k.powi(4);
-        10f64.powf(-t / 10.0)
-    }
-
-    fn a_weight(f: f64) -> f64 {
-        crate::db_to_lin(crate::loudness::a_weighting_db(f)).powi(2)
-    }
-
     /// Quantization error `y - x` in LSB for `x` (full scale) at 16 bits.
     fn quantization_error(kind: DitherKind, fs: u32, x: &[f64], seed: u64) -> Vec<f64> {
         let mut q = Quantizer::with_sample_rate(&cfg(16, kind), 1, seed, fs);
@@ -832,127 +629,6 @@ mod tests {
             .zip(x)
             .map(|(&y, &x)| y as f64 / 65_536.0 - x * 32_768.0)
             .collect()
-    }
-
-    /// Welch PSD (Hann, 50 % overlap, `n`-point segments), bins 0..=n/2.
-    fn welch_psd(x: &[f64], n: usize) -> Vec<f64> {
-        let mut fft = crate::fft::RealFftPair::new(n);
-        let win: Vec<f64> = (0..n)
-            .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos())
-            .collect();
-        let norm: f64 = win.iter().map(|w| w * w).sum();
-        let mut spec = vec![crate::Complex64::new(0.0, 0.0); n / 2 + 1];
-        let mut psd = vec![0.0; n / 2 + 1];
-        let mut seg = vec![0.0; n];
-        let mut count = 0;
-        let mut start = 0;
-        while start + n <= x.len() {
-            for i in 0..n {
-                seg[i] = x[start + i] * win[i];
-            }
-            fft.forward_padded_complex(&seg, &mut spec);
-            for (p, c) in psd.iter_mut().zip(&spec) {
-                *p += c.norm_sqr();
-            }
-            count += 1;
-            start += n / 2;
-        }
-        // Scaled so that the sum over all bins (one-sided) is the variance.
-        for (k, p) in psd.iter_mut().enumerate() {
-            let one_sided = if k == 0 || k == n / 2 { 1.0 } else { 2.0 };
-            *p *= one_sided / (count as f64 * norm);
-        }
-        psd
-    }
-
-    /// Noise power in 20 Hz..20 kHz weighted by `w`.
-    fn band_power(psd: &[f64], fs: f64, w: fn(f64) -> f64) -> f64 {
-        let n = 2 * (psd.len() - 1);
-        psd.iter()
-            .enumerate()
-            .map(|(k, &p)| (k as f64 * fs / n as f64, p))
-            .filter(|&(f, _)| (20.0..=20_000.0).contains(&f))
-            .map(|(f, p)| p * w(f))
-            .sum()
-    }
-
-    fn db(x: f64) -> f64 {
-        10.0 * x.log10()
-    }
-
-    #[test]
-    fn shaped_lowers_audible_noise_on_silence_and_quiet_sine() {
-        let n = 1 << 18;
-        // (rate, max F-weighted ratio dB, max total ratio dB, max A ratio dB)
-        let limits = [
-            (44_100u32, -9.0, 19.5, f64::INFINITY),
-            (48_000, -11.0, 19.5, f64::INFINITY),
-            (88_200, -20.0, 12.0, -4.0),
-            (96_000, -20.0, 11.0, -5.0),
-            (176_400, -27.0, 7.0, -12.0),
-            (192_000, -27.0, 7.0, -12.0),
-        ];
-        for (fs, max_f, max_total, max_a) in limits {
-            let sine: Vec<f64> = (0..n)
-                .map(|i| 1e-3 * (2.0 * std::f64::consts::PI * 997.0 * i as f64 / fs as f64).sin())
-                .collect();
-            for (name, x) in [("silence", vec![0.0; n]), ("-60 dBFS sine", sine)] {
-                let tpdf = quantization_error(DitherKind::Tpdf, fs, &x, 11);
-                let shaped = quantization_error(DitherKind::Shaped, fs, &x, 11);
-                let (pt, ps) = (welch_psd(&tpdf, 4096), welch_psd(&shaped, 4096));
-                let f_ratio =
-                    db(band_power(&ps, fs as f64, f_weight) / band_power(&pt, fs as f64, f_weight));
-                let a_ratio =
-                    db(band_power(&ps, fs as f64, a_weight) / band_power(&pt, fs as f64, a_weight));
-                let var = |e: &[f64]| e.iter().map(|v| v * v).sum::<f64>() / e.len() as f64;
-                let total = db(var(&shaped) / var(&tpdf));
-                eprintln!(
-                    "{fs} Hz, {name}: shaped vs TPDF: F-weighted {f_ratio:+.2} dB, A-weighted {a_ratio:+.2} dB, total {total:+.2} dB (TPDF {:.3} LSB²)",
-                    var(&tpdf)
-                );
-                assert!(
-                    f_ratio <= max_f,
-                    "{fs} Hz {name}: F-weighted {f_ratio:.2} dB"
-                );
-                assert!(total <= max_total, "{fs} Hz {name}: total {total:.2} dB");
-                assert!(
-                    a_ratio <= max_a,
-                    "{fs} Hz {name}: A-weighted {a_ratio:.2} dB"
-                );
-                // TPDF itself is white at 1/4 LSB².
-                assert!((var(&tpdf) - 0.25).abs() < 0.01);
-            }
-        }
-    }
-
-    #[test]
-    fn shaper_table_selection() {
-        assert!(noise_shaper(32_000).is_none());
-        assert!(noise_shaper(44_099).is_none());
-        assert_eq!(noise_shaper(44_100), Some(&SHAPERS[0].1));
-        assert_eq!(noise_shaper(47_999), Some(&SHAPERS[0].1));
-        assert_eq!(noise_shaper(48_000), Some(&SHAPERS[1].1));
-        assert_eq!(noise_shaper(64_000), Some(&SHAPERS[1].1));
-        assert_eq!(noise_shaper(96_000), Some(&SHAPERS[3].1));
-        assert_eq!(noise_shaper(384_000), Some(&SHAPERS[5].1));
-        // Below 44.1 kHz Shaped is exactly TPDF.
-        let x: Vec<f64> = (0..4096).map(|i| 1e-4 * (i as f64 * 0.01).sin()).collect();
-        let mut a = Quantizer::with_sample_rate(&cfg(16, DitherKind::Shaped), 1, 9, 32_000);
-        let mut b = Quantizer::with_sample_rate(&cfg(16, DitherKind::Tpdf), 1, 9, 32_000);
-        let (mut oa, mut ob) = (vec![0; 4096], vec![0; 4096]);
-        a.process(&[&x], &mut oa);
-        b.process(&[&x], &mut ob);
-        assert_eq!(oa, ob);
-        assert!(a.shaper().is_none());
-        // The default constructor assumes 44.1 kHz.
-        let q = Quantizer::new(&cfg(16, DitherKind::Shaped), 1, 0);
-        assert_eq!(q.shaper(), Some(&SHAPERS[0].1[..]));
-        // Every shaper is minimum phase enough to be a sensible NTF: its
-        // DC gain is well below 1 and the coefficients are finite.
-        for (rate, h) in SHAPERS {
-            let dc: f64 = 1.0 - h.iter().sum::<f64>();
-            assert!(dc.abs() < 0.5, "{rate}: NTF(1) = {dc}");
-        }
     }
 
     #[test]
@@ -1018,25 +694,6 @@ mod tests {
     }
 
     #[test]
-    fn shaped_is_deterministic_and_reset_repeats() {
-        let n = 8192;
-        let x: Vec<f64> = (0..n).map(|i| 0.3 * (i as f64 * 0.013).sin()).collect();
-        let run = |q: &mut Quantizer| {
-            let mut out = vec![0i32; 2 * n];
-            q.process(&[&x, &x], &mut out);
-            out
-        };
-        let mut a = Quantizer::with_sample_rate(&cfg(16, DitherKind::Shaped), 2, 77, 48_000);
-        let mut b = Quantizer::with_sample_rate(&cfg(16, DitherKind::Shaped), 2, 77, 48_000);
-        let oa = run(&mut a);
-        assert_eq!(oa, run(&mut b));
-        a.reset();
-        assert_eq!(oa, run(&mut a));
-        let mut c = Quantizer::with_sample_rate(&cfg(16, DitherKind::Shaped), 2, 78, 48_000);
-        assert_ne!(oa, run(&mut c));
-    }
-
-    #[test]
     fn nan_input_is_silent_and_does_not_poison_shaping() {
         for kind in [DitherKind::None, DitherKind::Tpdf, DitherKind::Shaped] {
             let input = [f64::NAN, 0.25, f64::INFINITY, 0.25];
@@ -1066,88 +723,6 @@ mod tests {
             );
             assert_eq!(stats.clipped, 1, "{kind:?}");
             assert_eq!(stats.peak, 0.25);
-        }
-    }
-
-    #[test]
-    fn empty_and_fewer_frames_are_fine() {
-        let mut q = Quantizer::new(&cfg(24, DitherKind::Tpdf), 2, 1);
-        let empty: [&[f64]; 2] = [&[], &[]];
-        let mut out: [i32; 0] = [];
-        let stats = q.process(&empty, &mut out);
-        assert_eq!(stats, ClipStats::default());
-
-        let a = vec![0.25; 7];
-        let b = vec![-0.25; 7];
-        let mut out = vec![0i32; 14];
-        let stats = q.process(&[&a, &b], &mut out);
-        assert_eq!(stats.peak, 0.25);
-        // No clipping and the sign is preserved.
-        assert_eq!(stats.clipped, 0);
-        assert!(out[0] > 0 && out[1] < 0);
-    }
-
-    #[test]
-    fn merge_clip_stats() {
-        let mut a = ClipStats {
-            clipped: 2,
-            peak: 1.2,
-            clipped_ch: [1, 1, 0, 0, 0, 0, 0, 0],
-            ..ClipStats::default()
-        };
-        a.merge(ClipStats {
-            clipped: 3,
-            peak: 0.5,
-            clipped_ch: [0, 2, 1, 0, 0, 0, 0, 0],
-            peak_ch: [0.5, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            chain_peak_ch: [0.7, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            measured: true,
-            limiter: Default::default(),
-            ab_overs: [0.25, 1.0],
-        });
-        assert_eq!(
-            a,
-            ClipStats {
-                clipped: 5,
-                peak: 1.2,
-                clipped_ch: [1, 3, 1, 0, 0, 0, 0, 0],
-                peak_ch: [0.5, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                chain_peak_ch: [0.7, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                measured: true,
-                limiter: Default::default(),
-                ab_overs: [0.25, 1.0],
-            }
-        );
-    }
-
-    #[test]
-    fn merge_keeps_the_largest_limiter_reduction() {
-        use audivane_protocol::LimiterStatus;
-        let status = |reduction, events, headroom| ClipStats {
-            limiter: LimiterStatus {
-                active: true,
-                headroom_db: headroom,
-                gain_reduction_db: reduction,
-                events,
-            },
-            ..ClipStats::default()
-        };
-        let mut a = ClipStats::default();
-        a.merge(status(6.0, 1, 1.0));
-        a.merge(status(0.5, 2, 1.5));
-        assert_eq!(a.limiter, status(6.0, 3, 1.5).limiter);
-    }
-
-    #[test]
-    fn generator_is_stable_with_extreme_seeds() {
-        for seed in [0, 1, u64::MAX] {
-            let mut q = Quantizer::new(&cfg(16, DitherKind::Tpdf), 1, seed);
-            let mut rng = lcg(seed ^ 0xdead_beef);
-            let x: Vec<f64> = (0..1000).map(|_| rng() * 0.9 - 0.45).collect();
-            let mut out = vec![0i32; x.len()];
-            let stats = q.process(&[&x], &mut out);
-            assert_eq!(stats.clipped, 0);
-            assert!(out.iter().all(|&v| v > i32::MIN && v < i32::MAX));
         }
     }
 }

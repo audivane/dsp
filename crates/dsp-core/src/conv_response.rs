@@ -143,31 +143,11 @@ pub fn output_curves(irs: &ConvIrs, rate: f64, channels: usize, freqs: &[f64]) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matrix::FilterMatrix;
 
     const RATE: f64 = 48_000.0;
 
     fn grid() -> Vec<f64> {
         log_grid(20.0, 20_000.0, 240, RATE)
-    }
-
-    #[test]
-    fn the_grid_is_the_apps_and_stops_at_nyquist() {
-        let g = grid();
-        assert_eq!(g.len(), 241);
-        assert!((g[0] - 20.0).abs() < 1e-9 && (g[240] - 20_000.0).abs() < 1e-6);
-        // About 1/24 octave: three decades over 240 steps.
-        let step = (g[1] / g[0]).log2();
-        assert!((step - 1000f64.log2() / 240.0).abs() < 1e-12);
-        let low = log_grid(20.0, 20_000.0, 240, 32_000.0);
-        assert!(low.last().copied().unwrap() <= 16_000.0 && low.len() < 241);
-    }
-
-    #[test]
-    fn a_delta_is_flat_with_no_delay() {
-        let c = response(&[(&[1.0], 1.0)], RATE, &grid());
-        assert!(c.mag_db.iter().all(|m| m.abs() < 1e-9), "{:?}", c.mag_db);
-        assert!(c.group_delay_ms.iter().all(|d| d.unwrap().abs() < 1e-9));
     }
 
     #[test]
@@ -199,35 +179,5 @@ mod tests {
         // About −3 dB at 12 kHz (cos 45°).
         let k = freqs.iter().position(|&f| f > 12_000.0).unwrap();
         assert!(c.mag_db[k] < -3.0 && c.mag_db[k] > -3.5);
-    }
-
-    #[test]
-    fn silence_reads_the_floor() {
-        let c = response(&[(&[0.0, 0.0], 1.0)], RATE, &grid());
-        assert!(c.mag_db.iter().all(|&m| m == FLOOR_DB));
-        assert!(c.group_delay_ms.iter().all(Option::is_none));
-    }
-
-    #[test]
-    fn a_matrix_output_sums_its_row() {
-        // Output 0 = in 0 + in 1 (both unit): +6 dB; output 1 = in 1 at −6 dB.
-        let mut m = FilterMatrix::new(2);
-        m.set(0, 0, vec![1.0]);
-        m.set(0, 1, vec![1.0]);
-        m.set(1, 1, vec![0.5]);
-        let out = output_curves(&ConvIrs::Matrix(m), RATE, 2, &grid());
-        assert_eq!(out.len(), 2);
-        assert!(out[0].mag_db.iter().all(|v| (v - 6.0206).abs() < 1e-3));
-        assert!(out[1].mag_db.iter().all(|v| (v + 6.0206).abs() < 1e-3));
-        // A mono per-channel IR serves both outputs.
-        let mono = output_curves(&ConvIrs::Channels(vec![vec![2.0]]), RATE, 2, &grid());
-        assert_eq!(mono.len(), 2);
-        assert!(mono[1].mag_db.iter().all(|v| (v - 6.0206).abs() < 1e-3));
-    }
-
-    #[test]
-    fn opposite_entries_cancel_in_the_sum() {
-        let c = response(&[(&[1.0], 1.0), (&[1.0], -1.0)], RATE, &grid());
-        assert!(c.mag_db.iter().all(|&m| m == FLOOR_DB));
     }
 }

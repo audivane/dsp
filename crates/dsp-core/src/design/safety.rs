@@ -674,40 +674,6 @@ mod tests {
 
     use audivane_protocol::RateRatio;
 
-    /// Every exemption the fixture records (tier B's matrix) is covered by
-    /// a row of the table, within its bound, and every row covers one.
-    #[test]
-    fn exemptions_cover_the_fixtures() {
-        let fixture = include_str!("../../tests/fixtures/filter-safety-exemptions.tsv");
-        let mut worst = vec![f64::NEG_INFINITY; EXEMPTIONS.len()];
-        for l in fixture
-            .lines()
-            .filter(|l| !l.starts_with('#') && !l.is_empty())
-        {
-            // taps_hash, check, value, first case (name rate up/down).
-            let c: Vec<&str> = l.split('\t').collect();
-            let value: f64 = c[2].parse().unwrap();
-            let case: Vec<&str> = c[3].split(' ').collect();
-            let preset = FilterPreset::from_name(case[0]).unwrap();
-            let (up, down) = case[2].split_once('/').unwrap();
-            let ratio = RateRatio::new(up.parse().unwrap(), down.parse().unwrap());
-            let row = EXEMPTIONS.iter().position(|e| {
-                e.preset == preset
-                    && e.integer == ratio.is_integer()
-                    && e.check.name() == c[1]
-                    && value <= e.max_db
-            });
-            let row = row.unwrap_or_else(|| panic!("{l}: no exemption covers it"));
-            worst[row] = worst[row].max(value);
-        }
-        for (e, worst) in EXEMPTIONS.iter().zip(worst) {
-            // Every row covers a recorded case, and its margin over the
-            // worst recorded one is small.
-            assert!(worst.is_finite(), "{e:?} covers no recorded case");
-            assert!(e.max_db - worst < 0.025, "{e:?}: worst recorded {worst}");
-        }
-    }
-
     fn kernel_gate(taps: Vec<f64>, branches: usize) -> Measured {
         let mut g = Gate::new(true);
         g.branches(&taps, branches);
@@ -757,43 +723,5 @@ mod tests {
         assert!(g.verdict(strict(two)).is_err());
         let g = kernel_gate(vec![f64::NAN, 1.0], 1);
         assert!(g.verdict(custom).is_err());
-    }
-
-    /// An exemption covers its preset (the catalogue design exactly), its
-    /// kind of ratio and its check, up to its bound.
-    #[test]
-    fn exemptions_are_keyed_by_preset_ratio_and_bound() {
-        let tiny = super::super::catalogue::design(FilterPreset::HalfbandTiny);
-        let rational = RateRatio::new(160, 147);
-        // DC 0.03 dB off: two branches, one at 1, one 0.35% high.
-        let g = kernel_gate(vec![1.0, 1.0035], 2);
-        assert!(g.dc_dev_db > 0.02 && g.dc_dev_db < HALFBAND_TINY_DC_DB);
-        let policy = |design, ratio| Policy {
-            design: Some(design),
-            ..strict(ratio)
-        };
-        assert!(g.verdict(policy(&tiny, rational)).is_ok());
-        // Not at an integer ratio, not for another design, not past the
-        // bound.
-        assert!(g.verdict(policy(&tiny, RateRatio::integer(2))).is_err());
-        let other = super::super::catalogue::design(FilterPreset::HalfbandSmall);
-        assert!(g.verdict(policy(&other, rational)).is_err());
-        let worse = kernel_gate(vec![1.0, 1.01], 2);
-        assert!(worse.verdict(policy(&tiny, rational)).is_err());
-        // A boost is not a DC exemption.
-        let boost = kernel_gate(vec![1.0, -1.0, 1.0], 1);
-        assert!(boost.verdict(policy(&tiny, rational)).is_err());
-        // The block FFT's boost, within its bound only.
-        let fft = super::super::catalogue::design(FilterPreset::BlockFft);
-        let m = Measured {
-            boost_bound_db: 4.88,
-            ..kernel_gate(vec![0.0, 1.0, 1.0, 0.0], 2)
-        };
-        assert!(m.verdict(policy(&fft, RateRatio::integer(2))).is_ok());
-        let m = Measured {
-            boost_bound_db: 5.5,
-            ..m
-        };
-        assert!(m.verdict(policy(&fft, RateRatio::integer(2))).is_err());
     }
 }

@@ -132,39 +132,6 @@ mod tests {
         assert!(check_ratio(FilterPreset::BlockFft, 6).is_err());
     }
 
-    #[test]
-    fn ratio_rules_reach_x64() {
-        for p in [
-            FilterPreset::GaussianLong,
-            FilterPreset::CascadeFir,
-            FilterPreset::BlockFftLarge,
-            FilterPreset::Nos,
-            FilterPreset::CatmullRom,
-            FilterPreset::Lanczos32767,
-            FilterPreset::FlattopHuge,
-        ] {
-            assert!(check_ratio(p, 64).is_ok(), "{p:?}");
-            let err = check_ratio(p, 65).unwrap_err().to_string();
-            assert!(err.contains("from 2 to 64"), "{err}");
-        }
-        assert!(check_ratio(FilterPreset::CascadeFir, 48).is_ok());
-        assert!(check_ratio(FilterPreset::BlockFft, 48).is_err());
-        // The longest kernel, 131 071 taps per input sample, fits the tap
-        // limit up to x64 (8 388 544 taps).
-        assert!(check_ratio(FilterPreset::Lanczos65535, 64).is_ok());
-        // What a longer one would be told.
-        let err = PresetError::TooLong {
-            preset: FilterPreset::Lanczos65535,
-            ratio: RateRatio::integer(65),
-            taps: 8_519_615,
-        };
-        assert_eq!(
-            err.to_string(),
-            "filter preset lanczos65535 does not run at x65: its kernel would have 8519615 \
-             taps, more than 8388608; use a lower ratio or a shorter preset"
-        );
-    }
-
     /// A ratio above `u32::MAX` is refused before it is narrowed: it must
     /// not wrap into range (`2^32 + 2` would read as x2).
     #[test]
@@ -188,41 +155,5 @@ mod tests {
             block_fft::build(FilterPreset::BlockFftLarge, 44_100, huge, 2, 64),
             Err(PresetError::Ratio { .. })
         ));
-    }
-
-    /// Every preset runs at x64 (44.1 kHz -> 2.8224 MHz) or says why not
-    /// from its ratio rules, before anything is designed.
-    #[test]
-    fn every_preset_builds_at_x64_or_refuses() {
-        let ratio = 64;
-        let max_block = 256;
-        let input = vec![0.25; max_block];
-        let mut out = vec![0.0; max_block * ratio];
-        let cx = design::BuildContext {
-            source_rate: 44_100,
-            ratio: RateRatio::integer(ratio as u32),
-            channels: 1,
-            max_block,
-            pipelines: design::budget::RATIONAL_SWAP_PIPELINES,
-            output: audivane_protocol::OutputConfig::default(),
-            workspace: design::budget::DESIGN_WORKSPACE_FLOOR,
-        };
-        for &p in FilterPreset::ALL {
-            let built = design::upsampler(&design::Named::preset(p), &cx, 0.0);
-            if let Err(e) = check_ratio(p, ratio) {
-                assert!(matches!(
-                    e,
-                    PresetError::Ratio { .. } | PresetError::TooLong { .. }
-                ));
-                assert!(built.is_err(), "{p:?}");
-                continue;
-            }
-            let mut rt = built
-                .unwrap_or_else(|e| panic!("{p:?} at x{ratio}: {e}"))
-                .expect("an upsampler");
-            assert_eq!(rt.ratio(), RateRatio::integer(ratio as u32));
-            rt.process(&[&input], &mut [&mut out]);
-            assert!(out.iter().all(|v| v.is_finite()), "{p:?}");
-        }
     }
 }

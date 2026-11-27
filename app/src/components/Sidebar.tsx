@@ -60,7 +60,26 @@ export function Sidebar() {
   const bypass = !cfg.dsp_enabled;
   const eq = cfg.chain.eq;
   const irs = convList(cfg.chain);
-  const convOn = irs.some((c) => c.enabled);
+  // The room calibration's item is the daemon's: its own power button
+  // switches the calibration, the stage's the whole stage (with the
+  // calibration too, when one is loaded).
+  const userIrs = irs.filter((c) => !c.calibration);
+  const hasCal = userIrs.length < irs.length;
+  const calOn = status?.calibration?.enabled ?? cfg.calibration?.enabled ?? true;
+  const convOn = (hasCal ? irs : userIrs).some((c) => c.enabled);
+  const calTitle = "Room calibration on/off (off also mutes its followers)";
+  const stageTitle = hasCal ? (convOn ? "Turn convolution and the room calibration off" : "Turn convolution and the room calibration on") : undefined;
+  const setConvStage = () => {
+    if (!hasCal) {
+      void st.setConvEnabled(!convOn);
+    } else if (convOn) {
+      void st.setConvEnabled(false);
+      void st.setCalibrationEnabled(false);
+    } else {
+      void st.setCalibrationEnabled(true);
+      void st.setConvEnabled(true);
+    }
+  };
   const ups = cfg.chain.upsampler;
   // What the engine runs now, when the DSP path is live: the summary shows
   // that (a fallback or a fractional landing) rather than the target.
@@ -105,7 +124,8 @@ export function Sidebar() {
         name="Convolution"
         sub={convSummary(cfg, irInfo)}
         power={convOn}
-        onPower={irs.length ? () => st.setConvEnabled(!convOn) : undefined}
+        onPower={irs.length ? setConvStage : undefined}
+        powerTitle={stageTitle}
         extra={
           <button className="icon-btn" aria-expanded={convOpen} aria-label="Show impulse responses" onClick={() => setConvOpen(!convOpen)}>
             <Chevron className={"chev" + (convOpen ? " open" : "")} />
@@ -116,11 +136,19 @@ export function Sidebar() {
         <div className="slots">
           {irs.map((c, i) => {
             const taps = irTaps(c, irInfo);
+            // `setIr` counts the user's items only.
+            const u = userIrs.indexOf(c);
             return (
-              <div key={irKey(c) + i} className={"slot" + (c.enabled ? "" : " off")}>
-                <button className="pwr" aria-pressed={c.enabled} aria-label={`${irName(c)} on`} onClick={() => st.setIr(i, { enabled: !c.enabled })}>
-                  <Power />
-                </button>
+              <div key={irKey(c) + i} className={"slot" + ((c.calibration ? calOn : c.enabled) ? "" : " off")}>
+                {c.calibration ? (
+                  <button className="pwr" aria-pressed={calOn} aria-label="Room calibration on" title={calTitle} onClick={() => void st.setCalibrationEnabled(!calOn)}>
+                    <Power />
+                  </button>
+                ) : (
+                  <button className="pwr" aria-pressed={c.enabled} aria-label={`${irName(c)} on`} onClick={() => st.setIr(u, { enabled: !c.enabled })}>
+                    <Power />
+                  </button>
+                )}
                 <span className="slot-name" title={irPaths(c).join("\n")}>
                   {irName(c)}
                 </span>

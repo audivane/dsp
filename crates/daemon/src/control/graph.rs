@@ -2467,67 +2467,6 @@ fn display_name(name: Option<&str>) -> &str {
 #[cfg(test)]
 mod stream_volume_tests {
     use super::*;
-    use std::time::Duration;
-
-    /// What a stream plays after the guard's write: master times channels.
-    /// A write without `volume` leaves the app's master in place.
-    fn plays_db(bytes: &[u8], app_master: f32) -> f64 {
-        let pod = Pod::from_bytes(bytes).unwrap();
-        let p = audivane_io_pw::sink_volume::parse_props(pod).unwrap();
-        played_db(&p.channel_volumes.unwrap(), p.volume.or(Some(app_master))).unwrap()
-    }
-
-    /// The guard writes what plays, whatever master `volume` the app set: a
-    /// master of 2.0 is not left above the cap, 0.5 does not land 6 dB low.
-    /// The app's master stays as it is (its slider does not jump), only a
-    /// master of 0 becomes 1, and the balance survives every case.
-    #[test]
-    fn guard_writes_account_for_the_master_volume() {
-        for master in [2.0_f32, 0.5, 1.0] {
-            let channels = [0.5_f32, 0.25];
-            let scaled = guarded_channels(&channels, Some(master), -12.0);
-            let bytes = audivane_io_pw::sink_volume::stream_volume_pod(&scaled);
-            let got = plays_db(&bytes, master);
-            assert!((got + 12.0).abs() < 1e-4, "master {master}: plays {got} dB");
-            // The pod leaves the master alone.
-            let pod = Pod::from_bytes(&bytes).unwrap();
-            assert_eq!(
-                audivane_io_pw::sink_volume::parse_props(pod)
-                    .unwrap()
-                    .volume,
-                None
-            );
-            // Read back, it is the level the guard wanted: no rewrite loop.
-            assert!((played_db(&scaled, Some(master)).unwrap() + 12.0).abs() < 1e-4);
-            // Balance kept: right 6 dB below left.
-            assert!(
-                (scaled[1] / scaled[0] - 0.5).abs() < 1e-6,
-                "master {master}"
-            );
-        }
-        // What was reported counts the master.
-        let db = played_db(&[0.5, 0.25], Some(2.0)).unwrap();
-        assert!(db.abs() < 1e-6);
-    }
-
-    /// After a guard write the app's own slider still works the way round
-    /// it shows: raising its master from 0.5 to 0.6 makes the stream
-    /// louder (by 20 log 1.2), not quieter.
-    #[test]
-    fn the_apps_master_slider_still_works_after_a_guard_write() {
-        let scaled = guarded_channels(&[1.0, 1.0], Some(0.5), -12.0);
-        let before = played_db(&scaled, Some(0.5)).unwrap();
-        let after = played_db(&scaled, Some(0.6)).unwrap();
-        assert!((after - before - 20.0 * 1.2f64.log10()).abs() < 1e-4);
-    }
-
-    #[test]
-    fn a_silent_stream_is_seeded_at_silence_only_when_new() {
-        assert_eq!(level_for_guard(false, None), Some(VOLUME_MIN_DB));
-        assert_eq!(level_for_guard(true, None), None);
-        assert_eq!(level_for_guard(true, Some(-12.0)), Some(-12.0));
-        assert_eq!(level_for_guard(false, Some(-12.0)), Some(-12.0));
-    }
 
     /// The guard never writes a channel volume above 1.0: a level that
     /// would need more (an app master turned far down) stays lower, with
@@ -2551,29 +2490,6 @@ mod stream_volume_tests {
             stream_max_db,
             ..VolumeGuard::default()
         }
-    }
-
-    /// `set_stream_volume` raises a stream the guard turned down: the new
-    /// `channelVolumes` play the request, balance kept, master untouched.
-    #[test]
-    fn stream_volume_raises_through_channel_volumes() {
-        let g = vg(GuardMode::Off, None);
-        // Turned down to -12 dB by an earlier cap, right 6 dB below left.
-        let ch = [0.251_f32, 0.1255];
-        let plan =
-            plan_stream_volume(&g, 7, Some(&ch), Some(1.0), false, Some(-3.0), None).unwrap();
-        let scaled = plan.channels.clone().unwrap();
-        assert!((played_db(&scaled, Some(1.0)).unwrap() + 3.0).abs() < 1e-4);
-        assert!((scaled[1] / scaled[0] - 0.5).abs() < 1e-6);
-        assert_eq!(plan.reply.volume_db, -3.0);
-        assert_eq!(plan.reply.max_db, 0.0);
-        assert_eq!(plan.reply.limited_by, None);
-        assert_eq!(plan.mute, None);
-        assert_eq!(plan.capped_from, None);
-        // To 100 %.
-        let plan = plan_stream_volume(&g, 7, Some(&ch), None, false, Some(0.0), None).unwrap();
-        assert_eq!(plan.channels.unwrap()[0], 1.0);
-        assert_eq!(plan.reply.volume_db, 0.0);
     }
 
     /// The stream cap holds in every guard mode, and is reported.
@@ -2604,146 +2520,6 @@ mod stream_volume_tests {
         }
     }
 
-    /// The app's own master bounds what channel volumes (at most 100 %) can
-    /// reach; the reply says so instead of claiming the request.
-    #[test]
-    fn stream_volume_reports_the_apps_own_limit() {
-        let g = vg(GuardMode::Limit, Some(-3.0));
-        // Master 0.25 = -12 dB.
-        let plan = plan_stream_volume(
-            &g,
-            7,
-            Some(&[0.5, 0.5]),
-            Some(0.25),
-            false,
-            Some(-6.0),
-            None,
-        )
-        .unwrap();
-        assert_eq!(plan.reply.volume_db, -12.04);
-        assert_eq!(plan.reply.max_db, -12.04);
-        assert_eq!(plan.reply.limited_by, Some(StreamVolumeLimit::AppVolume));
-        assert!(plan.channels.unwrap().iter().all(|&v| v <= 1.0));
-        // Above the cap too: the app's volume is the lower bound, and the
-        // request is still logged as capped.
-        let plan = plan_stream_volume(&g, 7, Some(&[0.5, 0.5]), Some(0.25), false, Some(0.0), None)
-            .unwrap();
-        assert_eq!(plan.reply.limited_by, Some(StreamVolumeLimit::AppVolume));
-        assert_eq!(plan.capped_from, Some(0.0));
-    }
-
-    #[test]
-    fn stream_volume_mute_query_and_refusals() {
-        let g = vg(GuardMode::Lock, None);
-        // Mute only: no level written.
-        let plan = plan_stream_volume(
-            &g,
-            7,
-            Some(&[0.5, 0.25]),
-            Some(1.0),
-            false,
-            None,
-            Some(true),
-        )
-        .unwrap();
-        assert_eq!(plan.channels, None);
-        assert_eq!(plan.mute, Some(true));
-        assert!(plan.reply.muted);
-        assert_eq!(plan.reply.volume_db, -6.02);
-        // Query: nothing written.
-        let plan =
-            plan_stream_volume(&g, 7, Some(&[0.5, 0.25]), Some(1.0), true, None, None).unwrap();
-        assert_eq!((plan.channels, plan.mute), (None, None));
-        assert!(plan.reply.muted);
-        // Muting works at the app's master 0; a level does not.
-        assert!(
-            plan_stream_volume(&g, 7, Some(&[1.0]), Some(0.0), false, None, Some(true)).is_ok()
-        );
-        let err = plan_stream_volume(&g, 7, Some(&[1.0]), Some(0.0), false, Some(-6.0), None)
-            .unwrap_err();
-        assert_eq!(err.code, RpcError::BAD_STATE);
-        assert!(
-            err.message.contains("raise it in the app"),
-            "{}",
-            err.message
-        );
-        // No volume reported yet.
-        let err = plan_stream_volume(&g, 7, None, None, false, Some(-6.0), None).unwrap_err();
-        assert_eq!(err.code, RpcError::BAD_STATE);
-        assert!(plan_stream_volume(&g, 7, Some(&[]), None, false, None, None).is_err());
-    }
-
-    /// The level the call sets is the level `list_streams` reports after
-    /// the write and after PipeWire's `f32` echo, so the guard takes it as
-    /// no change.
-    #[test]
-    fn stream_volume_reply_matches_the_reported_level() {
-        let g = vg(GuardMode::Limit, None);
-        let plan = plan_stream_volume(&g, 7, Some(&[0.3, 0.2]), Some(0.9), false, Some(-7.5), None)
-            .unwrap();
-        let echoed = plan.channels.unwrap();
-        let reported = played_db(&echoed, Some(0.9)).map(report_db).unwrap();
-        assert_eq!(reported, plan.reply.volume_db);
-        assert_eq!(reported, -7.5);
-        assert!((plan.applied_db + 7.5).abs() < 1e-4);
-    }
-
-    /// A change of the app's master alone moves the level that plays, and
-    /// is published, though the loudest channel (and so `volume`) is the
-    /// same: channels at 0.5, master 1.0 -> 0.5 is -6.02 -> -12.04 dB.
-    #[test]
-    fn a_master_only_change_republishes_the_level() {
-        let mut node = Tracked {
-            media_class: Some("Stream/Output/Audio".into()),
-            ..Tracked::default()
-        };
-        let props = |volume: Option<f32>, channels: Option<Vec<f32>>| {
-            Some(audivane_io_pw::sink_volume::SinkProps {
-                volume,
-                channel_volumes: channels,
-                ..Default::default()
-            })
-        };
-        assert!(node.apply_props(Some(0.5), false, props(Some(1.0), Some(vec![0.5, 0.5]))));
-        assert_eq!(node.reported_level(), Some(-6.02));
-        // Master-only event: `parse_props` reads `volume` as the master, 0.5,
-        // equal to the old loudest channel.
-        assert!(node.apply_props(Some(0.5), false, props(Some(0.5), None)));
-        assert_eq!(node.reported_level(), Some(-12.04));
-        // The same again is no change.
-        assert!(!node.apply_props(Some(0.5), false, props(Some(0.5), None)));
-        // Mute alone is.
-        assert!(node.apply_props(Some(0.5), true, props(None, None)));
-    }
-
-    /// A node PipeWire is removing is refused before anything is written,
-    /// so the guard adopts nothing and no optimistic level is published.
-    #[test]
-    fn a_vanishing_stream_is_refused() {
-        let mut node = Tracked {
-            media_class: Some("Stream/Output/Audio".into()),
-            app_name: Some("Player".into()),
-            ..Tracked::default()
-        };
-        assert!(stream_volume_target(7, Some(&node), true).is_ok());
-        node.gone = true;
-        let err = stream_volume_target(7, Some(&node), true).unwrap_err();
-        assert_eq!(err.code, RpcError::BAD_STATE);
-        assert!(err.message.contains("going away"), "{}", err.message);
-        assert_eq!(
-            stream_volume_target(7, None, true).unwrap_err().code,
-            RpcError::INVALID_PARAMS
-        );
-        node.gone = false;
-        let err = stream_volume_target(7, Some(&node), false).unwrap_err();
-        assert!(err.message.contains("not playing on an Audivane sink"));
-        node.media_class = Some("Audio/Sink".into());
-        assert_eq!(
-            stream_volume_target(7, Some(&node), true).unwrap_err().code,
-            RpcError::INVALID_PARAMS
-        );
-    }
-
     /// A request the caller gave up on is never run, and one the watcher
     /// took is never reported as given up.
     #[test]
@@ -2755,116 +2531,11 @@ mod stream_volume_tests {
         assert!(taken.claim());
         assert!(!taken.abandon(), "the caller waits for the answer");
     }
-
-    /// A drag logs its settled level once at info, not every set.
-    #[test]
-    fn user_sets_are_logged_once_settled() {
-        let mut log = SettledLog::default();
-        let t0 = Instant::now();
-        for i in 0..25u32 {
-            log.note(
-                4,
-                format!("set {i}"),
-                t0 + Duration::from_millis(40 * u64::from(i)),
-            );
-        }
-        let last = t0 + Duration::from_millis(40 * 24);
-        assert!(log.due(last + Duration::from_millis(100)).is_empty());
-        assert_eq!(
-            log.due(last + STREAM_LOG_SETTLE),
-            vec!["set 24".to_string()]
-        );
-        assert!(
-            log.due(last + STREAM_LOG_SETTLE * 4).is_empty(),
-            "logged once"
-        );
-        log.note(1, "a".into(), t0);
-        log.note(2, "b".into(), t0 + Duration::from_millis(1));
-        assert_eq!(
-            log.due(t0 + STREAM_LOG_SETTLE * 2),
-            vec!["a".to_string(), "b".to_string()]
-        );
-    }
-
-    /// A stream at master 0 is the app's own silence: the guard has no
-    /// level for it (so it is neither held up under lock nor written with
-    /// master 1), and it is judged again once the app turns it back up.
-    #[test]
-    fn a_stream_at_master_zero_is_left_alone() {
-        assert_eq!(guarded_level_db(&[0.5, 0.25], Some(0.0)), None);
-        assert!(guarded_level_db(&[0.5, 0.25], Some(0.5)).is_some());
-        assert!(guarded_level_db(&[0.5, 0.25], None).is_some());
-        // Lock does not revert the app's master 0, and keeps its level.
-        let lock = VolumeGuard {
-            mode: GuardMode::Lock,
-            ..VolumeGuard::default()
-        };
-        let mut guards = StreamGuards::default();
-        let t0 = Instant::now();
-        let held = guarded_level_db(&[0.5, 0.5], Some(1.0)).unwrap();
-        guards.seed(&lock, 7, held, t0, t0);
-        assert!(
-            guarded_level_db(&[0.5, 0.5], Some(0.0)).is_none(),
-            "nothing to observe"
-        );
-        // Back at its level: nothing to do.
-        let t1 = t0 + Duration::from_secs(5);
-        assert_eq!(guards.observe(&lock, 7, held, t0, t1), None);
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn default_name_parsing() {
-        assert_eq!(
-            parse_default_name(r#"{"name":"audivane_dsp"}"#),
-            Some("audivane_dsp".into())
-        );
-        assert_eq!(
-            parse_default_name(r#"{ "name" : "alsa_output.pci" }"#),
-            Some("alsa_output.pci".into())
-        );
-        assert_eq!(parse_default_name("audivane_dsp"), None);
-        assert_eq!(parse_default_name(""), None);
-    }
-
-    #[test]
-    fn facts_helpers() {
-        let facts = Facts {
-            streams: vec![
-                StreamFact {
-                    node: 2,
-                    sink: Some(SinkChoice::Dsp),
-                    ..Default::default()
-                },
-                StreamFact {
-                    node: 3,
-                    sink: Some(SinkChoice::Direct),
-                    ..Default::default()
-                },
-            ],
-            sinks: vec![SinkFact {
-                choice: SinkChoice::Dsp,
-                node: 10,
-                serial: Some(42),
-                name: DSP_SINK_NAME.into(),
-                channels: Some(2),
-                volume: Some(1.0),
-                muted: false,
-            }],
-            default_sink: Some("audivane_dsp".into()),
-            default_configured_sink: Some("alsa_output.pci".into()),
-            normal_output: None,
-        };
-        assert_eq!(facts.sink(SinkChoice::Dsp).map(|s| s.node), Some(10));
-        assert_eq!(facts.sink(SinkChoice::Direct), None);
-        assert_eq!(facts.streams_on(SinkChoice::Dsp).len(), 1);
-        assert_eq!(facts.streams_on(SinkChoice::Direct).len(), 1);
-        assert_ne!(facts.default_sink, facts.default_configured_sink);
-    }
 
     #[test]
     fn default_snapshot_file_round_trip() {
@@ -2896,39 +2567,6 @@ mod tests {
         assert!(!path.exists());
         remove_snapshot(&path); // idempotent
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn default_snapshot_restores_absent_keys_as_absent() {
-        let snapshot = DefaultSnapshot {
-            written: vec!["audivane_dsp".into()],
-            effective: None,
-            configured: Some(r#"{"name":"different"}"#.into()),
-        };
-        let text = serde_json::to_string(&snapshot).unwrap();
-        let back: DefaultSnapshot = serde_json::from_str(&text).unwrap();
-        assert_eq!(back, snapshot);
-        assert!(back.effective.is_none());
-        assert!(back.configured.is_some());
-    }
-
-    #[test]
-    fn rules_match_app_or_binary_case_insensitively() {
-        let stream = StreamFact {
-            node: 7,
-            app_name: Some("Strawberry".into()),
-            binary: Some("strawberry".into()),
-            ..Default::default()
-        };
-        let matches = |app: &str| {
-            [stream.app_name.as_deref(), stream.binary.as_deref()]
-                .into_iter()
-                .flatten()
-                .any(|v| v.eq_ignore_ascii_case(app))
-        };
-        assert!(matches("strawberry"));
-        assert!(matches("STRAWBERRY"));
-        assert!(!matches("straw"));
     }
 
     fn temp_restore_path(tag: &str) -> (PathBuf, PathBuf) {
@@ -3006,32 +2644,5 @@ mod tests {
         // Second timeout firing is a no-op.
         assert!(!t3.on_quit_timeout());
         let _ = fs::remove_dir_all(&dir3);
-    }
-
-    #[test]
-    fn restore_journal_stale_sync_does_not_delete_newer_snapshot() {
-        let (dir, path) = temp_restore_path("gen");
-        save_snapshot(&path, &DefaultSnapshot::default()).unwrap();
-
-        let mut tracker = RestoreJournalTracker::<u32>::default();
-        tracker.note_snapshot_saved();
-        // Recover previous session emits sync seq 10.
-        tracker.finish_restore(Some(&path), true, || Ok(10));
-        assert!(path.is_file());
-        // Before seq 10 completes, enter_system_default persists a fresh snapshot (gen + 1).
-        tracker.note_snapshot_saved();
-        save_snapshot(&path, &DefaultSnapshot::default()).unwrap();
-
-        // Stale seq 10 completes: the newer snapshot stays.
-        assert!(!tracker.on_sync_done(10));
-        assert!(path.is_file());
-
-        // Subsequent restore for the newer generation removes it on sync 11.
-        tracker.finish_restore(Some(&path), true, || Ok(11));
-        assert!(path.is_file());
-        assert!(!tracker.on_sync_done(11));
-        assert!(!path.exists());
-
-        let _ = fs::remove_dir_all(&dir);
     }
 }

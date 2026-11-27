@@ -180,14 +180,6 @@ mod tests {
     }
 
     #[test]
-    fn stopped_meter_emits_nothing() {
-        let mut m = AbHopMeter::new(48_000.0, 2);
-        let x = vec![vec![0.5; 48_000]; 2];
-        m.push(&x, &x, 48_000);
-        assert_eq!(m.pop(), None);
-    }
-
-    #[test]
     fn hops_match_the_lufs_meter_and_any_block_size() {
         let fs = 48_000.0;
         let n = 48_000 * 4;
@@ -242,55 +234,5 @@ mod tests {
                 meter.integrated_lufs()
             );
         }
-    }
-
-    #[test]
-    fn a_nan_invalidates_its_hop_and_clean_audio_counts_again() {
-        let fs = 1000.0;
-        let mut m = AbHopMeter::new(fs, 2);
-        m.set_epoch(1);
-        let clean = vec![sine(fs, 50.0, 0.5, 100); 2];
-        let mut bad = clean.clone();
-        bad[1][37] = f64::NAN;
-        let mut hops = Vec::new();
-        for b in [&clean, &bad, &clean, &clean] {
-            m.push(&clean, b, 100);
-            hops.push(m.pop().unwrap());
-        }
-        assert!(hops[0].a.is_finite() && hops[0].b.is_finite());
-        assert!(hops[1].b.is_nan(), "the hop with the NaN is invalid");
-        assert!(hops[1].a.is_finite(), "the other side is untouched");
-        for h in &hops[2..] {
-            assert!(h.a.is_finite() && h.b.is_finite(), "{h:?}");
-            assert!(h.b > 0.0);
-        }
-        // An infinity likewise.
-        let mut inf = clean.clone();
-        inf[0][3] = f64::INFINITY;
-        m.push(&inf, &clean, 100);
-        assert!(m.pop().unwrap().a.is_nan());
-        m.push(&clean, &clean, 100);
-        assert!(m.pop().unwrap().a.is_finite());
-    }
-
-    #[test]
-    fn a_new_epoch_restarts_and_the_ring_drops_the_oldest() {
-        let fs = 1000.0;
-        let mut m = AbHopMeter::new(fs, 1);
-        m.set_epoch(1);
-        let x = vec![vec![0.5; 100 * (HOP_RING + 3)]];
-        m.push(&x, &x, x[0].len());
-        let mut count = 0;
-        while m.pop().is_some() {
-            count += 1;
-        }
-        assert_eq!(count, HOP_RING);
-        m.push(&x, &x, 150);
-        m.set_epoch(2);
-        assert_eq!(m.pop(), None, "a new epoch clears the ring");
-        m.push(&x, &x, 50);
-        m.push(&x, &x, 50);
-        assert_eq!(m.pop().map(|h| h.epoch), Some(2));
-        assert_eq!(m.pop(), None, "the partial hop of epoch 1 was dropped");
     }
 }

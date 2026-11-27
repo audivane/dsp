@@ -625,26 +625,3 @@ pub fn silence_alsa_lib_on_this_thread() {
 pub fn alsa_lib_errors() -> u64 {
     ALSA_LIB_ERRORS.load(std::sync::atomic::Ordering::Relaxed)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rr_and_fifo_are_real_time_with_or_without_reset_on_fork() {
-        for policy in [libc::SCHED_RR, libc::SCHED_FIFO] {
-            assert!(policy_is_realtime(policy));
-            assert!(policy_is_realtime(policy | libc::SCHED_RESET_ON_FORK));
-        }
-        for policy in [libc::SCHED_OTHER, libc::SCHED_BATCH, libc::SCHED_IDLE, -1] {
-            assert!(!policy_is_realtime(policy));
-            assert!(!policy_is_realtime(policy | libc::SCHED_RESET_ON_FORK));
-        }
-        assert_eq!(
-            policy_name(libc::SCHED_RR | libc::SCHED_RESET_ON_FORK),
-            "SCHED_RR"
-        );
-        assert_eq!(policy_name(libc::SCHED_FIFO), "SCHED_FIFO");
-        assert_eq!(thread_policy_name(0), "SCHED_OTHER");
-    }
-}

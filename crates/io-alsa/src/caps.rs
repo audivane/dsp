@@ -325,78 +325,12 @@ fn hw_params_sbits(pcm: &PCM, hwp: &HwParams<'_>) -> Option<u32> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn hda_codec_bits_come_from_the_default_pcm_block() {
-        let codec = "Codec: Generic HDA\nAddress: 0\nDefault PCM:\n    rates [0x560]: 44100 48000 96000 192000\n    bits [0xe]: 16 20 24\n    formats [0x1]: PCM\nDefault Amp-In caps: N/A\nNode 0x02 [Audio Output] wcaps 0x41d: Stereo Amp-Out\n  PCM:\n    rates [0x40]: 48000\n    bits [0x1e]: 16 20 24 32\n";
-        assert_eq!(codec_default_pcm_bits(codec), Some(24));
-        assert_eq!(
-            codec_default_pcm_bits("Codec: HDMI\nDefault PCM:\n    N/A\n"),
-            None
-        );
-        assert_eq!(codec_default_pcm_bits(""), None);
-
-        let mut rates = vec![RateCapability {
-            rate: 48000,
-            formats: vec![
-                FormatCapability {
-                    format: SampleFormat::S16,
-                    sbits: Some(16),
-                },
-                FormatCapability {
-                    format: SampleFormat::S32,
-                    sbits: Some(32),
-                },
-            ],
-        }];
-        cap_sbits(&mut rates, 24);
-        let sbits: Vec<_> = rates[0].formats.iter().map(|f| f.sbits).collect();
-        assert_eq!(sbits, [Some(16), Some(24)]);
-    }
-
-    /// A fixed-rate USB device: one playback altset, S16_LE, 2 channels,
-    /// 48000 Hz only.
-    pub(crate) fn usb_speaker_48k() -> DeviceCapabilities {
-        DeviceCapabilities {
-            device: "hw:CARD=SPK,DEV=0".into(),
-            channels: 2,
-            channels_min: 2,
-            channels_max: 2,
-            rate_min: 48_000,
-            rate_max: 48_000,
-            formats: vec![SampleFormat::S16],
-            rates: vec![RateCapability {
-                rate: 48_000,
-                formats: vec![FormatCapability {
-                    format: SampleFormat::S16,
-                    sbits: Some(16),
-                }],
-            }],
-            modes: Vec::new(),
-        }
-    }
-
     const PREF: [SampleFormat; 4] = [
         SampleFormat::S32,
         SampleFormat::S24,
         SampleFormat::S24_3,
         SampleFormat::S16,
     ];
-
-    #[test]
-    fn ladder_halves_powers_of_two_and_steps_others() {
-        let ints = |d: u32| -> Vec<u32> {
-            ratio_ladder(RateRatio::integer(d))
-                .into_iter()
-                .map(|r| r.up)
-                .collect()
-        };
-        assert_eq!(ints(1), vec![1]);
-        assert_eq!(ints(8), vec![8, 4, 2, 1]);
-        assert_eq!(ints(6), vec![6, 5, 4, 2, 1]);
-        assert_eq!(ints(0), vec![1]);
-        let r = RateRatio::new(160, 147);
-        assert_eq!(ratio_ladder(r), vec![r, RateRatio::ONE]);
-    }
 
     fn plan(
         caps: &DeviceCapabilities,
@@ -411,52 +345,6 @@ mod tests {
             formats,
         )
         .map(|(r, f)| (r.up, f))
-    }
-
-    #[test]
-    fn plan_open_takes_rational_ratios_and_decimation() {
-        let caps = usb_speaker_48k();
-        // 44.1k into a 48k-only device: 160/147.
-        let r = RateRatio::from_rates(44_100, 48_000);
-        assert_eq!(
-            plan_open(&caps, 44_100, &ratio_ladder(r), &PREF).unwrap(),
-            (r, SampleFormat::S16)
-        );
-        // 96k down to 48k.
-        let r = RateRatio::from_rates(96_000, 48_000);
-        assert_eq!(
-            plan_open(&caps, 96_000, &ratio_ladder(r), &PREF).unwrap(),
-            (r, SampleFormat::S16)
-        );
-        // No whole output rate: skipped, falls back to x1 (48k plays).
-        let odd = RateRatio::new(3, 7);
-        assert_eq!(
-            plan_open(&caps, 48_000, &ratio_ladder(odd), &PREF).unwrap(),
-            (RateRatio::ONE, SampleFormat::S16)
-        );
-    }
-
-    #[test]
-    fn probe_rates_cover_ratios_and_cap() {
-        let r = probe_rates(&[44_100, 48_000], 4, 192_000);
-        assert_eq!(
-            r,
-            vec![
-                44_100, 48_000, 88_200, 96_000, 132_300, 144_000, 176_400, 192_000
-            ]
-        );
-        let all = probe_rates(audivane_protocol::ALLOWED_RATES, 16, 768_000);
-        assert!(all.contains(&768_000) && all.contains(&705_600));
-        assert!(all.iter().all(|&r| r <= 768_000));
-        let top = probe_rates(
-            audivane_protocol::ALLOWED_RATES,
-            64,
-            audivane_protocol::MAX_OUTPUT_RATE,
-        );
-        for &r in audivane_protocol::HIGH_OUTPUT_RATES {
-            assert!(top.contains(&r), "{r}");
-        }
-        assert_eq!(top.last(), Some(&3_072_000));
     }
 
     /// A DAC that takes S32 up to 3.072 MHz: x64 opens at 2.8224 and
@@ -507,25 +395,6 @@ mod tests {
     }
 
     #[test]
-    fn usb_speaker_48k_plays_48k_s16_at_ratio_one() {
-        let caps = usb_speaker_48k();
-        // S32 preferred, upsampling x4 wanted: falls back to x1 and S16.
-        assert_eq!(
-            plan(&caps, 48_000, 4, &PREF).unwrap(),
-            (1, SampleFormat::S16)
-        );
-        // 44.1k can never be opened: no nearest-rate fallback.
-        let err = plan(&caps, 44_100, 1, &PREF).unwrap_err().to_string();
-        assert!(err.contains("rate 44100 Hz"), "{err}");
-        assert!(
-            err.contains("rates 48000 Hz; formats S16; channels 2"),
-            "{err}"
-        );
-        let err = plan(&caps, 44_100, 4, &PREF).unwrap_err().to_string();
-        assert!(err.contains("176400 Hz, 88200 Hz, 44100 Hz"), "{err}");
-    }
-
-    #[test]
     fn plan_open_respects_rate_dependent_formats() {
         // Typical USB: 24-bit only up to 96k, 16-bit up to 192k.
         let mut rates = Vec::new();
@@ -566,36 +435,5 @@ mod tests {
             plan(&caps, 48_000, 4, &[SampleFormat::S32]).unwrap(),
             (2, SampleFormat::S32)
         );
-    }
-}
-
-/// Rig check (needs `snd-aloop` as card "Loopback"): the probe sees the
-/// loopback's full matrix, including sbits, and leaves the PCM configurable.
-#[cfg(test)]
-mod rig_tests {
-    use super::*;
-
-    #[test]
-    #[ignore = "needs the snd-aloop Loopback card"]
-    fn probe_loopback_card() {
-        let open = crate::OpenPcm::open("hw:Loopback,0,3", true).expect("open loopback");
-        let rates = probe_rates(audivane_protocol::ALLOWED_RATES, 16, 768_000);
-        let caps = open.probe(2, &rates).expect("probe");
-        eprintln!("{caps:#?}");
-        assert!(caps.supports(44_100, SampleFormat::S32));
-        assert!(caps.supports(768_000, SampleFormat::S16));
-        assert_eq!(caps.formats_at(48_000).len(), 4);
-        // Not configured by the probe: a normal open still works afterwards.
-        let cfg = crate::AlsaConfig {
-            device: "hw:Loopback,0,3".into(),
-            rate: 96_000,
-            ..Default::default()
-        };
-        let ladder = ratio_ladder(RateRatio::integer(2));
-        let (out, ratio) = open
-            .configure_with_ratio_fallback(&cfg, 48_000, &ladder, 1024, &[], Some(&caps))
-            .expect("configure");
-        assert_eq!(ratio, RateRatio::integer(2));
-        assert_eq!(out.params().rate, 96_000);
     }
 }

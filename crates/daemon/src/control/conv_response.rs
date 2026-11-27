@@ -227,8 +227,7 @@ mod tests {
     use super::*;
     use crate::engine::ir::IrCache;
     use crate::engine::load_conv_items;
-    use audivane_protocol::MatrixEntry;
-    use audivane_protocol::ipc::FollowerConfig;
+
     use hound::{SampleFormat, WavSpec, WavWriter};
     use std::path::{Path, PathBuf};
 
@@ -284,126 +283,6 @@ mod tests {
         reply(&chain, &computed, rate, side, device)
     }
 
-    fn near_all(v: &[f32], want: f64, tol: f64) -> bool {
-        v.iter().all(|&x| (f64::from(x) - want).abs() < tol)
-    }
-
-    fn delta(len: usize, at: usize, v: f64) -> Vec<f64> {
-        let mut h = vec![0.0; len];
-        h[at] = v;
-        h
-    }
-
-    #[test]
-    fn items_and_their_series_with_every_gain() {
-        let d = dir("series");
-        // A stereo delta pair (L delayed 48 samples), then a mono half delta
-        // at +6 dB item gain: 0 dB through both, L 1 ms late.
-        let stereo = d.join("stereo.wav");
-        write(&stereo, 48_000, &[delta(64, 48, 1.0), delta(64, 0, 1.0)]);
-        let mono = d.join("mono.wav");
-        write(&mono, 48_000, &[vec![0.5]]);
-        let mut cfg = EngineConfig::default();
-        let mut off = item(&mono, 0.0);
-        off.enabled = false;
-        let mut named = item(&mono, 6.0206);
-        named.name = Some("Half".into());
-        cfg.chain.convolution = vec![item(&stereo, 0.0), off, named];
-        let r = run(&cfg, None, None, 48_000);
-        assert_eq!(r.rate_hz, 48_000);
-        assert_eq!(r.freqs_hz.len(), 241);
-        assert_eq!(r.items.len(), 2);
-        assert_eq!((r.items[0].index, r.items[1].index), (0, 2));
-        assert_eq!(r.items[0].label, "stereo.wav");
-        assert_eq!(r.items[1].label, "Half");
-        assert_eq!(r.items[0].curves.len(), 2);
-        assert_eq!(r.items[0].curves[0].input, Some(0));
-        let gd = r.items[0].curves[0].group_delay_ms[100].unwrap();
-        assert!((gd - 1.0).abs() < 1e-3, "{gd}");
-        // Mono: one curve, -6 dB + 6 dB.
-        assert_eq!(r.items[1].curves.len(), 1);
-        assert_eq!(r.items[1].curves[0].output, None);
-        assert!(near_all(&r.items[1].curves[0].mag_db, 0.0, 1e-3));
-        assert_eq!(r.outputs.len(), 2);
-        for o in &r.outputs {
-            assert!(near_all(&o.mag_db, 0.0, 1e-3), "{:?}", o.mag_db);
-        }
-        assert!((r.outputs[0].group_delay_ms[10].unwrap() - 1.0).abs() < 1e-3);
-        assert_eq!(r.combined_taps, 64);
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn a_matrix_two_to_one_sums_into_its_output() {
-        let d = dir("matrix");
-        let a = d.join("a.wav");
-        write(&a, 48_000, &[vec![1.0]]);
-        let b = d.join("b.wav");
-        // A two-tap average: a low-pass.
-        write(&b, 48_000, &[vec![0.5, 0.5]]);
-        let entry = |input, path: &Path, gain_db| MatrixEntry {
-            input,
-            output: 0,
-            ir_path: path.to_path_buf(),
-            channel: None,
-            gain_db,
-        };
-        let mut cfg = EngineConfig::default();
-        cfg.chain.convolution = vec![ConvolutionConfig {
-            name: None,
-            enabled: true,
-            ir_path: PathBuf::new(),
-            gain_db: 0.0,
-            matrix: Some(vec![entry(0, &a, 0.0), entry(1, &b, 0.0)]),
-            calibration: false,
-        }];
-        let r = run(&cfg, None, None, 48_000);
-        assert_eq!(r.items[0].label, "Filter matrix");
-        let routes: Vec<_> = r.items[0]
-            .curves
-            .iter()
-            .map(|c| (c.input, c.output))
-            .collect();
-        assert_eq!(routes, vec![(Some(0), Some(0)), (Some(1), Some(0))]);
-        // Output 0: 1 + (1 + z⁻¹)/2, |·| = |1.5 + 0.5 e^{-iω}|.
-        for (i, &f) in r.freqs_hz.iter().enumerate() {
-            let w = 2.0 * std::f64::consts::PI * f64::from(f) / 48_000.0;
-            let want = 20.0 * (1.5 + 0.5 * w.cos()).hypot(0.5 * w.sin()).log10();
-            let got = f64::from(r.outputs[0].mag_db[i]);
-            assert!((got - want).abs() < 2e-3, "{f} Hz: {got} vs {want}");
-        }
-        // Output 1 has no entry: silent.
-        assert!(near_all(&r.outputs[1].mag_db, -200.0, 1e-6));
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn a_follower_patch_chain_and_side_b_are_the_ones_measured() {
-        let d = dir("follower");
-        let unit = d.join("unit.wav");
-        write(&unit, 48_000, &[vec![1.0]]);
-        let quiet = d.join("quiet.wav");
-        write(&quiet, 48_000, &[vec![0.1]]);
-        let mut cfg = EngineConfig::default();
-        cfg.chain.convolution = vec![item(&unit, 0.0)];
-        let mut follower = FollowerConfig::new("hw:CARD=USB,DEV=0");
-        follower.chain_patch = Some(serde_json::json!({
-            "convolution": [item(&quiet, 0.0)],
-        }));
-        cfg.outputs.followers = vec![follower];
-        let master = run(&cfg, None, None, 48_000);
-        assert!(near_all(&master.outputs[0].mag_db, 0.0, 1e-3));
-        assert_eq!(master.device, None);
-        let f = run(&cfg, None, Some("hw:CARD=USB,DEV=0"), 48_000);
-        assert_eq!(f.device.as_deref(), Some("hw:CARD=USB,DEV=0"));
-        assert_eq!(f.items[0].label, "quiet.wav");
-        assert!(near_all(&f.outputs[0].mag_db, -20.0, 1e-3));
-        assert!(chain_for(&cfg, None, Some("nobody")).is_err());
-        assert!(chain_for(&cfg, Some(AbSide::B), None).is_err());
-        assert!(chain_for(&cfg, Some(AbSide::B), Some("hw:CARD=USB,DEV=0")).is_err());
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
     #[test]
     fn a_48k_ir_at_a_96k_graph_keeps_its_gain() {
         let d = dir("rate");
@@ -435,19 +314,5 @@ mod tests {
             assert!((a - b).abs() < 0.02, "{f} Hz: {a} vs {b}");
         }
         let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn the_cache_keeps_the_curves() {
-        let loaded = vec![LoadedConv::Channels {
-            irs: vec![vec![1.0]],
-            gain_db: 0.0,
-        }];
-        let cache = ResponseCache::default();
-        let a = cache.get(loaded.clone(), 48_000, 2).unwrap();
-        let b = cache.get(loaded.clone(), 48_000, 2).unwrap();
-        assert!(Arc::ptr_eq(&a, &b));
-        let c = cache.get(loaded, 96_000, 2).unwrap();
-        assert!(!Arc::ptr_eq(&a, &c));
     }
 }

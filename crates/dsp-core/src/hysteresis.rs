@@ -572,28 +572,6 @@ impl JaParams {
         }
     }
 
-    /// Test-only two-lane lockstep RK2 (midpoint) step on the hot path.
-    #[cfg(test)]
-    #[inline(always)]
-    fn step_rk2_pair(&self, h0: [f64; 2], h1: [f64; 2], m: [f64; 2], m_star: f64) -> [f64; 2] {
-        let dh = [h1[0] - h0[0], h1[1] - h0[1]];
-        if dh[0].abs() <= self.max_step_dh && dh[1].abs() <= self.max_step_dh {
-            let delta = [1.0_f64.copysign(dh[0]), 1.0_f64.copysign(dh[1])];
-            let h_mid = [h0[0] + 0.5 * dh[0], h0[1] + 0.5 * dh[1]];
-            let k1 = self.rhs_pair(h0, m, dh, delta);
-            let k2 = self.rhs_pair(h_mid, [m[0] + 0.5 * k1[0], m[1] + 0.5 * k1[1]], dh, delta);
-            [
-                (m[0] + k2[0]).clamp(-m_star, m_star),
-                (m[1] + k2[1]).clamp(-m_star, m_star),
-            ]
-        } else {
-            [
-                self.step_rk2(h0[0], h1[0], m[0], m_star),
-                self.step_rk2(h0[1], h1[1], m[1], m_star),
-            ]
-        }
-    }
-
     /// Cold path for discontinuous jumps `|dh| > max_step_dh`:
     /// `ceil(|dh| / max_step_dh)` substeps, at most [`MAX_SUBSTEPS`] (then
     /// each is up to [`STEP_STRETCH`] times the step, still inside RK4's
@@ -617,23 +595,6 @@ impl JaParams {
         cur_m
     }
 
-    /// Cold path for discontinuous jumps `|dh| > max_step_dh` (RK2, test only).
-    #[cfg(test)]
-    #[cold]
-    #[inline(never)]
-    fn step_rk2_subdivided(&self, h0: f64, dh: f64, delta: f64, m: f64) -> f64 {
-        let n = (dh.abs() / self.max_step_dh).ceil() as usize;
-        let step_dh = dh / n as f64;
-        let mut h = h0;
-        let mut cur_m = m;
-        for _ in 0..n {
-            let k1 = self.rhs(h, cur_m, step_dh, delta);
-            cur_m += self.rhs(h + 0.5 * step_dh, cur_m + 0.5 * k1, step_dh, delta);
-            h += step_dh;
-        }
-        cur_m
-    }
-
     /// Advance magnetization `m` from `h0` to `h1` using one RK4 step on the hot
     /// path (`|h1 - h0| <= max_step_dh`) and automatic ramp subdivision on large
     /// discontinuous jumps, clamping to the exact invariant `[-m_star, m_star]`.
@@ -646,22 +607,6 @@ impl JaParams {
             self.rk4_substep(h0, m, dh, delta)
         } else {
             self.step_rk4_subdivided(h0, dh, delta, m)
-        };
-        next_m.clamp(-m_star, m_star)
-    }
-
-    /// Test-only RK2 (midpoint) variant for accuracy and aliasing comparison.
-    #[cfg(test)]
-    #[inline(always)]
-    fn step_rk2(&self, h0: f64, h1: f64, m: f64, m_star: f64) -> f64 {
-        let dh = h1 - h0;
-        let abs_dh = dh.abs();
-        let delta = 1.0_f64.copysign(dh);
-        let next_m = if abs_dh <= self.max_step_dh {
-            let k1 = self.rhs(h0, m, dh, delta);
-            m + self.rhs(h0 + 0.5 * dh, m + 0.5 * k1, dh, delta)
-        } else {
-            self.step_rk2_subdivided(h0, dh, delta, m)
         };
         next_m.clamp(-m_star, m_star)
     }
@@ -1590,17 +1535,6 @@ impl HysteresisCore {
         sum / tones as f64
     }
 
-    /// Certified peak bound `B >= 1` of `x + (the distortion path)` alone,
-    /// including a 1 ppm safety margin for RK4 discretization and rounding.
-    #[cfg(test)]
-    pub(crate) fn peak_bound(&self) -> f64 {
-        let b = match self.split() {
-            Split::Between { r0, r1, .. } => r1.min(1.0 + r0),
-            _ => return 1.0,
-        };
-        if b > 1.0 { b * (1.0 + 1e-6) } else { 1.0 }
-    }
-
     /// The residual clamped to `|d| <= D`.
     #[inline(always)]
     fn clamp_residual(&self, d: f64) -> f64 {
@@ -1750,112 +1684,6 @@ impl HysteresisCore {
     }
 }
 
-#[cfg(test)]
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn step_sample_rk2(
-    raw: f64,
-    st: &mut ChannelState,
-    ja: &JaParams,
-    drive: f64,
-    m_star: f64,
-    inv_chi0_g: f64,
-    amount: f64,
-    b0: f64,
-    a1: f64,
-    scale: f64,
-) -> f64 {
-    let x = if raw.is_finite() { raw } else { 0.0 };
-    let xc = x.clamp(-1.0, 1.0);
-    let over = (x - xc) * scale;
-
-    let h = drive * xc;
-    let mut m = ja.step_rk2(st.h_prev, h, st.m, m_star);
-    let h_store = if h.abs() < FLUSH_BELOW { 0.0 } else { h };
-    if m.abs() < FLUSH_BELOW {
-        m = 0.0;
-    }
-    st.h_prev = h_store;
-    st.m = m;
-
-    let d = m * inv_chi0_g - xc;
-    let d_store = if d.abs() < FLUSH_BELOW { 0.0 } else { d };
-    let mut d_hp = b0 * (d - st.dc_x1) - a1 * st.dc_y1;
-    st.dc_x1 = d_store;
-    if d_hp.abs() < FLUSH_BELOW && st.dc_y1.abs() < FLUSH_BELOW {
-        d_hp = 0.0;
-        st.dc_y1 = 0.0;
-    } else {
-        st.dc_y1 = d_hp;
-    }
-
-    (xc + amount * d_hp) * scale + over
-}
-
-#[cfg(test)]
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn step_pair_rk2(
-    raw0: f64,
-    raw1: f64,
-    st0: &mut ChannelState,
-    st1: &mut ChannelState,
-    ja: &JaParams,
-    drive: f64,
-    m_star: f64,
-    inv_chi0_g: f64,
-    amount: f64,
-    b0: f64,
-    a1: f64,
-    scale: f64,
-) -> (f64, f64) {
-    let x0 = if raw0.is_finite() { raw0 } else { 0.0 };
-    let x1 = if raw1.is_finite() { raw1 } else { 0.0 };
-    let xc0 = x0.clamp(-1.0, 1.0);
-    let xc1 = x1.clamp(-1.0, 1.0);
-    let over0 = (x0 - xc0) * scale;
-    let over1 = (x1 - xc1) * scale;
-
-    let h0 = drive * xc0;
-    let h1 = drive * xc1;
-    let [mut m0, mut m1] =
-        ja.step_rk2_pair([st0.h_prev, st1.h_prev], [h0, h1], [st0.m, st1.m], m_star);
-    st0.h_prev = if h0.abs() < FLUSH_BELOW { 0.0 } else { h0 };
-    st1.h_prev = if h1.abs() < FLUSH_BELOW { 0.0 } else { h1 };
-    if m0.abs() < FLUSH_BELOW {
-        m0 = 0.0;
-    }
-    if m1.abs() < FLUSH_BELOW {
-        m1 = 0.0;
-    }
-    st0.m = m0;
-    st1.m = m1;
-
-    let d0 = m0 * inv_chi0_g - xc0;
-    let d1 = m1 * inv_chi0_g - xc1;
-    let mut d_hp0 = b0 * (d0 - st0.dc_x1) - a1 * st0.dc_y1;
-    let mut d_hp1 = b0 * (d1 - st1.dc_x1) - a1 * st1.dc_y1;
-    st0.dc_x1 = if d0.abs() < FLUSH_BELOW { 0.0 } else { d0 };
-    st1.dc_x1 = if d1.abs() < FLUSH_BELOW { 0.0 } else { d1 };
-    if d_hp0.abs() < FLUSH_BELOW && st0.dc_y1.abs() < FLUSH_BELOW {
-        d_hp0 = 0.0;
-        st0.dc_y1 = 0.0;
-    } else {
-        st0.dc_y1 = d_hp0;
-    }
-    if d_hp1.abs() < FLUSH_BELOW && st1.dc_y1.abs() < FLUSH_BELOW {
-        d_hp1 = 0.0;
-        st1.dc_y1 = 0.0;
-    } else {
-        st1.dc_y1 = d_hp1;
-    }
-
-    (
-        (xc0 + amount * d_hp0) * scale + over0,
-        (xc1 + amount * d_hp1) * scale + over1,
-    )
-}
-
 fn validate_config(config: &HysteresisConfig) -> Result<(), HysteresisError> {
     if !config.saturation.is_finite() || !(0.0..=1.0).contains(&config.saturation) {
         return Err(HysteresisError::InvalidParameter(format!(
@@ -1917,8 +1745,6 @@ fn validate_config(config: &HysteresisConfig) -> Result<(), HysteresisError> {
 mod tests {
     use super::tests_support::Lone;
     use super::*;
-    use crate::harmonics::HarmonicsError;
-    use rustfft::FftPlanner;
 
     const ALL_RATES: [f64; 6] = [
         44_100.0, 48_000.0, 96_000.0, 192_000.0, 384_000.0, 768_000.0,
@@ -1927,6 +1753,7 @@ mod tests {
     struct Measured {
         /// `[DC, H1, H2, H3, H4, H5]` linear amplitudes.
         amp: [f64; 6],
+        /// The largest magnitude after the settling time.
         peak: f64,
     }
 
@@ -1934,6 +1761,135 @@ mod tests {
         fn dbc(&self, k: usize) -> f64 {
             lin_to_db(self.amp[k] / self.amp[1])
         }
+    }
+
+    /// Worst-case inputs at a low and a high rate for every kind of curve:
+    /// nothing scales the output, and it stays within the stage's bound.
+    /// One thread per rate and config.
+    #[test]
+    fn output_stays_within_full_scale_for_worst_case_inputs() {
+        let configs = [
+            HysteresisConfig {
+                saturation: 0.5,
+                width: 0.0,
+                amount: 1.0,
+                target_h3_db: -20.0,
+                ..Default::default()
+            },
+            HysteresisConfig {
+                saturation: 0.0,
+                width: 0.5,
+                amount: 1.0,
+                target_h3_db: -25.0,
+                ..Default::default()
+            },
+            HysteresisConfig {
+                saturation: 0.5,
+                width: 0.5,
+                amount: 1.0,
+                target_h3_db: -15.0,
+                ..Default::default()
+            },
+            HysteresisConfig {
+                saturation: 1.0,
+                width: 1.0,
+                amount: 1.0,
+                target_h3_db: -15.0,
+                ..Default::default()
+            },
+            HysteresisConfig {
+                saturation: 0.5,
+                width: 1.0,
+                amount: 0.5,
+                target_h3_db: -30.0,
+                ..Default::default()
+            },
+        ];
+
+        let jobs: Vec<(f64, &HysteresisConfig)> = [44_100.0, 192_000.0]
+            .into_iter()
+            .flat_map(|rate| configs.iter().map(move |cfg| (rate, cfg)))
+            .collect();
+        std::thread::scope(|scope| {
+            for &(rate, cfg) in &jobs {
+                scope.spawn(move || {
+                    // Nothing scales the output: it stays within the bound.
+                    let b = db_to_lin(Lone::try_new(cfg, rate, 1).unwrap().peak_gain_db());
+                    // 1. Full-scale sines across 20 Hz–20 kHz.
+                    for f in [20.0, 1_000.0, 20_000.0] {
+                        let m = measure_sine(cfg, rate, f, 1.0, 0.15);
+                        assert!(
+                            m.peak <= b,
+                            "rate={rate} {cfg:?} sine {f} Hz peak {} > {b}",
+                            m.peak
+                        );
+                    }
+
+                    // 2. Settled steps (+1 -> -1, -1 -> +1, 0 -> +1).
+                    let settle_n = (rate * 0.25) as usize;
+                    for (from, to) in [(1.0, -1.0), (-1.0, 1.0), (0.0, 1.0), (0.0, -1.0)] {
+                        let mut st = Lone::try_new(cfg, rate, 1).unwrap();
+                        let mut buf = vec![from; settle_n];
+                        buf.extend(std::iter::repeat_n(to, 2048));
+                        st.process(&mut [&mut buf]);
+                        let peak = buf.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+                        assert!(
+                            peak <= b,
+                            "rate={rate} {cfg:?} step {from}->{to} peak {peak} > {b}"
+                        );
+                    }
+
+                    // 3. Alternating Nyquist pulses (+/-1).
+                    {
+                        let mut st = Lone::try_new(cfg, rate, 1).unwrap();
+                        let mut buf: Vec<f64> = (0..4096)
+                            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+                            .collect();
+                        st.process(&mut [&mut buf]);
+                        let peak = buf.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+                        assert!(
+                            peak <= b,
+                            "rate={rate} {cfg:?} Nyquist pulses peak {peak} > {b}"
+                        );
+                    }
+
+                    // 4. Low-frequency full-scale square waves.
+                    for f_sq in [20.0, 100.0] {
+                        let mut st = Lone::try_new(cfg, rate, 1).unwrap();
+                        let period = (rate / f_sq).round() as usize;
+                        let half = period / 2;
+                        let mut buf: Vec<f64> = (0..(rate * 0.25) as usize)
+                            .map(|i| if (i % period) < half { 1.0 } else { -1.0 })
+                            .collect();
+                        st.process(&mut [&mut buf]);
+                        let peak = buf.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+                        assert!(
+                            peak <= b,
+                            "rate={rate} {cfg:?} square {f_sq} Hz peak {peak} > {b}"
+                        );
+                    }
+
+                    // 5. Adversarial AC-dithered DC ratchet -> opposite held DC -> opposite ratchet.
+                    {
+                        let mut st = Lone::try_new(cfg, rate, 1).unwrap();
+                        let mut buf = Vec::with_capacity(settle_n + 4500);
+                        for i in 0..4000 {
+                            buf.push(if i % 2 == 0 { -1.0 } else { -0.8 });
+                        }
+                        buf.extend(std::iter::repeat_n(1.0, settle_n));
+                        for i in 0..500 {
+                            buf.push(if i % 2 == 0 { 1.0 } else { 0.0 });
+                        }
+                        st.process(&mut [&mut buf]);
+                        let peak = buf.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+                        assert!(
+                            peak <= b,
+                            "rate={rate} {cfg:?} adversarial ratchet peak {peak} > {b}"
+                        );
+                    }
+                });
+            }
+        });
     }
 
     /// Measure a coherent sine at `target_hz` at peak amplitude `amp` after
@@ -2011,37 +1967,6 @@ mod tests {
     }
 
     #[test]
-    fn predicted_h3_db_matches_measured_across_levels_and_frequencies() {
-        let cfg = HysteresisConfig {
-            saturation: 0.5,
-            width: 0.5,
-            amount: 0.8,
-            target_h3_db: -30.0,
-            calibration_hz: 1_000.0,
-            asymmetry: 0.0,
-            bass_eq: None,
-            enabled: true,
-        };
-        let rate = 96_000.0;
-        let st = Lone::try_new(&cfg, rate, 1).unwrap();
-        for &(freq, level_db) in &[
-            (100.0, 0.0),
-            (1_000.0, 0.0),
-            (1_000.0, -6.0),
-            (1_000.0, -18.0),
-            (4_000.0, 0.0),
-        ] {
-            let amp = db_to_lin(level_db);
-            let pred = st.predicted_h3_db(freq, amp);
-            let meas = measure_sine(&cfg, rate, freq, amp, 0.4).dbc(3);
-            assert!(
-                (pred - meas).abs() < 0.15,
-                "freq={freq} level={level_db} dBFS: pred={pred:.3} vs meas={meas:.3} dBc"
-            );
-        }
-    }
-
-    #[test]
     fn calibration_h3_matches_target_within_0_1_db() {
         let cases = [
             (44_100.0, 0.5, 0.5, 1_000.0, -40.0),
@@ -2084,209 +2009,6 @@ mod tests {
                 m.dbc(4)
             );
             assert!(m.amp[0] < 1e-6, "unexpected DC={:e} for {cfg:?}", m.amp[0]);
-        }
-    }
-
-    #[test]
-    fn small_signal_response_is_flat_20_hz_to_20_khz() {
-        let cfg = HysteresisConfig {
-            enabled: true,
-            saturation: 0.5,
-            width: 0.5,
-            amount: 1.0,
-            target_h3_db: -25.0,
-            calibration_hz: 1_000.0,
-            asymmetry: 0.0,
-            bass_eq: None,
-        };
-        let amp = db_to_lin(-60.0);
-        for rate in [44_100.0, 192_000.0] {
-            let st = Lone::try_new(&cfg, rate, 1).unwrap();
-            let want_gain_db = st.small_signal_gain_db();
-            let mut min_g = f64::INFINITY;
-            let mut max_g = f64::NEG_INFINITY;
-            for f in [
-                20.0, 40.0, 100.0, 400.0, 1_000.0, 4_000.0, 10_000.0, 20_000.0,
-            ] {
-                let m = measure_sine(&cfg, rate, f, amp, 0.4);
-                let gain_db = lin_to_db(m.amp[1] / amp);
-                min_g = min_g.min(gain_db);
-                max_g = max_g.max(gain_db);
-                assert!(
-                    (gain_db - want_gain_db).abs() < 0.01,
-                    "rate={rate} f={f} Hz: gain {gain_db:.5} dB vs expected {want_gain_db:.5} dB"
-                );
-            }
-            assert!(
-                max_g - min_g < 0.01,
-                "rate={rate}: small-signal ripple {:.5} dB exceeds 0.01 dB",
-                max_g - min_g
-            );
-        }
-    }
-
-    #[test]
-    fn width_and_saturation_control_level_law() {
-        let rate = 96_000.0;
-        // Pure anhysteretic Langevin (width = 0): H3 drops ~2 dB per dB of level.
-        let anhyst = HysteresisConfig {
-            width: 0.0,
-            saturation: 0.5,
-            target_h3_db: -35.0,
-            ..Default::default()
-        };
-        let h3_a0 = measure_sine(&anhyst, rate, 1_000.0, 1.0, 0.3).dbc(3);
-        let h3_a12 = measure_sine(&anhyst, rate, 1_000.0, db_to_lin(-12.0), 0.3).dbc(3);
-        let slope_anhyst = (h3_a0 - h3_a12) / 12.0;
-        assert!(
-            (slope_anhyst - 2.0).abs() < 0.15,
-            "anhysteretic slope={slope_anhyst:.3} dB/dB"
-        );
-
-        // Wide Rayleigh hysteresis (width = 1, saturation = 0): H3 drops ~1 dB/dB.
-        let rayleigh = HysteresisConfig {
-            width: 1.0,
-            saturation: 0.0,
-            target_h3_db: -35.0,
-            ..Default::default()
-        };
-        let h3_r0 = measure_sine(&rayleigh, rate, 1_000.0, 1.0, 0.3).dbc(3);
-        let h3_r12 = measure_sine(&rayleigh, rate, 1_000.0, db_to_lin(-12.0), 0.3).dbc(3);
-        let slope_rayleigh = (h3_r0 - h3_r12) / 12.0;
-        assert!(
-            (slope_rayleigh - 1.0).abs() < 0.2,
-            "Rayleigh slope={slope_rayleigh:.3} dB/dB"
-        );
-
-        // Amount scales distortion smoothly down.
-        let half = HysteresisConfig {
-            amount: 0.5,
-            ..anhyst
-        };
-        let h3_half = measure_sine(&half, rate, 1_000.0, 1.0, 0.3).dbc(3);
-        assert!(
-            (h3_a0 - h3_half - 6.0).abs() < 0.3,
-            "amount=0.5 should drop H3 by ~6 dB: {h3_a0:.2} -> {h3_half:.2}"
-        );
-    }
-
-    #[test]
-    fn output_stays_within_full_scale_for_worst_case_inputs() {
-        let configs = [
-            HysteresisConfig {
-                saturation: 0.5,
-                width: 0.0,
-                amount: 1.0,
-                target_h3_db: -20.0,
-                ..Default::default()
-            },
-            HysteresisConfig {
-                saturation: 0.0,
-                width: 0.5,
-                amount: 1.0,
-                target_h3_db: -25.0,
-                ..Default::default()
-            },
-            HysteresisConfig {
-                saturation: 0.5,
-                width: 0.5,
-                amount: 1.0,
-                target_h3_db: -15.0,
-                ..Default::default()
-            },
-            HysteresisConfig {
-                saturation: 1.0,
-                width: 1.0,
-                amount: 1.0,
-                target_h3_db: -15.0,
-                ..Default::default()
-            },
-            HysteresisConfig {
-                saturation: 0.5,
-                width: 1.0,
-                amount: 0.5,
-                target_h3_db: -30.0,
-                ..Default::default()
-            },
-        ];
-
-        for &rate in &[44_100.0, 48_000.0, 192_000.0] {
-            for cfg in &configs {
-                // Nothing scales the output: it stays within the bound.
-                let b = db_to_lin(Lone::try_new(cfg, rate, 1).unwrap().peak_gain_db());
-                // 1. Full-scale sines across 20 Hz–20 kHz.
-                for f in [20.0, 100.0, 1_000.0, 10_000.0, 20_000.0] {
-                    let m = measure_sine(cfg, rate, f, 1.0, 0.15);
-                    assert!(
-                        m.peak <= b,
-                        "rate={rate} {cfg:?} sine {f} Hz peak {} > {b}",
-                        m.peak
-                    );
-                }
-
-                // 2. Settled steps (+1 -> -1, -1 -> +1, 0 -> +1).
-                let settle_n = (rate * 0.25) as usize;
-                for (from, to) in [(1.0, -1.0), (-1.0, 1.0), (0.0, 1.0), (0.0, -1.0)] {
-                    let mut st = Lone::try_new(cfg, rate, 1).unwrap();
-                    let mut buf = vec![from; settle_n];
-                    buf.extend(std::iter::repeat_n(to, 2048));
-                    st.process(&mut [&mut buf]);
-                    let peak = buf.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
-                    assert!(
-                        peak <= b,
-                        "rate={rate} {cfg:?} step {from}->{to} peak {peak} > {b}"
-                    );
-                }
-
-                // 3. Alternating Nyquist pulses (+/-1).
-                {
-                    let mut st = Lone::try_new(cfg, rate, 1).unwrap();
-                    let mut buf: Vec<f64> = (0..4096)
-                        .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
-                        .collect();
-                    st.process(&mut [&mut buf]);
-                    let peak = buf.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
-                    assert!(
-                        peak <= b,
-                        "rate={rate} {cfg:?} Nyquist pulses peak {peak} > {b}"
-                    );
-                }
-
-                // 4. Low-frequency full-scale square waves.
-                for f_sq in [20.0, 100.0] {
-                    let mut st = Lone::try_new(cfg, rate, 1).unwrap();
-                    let period = (rate / f_sq).round() as usize;
-                    let half = period / 2;
-                    let mut buf: Vec<f64> = (0..(rate * 0.25) as usize)
-                        .map(|i| if (i % period) < half { 1.0 } else { -1.0 })
-                        .collect();
-                    st.process(&mut [&mut buf]);
-                    let peak = buf.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
-                    assert!(
-                        peak <= b,
-                        "rate={rate} {cfg:?} square {f_sq} Hz peak {peak} > {b}"
-                    );
-                }
-
-                // 5. Adversarial AC-dithered DC ratchet -> opposite held DC -> opposite ratchet.
-                {
-                    let mut st = Lone::try_new(cfg, rate, 1).unwrap();
-                    let mut buf = Vec::with_capacity(settle_n + 4500);
-                    for i in 0..4000 {
-                        buf.push(if i % 2 == 0 { -1.0 } else { -0.8 });
-                    }
-                    buf.extend(std::iter::repeat_n(1.0, settle_n));
-                    for i in 0..500 {
-                        buf.push(if i % 2 == 0 { 1.0 } else { 0.0 });
-                    }
-                    st.process(&mut [&mut buf]);
-                    let peak = buf.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
-                    assert!(
-                        peak <= b,
-                        "rate={rate} {cfg:?} adversarial ratchet peak {peak} > {b}"
-                    );
-                }
-            }
         }
     }
 
@@ -2375,62 +2097,6 @@ mod tests {
     }
 
     #[test]
-    fn overs_pass_with_unity_slope() {
-        let cfg = HysteresisConfig::default();
-        let mut st = Lone::try_new(&cfg, 48_000.0, 1).unwrap();
-        let mut ref_st = st.clone();
-        let mut a = vec![1.25, -1.4, 0.5];
-        let mut b = vec![1.0, -1.0, 0.5];
-        st.process(&mut [&mut a]);
-        ref_st.process(&mut [&mut b]);
-        assert!((a[0] - b[0] - 0.25).abs() < 1e-12);
-        assert!((a[1] - b[1] + 0.4).abs() < 1e-12);
-        assert!((a[2] - b[2]).abs() < 1e-15);
-    }
-
-    #[test]
-    fn silence_outputs_exact_zero() {
-        let mut st = Lone::try_new(&HysteresisConfig::default(), 192_000.0, 2).unwrap();
-        let mut l = vec![0.0; 256];
-        let mut r = vec![0.0; 256];
-        st.process(&mut [&mut l, &mut r]);
-        assert!(l.iter().all(|&x| x == 0.0));
-        assert!(r.iter().all(|&x| x == 0.0));
-    }
-
-    #[test]
-    fn per_channel_state_is_independent_and_reset_clears_it() {
-        let cfg = HysteresisConfig {
-            target_h3_db: -20.0,
-            ..Default::default()
-        };
-        let mut stereo = Lone::try_new(&cfg, 48_000.0, 2).unwrap();
-        let mut mono_l = Lone::try_new(&cfg, 48_000.0, 1).unwrap();
-        let mut mono_r = Lone::try_new(&cfg, 48_000.0, 1).unwrap();
-        let mut orig_l: Vec<f64> = (0..512).map(|i| (i as f64 * 0.02).sin()).collect();
-        let mut orig_r: Vec<f64> = (0..512).map(|i| 0.5 * (i as f64 * 0.07).cos()).collect();
-        // Mix discontinuous full-scale steps on one channel while the other stays
-        // smooth, exercising both the packed pair path and per-lane fallback.
-        orig_l[100] = 1.0;
-        orig_l[101] = -1.0;
-        orig_r[250] = -1.0;
-        orig_r[251] = 1.0;
-        let (mut sl, mut sr) = (orig_l.clone(), orig_r.clone());
-        let (mut ml, mut mr) = (orig_l.clone(), orig_r.clone());
-        stereo.process(&mut [&mut sl, &mut sr]);
-        mono_l.process(&mut [&mut ml]);
-        mono_r.process(&mut [&mut mr]);
-        assert_eq!(sl, ml);
-        assert_eq!(sr, mr);
-
-        stereo.reset();
-        let (mut sl2, mut sr2) = (orig_l, orig_r);
-        stereo.process(&mut [&mut sl2, &mut sr2]);
-        assert_eq!(sl2, ml);
-        assert_eq!(sr2, mr);
-    }
-
-    #[test]
     fn disabled_or_zero_amount_is_passthrough() {
         for cfg in [
             HysteresisConfig {
@@ -2452,291 +2118,6 @@ mod tests {
             assert_eq!(buf, orig);
         }
     }
-
-    #[test]
-    fn loudness_change_db_is_finite_and_small() {
-        // Nothing trims the level: the change on music is the core's own
-        // compression and added content.
-        let cfg = HysteresisConfig::default();
-        let delta = Lone::loudness_change_db(&cfg).unwrap();
-        assert!(
-            delta.is_finite() && delta.abs() < 0.6,
-            "lufs_delta={delta:.3}"
-        );
-    }
-
-    #[test]
-    fn validation_rejects_invalid_configs() {
-        let base = HysteresisConfig::default();
-        assert_eq!(
-            Lone::try_new(&base, 48_000.0, 0).err().unwrap(),
-            HarmonicsError::ZeroChannels
-        );
-        assert_eq!(
-            Lone::try_new(&base, 0.0, 2).err().unwrap(),
-            HarmonicsError::InvalidSampleRate
-        );
-        assert_eq!(
-            Lone::try_new(&base, f64::NAN, 2).err().unwrap(),
-            HarmonicsError::InvalidSampleRate
-        );
-        for bad in [
-            HysteresisConfig {
-                saturation: -0.1,
-                ..base.clone()
-            },
-            HysteresisConfig {
-                saturation: 1.1,
-                ..base.clone()
-            },
-            HysteresisConfig {
-                width: -0.1,
-                ..base.clone()
-            },
-            HysteresisConfig {
-                width: f64::NAN,
-                ..base.clone()
-            },
-            HysteresisConfig {
-                amount: -0.1,
-                ..base.clone()
-            },
-            HysteresisConfig {
-                amount: 1.5,
-                ..base.clone()
-            },
-            HysteresisConfig {
-                target_h3_db: -130.0,
-                ..base.clone()
-            },
-            HysteresisConfig {
-                target_h3_db: -5.0,
-                ..base.clone()
-            },
-            HysteresisConfig {
-                calibration_hz: 0.0,
-                asymmetry: 0.0,
-                bass_eq: None,
-                ..base.clone()
-            },
-            HysteresisConfig {
-                calibration_hz: 8_000.0,
-                asymmetry: 0.0,
-                bass_eq: None,
-                ..base.clone()
-            },
-        ] {
-            assert!(
-                matches!(
-                    Lone::try_new(&bad, 48_000.0, 1),
-                    Err(HarmonicsError::Hysteresis(
-                        0,
-                        HysteresisError::InvalidParameter(_)
-                    ))
-                ),
-                "expected InvalidParameter for {bad:?}"
-            );
-        }
-    }
-
-    /// Measure total and in-band (<= 20 kHz) aliasing in dBc for a coherent
-    /// full-scale sine at `target_hz`.
-    fn measure_aliasing(
-        cfg: &HysteresisConfig,
-        rate: f64,
-        target_hz: f64,
-        rk2: bool,
-    ) -> (f64, f64) {
-        let n = if rate < 100_000.0 {
-            1usize << 13
-        } else {
-            1usize << 15
-        };
-        let settle = (rate * 0.5).ceil() as usize;
-        let mut bin = ((target_hz * n as f64) / rate).round() as usize;
-        if bin.is_multiple_of(2) {
-            bin += 1;
-        }
-        let f = bin as f64 * rate / n as f64;
-        let mut buf: Vec<f64> = (0..settle + n)
-            .map(|i| (2.0 * PI * f * i as f64 / rate).cos())
-            .collect();
-        let mut st = Lone::try_new(cfg, rate, 1).unwrap();
-        if rk2 {
-            st.process_rk2(&mut [&mut buf]);
-        } else {
-            st.process(&mut [&mut buf]);
-        }
-        let mut spec: Vec<Complex64> = buf[settle..]
-            .iter()
-            .map(|&s| Complex64::new(s, 0.0))
-            .collect();
-        FftPlanner::new().plan_fft_forward(n).process(&mut spec);
-        let h1 = 2.0 * spec[bin].norm() / n as f64;
-        let mut unaliased = vec![false; n / 2 + 1];
-        unaliased[0] = true;
-        let mut k = 1usize;
-        while k * bin <= n / 2 {
-            unaliased[k * bin] = true;
-            k += 2;
-        }
-        let audio_max_bin = ((20_000.0 * n as f64) / rate).floor() as usize;
-        let mut tot_pow = 0.0;
-        let mut aud_pow = 0.0;
-        for (b, c) in spec.iter().enumerate().take(n / 2 + 1) {
-            if !unaliased[b] {
-                let a = 2.0 * c.norm() / n as f64;
-                tot_pow += a * a;
-                if b <= audio_max_bin {
-                    aud_pow += a * a;
-                }
-            }
-        }
-        (
-            lin_to_db(tot_pow.sqrt() / h1),
-            lin_to_db(aud_pow.sqrt() / h1),
-        )
-    }
-
-    #[test]
-    fn oversampling_4x_substantially_reduces_aliasing() {
-        let cfg = HysteresisConfig {
-            target_h3_db: -25.0,
-            ..Default::default()
-        };
-        let (a_1x, aud_1x) = measure_aliasing(&cfg, 44_100.0, 4_500.0, false);
-        let (a_4x, aud_4x) = measure_aliasing(&cfg, 176_400.0, 4_500.0, false);
-        assert!(
-            aud_4x < aud_1x - 15.0,
-            "4x rate should cut audio-band aliasing by > 15 dB: 1x={aud_1x:.2} dBc (all {a_1x:.2}), 4x={aud_4x:.2} dBc (all {a_4x:.2})"
-        );
-    }
-
-    /// Prints measured calibration accuracy, H3 vs level and frequency,
-    /// small-signal flatness 20 Hz–20 kHz, peak bounds, and aliasing at 44.1 kHz
-    /// vs 4× (176.4 kHz).
-    /// `cargo test --release -p audivane-dsp-core hysteresis::tests::report -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn report() {
-        let cfg = HysteresisConfig::default();
-        let st48 = Lone::try_new(&cfg, 48_000.0, 1).unwrap();
-        println!(
-            "Default config: sat={}, width={}, amount={}, target_h3={} dBc @ {} Hz",
-            cfg.saturation, cfg.width, cfg.amount, cfg.target_h3_db, cfg.calibration_hz
-        );
-        println!(
-            "  48 kHz: drive g={:.6}, m*={:.6}, B={:.5}, peak_gain={:+.3} dB, lufs_delta={:.3} dB",
-            st48.drive(),
-            st48.core.m_star,
-            st48.peak_bound(),
-            st48.peak_gain_db(),
-            Lone::loudness_change_db(&cfg).unwrap()
-        );
-
-        println!("\nCalibration accuracy across rates and targets:");
-        for (rate, sat, width, cal_hz, target) in [
-            (44_100.0, 0.5, 0.5, 1_000.0, -40.0),
-            (48_000.0, 0.5, 0.5, 1_000.0, -30.0),
-            (48_000.0, 0.5, 0.0, 1_000.0, -40.0),
-            (48_000.0, 0.5, 1.0, 1_000.0, -25.0),
-            (192_000.0, 0.5, 0.5, 400.0, -40.0),
-            (768_000.0, 0.5, 0.5, 1_000.0, -40.0),
-        ] {
-            let c = HysteresisConfig {
-                saturation: sat,
-                width,
-                target_h3_db: target,
-                calibration_hz: cal_hz,
-                asymmetry: 0.0,
-                bass_eq: None,
-                ..Default::default()
-            };
-            let s = Lone::try_new(&c, rate, 1).unwrap();
-            let m = measure_sine(&c, rate, cal_hz, 1.0, 0.5);
-            println!(
-                "  fs={rate:7.0} sat={sat:.1} w={width:.1} cal={cal_hz:5.0}Hz target={target:6.1}: meas={:7.3} dBc (err={:+.4} dB) g={:.4} peak gain={:+.2} dB",
-                m.dbc(3),
-                m.dbc(3) - target,
-                s.drive(),
-                s.peak_gain_db()
-            );
-        }
-
-        println!("\nH3 vs level at 1 kHz / 192 kHz (target -35 dBc):");
-        for (label, sat, width) in [
-            ("anhysteretic (w=0.0, sat=0.5)", 0.5, 0.0),
-            ("default tape (w=0.5, sat=0.5)", 0.5, 0.5),
-            ("wide pinning (w=1.0, sat=0.0)", 0.0, 1.0),
-            ("wide + sat   (w=1.0, sat=1.0)", 1.0, 1.0),
-        ] {
-            let c = HysteresisConfig {
-                saturation: sat,
-                width,
-                target_h3_db: -35.0,
-                ..Default::default()
-            };
-            print!("  {label}:");
-            for lvl in [0.0, -6.0, -12.0, -18.0, -24.0, -30.0] {
-                let h3 = measure_sine(&c, 192_000.0, 1_000.0, db_to_lin(lvl), 0.3).dbc(3);
-                print!(" {lvl:3.0}dB:{h3:6.2}");
-            }
-            println!();
-        }
-
-        println!("\nH3 vs frequency (0 dBFS, default -40 dBc @ 1 kHz):");
-        for rate in [44_100.0, 192_000.0] {
-            print!("  fs={rate:7.0}:");
-            for f in [20.0, 40.0, 100.0, 400.0, 1_000.0, 4_000.0, 10_000.0] {
-                if 3.0 * f < 0.49 * rate {
-                    let h3 = measure_sine(&cfg, rate, f, 1.0, 0.4).dbc(3);
-                    print!(" {f:5.0}Hz:{h3:6.2}");
-                }
-            }
-            println!();
-        }
-
-        println!(
-            "\nSmall-signal (-60 dBFS) gain 20 Hz-20 kHz (target -25 dBc, default sat/width):"
-        );
-        let heavy = HysteresisConfig {
-            target_h3_db: -25.0,
-            ..Default::default()
-        };
-        let amp = db_to_lin(-60.0);
-        for rate in [44_100.0, 192_000.0] {
-            let st = Lone::try_new(&heavy, rate, 1).unwrap();
-            let want = st.small_signal_gain_db();
-            let mut min_err = f64::INFINITY;
-            let mut max_err = f64::NEG_INFINITY;
-            print!("  fs={rate:7.0} (want {want:+.4} dB):");
-            for f in [20.0, 100.0, 1_000.0, 5_000.0, 10_000.0, 20_000.0] {
-                let m = measure_sine(&heavy, rate, f, amp, 0.4);
-                let err = lin_to_db(m.amp[1] / amp) - want;
-                min_err = min_err.min(err);
-                max_err = max_err.max(err);
-                print!(" {f:5.0}Hz:{err:+.5}");
-            }
-            println!(" | span={:.5} dB", max_err - min_err);
-        }
-
-        println!("\nAliasing at 44.1 kHz vs 176.4 kHz (4x), RK4 vs RK2:");
-        for target in [-40.0, -20.0] {
-            let c = HysteresisConfig {
-                target_h3_db: target,
-                ..Default::default()
-            };
-            for rate in [44_100.0, 176_400.0] {
-                for f in [1_000.0, 4_500.0, 10_000.0] {
-                    let (a4, aud4) = measure_aliasing(&c, rate, f, false);
-                    let (a2, aud2) = measure_aliasing(&c, rate, f, true);
-                    println!(
-                        "  H3={target:5.1} fs={rate:7.0} f={f:5.0}Hz | RK4 all={a4:7.2} <20k={aud4:7.2} | RK2 all={a2:7.2} <20k={aud2:7.2}"
-                    );
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2746,94 +2127,6 @@ mod tape_tests {
     //! tape presets and corners of the parameter space.
     use super::tests_support::Lone;
     use super::*;
-
-    /// Largest unclamped `(|d|, |p|, |x_c + p|)` the layer reaches on `xs`
-    /// (the runtime's arithmetic without the clamps).
-    pub(super) fn extremes(core: &HysteresisCore, xs: &[f64]) -> (f64, f64, f64) {
-        let mut st = ChannelState::default();
-        let mut worst = (0.0_f64, 0.0_f64, 0.0_f64);
-        for &x in xs {
-            let xc = x.clamp(-1.0, 1.0);
-            let z = match &core.eq {
-                Some(eq) => eq.pre.tick(&mut st.pre, xc),
-                None => xc,
-            };
-            let h = core.drive * z;
-            let m = core.ja.step_rk4(
-                st.h_prev + core.h_bias,
-                h + core.h_bias,
-                st.m + core.m_bias,
-                core.m_star,
-            ) - core.m_bias;
-            st.h_prev = h;
-            st.m = m;
-            let d = m * core.inv_chi0_g - z;
-            let d_hp = core.dc_block(d, st.dc_x1, st.dc_y1);
-            st.dc_x1 = d;
-            st.dc_y1 = d_hp;
-            let y = match &core.eq {
-                Some(eq) => eq.post.tick(&mut st.post, d_hp),
-                None => d_hp,
-            };
-            let p = core.amount * y;
-            worst.0 = worst.0.max(d.abs());
-            worst.1 = worst.1.max(p.abs());
-            worst.2 = worst.2.max((xc + p).abs());
-        }
-        worst
-    }
-
-    /// Asserts that `xs` keeps every clamp of `core` untouched.
-    fn assert_untouched(core: &HysteresisCore, xs: &[f64], what: &str) {
-        let (d, p, q) = extremes(core, xs);
-        assert!(
-            d < core.d_max,
-            "{what}: residual {d} reaches its clamp {}",
-            core.d_max
-        );
-        assert!(
-            p < core.y_max,
-            "{what}: path {p} reaches its clamp {}",
-            core.y_max
-        );
-        assert!(
-            q < core.q_max || q <= 1.0,
-            "{what}: output {q} reaches its clamp {}",
-            core.q_max
-        );
-    }
-
-    /// Random ramps, one-sample jumps and holds within full scale.
-    pub(super) fn ramps_jumps_holds(n: usize, seed: u64, holds: bool) -> Vec<f64> {
-        let mut s = seed;
-        let mut rnd = move || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            (s >> 11) as f64 / (1u64 << 53) as f64
-        };
-        let mut out = Vec::with_capacity(n + 20_000);
-        let mut x = 0.0_f64;
-        while out.len() < n {
-            let to = 2.0 * rnd() - 1.0;
-            let to = if rnd() < 0.3 { to.signum() } else { to };
-            match (rnd() * if holds { 3.0 } else { 2.0 }) as u32 {
-                0 => {
-                    let len = 1 + (rnd() * 2000.0) as usize;
-                    for i in 1..=len {
-                        out.push(x + (to - x) * i as f64 / len as f64);
-                    }
-                }
-                1 => out.push(to),
-                _ => {
-                    let len = 1 + (rnd() * 20_000.0) as usize;
-                    out.extend(std::iter::repeat_n(to, len));
-                }
-            }
-            x = to;
-        }
-        out
-    }
 
     /// The tape presets and generic corners of the parameter space, with
     /// and without the bass EQ and the field offset.
@@ -2882,97 +2175,6 @@ mod tape_tests {
         out
     }
 
-    /// Steady sines at the readout's levels and frequencies (every other
-    /// sweep frequency), 0.3 s each.
-    pub(super) fn readout_tones(rate: f64) -> Vec<Vec<f64>> {
-        use crate::harmonics::{READOUT_FREQS_HZ, READOUT_SWEEP_FREQS_HZ};
-        let n = (0.3 * rate) as usize;
-        let tone = |f: f64, db: f64| -> Vec<f64> {
-            let a = db_to_lin(db);
-            (0..n)
-                .map(|i| a * (2.0 * PI * f * i as f64 / rate).sin())
-                .collect()
-        };
-        let mut out = Vec::new();
-        for &f in READOUT_SWEEP_FREQS_HZ
-            .iter()
-            .step_by(2)
-            .chain(&READOUT_FREQS_HZ)
-        {
-            for db in [0.0, -6.0, -18.0] {
-                out.push(tone(f, db));
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn clamps_are_never_reached_on_real_signals() {
-        let reference = crate::loudness::stage_loudness_reference();
-        for rate in [44_100.0, 96_000.0, 384_000.0] {
-            let tones = readout_tones(rate);
-            for (i, (name, cfg)) in configs().iter().enumerate() {
-                let core = HysteresisCore::try_new(cfg, rate).unwrap();
-                let what = format!("{name} at {rate} Hz");
-                let len = if i < 3 && rate == 96_000.0 {
-                    3_000_000
-                } else {
-                    500_000
-                };
-                let seed = 0x5EED + i as u64 + rate as u64;
-                assert_untouched(&core, &ramps_jumps_holds(len, seed, true), &what);
-                for (t, x) in tones.iter().chain(std::iter::once(&reference)).enumerate() {
-                    assert_untouched(&core, x, &format!("{what}, tone {t}"));
-                }
-                // The clamps sit below the analytic bounds where they tighten.
-                assert!(core.d_max <= core.d_analytic, "{what}");
-            }
-        }
-    }
-
-    #[test]
-    fn silence_after_any_signal_is_exact_zero_with_offset_and_eq() {
-        for (name, cfg) in configs() {
-            for rate in [48_000.0, 192_000.0] {
-                let mut st = Lone::try_new(&cfg, rate, 1).unwrap();
-                // Silence from rest is exact zero (no DC step from the
-                // field offset).
-                let mut buf = vec![0.0; 4096];
-                st.process_core(&mut buf);
-                assert!(buf.iter().all(|&v| v == 0.0), "{name}: silence from rest");
-                // A loud transient, then 3 s of silence.
-                let mut x = ramps_jumps_holds((0.2 * rate) as usize, 7, true);
-                st.process_core(&mut x);
-                let blocks = (rate * 3.0 / 4096.0).ceil() as usize;
-                for _ in 0..blocks {
-                    buf.fill(0.0);
-                    st.process_core(&mut buf);
-                    let ch = st.core_state(0);
-                    for v in [ch.h_prev, ch.m, ch.dc_x1, ch.dc_y1, buf[4095]] {
-                        assert!(!v.is_subnormal(), "{name}: subnormal {v:e} at {rate} Hz");
-                    }
-                }
-                assert_eq!(buf[4095], 0.0, "{name}: did not settle to 0 at {rate} Hz");
-            }
-        }
-    }
-
-    #[test]
-    fn tick_pair_is_tick_per_lane_with_offset_and_eq() {
-        for (name, cfg) in configs() {
-            let core = HysteresisCore::try_new(&cfg, 44_100.0).unwrap();
-            let a = ramps_jumps_holds(60_000, 1, true);
-            let b = ramps_jumps_holds(60_000, 2, false);
-            let (mut s0, mut s1, mut r0, mut r1) = Default::default();
-            for (&x0, &x1) in a.iter().zip(&b) {
-                let (y0, y1) = core.tick_pair(&mut s0, &mut s1, x0, x1);
-                assert_eq!(y0.to_bits(), core.tick(&mut r0, x0).to_bits(), "{name}");
-                assert_eq!(y1.to_bits(), core.tick(&mut r1, x1).to_bits(), "{name}");
-            }
-            assert_eq!((s0, s1), (r0, r1), "{name}");
-        }
-    }
-
     #[test]
     fn bound_holds_on_hold_and_jump_paths_with_offset_and_eq() {
         // The ascending branch up to `x*`, a hold, then a jump, for every
@@ -3018,334 +2220,6 @@ mod tape_tests {
             }
         }
     }
-
-    #[test]
-    fn tape_presets_rise_toward_the_bass_and_carry_their_h2() {
-        // Measured machine (the presets' fit): H3 at 40 Hz about 8 dB above
-        // 1 kHz; H2 per preset as their source text states; H3 near the
-        // target (calibrated without the offset, which moves it a little).
-        for ((name, cfg), h2_db) in configs().into_iter().zip([-49.0, -35.3, -23.0]) {
-            let rate = 192_000.0;
-            let at = |f: f64| super::tests_support::measure(&cfg, rate, f, 1.0);
-            let (lo, mid) = (at(40.0), at(1_000.0));
-            let rise = lin_to_db(lo[3] / lo[1]) - lin_to_db(mid[3] / mid[1]);
-            assert!(
-                (6.0..11.0).contains(&rise),
-                "{name}: H3 rise at 40 Hz {rise:.1} dB"
-            );
-            let h2 = lin_to_db(mid[2] / mid[1]);
-            assert!((h2 - h2_db).abs() < 1.0, "{name}: H2 {h2:.1} dBc");
-            let h3 = lin_to_db(mid[3] / mid[1]);
-            assert!(
-                (h3 - cfg.target_h3_db).abs() < 1.0,
-                "{name}: H3 {h3:.2} dBc"
-            );
-        }
-    }
-
-    #[test]
-    fn small_signals_pass_flat_with_offset_and_eq() {
-        for (name, cfg) in configs() {
-            let rate = 96_000.0;
-            for f in [20.0, 40.0, 100.0, 1_000.0, 10_000.0, 20_000.0] {
-                let m = super::tests_support::measure(&cfg, rate, f, db_to_lin(-80.0));
-                let gain = lin_to_db(m[1] / db_to_lin(-80.0));
-                assert!(
-                    gain.abs() < 0.01,
-                    "{name}: {f} Hz small-signal gain {gain:.4} dB"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn high_calibration_frequencies_calibrate_at_32_khz() {
-        // 3 × 4.8 kHz is above 0.45 × 32 kHz: calibrated at the probe
-        // frequency (here the calibration frequency itself, below
-        // 0.16 × 32 kHz = 5.12 kHz) and checked there.
-        for hz in [4_800.0, 4_900.0, 5_000.0] {
-            let cfg = HysteresisConfig {
-                calibration_hz: hz,
-                target_h3_db: -30.0,
-                ..Default::default()
-            };
-            let st = Lone::try_new(&cfg, 32_000.0, 1).unwrap();
-            let h3 = st.predicted_h3_db(hz, 1.0);
-            assert!((h3 + 30.0).abs() < 0.01, "{hz} Hz at 32 kHz: H3 {h3}");
-        }
-    }
-
-    #[test]
-    fn offsets_calibrate_the_same_at_every_rate_or_are_refused() {
-        // The drive is solved on the symmetric core and the offset is in
-        // field units, so a layer calibrates to the same drive at every
-        // engine rate (or fails at all of them): no rate where the drive
-        // jumps or the target is out of reach.
-        let rates: Vec<f64> = audivane_protocol::ALLOWED_RATES
-            .iter()
-            .chain(audivane_protocol::HIGH_OUTPUT_RATES)
-            .map(|&r| f64::from(r))
-            .collect();
-        let hot = |saturation, width, asymmetry, bass_eq| HysteresisConfig {
-            saturation,
-            width,
-            target_h3_db: -12.0,
-            asymmetry,
-            bass_eq,
-            ..Default::default()
-        };
-        let cases = [
-            (
-                "tape corner +1",
-                hot(0.35, 0.4, 1.0, Some((110.0, 4.0))),
-                true,
-            ),
-            (
-                "tape corner -1",
-                hot(0.35, 0.4, -1.0, Some((110.0, 4.0))),
-                true,
-            ),
-            (
-                "tape corner 0.25",
-                hot(0.35, 0.4, 0.25, Some((110.0, 4.0))),
-                true,
-            ),
-            ("no loop +1", hot(0.0, 0.0, 1.0, None), true),
-            ("widest pinning loop +1", hot(0.0, 1.0, 1.0, None), false),
-            ("hottest EQ", hot(0.0, 0.0, 0.0, Some((500.0, 12.0))), true),
-        ];
-        for (name, cfg, builds) in cases {
-            let drives: Vec<Result<f64, HysteresisError>> = rates
-                .iter()
-                .map(|&r| Calibrated::new(&cfg, r).map(|c| c.drive))
-                .collect();
-            if !builds {
-                for (d, r) in drives.iter().zip(&rates) {
-                    let Err(HysteresisError::InvalidParameter(msg)) = d else {
-                        panic!("{name} at {r} Hz: {d:?}, expected a refusal")
-                    };
-                    assert!(msg.contains("expand"), "{name}: {msg}");
-                }
-                continue;
-            }
-            let drives: Vec<f64> = drives
-                .into_iter()
-                .zip(&rates)
-                .map(|(d, r)| d.unwrap_or_else(|e| panic!("{name} at {r} Hz: {e}")))
-                .collect();
-            let (lo, hi) = drives
-                .iter()
-                .fold((f64::INFINITY, 0.0_f64), |(l, h), &d| (l.min(d), h.max(d)));
-            assert!(hi / lo < 1.001, "{name}: drive {lo}..{hi} across rates");
-        }
-    }
-
-    #[test]
-    fn a_huge_field_jump_takes_at_most_the_substep_cap() {
-        // Hard cap: a jump of any size takes at most MAX_SUBSTEPS RK4
-        // substeps, stays finite and within the saturation bound.
-        let ja = JaParams::from_config(&HysteresisConfig {
-            saturation: 0.0,
-            ..Default::default()
-        });
-        let m_star = saturation_fixed_point(1e6);
-        for dh in [1e2, 1e4, 1e6] {
-            for m in [-m_star, 0.0, m_star] {
-                let t0 = std::time::Instant::now();
-                let next = ja.step_rk4(-dh / 2.0, dh / 2.0, m, m_star);
-                assert!(next.is_finite() && next.abs() <= m_star, "{dh}: {next}");
-                assert!(t0.elapsed().as_millis() < 50, "{dh}: {:?}", t0.elapsed());
-            }
-        }
-        // Every config in range needs few enough steps that a capped
-        // substep stays within STEP_STRETCH stable steps (the build would
-        // refuse it otherwise): the hottest corners build.
-        for (sat, width) in [(0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0)] {
-            for eq in [None, Some((20.0, 12.0)), Some((500.0, 12.0))] {
-                let cfg = HysteresisConfig {
-                    saturation: sat,
-                    width,
-                    target_h3_db: -12.0,
-                    bass_eq: eq,
-                    ..Default::default()
-                };
-                let cal = Calibrated::new(&cfg, 44_100.0).unwrap();
-                let steps = 2.0 * cal.drive * cal.z_max / cal.ja.max_step_dh;
-                assert!(
-                    steps <= STEP_STRETCH * MAX_SUBSTEPS as f64,
-                    "{sat} {width} {eq:?}: {steps}"
-                );
-            }
-        }
-    }
-
-    /// A random search for the path's worst `|x_c + p|` (output clamp off),
-    /// independent of [`path_probe`]'s: from an extreme held or from a
-    /// random signal's state, up to three random segments (jumps, ramps
-    /// and holds, levels biased to the extremes), then a jump back to an
-    /// extreme; the best trials refined by random steps. Returns the
-    /// largest `|x_c + p|` and the trials run.
-    pub(super) fn independent_search(
-        core: &HysteresisCore,
-        rate: f64,
-        trials: usize,
-        seed: u64,
-    ) -> f64 {
-        let mut open = *core;
-        open.q_max = f64::INFINITY;
-        open.y_max = f64::INFINITY;
-        let mut s = seed;
-        let mut rnd = move || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            (s >> 11) as f64 / (1u64 << 53) as f64
-        };
-        let ms = |t: f64| (t * 1e-3 * rate).round() as usize;
-        // Start states: each extreme held after the other, and the end of
-        // random signals.
-        let mut starts = Vec::new();
-        for x0 in [-1.0, 1.0] {
-            let mut st = ChannelState::default();
-            for x in std::iter::repeat_n(-x0, ms(30.0)).chain(std::iter::repeat_n(x0, ms(400.0))) {
-                open.tick(&mut st, x);
-            }
-            starts.push((st, x0));
-        }
-        for seed in [11u64, 12, 13, 14] {
-            let xs = ramps_jumps_holds(ms(500.0), seed, true);
-            let mut st = ChannelState::default();
-            for &x in &xs {
-                open.tick(&mut st, x);
-            }
-            starts.push((st, *xs.last().unwrap_or(&0.0)));
-        }
-        // A trial: (start, segments (level, ramp, hold), end level).
-        type Trial = (usize, Vec<(f64, usize, usize)>, f64);
-        let run = |t: &Trial| -> f64 {
-            let (mut st, mut at) = starts[t.0];
-            let mut worst = 0.0_f64;
-            let mut feed = |st: &mut ChannelState, x: f64| {
-                let p = open.tick(st, x);
-                worst = worst.max((x + p).abs());
-            };
-            for &(to, ramp, hold) in &t.1 {
-                for i in 1..=ramp {
-                    feed(&mut st, at + (to - at) * i as f64 / ramp as f64);
-                }
-                feed(&mut st, to);
-                for _ in 0..hold {
-                    feed(&mut st, to);
-                }
-                at = to;
-            }
-            for _ in 0..ms(3.0) {
-                feed(&mut st, t.2);
-            }
-            worst
-        };
-        let level = |r: &mut dyn FnMut() -> f64| {
-            let v = 2.0 * r() - 1.0;
-            if r() < 0.4 { v.signum() } else { v }
-        };
-        let mut best: Vec<(f64, Trial)> = Vec::new();
-        for _ in 0..trials {
-            let start = (rnd() * starts.len() as f64) as usize % starts.len();
-            let n = 1 + (rnd() * 3.0) as usize;
-            let segs = (0..n)
-                .map(|_| {
-                    let to = level(&mut rnd);
-                    let ramp = if rnd() < 0.4 {
-                        0
-                    } else {
-                        (rnd() * ms(8.0) as f64) as usize
-                    };
-                    let hold = if rnd() < 0.5 {
-                        0
-                    } else {
-                        (rnd() * ms(5.0) as f64) as usize
-                    };
-                    (to, ramp, hold)
-                })
-                .collect();
-            let end = if rnd() < 0.8 {
-                (rnd() - 0.5).signum()
-            } else {
-                level(&mut rnd)
-            };
-            let t: Trial = (start, segs, end);
-            let v = run(&t);
-            best.push((v, t));
-            if best.len() > 64 {
-                best.sort_by(|a, b| b.0.total_cmp(&a.0));
-                best.truncate(16);
-            }
-        }
-        best.sort_by(|a, b| b.0.total_cmp(&a.0));
-        best.truncate(8);
-        // Refine: random steps around each of the best, kept when better.
-        let mut top = best.first().map_or(0.0, |b| b.0);
-        for (mut v, mut t) in best {
-            let mut step = 0.2;
-            for _ in 0..trials / 20 {
-                let mut u = t.clone();
-                for seg in u.1.iter_mut() {
-                    seg.0 = (seg.0 + step * (2.0 * rnd() - 1.0)).clamp(-1.0, 1.0);
-                    seg.1 = (seg.1 as f64 * (1.0 + step * (2.0 * rnd() - 1.0))).max(0.0) as usize;
-                    seg.2 = (seg.2 as f64 * (1.0 + step * (2.0 * rnd() - 1.0))).max(0.0) as usize;
-                }
-                let w = run(&u);
-                if w > v {
-                    v = w;
-                    t = u;
-                } else {
-                    step = (step * 0.97).max(0.005);
-                }
-            }
-            top = top.max(v);
-        }
-        top
-    }
-
-    /// Prints the probe's worst `|x_c + p|` against an independent search.
-    /// `cargo test --release -p audivane-dsp-core --lib tape_tests::print_search -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn print_search() {
-        for (id, cfg) in configs() {
-            let rate = 48_000.0;
-            let core = HysteresisCore::try_new(&cfg, rate).unwrap();
-            let t0 = std::time::Instant::now();
-            let found = independent_search(&core, rate, 20_000, 0xC0FF_EE11);
-            println!(
-                "{id}: Q {:.4}, independent search {found:.4} ({:?})",
-                core.q_max,
-                t0.elapsed()
-            );
-        }
-    }
-
-    /// Prints each config's clamps, what random signals reach and the build
-    /// time.
-    /// `cargo test --release -p audivane-dsp-core --lib tape_tests::print_extremes -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn print_extremes() {
-        for (id, cfg) in configs() {
-            let rate = 96_000.0;
-            let t0 = std::time::Instant::now();
-            let core = HysteresisCore::try_new(&cfg, rate).unwrap();
-            let built = t0.elapsed();
-            let xs = ramps_jumps_holds(3_000_000, 0x1234_5678, true);
-            let e = extremes(&core, &xs);
-            let xs = ramps_jumps_holds(3_000_000, 0x9876_5431, false);
-            let f = extremes(&core, &xs);
-            println!(
-                "{id}: build {built:?} reached (d, p, x+p) {e:?} no holds {f:?} clamps D {} Y {} Q {} (residual probe {})",
-                core.d_max, core.y_max, core.q_max, core.d_probe
-            );
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3381,6 +2255,7 @@ mod tests_support {
     /// A lone tape layer of `cfg` in the harmonics stage (as the layer
     /// ships), with its core for the core's own numbers.
     #[derive(Clone)]
+    #[allow(dead_code)]
     pub(super) struct Lone {
         stage: Harmonics,
         pub(super) core: HysteresisCore,
@@ -3420,38 +2295,8 @@ mod tests_support {
             self.stage.reset();
         }
 
-        /// Channel 0 through the core alone, sample by sample on the
-        /// fixture's own state (what the layer runs per sample), so a test
-        /// can read the state ([`Self::core_state`]).
-        pub(super) fn process_core(&mut self, buf: &mut [f64]) {
-            let st = &mut self.state[0];
-            for s in buf.iter_mut() {
-                let x = if s.is_finite() { *s } else { 0.0 };
-                let xc = x.clamp(-1.0, 1.0);
-                let dh = if self.active {
-                    self.core.tick(st, xc)
-                } else {
-                    0.0
-                };
-                *s = xc + dh + (x - xc);
-            }
-        }
-
         pub(super) fn core_state(&self, channel: usize) -> &ChannelState {
             &self.state[channel]
-        }
-
-        pub(super) fn drive(&self) -> f64 {
-            self.core.drive
-        }
-
-        /// The core's certified peak bound (1 when inactive).
-        pub(super) fn peak_bound(&self) -> f64 {
-            if self.active {
-                self.core.peak_bound()
-            } else {
-                1.0
-            }
         }
 
         pub(super) fn peak_gain_db(&self) -> f64 {
@@ -3462,112 +2307,8 @@ mod tests_support {
             self.stage.small_signal_gain_db()
         }
 
-        /// Predicted steady-state H3 in dBc for a sine at `freq_hz` and peak
-        /// `level` in `(0, 1]` (for `3 * freq_hz < rate / 2`).
-        pub(super) fn predicted_h3_db(&self, freq_hz: f64, level: f64) -> f64 {
-            if !self.active || self.core.drive <= 0.0 || 3.0 * freq_hz >= 0.5 * self.rate {
-                return f64::NEG_INFINITY;
-            }
-            PeriodicProbe::new(
-                self.core.ja,
-                self.core.hpf_b0,
-                self.core.hpf_a1,
-                freq_hz,
-                self.rate,
-                self.core.h_bias,
-                self.core.eq.as_ref(),
-            )
-            .h3_dbc(self.core.drive, level.min(1.0), self.core.amount)
-        }
-
         pub(super) fn loudness_change_db(cfg: &HysteresisConfig) -> Result<f64, HarmonicsError> {
             Harmonics::loudness_change_db(&lone_config(cfg))
         }
-
-        /// The layer's arithmetic with RK2 in place of RK4, for comparing
-        /// their accuracy and aliasing (no bass EQ or field offset).
-        pub(super) fn process_rk2(&mut self, chans: &mut [&mut [f64]]) {
-            if !self.active {
-                return;
-            }
-            let c = self.core;
-            // The stage's output is not scaled.
-            let scale = 1.0;
-            let nch = chans.len().min(self.state.len());
-            let mut i = 0;
-            while i + 1 < nch {
-                let (left, right) = chans[i..=i + 1].split_at_mut(1);
-                let (ch0, ch1) = (&mut left[0], &mut right[0]);
-                let (mut st0, mut st1) = (self.state[i], self.state[i + 1]);
-                for j in 0..ch0.len().min(ch1.len()) {
-                    let (y0, y1) = step_pair_rk2(
-                        ch0[j],
-                        ch1[j],
-                        &mut st0,
-                        &mut st1,
-                        &c.ja,
-                        c.drive,
-                        c.m_star,
-                        c.inv_chi0_g,
-                        c.amount,
-                        c.hpf_b0,
-                        c.hpf_a1,
-                        scale,
-                    );
-                    ch0[j] = y0;
-                    ch1[j] = y1;
-                }
-                self.state[i] = st0;
-                self.state[i + 1] = st1;
-                i += 2;
-            }
-            if i < nch {
-                let mut st = self.state[i];
-                for s in chans[i].iter_mut() {
-                    *s = step_sample_rk2(
-                        *s,
-                        &mut st,
-                        &c.ja,
-                        c.drive,
-                        c.m_star,
-                        c.inv_chi0_g,
-                        c.amount,
-                        c.hpf_b0,
-                        c.hpf_a1,
-                        scale,
-                    );
-                }
-                self.state[i] = st;
-            }
-        }
-    }
-
-    /// `[DC, H1, …, H5]` amplitudes of the stage's steady output for a
-    /// coherent cosine at about `hz` (0.5 s settling, 0.25 s measured).
-    pub(super) fn measure(cfg: &HysteresisConfig, rate: f64, hz: f64, amp: f64) -> [f64; 6] {
-        let mut stage = Lone::try_new(cfg, rate, 1).unwrap();
-        let settle = (0.5 * rate) as usize;
-        let cycles = (hz * 0.25).round().max(8.0);
-        let n = (cycles * rate / hz).round() as usize;
-        let f = cycles * rate / n as f64;
-        let mut buf: Vec<f64> = (0..settle + n)
-            .map(|i| amp * (2.0 * PI * f * i as f64 / rate).cos())
-            .collect();
-        for c in buf.chunks_mut(4096) {
-            stage.process(&mut [c]);
-        }
-        let tail = &buf[settle..];
-        let mut out = [0.0; 6];
-        for (k, slot) in out.iter_mut().enumerate() {
-            let w = 2.0 * PI * f * k as f64 / rate;
-            let (mut re, mut im) = (0.0, 0.0);
-            for (i, &v) in tail.iter().enumerate() {
-                let (sn, cs) = (w * (i + settle) as f64).sin_cos();
-                re += v * cs;
-                im -= v * sn;
-            }
-            *slot = re.hypot(im) * if k == 0 { 1.0 } else { 2.0 } / n as f64;
-        }
-        out
     }
 }

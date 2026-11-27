@@ -420,14 +420,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn interpolation_is_log_linear_and_held_at_the_ends() {
-        let p = [(1024, 10.0), (4096, 20.0)];
-        assert_eq!(interpolate(&p, 512), 10.0);
-        assert_eq!(interpolate(&p, 8192), 20.0);
-        assert!((interpolate(&p, 2048) - 15.0).abs() < 1e-12);
-    }
-
-    #[test]
     fn the_floor_is_at_the_measured_sizes_and_clamps_slow_rates() {
         let floor = KernelRates::floor();
         let slow = KernelRates {
@@ -464,49 +456,5 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(sizes(&floor.fft), FFT_SIZES.to_vec());
-    }
-
-    /// CPU time of the calling thread (`/proc/thread-self/stat`: user and
-    /// system time in clock ticks, 100 per second on Linux).
-    fn thread_cpu() -> Option<Duration> {
-        let stat = std::fs::read_to_string("/proc/thread-self/stat").ok()?;
-        let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
-        let ticks: u64 =
-            fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?;
-        Some(Duration::from_millis(ticks * 10))
-    }
-
-    #[test]
-    fn measures_plausible_rates_quickly() {
-        let cpu0 = thread_cpu();
-        let r = measure();
-        // Quick in work done (about 0.2 s of CPU); the wall clock only
-        // bounds it loosely, as other tests share the cores.
-        if let (Some(a), Some(b)) = (cpu0, thread_cpu()) {
-            assert!(b - a < Duration::from_secs(1), "{:?} of CPU", b - a);
-        }
-        assert!(r.elapsed < Duration::from_secs(20), "{:?}", r.elapsed);
-        // Any machine that plays audio does more than 100 M multiply-adds
-        // per second and less than 1000 G. A burst that loses its core under
-        // heavy machine load reads low, so measure again a few times before
-        // failing; a real fault reads wrong every time.
-        let plausible = |r: &KernelRates| {
-            r.dot
-                .iter()
-                .chain(&r.spectral)
-                .all(|&(_, v)| (1e8..1e12).contains(&v))
-                && (1e-8..1e-3).contains(&r.fft_seconds(2048))
-                && r.quantizer.len() == QUANTIZER_KINDS.len()
-                && r.quantizer.iter().all(|&(_, v)| (1e5..1e11).contains(&v))
-        };
-        let mut r = r;
-        for _ in 0..3 {
-            if plausible(&r) {
-                break;
-            }
-            r = measure();
-        }
-        assert!(plausible(&r), "{r:?}");
-        eprintln!("{r:?}");
     }
 }

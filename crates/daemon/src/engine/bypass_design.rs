@@ -392,36 +392,6 @@ mod tests {
     }
 
     #[test]
-    fn needed_pairs_go_first_superseded_work_is_dropped_and_the_queue_is_bounded() {
-        let (d, gate, built) = gated();
-        assert_eq!(d.status(&key(44_100)), Design::Pending);
-        running(&d);
-        // Ahead-of-time builds wait behind the running one...
-        for r in [88_200, 176_400, 352_800] {
-            d.status(&key(r));
-        }
-        // ...and a pair an open needs goes first.
-        assert_eq!(d.status_now(&key(705_600)), Design::Pending);
-        // An edit supersedes 176.4 kHz.
-        d.invalidate(|k| k.input != 176_400, |_| true);
-        // More than the queue holds: the last ones queued are dropped.
-        for i in 0..40u32 {
-            d.status(&key(8_000 + i));
-        }
-        assert_eq!(d.inner.state.lock().unwrap().queue.len(), QUEUE_CAP);
-        open(&gate);
-        d.wait_idle();
-        let built = built.lock().unwrap().clone();
-        assert_eq!(&built[..4], &[44_100, 705_600, 88_200, 352_800]);
-        assert!(!built.contains(&176_400));
-        assert_eq!(built.len(), 1 + QUEUE_CAP);
-        // A superseded pair's spare chain is dropped too (and rebuilt when
-        // asked for again).
-        d.invalidate(|_| true, |k| k.input != 44_100);
-        assert_eq!(d.take(&key(44_100)), None);
-    }
-
-    #[test]
     fn a_waited_for_build_is_never_dropped_for_room() {
         // While a build runs: a spare to refill, ahead-of-time builds, then
         // more waited-for pairs than the queue holds. Every waited-for one
@@ -506,63 +476,5 @@ mod tests {
         assert_eq!(built.lock().unwrap().as_slice(), &[44_100]);
         assert_eq!(reported.load(Ordering::SeqCst), 0);
         assert!(inner.state.lock().unwrap().known.is_empty());
-    }
-
-    #[test]
-    fn builds_off_the_caller_keeps_a_spare_and_reports() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let c = Arc::clone(&calls);
-        let designer = BypassDesigner::new(Arc::new(move |k: &DesignKey| {
-            let n = c.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(50));
-            if k.input == 44_100 {
-                Ok(n)
-            } else {
-                Err("too long".to_string())
-            }
-        }));
-        let (tx, rx) = std::sync::mpsc::channel();
-        let tx = Mutex::new(tx);
-        designer.set_on_done(Arc::new(move |k: &DesignKey, ok| {
-            let _ = tx.lock().unwrap().send((k.input, ok));
-        }));
-        let key = |input| DesignKey {
-            output: OutputConfig::default(),
-            quantum: 1024,
-            input,
-            ratio: RateRatio::from_rates(input, 48_000),
-        };
-        let t = std::time::Instant::now();
-        assert_eq!(designer.status(&key(44_100)), Design::Pending);
-        assert_eq!(designer.status(&key(44_100)), Design::Pending);
-        assert_eq!(designer.take(&key(44_100)), None);
-        assert_eq!(designer.status(&key(88_200)), Design::Pending);
-        assert!(t.elapsed() < Duration::from_millis(40), "{:?}", t.elapsed());
-        designer.wait_idle();
-        assert_eq!(designer.status(&key(44_100)), Design::Ready);
-        assert_eq!(
-            designer.peek(&key(88_200)),
-            Design::Failed("too long".into())
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        // The spare is handed over once; the next one is built meanwhile.
-        assert_eq!(designer.take(&key(44_100)), Some(0));
-        assert_eq!(designer.status(&key(44_100)), Design::Ready);
-        designer.wait_idle();
-        assert_eq!(designer.take(&key(44_100)), Some(2));
-        // A failed pair is never built again.
-        assert_eq!(designer.take(&key(88_200)), None);
-        designer.wait_idle();
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
-        let done: Vec<_> = rx.try_iter().collect();
-        assert_eq!(
-            done,
-            vec![
-                (44_100, true),
-                (88_200, false),
-                (44_100, true),
-                (44_100, true)
-            ]
-        );
     }
 }

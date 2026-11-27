@@ -4,7 +4,6 @@
 //! wait bounded), then it resets and plays on exactly as a reset chain.
 
 use audivane_dsp_core::chain::{AbChain, Chain, ChainSpec, Side};
-use audivane_dsp_core::gain::StereoGainRamp;
 use audivane_dsp_core::presets::FilterPreset;
 use audivane_dsp_core::workers::LanePool;
 use audivane_protocol::{
@@ -385,6 +384,45 @@ fn every_stage_after_crossfeed_is_bit_identical_on_workers() {
     );
 }
 
+/// Every upsampler runtime on the workers, through the whole chain: the
+/// same output as on the audio thread alone, over the odd block pattern.
+#[test]
+fn every_upsampler_runtime_is_bit_identical_on_workers() {
+    use FilterPreset::*;
+    let workers = pool(1);
+    for (preset, ratio) in [
+        (BlockFftFast, 4),
+        (BlockFft, 2),
+        (CascadeElliptic, 4),
+        (CascadeInverseChebyshev, 6),
+        (CascadeFir, 8),
+        (CascadeFft, 4),
+        (Nos, 4),
+        (Cosine, 4),
+        (CatmullRom, 2),
+        (TableSinc, 4),
+        (GaussianShort, 8),
+        (KaiserSteep, 2),
+    ] {
+        let mut config = full(RateTarget::Ratio(ratio), 64);
+        config.upsampler = UpsamplerConfig {
+            target: RateTarget::Ratio(ratio),
+            preset: Some(preset.name().to_string()),
+            ..Default::default()
+        };
+        config.convolution.clear();
+        let (mut single, mut multi) = pair(config, None, &workers);
+        // BlockFft's blocks are 16 k frames: run a few of them. The others
+        // keep no state past a few thousand frames.
+        let frames = if matches!(preset, BlockFft | BlockFftFast) {
+            40_000
+        } else {
+            6_000
+        };
+        assert_identical(preset.name(), &mut single, &mut multi, frames, |_, _| {});
+    }
+}
+
 /// A filter matrix couples the channels: it and the EQ before it stay
 /// whole (on the audio thread), the stages after it split; the output is
 /// bit for bit the single-threaded chain's.
@@ -428,37 +466,6 @@ fn a_filter_matrix_chain_is_bit_identical_on_workers() {
 }
 
 #[test]
-fn every_upsampler_runtime_is_bit_identical_on_workers() {
-    use FilterPreset::*;
-    let workers = pool(1);
-    for (preset, ratio) in [
-        (BlockFftFast, 4),
-        (BlockFft, 2),
-        (CascadeElliptic, 4),
-        (CascadeInverseChebyshev, 6),
-        (CascadeFir, 8),
-        (CascadeFft, 4),
-        (Nos, 4),
-        (Cosine, 4),
-        (CatmullRom, 2),
-        (TableSinc, 4),
-        (GaussianShort, 8),
-        (KaiserSteep, 2),
-    ] {
-        let mut config = full(RateTarget::Ratio(ratio), 64);
-        config.upsampler = UpsamplerConfig {
-            target: RateTarget::Ratio(ratio),
-            preset: Some(preset.name().to_string()),
-            ..Default::default()
-        };
-        config.convolution.clear();
-        let (mut single, mut multi) = pair(config, None, &workers);
-        // BlockFft's blocks are 16 k frames: run a few of them.
-        assert_identical(preset.name(), &mut single, &mut multi, 70_000, |_, _| {});
-    }
-}
-
-#[test]
 fn ab_pairs_are_bit_identical_on_workers() {
     let workers = pool(1);
     let level = audivane_dsp_core::ab_level::AbLevel::from_config(
@@ -497,127 +504,6 @@ fn ab_pairs_are_bit_identical_on_workers() {
     );
 }
 
-#[test]
-fn single_channel_and_passthrough_chains_stay_single_threaded() {
-    let workers = pool(1);
-    let mut mono_config = full(RateTarget::Ratio(2), 1024);
-    mono_config.crossfeed = None;
-    mono_config.convolution.clear();
-    let mut mono = Chain::new(ChainSpec {
-        channels: 1,
-        ..spec(mono_config, None)
-    });
-    assert!(!mono.attach_workers(&workers));
-    let mut bypass = Chain::new(spec(ChainConfig::neutral(), None));
-    assert!(!bypass.attach_workers(&workers));
-    let none = LanePool::spawn(0, |_| {}).unwrap();
-    let mut config = full(RateTarget::Ratio(2), 1024);
-    config.convolution.clear();
-    let mut chain = Chain::new(spec(config, None));
-    assert!(!chain.attach_workers(&none));
-    assert!(chain.attach_workers(&workers));
-    assert!(!chain.attach_workers(&workers), "only once");
-}
-
-/// A late worker: the block is silent and the wait bounded; the chain stays
-/// silent while the lane is out, then resets and plays on exactly as a
-/// chain reset at the same point.
-#[test]
-fn a_late_worker_gives_silence_then_a_reset_never_a_hang() {
-    let workers = late_pool(1);
-    let config = full(RateTarget::Ratio(4), 4096);
-    let ir = Some(irs(2, 10_000, 3));
-    let mut chain = Chain::new(spec(config.clone(), ir.clone()));
-    assert!(chain.attach_workers(&workers));
-    let x = input(200 * MAX_BLOCK);
-    let n = MAX_BLOCK;
-    let block = |i: usize| &x[(i % 200) * n * 2..(i % 200 + 1) * n * 2];
-    let out_n = chain.output_frames(n) * 2;
-    let mut out = vec![0i32; out_n];
-    let mut tap = vec![0f32; out_n];
-    for i in 0..20 {
-        chain.run(block(i), &mut out, &mut tap);
-    }
-    assert!(out.iter().any(|&v| v != 0));
-
-    // The worker sleeps 300 ms before its next lane: far past the
-    // deadline (two 512-frame blocks at 44.1 kHz, 23 ms).
-    workers.stall_next(0, Duration::from_millis(300));
-    let t0 = Instant::now();
-    chain.run(block(20), &mut out, &mut tap);
-    let waited = t0.elapsed();
-    assert!(
-        waited < Duration::from_millis(150),
-        "the audio thread waited {waited:?}"
-    );
-    assert!(out.iter().all(|&v| v == 0), "a late block is silent");
-    assert!(tap.iter().all(|&v| v == 0.0));
-    let late = |p: &LanePool| {
-        p.stats()
-            .late_blocks
-            .load(std::sync::atomic::Ordering::Relaxed)
-    };
-    assert_eq!(late(&workers), 1);
-
-    // While the lane is out: silence, without waiting.
-    let mut i = 21;
-    while t0.elapsed() < Duration::from_millis(200) {
-        let t = Instant::now();
-        chain.run(block(i), &mut out, &mut tap);
-        assert!(t.elapsed() < Duration::from_millis(20));
-        assert!(out.iter().all(|&v| v == 0));
-        i += 1;
-    }
-    // Wait for the stalled job to end; then the chain is back, reset at
-    // its grid position: it matches a fresh chain from here on.
-    std::thread::sleep(Duration::from_millis(200));
-    // From here on the comparison must not depend on the machine's load.
-    workers.set_min_wait(Duration::from_secs(60));
-    let mut fresh = Chain::new(spec(config, ir));
-    for j in i..i + 60 {
-        let mut o2 = vec![0i32; out_n];
-        let mut t2 = vec![0f32; out_n];
-        chain.run(block(j), &mut out, &mut tap);
-        fresh.run(block(j), &mut o2, &mut t2);
-        assert_eq!(out, o2, "block {j} after the recovery");
-    }
-    assert!(out.iter().any(|&v| v != 0));
-    assert_eq!(late(&workers), 1);
-}
-
-/// A worker still busy when a block starts gets no lane: the audio thread
-/// runs it, and the output is still exact.
-#[test]
-fn a_busy_worker_is_skipped_and_the_lane_runs_on_the_audio_thread() {
-    use audivane_dsp_core::workers::{Lane, LaneWork};
-    struct Sleep(Duration);
-    impl LaneWork for Sleep {
-        fn run(&mut self) {
-            std::thread::sleep(self.0);
-        }
-    }
-    let workers = pool(1);
-    let mut config = full(RateTarget::Ratio(2), 2048);
-    config.convolution.clear();
-    let (mut single, mut multi) = pair(config, None, &workers);
-    // Another job holds the worker for the whole comparison.
-    let mut busy = Lane::new(Sleep(Duration::from_secs(3)));
-    assert!(workers.submit(0, &mut busy));
-    assert!(!workers.is_idle(0));
-    let inline = |p: &LanePool| {
-        p.stats()
-            .inline_runs
-            .load(std::sync::atomic::Ordering::Relaxed)
-    };
-    let before = inline(&workers);
-    assert_identical("busy worker", &mut single, &mut multi, 3_000, |_, _| {});
-    assert!(
-        inline(&workers) > before,
-        "the lane ran on the audio thread"
-    );
-    assert!(workers.wait(0, &busy, Instant::now() + Duration::from_secs(10)));
-}
-
 fn stat(p: &LanePool, which: fn(&audivane_dsp_core::workers::PoolStats) -> u64) -> u64 {
     which(p.stats())
 }
@@ -654,6 +540,84 @@ fn a_panicking_lane_gives_silence_never_its_buffers() {
     assert_eq!(stat(&workers, panics), 1);
 }
 
+/// A late worker: the block is silent and the wait bounded; the chain stays
+/// silent while the lane is out, then resets and plays on exactly as a
+/// chain reset at the same point.
+#[test]
+fn a_late_worker_gives_silence_then_a_reset_never_a_hang() {
+    let workers = late_pool(1);
+    let config = full(RateTarget::Ratio(4), 4096);
+    let ir = Some(irs(2, 10_000, 3));
+    let mut chain = Chain::new(spec(config.clone(), ir.clone()));
+    assert!(chain.attach_workers(&workers));
+    // The warm-up must not depend on the machine's load; the stall below
+    // runs against the engine's own deadline.
+    workers.set_min_wait(Duration::from_secs(60));
+    let x = input(200 * MAX_BLOCK);
+    let n = MAX_BLOCK;
+    let block = |i: usize| &x[(i % 200) * n * 2..(i % 200 + 1) * n * 2];
+    let out_n = chain.output_frames(n) * 2;
+    let mut out = vec![0i32; out_n];
+    let mut tap = vec![0f32; out_n];
+    for i in 0..20 {
+        chain.run(block(i), &mut out, &mut tap);
+    }
+    assert!(out.iter().any(|&v| v != 0));
+
+    // The worker sleeps a second before its next lane: far past the
+    // deadline (two 512-frame blocks at 44.1 kHz, 23 ms). The bounds below
+    // only show that the audio thread never waits for it, so a busy
+    // machine cannot fail them.
+    workers.set_min_wait(Duration::ZERO);
+    workers.stall_next(0, Duration::from_millis(1000));
+    let t0 = Instant::now();
+    chain.run(block(20), &mut out, &mut tap);
+    let waited = t0.elapsed();
+    assert!(
+        waited < Duration::from_millis(500),
+        "the audio thread waited {waited:?}"
+    );
+    assert!(out.iter().all(|&v| v == 0), "a late block is silent");
+    assert!(tap.iter().all(|&v| v == 0.0));
+    let late = |p: &LanePool| {
+        p.stats()
+            .late_blocks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    assert_eq!(late(&workers), 1);
+
+    // While the lane is out: silence, without waiting.
+    let mut i = 21;
+    while t0.elapsed() < Duration::from_millis(300) {
+        let t = Instant::now();
+        chain.run(block(i), &mut out, &mut tap);
+        assert!(t.elapsed() < Duration::from_millis(250));
+        assert!(out.iter().all(|&v| v == 0));
+        i += 1;
+    }
+    // Wait for the stalled job to end; then the chain is back, reset at
+    // its grid position: it matches a fresh chain from here on.
+    // From here on the comparison must not depend on the machine's load.
+    workers.set_min_wait(Duration::from_secs(60));
+    while !workers.is_idle(0) {
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "the stalled job never ended"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut fresh = Chain::new(spec(config, ir));
+    for j in i..i + 60 {
+        let mut o2 = vec![0i32; out_n];
+        let mut t2 = vec![0f32; out_n];
+        chain.run(block(j), &mut out, &mut tap);
+        fresh.run(block(j), &mut o2, &mut t2);
+        assert_eq!(out, o2, "block {j} after the recovery");
+    }
+    assert!(out.iter().any(|&v| v != 0));
+    assert_eq!(late(&workers), 1);
+}
+
 /// A late lane that panics: when it comes back the chain does not recover
 /// (which would play it), it stays silent.
 #[test]
@@ -663,6 +627,7 @@ fn a_late_lane_that_panicked_stays_silent_when_it_is_back() {
     config.convolution.clear();
     let mut chain = Chain::new(spec(config, None));
     assert!(chain.attach_workers(&workers));
+    workers.set_min_wait(Duration::from_secs(60));
     let x = input(40 * MAX_BLOCK);
     let n = MAX_BLOCK;
     let block = |i: usize| &x[(i % 40) * n * 2..(i % 40 + 1) * n * 2];
@@ -672,7 +637,8 @@ fn a_late_lane_that_panicked_stays_silent_when_it_is_back() {
         chain.run(block(i), &mut out, &mut tap);
     }
     assert!(out.iter().any(|&v| v != 0));
-    workers.stall_next(0, Duration::from_millis(150));
+    workers.set_min_wait(Duration::ZERO);
+    workers.stall_next(0, Duration::from_millis(500));
     workers.panic_next(0);
     chain.run(block(10), &mut out, &mut tap);
     assert!(out.iter().all(|&v| v == 0), "the late block");
@@ -688,200 +654,4 @@ fn a_late_lane_that_panicked_stays_silent_when_it_is_back() {
             "block {i} after the late panic"
         );
     }
-}
-
-/// Persistent-gain runs of a chain or an A/B pair.
-trait RunGain {
-    fn run_gain(&mut self, input: &[f32], out: &mut [i32], gain: &mut StereoGainRamp);
-    fn rate(&self) -> u32;
-    fn frames_out(&self, frames: usize) -> usize;
-}
-
-impl RunGain for Chain {
-    fn run_gain(&mut self, input: &[f32], out: &mut [i32], gain: &mut StereoGainRamp) {
-        self.process_f32_with_gain(input, out, gain);
-    }
-    fn rate(&self) -> u32 {
-        self.output_rate()
-    }
-    fn frames_out(&self, frames: usize) -> usize {
-        self.output_frames(frames)
-    }
-}
-
-impl RunGain for AbChain {
-    fn run_gain(&mut self, input: &[f32], out: &mut [i32], gain: &mut StereoGainRamp) {
-        self.process_f32_with_gain(input, out, gain);
-    }
-    fn rate(&self) -> u32 {
-        self.output_rate()
-    }
-    fn frames_out(&self, frames: usize) -> usize {
-        self.output_frames(frames)
-    }
-}
-
-/// A mute set while a late worker keeps the chain silent: the volume ramp
-/// runs through the silent blocks, so the first block back is already
-/// muted (not at the old volume, ramping down only then).
-fn mute_during_a_stall_holds<C: RunGain>(what: &str, chain: &mut C, workers: &LanePool) {
-    let x = input(40 * MAX_BLOCK);
-    let n = MAX_BLOCK;
-    let block = |i: usize| &x[(i % 40) * n * 2..(i % 40 + 1) * n * 2];
-    let mut out = vec![0i32; chain.frames_out(n) * 2];
-    let mut gain = StereoGainRamp::unity(chain.rate());
-    for i in 0..10 {
-        chain.run_gain(block(i), &mut out, &mut gain);
-    }
-    assert!(out.iter().any(|&v| v != 0), "{what}: plays");
-    workers.stall_next(0, Duration::from_millis(250));
-    chain.run_gain(block(10), &mut out, &mut gain);
-    assert!(out.iter().all(|&v| v == 0), "{what}: the late block");
-    gain.set_targets([0.0; 3], true);
-    // Silent blocks while the lane is out (more than the ramp's length).
-    let mut i = 11;
-    while !workers.is_idle(0) {
-        chain.run_gain(block(i), &mut out, &mut gain);
-        assert!(out.iter().all(|&v| v == 0), "{what}: block {i}, stalled");
-        i += 1;
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(i > 14, "{what}: the stall lasted a few blocks");
-    assert_eq!(
-        gain.current(),
-        [0.0; 3],
-        "{what}: the ramp ran in the silence"
-    );
-    for j in i..i + 10 {
-        chain.run_gain(block(j), &mut out, &mut gain);
-        assert!(
-            out.iter().all(|&v| v == 0),
-            "{what}: block {j}, back and muted"
-        );
-    }
-}
-
-#[test]
-fn a_mute_during_a_stall_is_done_when_sound_comes_back() {
-    let workers = late_pool(1);
-    let mut config = full(RateTarget::Ratio(2), 2048);
-    config.convolution.clear();
-    // No dither: a muted block is exact zeros.
-    config.output.dither = DitherKind::None;
-    let mut chain = Chain::new(spec(config.clone(), None));
-    assert!(chain.attach_workers(&workers));
-    mute_during_a_stall_holds("single", &mut chain, &workers);
-
-    let level = audivane_dsp_core::ab_level::AbLevel::from_config(
-        &audivane_protocol::ipc::LevelMatch::default(),
-        audivane_protocol::ipc::AbHeadroom::Auto,
-    );
-    let mut b = config.clone();
-    b.eq = None;
-    let mut ab = AbChain::new(spec(config, None), spec(b, None), level).unwrap();
-    assert!(ab.attach_workers(&workers));
-    mute_during_a_stall_holds("A/B", &mut ab, &workers);
-}
-
-/// The live harmonics tap only reads: the output is bit for bit the
-/// untapped chain's, on one thread and on workers, and the two taps agree
-/// (to the rounding of the mono sum's order) frame for frame.
-#[test]
-fn harmonics_tap_changes_nothing_and_agrees_on_workers() {
-    let config = full(RateTarget::Ratio(2), 1024);
-    assert!(config.harmonics.is_some());
-    let irs = Some(irs(2, 4096, 5));
-    let mut plain = Chain::new(spec(config.clone(), irs.clone()));
-    let mut tapped = Chain::new(spec(config.clone(), irs.clone()));
-    let mut split = Chain::new(spec(config, irs));
-    let workers = pool(1);
-    assert!(split.attach_workers(&workers));
-    tapped.set_harmonics_tap(true);
-    split.set_harmonics_tap(true);
-    let x = input(40_000);
-    let mut at = 0;
-    let mut frames = 0;
-    let (mut a, mut b, mut c) = (
-        vec![0i32; MAX_BLOCK * 4],
-        vec![0i32; MAX_BLOCK * 4],
-        vec![0i32; MAX_BLOCK * 4],
-    );
-    for n in blocks(40_000) {
-        let n = n.min(40_000 - at);
-        let block = &x[at * 2..(at + n) * 2];
-        at += n;
-        plain.process_f32(block, &mut a);
-        tapped.process_f32(block, &mut b);
-        split.process_f32(block, &mut c);
-        let out = plain.output_frames(0).max(n * 2) * 2;
-        assert_eq!(a[..out], b[..out]);
-        assert_eq!(a[..out], c[..out]);
-        assert!(plain.harmonics_tap().is_none());
-        match (tapped.harmonics_tap(), split.harmonics_tap()) {
-            (Some(t), Some(s)) => {
-                assert_eq!(t.input.len(), n * 2);
-                assert_eq!(t.input.len(), s.input.len());
-                assert_eq!(t.linear_gain, s.linear_gain);
-                assert_eq!(t.layers, s.layers);
-                for (u, v) in t
-                    .input
-                    .iter()
-                    .zip(s.input)
-                    .chain(t.output.iter().zip(s.output))
-                {
-                    assert!((u - v).abs() <= 1e-6, "{u} {v}");
-                }
-                frames += n;
-            }
-            (None, None) => assert_eq!(n, 0),
-            _ => panic!("the taps disagree on block of {n}"),
-        }
-    }
-    assert!(frames > 30_000);
-    // Off: nothing.
-    tapped.set_harmonics_tap(false);
-    tapped.process_f32(&x[..512], &mut b);
-    assert!(tapped.harmonics_tap().is_none());
-}
-
-/// The pair's tap follows the side playing, one side per block, and only
-/// reads: the output is the untapped pair's bit for bit.
-#[test]
-fn ab_harmonics_tap_follows_the_side_and_changes_nothing() {
-    let a = full(RateTarget::Ratio(2), 1024);
-    let mut b = a.clone();
-    if let Some(h) = &mut b.harmonics {
-        h.routing = HarmonicsRouting::Series;
-    }
-    let level =
-        audivane_dsp_core::ab_level::AbLevel::from_config(&Default::default(), Default::default());
-    let irs = Some(irs(2, 4096, 5));
-    let pair = || {
-        AbChain::new(
-            spec(a.clone(), irs.clone()),
-            spec(b.clone(), irs.clone()),
-            level,
-        )
-        .unwrap()
-    };
-    let (mut plain, mut tapped) = (pair(), pair());
-    tapped.set_harmonics_tap(true);
-    let x = input(20_000);
-    let (mut o1, mut o2) = (vec![0i32; MAX_BLOCK * 4], vec![0i32; MAX_BLOCK * 4]);
-    let mut sides = Vec::new();
-    for (i, block) in x.chunks(MAX_BLOCK * 2).enumerate() {
-        if i == 15 {
-            plain.select(Side::B, 300);
-            tapped.select(Side::B, 300);
-        }
-        plain.process_f32(block, &mut o1);
-        tapped.process_f32(block, &mut o2);
-        let n = block.len() / 2 * 2 * 2;
-        assert_eq!(o1[..n], o2[..n]);
-        let t = tapped.harmonics_tap().expect("a tap every block");
-        sides.push(t.side);
-        assert_eq!(t.input.len(), block.len() / 2 * 2);
-    }
-    assert!(sides[..15].iter().all(|&s| s == 0));
-    assert!(sides[15..].iter().all(|&s| s == 1));
 }

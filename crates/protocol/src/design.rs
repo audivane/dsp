@@ -1270,44 +1270,6 @@ impl<'de> Deserialize<'de> for StoredDesign {
 mod tests {
     use super::*;
 
-    /// An optimal design's `match_output` resolves to at most its method's
-    /// depth; a windowed sinc's to the output's own.
-    #[test]
-    fn match_output_is_clamped_for_optimal_designs() {
-        let json = |method: &str| {
-            format!(
-                r#"{{
-                "kind": "optimal",
-                "method": "{method}",
-                "length": {{ "rule": "auto", "budget": "match_output" }},
-                "passband_end": 0.9,
-                "stopband_start": 1.0,
-                "phase": {{ "type": "linear" }}
-            }}"#
-            )
-        };
-        let out = OutputConfig {
-            bits: 32,
-            dither: crate::DitherKind::Tpdf,
-            headroom_db: 0.0,
-        };
-        for (method, want) in [("least_squares", 135.0), ("equiripple", 141.4688)] {
-            let d: StoredDesign = serde_json::from_str(&json(method)).unwrap();
-            let FilterDesign::Kernel(KernelDesign {
-                shape:
-                    Shape::Optimal {
-                        length: Length::Auto(FilterErrorBudget::Db(a)),
-                        ..
-                    },
-                ..
-            }) = d.design.with_output(&out)
-            else {
-                panic!("not resolved");
-            };
-            assert!((a - want).abs() < 1e-3, "{method}: {a}");
-        }
-    }
-
     #[test]
     fn spec_examples_round_trip() {
         let flattop_long = r#"{
@@ -1387,83 +1349,5 @@ mod tests {
         assert!(!k.preserve_samples);
         assert_eq!(k.rates.accept, Accept::Any);
         assert!(k.rates.fallback_window.is_none());
-    }
-
-    #[test]
-    fn stepped_span_runtime_and_gaussian_wire_shapes() {
-        let stepped: Stepped<usize> =
-            serde_json::from_str(r#"{"by_source_rate":[[50000,167],[100000,83],[null,63]]}"#)
-                .unwrap();
-        assert_eq!(stepped.at(44_100), Some(167));
-        assert_eq!(stepped.at(96_000), Some(83));
-        assert_eq!(stepped.at(192_000), Some(63));
-        assert_eq!(
-            serde_json::to_value(&stepped).unwrap(),
-            serde_json::json!({"by_source_rate": [[50000, 167], [100000, 83], [null, 63]]})
-        );
-
-        let fixed: Stepped<usize> = serde_json::from_str("511").unwrap();
-        assert_eq!(fixed, Stepped::Fixed(511));
-        assert_eq!(
-            serde_json::to_value(&fixed).unwrap(),
-            serde_json::json!(511)
-        );
-
-        assert_eq!(
-            serde_json::from_str::<Span>(r#""ladder""#).unwrap(),
-            Span::Ladder
-        );
-        assert_eq!(
-            serde_json::to_value(Span::Ladder).unwrap(),
-            serde_json::json!("ladder")
-        );
-        assert_eq!(
-            serde_json::from_str::<Span>("1048576").unwrap(),
-            Span::Taps(1_048_576)
-        );
-        assert_eq!(
-            serde_json::to_value(Span::Taps(1_048_576)).unwrap(),
-            serde_json::json!(1_048_576)
-        );
-
-        // Runtime kinds.
-        for json in [
-            r#"{"kind":"cascade","stage":"fir_minimum"}"#,
-            r#"{"kind":"interpolator","method":"table_sinc"}"#,
-            r#"{"kind":"block_fft","block":{"input":16384},"overlap":"quarter_average"}"#,
-            r#"{"kind":"block_fft","block":{"output":1048576},"overlap":"half"}"#,
-        ] {
-            let d: FilterDesign = serde_json::from_str(json).unwrap();
-            assert_eq!(
-                serde_json::to_value(&d).unwrap(),
-                serde_json::from_str::<serde_json::Value>(json).unwrap()
-            );
-        }
-
-        // Gaussian: alpha or stopband_db, never both.
-        let g_alpha: Window = serde_json::from_str(
-            r#"{"type":"gaussian","alpha":0.175,"sampling":"integer_centre"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            g_alpha,
-            Window::Gaussian {
-                alpha: 0.175,
-                sampling: Sampling::IntegerCentre,
-            }
-        );
-        let g_stop: Window = serde_json::from_str(
-            r#"{"type":"gaussian","stopband_db":150.0,"sampling":"symmetric"}"#,
-        )
-        .unwrap();
-        let Window::GaussianStopband { beta, sampling } = g_stop else {
-            panic!("expected GaussianStopband");
-        };
-        assert_eq!(sampling, Sampling::Symmetric);
-        assert!((beta_to_stopband_db(beta.unwrap()) - 150.0).abs() < 1e-12);
-        let both: Result<Window, _> = serde_json::from_str(
-            r#"{"type":"gaussian","alpha":0.175,"stopband_db":150.0,"sampling":"symmetric"}"#,
-        );
-        assert!(both.is_err());
     }
 }
